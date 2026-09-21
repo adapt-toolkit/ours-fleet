@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,7 +9,7 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import {
   activateRoom, advanceSaga, closeRoom, createRoomRecord, getRoomRecord, setSagaError,
-  setOwnerSeat, updateMemberSeats, updateMemberStartup,
+  setOwnerSeat, updateMemberSeats, updateMemberStartup, roomsDir,
 } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
@@ -921,6 +921,10 @@ describe('task create/start surface parity', () => {
   it('loads configured templates and cleans legacy rooms before live room listing', async () => {
     const closed = createRoomRecord({ room_id: 'room-legacy', room_name: 'Legacy' });
     closeRoom(closed.room_id);
+    const legacyPath = join(roomsDir(), `${closed.room_id}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace; // fixture written by a pre-workspace Fleet
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     const deleteRoom = vi.fn(async () => undefined);
     const listRooms = vi.fn(async () => [{ room_id: 'room-live', identity_name: 'Live',
       identity_cid: 'cid-live', room_name: 'Live', state: 'active' as const, seats: [], role_briefings: {} }]);
@@ -937,6 +941,10 @@ describe('task create/start surface parity', () => {
   it('cleans a stale legacy room record when Cowork already deleted the room', async () => {
     const closed = createRoomRecord({ room_id: 'room-stale', room_name: 'Stale' });
     closeRoom(closed.room_id);
+    const legacyPath = join(roomsDir(), `${closed.room_id}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace; // fixture written by a pre-workspace Fleet
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     const deleteRoom = vi.fn(async () => {
       throw new CoworkProtocolError('room.delete', 'room directory does not exist', 'not_found');
     });

@@ -3,6 +3,8 @@ import { existsSync } from 'node:fs';
 
 import { withFileLock } from '../atomic-file.js';
 import { agentDir } from '../paths.js';
+import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
+import { collectWorkspaceArchives } from './workspace-artifacts.js';
 import { secureStoppedTempArchive, stopTempSupervisor } from '../temp-lifecycle.js';
 import {
   closeManagedRoom, identityCidPresent, inspectMember, removeExactMemberIdentity,
@@ -283,6 +285,11 @@ export async function settleTaskDeletion(input: {
         if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before task unlink');
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
+      if (task.workspace) {
+        assertWorkspaceDeletable(task.workspace, 'task', taskId);
+        collectWorkspaceArchives(task.workspace);
+        deleteWorkspace(task.workspace, 'task', taskId);
+      }
       unlinkDeletedTask(taskId);
     } catch (error) {
       setTaskDeletionError(taskId, errorText(error), recoveryHint);

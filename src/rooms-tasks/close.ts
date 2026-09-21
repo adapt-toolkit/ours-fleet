@@ -1,3 +1,5 @@
+import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
+import { collectWorkspaceArchives } from './workspace-artifacts.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -17,7 +19,7 @@ import {
 } from './room-state.js';
 import type { RoomMemberSeat, RoomOrchestrationRecord } from './types.js';
 
-const CLOSE_LOCK_STALE_MS = 5 * 60_000;
+export const CLOSE_LOCK_STALE_MS = 5 * 60_000;
 const STOP_POLLS = 50;
 const STOP_POLL_MS = 100;
 
@@ -317,6 +319,8 @@ export async function deleteLegacyClosedRooms(input: {
 }): Promise<string[]> {
   const deleted: string[] = [];
   for (const room of listRoomRecords({ state: 'closed' })) {
+    // This compatibility sweep is retirement, never explicit workspace deletion.
+    if (room.workspace) continue;
     try {
       await input.cowork.deleteRoom(room.room_id);
     } catch (error) {
@@ -337,16 +341,26 @@ export async function deleteManagedRoom(input: {
   deps?: RoomCloseDeps;
 }): Promise<ManagedRoomDeleteResult> {
   await closeManagedRoom(input);
-  try {
-    await input.cowork.deleteRoom(input.roomId);
-  } catch (error) {
-    setRoomCloseError(
-      input.roomId,
-      errorText(error),
-      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}'.`,
-    );
-    throw error;
-  }
-  deleteRoomRecord(input.roomId);
-  return { room_id: input.roomId, deleted: true };
+  return withFileLock(roomCloseLockPath(input.roomId), async () => {
+    try {
+      try { await input.cowork.deleteRoom(input.roomId); }
+      catch (error) {
+        // An earlier explicit delete may have removed the remote room before
+        // local filesystem cleanup failed. Never restore it or repeat creation.
+        if (!(error instanceof CoworkProtocolError && error.code === 'not_found')) throw error;
+      }
+      const retained = getRoomRecord(input.roomId);
+      if (retained?.workspace && !retained.task_id) {
+        assertWorkspaceDeletable(retained.workspace, 'room', input.roomId);
+        collectWorkspaceArchives(retained.workspace);
+        deleteWorkspace(retained.workspace, 'room', input.roomId);
+      }
+      deleteRoomRecord(input.roomId);
+      return { room_id: input.roomId, deleted: true as const };
+    } catch (error) {
+      setRoomCloseError(input.roomId, errorText(error),
+        `Fix the cleanup error and explicitly retry room delete ${input.roomId} ${input.roomId}.`);
+      throw error;
+    }
+  }, {}, CLOSE_LOCK_STALE_MS);
 }

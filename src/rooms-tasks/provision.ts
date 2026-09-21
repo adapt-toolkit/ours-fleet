@@ -1,4 +1,5 @@
 import { readRoomReadiness } from '../agent-ours/service.js';
+import { ensureWorkspace, validateWorkspace } from './workspace.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
@@ -32,7 +33,7 @@ import {
 } from '../fleet-proxy.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError } from '../session/types.js';
-import { closeManagedRoom, roomCloseLockPath } from './close.js';
+import { closeManagedRoom, roomCloseLockPath, CLOSE_LOCK_STALE_MS } from './close.js';
 import { withFileLock } from '../atomic-file.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import { TaskStateError, taskDeletionState } from './task-state.js';
@@ -217,6 +218,7 @@ function roomTask(
   anonymous: boolean,
 ): string {
   return buildRoomMemberTask({
+    workspace: getRoomRecord(input.roomId)?.workspace?.path,
     taskId: input.taskId,
     roomId: input.roomId,
     roomIdentityCid,
@@ -252,10 +254,14 @@ function launchMatches(
   try {
     const role = parse(readFileSync(`${dir}/role.yaml`, 'utf8')) as {
       identity?: unknown;
+      cwd?: unknown;
       mission?: unknown;
       roomMemberStartup?: Partial<RoomMemberStartup>;
     };
     const startup = role.roomMemberStartup;
+    const workspace = getRoomRecord(roomId)?.workspace;
+    if (workspace && (role.cwd !== workspace.path
+      || JSON.stringify(startup?.workspace) !== JSON.stringify(workspace))) return false;
     return role.identity === member.name
       && startup?.room_id === roomId
       && startup.room_identity_cid === roomIdentityCid
@@ -370,41 +376,14 @@ async function retainRunningLaunch(input: {
   return false;
 }
 
-/**
- * Member-launch publication window: for a task-bound room, the durable launch
- * intent, spawn, and launch record publish under the common task-operation
- * lock so an accepted deletion linearizes strictly before (bounded abort — no
- * spawn happens) or strictly after (the seat's launch record is visible to
- * deletion retirement). The lock is held per member only, never across
- * seat-wait loops.
- */
 async function launchMember(input: {
   provision: ProvisionMembersInput;
   member: ExpandedMember;
   settings: MemberSettings;
   startup: RoomMemberStartup;
 }): Promise<void> {
-  const taskId = input.provision.taskId;
-  const launch = () => withFileLock(roomCloseLockPath(input.provision.roomId), () => {
-    assertProvisioningOpen(input.provision);
-    return launchMemberUnlocked(input);
-  }, {}, TASK_OPERATION_LOCK_STALE_MS);
-  if (!taskId) return launch();
-  return withFileLock(taskOperationLockPath(taskId), () => {
-    if (taskDeletionState(taskId) !== 'none')
-      throw new Error(
-        `task ${taskId} is pending deletion; aborting member launch for ${input.member.name}`,
-      );
-    return launch();
-  }, {}, TASK_OPERATION_LOCK_STALE_MS);
-}
-
-async function launchMemberUnlocked(input: {
-  provision: ProvisionMembersInput;
-  member: ExpandedMember;
-  settings: MemberSettings;
-  startup: RoomMemberStartup;
-}): Promise<void> {
+  // provisionMembers holds the task and room lifecycle locks through every launch.
+  assertProvisioningOpen(input.provision);
   const { provision, member, settings, startup } = input;
   const seat = getRoomRecord(provision.roomId)!.member_seats
     .find(candidate => candidate.role_name === member.name)!;
@@ -544,12 +523,23 @@ function assertProvisioningOpen(input: ProvisionMembersInput): void {
     throw new Error(`room ${input.roomId} is ${room.state}; refusing to provision members`);
 }
 
-export async function provisionMembers(
-  input: ProvisionMembersInput,
-): Promise<RoomOrchestrationRecord> {
+export async function provisionMembers(input: ProvisionMembersInput): Promise<RoomOrchestrationRecord> {
+  // Same lock order as terminal/deletion settlement. Serialize concurrent retries
+  // and standalone retirement as well as member publication. Seat waits are bounded.
+  const run = () => withFileLock(roomCloseLockPath(input.roomId), () => {
+    assertProvisioningOpen(input);
+    if (!getRoomRecord(input.roomId))
+      throw new Error(`room ${input.roomId} is missing; refusing provisioning`);
+    return provisionMembersUnlocked(input);
+  }, {}, CLOSE_LOCK_STALE_MS);
+  return input.taskId
+    ? withFileLock(taskOperationLockPath(input.taskId), run, {}, TASK_OPERATION_LOCK_STALE_MS)
+    : run();
+}
+
+async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<RoomOrchestrationRecord> {
   const { cfg, cowork, roomId, taskId, template } = input;
-  assertProvisioningOpen(input);
-  // Deletion-epoch pre-check; each member launch re-checks under the lock.
+  // The common task-operation lock protects this epoch through all member launches.
   if (taskId && taskDeletionState(taskId) !== 'none')
     throw new Error(`task ${taskId} is pending deletion; refusing to provision members`);
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
@@ -561,6 +551,11 @@ export async function provisionMembers(
   const existing = getRoomRecord(roomId);
   if (!existing?.room_identity_cid)
     throw new Error(`room ${roomId} has no pinned room identity CID`);
+  if (existing.workspace) {
+    validateWorkspace(existing.workspace, taskId ? 'task' : 'room', taskId ?? roomId);
+    ensureWorkspace(existing.workspace);
+    for (const setting of settings.values()) setting.definition.cwd = existing.workspace.path;
+  }
   const roomIdentityCid = existing.room_identity_cid;
   const ownerSeatCid = existing.owner_seat_cid ?? null;
   const roomPolicy = storedRoomLaunchPolicy(existing.room_policy);
@@ -652,6 +647,7 @@ export async function provisionMembers(
           member,
           settings: settings.get(member.name)!,
           startup: {
+            workspace: existing.workspace,
             room_id: roomId,
             room_identity_cid: roomIdentityCid,
             identity_name: member.name,

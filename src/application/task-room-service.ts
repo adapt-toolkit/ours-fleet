@@ -1014,6 +1014,7 @@ export class TaskRoomApplicationService {
     const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
     let launchTemplate: TemplateSnapshot | undefined;
     let room: RoomOrchestrationRecord;
+    let reusedRoom = false;
     try {
       launchTemplate = template ? (template.launch_snapshot_hash ? template
         : sealTemplateSnapshot(template, cfg.agentTemplates ?? {}, launchDefinitions)) : undefined;
@@ -1028,6 +1029,17 @@ export class TaskRoomApplicationService {
           if (fresh.deletion?.status === 'pending')
             throw new TaskRoomApplicationError('task_deleting',
               `task ${task.task_id} is pending deletion`, { task: task.task_id });
+          // A concurrent caller or a restart after local Room publication must
+          // reuse the task's one durable room, never create a second workspace/room.
+          const candidates = listRoomRecords().filter(record => record.task_id === task.task_id);
+          if (candidates.length > 1) throw new Error('ambiguous task room ownership');
+          const existing = fresh.room_id ? getRoomRecord(fresh.room_id) : candidates[0];
+          if (fresh.room_id && !existing) throw new Error('recorded task room is missing; refusing duplicate creation');
+          if (existing) {
+            reusedRoom = true;
+            onCreated(existing);
+            return existing;
+          }
         }
         const requiredRoles = new Map<string, number>();
         if (attachOwner) requiredRoles.set(rooms.owner.role, 1);
@@ -1056,6 +1068,7 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
+    if (reusedRoom) return room;
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       room = advanceSaga(room.room_id, 'attach_owner', 2);

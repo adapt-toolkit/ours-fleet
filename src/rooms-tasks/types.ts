@@ -119,6 +119,7 @@ export interface TaskDeletionIntent {
 }
 
 export interface TaskRecord {
+  workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
   list_id: string;
@@ -279,6 +280,7 @@ export interface RoomMemberSeat {
 }
 
 export interface RoomOrchestrationRecord {
+  workspace?: import('./workspace.js').OwnedWorkspace;
   room_id: string;
   room_identity_cid?: string;
   room_name: string;

@@ -18,6 +18,7 @@
     "examples",
     "presets",
     "README.md",
+    "docs/task-workspaces.md",
     "LICENSE"
   ],
   "engines": {

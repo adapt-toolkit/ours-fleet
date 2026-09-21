@@ -568,22 +568,16 @@ describe('gated concurrency and stranger safety', () => {
         binPath: '/bin/true',
       }).then(() => 'resolved', error => error as Error);
       void provisioning.then(value => { settledEarly = value; });
-      const deadline = Date.now() + 5_000;
-      while (!inviteIssued && settledEarly === undefined && Date.now() < deadline)
-        await new Promise(resolve => setTimeout(resolve, 20));
-      if (settledEarly !== undefined && !inviteIssued)
-        throw new Error(`provisioning settled before the gated window: ${String(settledEarly)}`);
-      expect(inviteIssued).toBe(true); // provisioning reached the gated window
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(inviteIssued).toBe(false); // entire provisioning waits for the deletion epoch
+      expect(settledEarly).toBeUndefined();
       beginTaskDeletionIntent(t.task_id, CLI_ACTOR); // delete wins the epoch
     });
     const outcome = await provisioning!;
     expect(outcome).toBeInstanceOf(Error);
     expect((outcome as Error).message).toMatch(/pending deletion/);
-    expect(revoked).toBe(true); // issued invite rolled back
-    const seat = getRoomRecord('room-dw')!.member_seats[0];
-    // Spawn count zero: the durable launch record never left its pre-launch state.
-    expect(seat.launch?.state).toBe('pending');
-    expect(seat.launch?.attempt).toBe(0);
+    expect(revoked).toBe(false); // no invite was issued
+    expect(getRoomRecord('room-dw')!.member_seats).toEqual([]);
   }, 20_000);
 
   it('leaves a same-name different-CID stranger identity untouched', async () => {

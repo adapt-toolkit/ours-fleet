@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
+import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
@@ -152,7 +153,7 @@ export interface CreateTaskInput {
 
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
-  const existing = findByIdempotencyKey(key);
+  const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
   if (existing) {
     const existingPlan = existing.execution_plan?.plan_hash;
     const requestedPlan = input.execution_plan?.plan_hash;
@@ -160,7 +161,12 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
     if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy))
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
-    return existing;
+    return withTaskLock(existing.task_id, () => {
+      const fresh = readTask(existing.task_id);
+      assertNoPendingDeletion(fresh);
+      if (fresh.workspace) ensureWorkspace(fresh.workspace);
+      return fresh;
+    });
   }
 
   const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
@@ -181,7 +187,9 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     created_at: new Date().toISOString(),
     started_at: state === 'provisioning' ? new Date().toISOString() : undefined,
   };
+  record.workspace = planWorkspace('task', record.task_id);
   writeTask(record);
+  ensureWorkspace(record.workspace);
   return readTask(record.task_id);
 }
 
