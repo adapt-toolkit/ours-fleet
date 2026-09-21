@@ -54,6 +54,8 @@ This review uses unpublished local artifacts: SDK `3.8.1-supervisor.0` and MCP
 `scripts/prepare-supervisor-review.sh` from this repository. It builds the tarballs
 referenced by the review lockfiles. Fleet and MCP share the reviewed SDK; the existing
 operator CLI/dev-daemon packages retain their original dependencies.
+CI runs `scripts/prepare-supervisor-ci.sh` before `npm ci`: it builds these same
+artifacts from immutable MCP and SDK revisions without publishing packages.
 
 For release, publish the reviewed SDK and MCP artifacts through the normal release
 process, replace the two Fleet local-file pins and MCP workspace development pin

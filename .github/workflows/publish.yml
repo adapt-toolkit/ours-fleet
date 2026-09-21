@@ -35,6 +35,21 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Read pinned dependency sources
+        id: dependency-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ours-sdk
+            ours-mcp
+          permission-contents: read
+      - name: Build pinned review dependencies
+        env:
+          GH_TOKEN: ${{ steps.dependency-token.outputs.token }}
+        run: bash scripts/prepare-supervisor-ci.sh
       - run: npm ci
       - run: npm run build
       - run: npm test
