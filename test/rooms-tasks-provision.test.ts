@@ -1,3 +1,5 @@
+import { privateRuntimeRoot } from '../src/agent-ours/service.js';
+import { atomicPrivateWrite, binderKey } from '../src/agent-ours/state.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -109,6 +111,8 @@ function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number;
   const revokeInvite = vi.fn().mockResolvedValue(undefined);
   const accept = (spawn: Record<string, any>) => {
     const startup = spawn.roomMemberStartup;
+    const readyRoot=join(privateRuntimeRoot(),'room-inputs');mkdirSync(readyRoot,{recursive:true});
+    atomicPrivateWrite(join(readyRoot,binderKey(startup.room_identity_cid,spawn.name)+'.ready.json'),{room:startup.room_id,invite:startup.invite_id,cid:`cid-${startup.identity_name}`,generation:1});
     const seat = {
       identity_cid: `cid-${startup.identity_name}`,
       display_name: startup.identity_name,
@@ -201,7 +205,7 @@ beforeEach(() => {
         inject: 'notification', interrupt: true, turn_fail_threshold: 3 },
       ...(definition.isolation ? { isolation: definition.isolation } : {}),
       sourceFile: '(temp)',
-      roomMemberStartup: opts.roomMemberStartup,
+      roomMemberStartup: {...opts.roomMemberStartup,invite:''},
     }));
     writeFileSync(join(dir, 'creation.json'), JSON.stringify({
       creationActionId: opts.creationActionId, role: opts.name,
@@ -387,6 +391,8 @@ describe('simple Cowork room member startup', () => {
     const h = coworkHarness();
     acceptSpawn = (spawn: Record<string, any>) => {
       const startup = spawn.roomMemberStartup;
+    const readyRoot=join(privateRuntimeRoot(),'room-inputs');mkdirSync(readyRoot,{recursive:true});
+    atomicPrivateWrite(join(readyRoot,binderKey(startup.room_identity_cid,spawn.name)+'.ready.json'),{room:startup.room_id,invite:startup.invite_id,cid:`cid-${startup.identity_name}`,generation:1});
       const info = roomInfo('room-spoof', [{
         identity_cid: 'attacker', display_name: startup.identity_name,
         invite_id: startup.invite_id, role: 'Owner', seat_state: 'active',

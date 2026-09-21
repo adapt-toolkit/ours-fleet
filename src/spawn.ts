@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { storeRoomSecret, storeTemporaryLaunch, preparePermanentAssignment } from './agent-ours/service.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -314,26 +316,12 @@ export async function spawnPermanent(
     async tx => {
       assertNameFree(o);
       const cfg = loadConfig(o.configPath);
-      // Establish the identity BEFORE the service is enabled, and record
-      // what was actually guaranteed so the briefing can say something true.
+      // Pin an existing assignment without binding; the supervisor provisions
+      // a missing role identity before starting its harness.
       creation.onStage?.('checking_identity');
-      const guarantee = await ensureIdentity(
-        effectiveIdentity(o),
-        { bio: prepared.role.bio, persona: prepared.role.persona },
-        creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
-        deps.log);
-      creation.onStage?.('checking_identity', {
-        result: guarantee.evidence, guarantee: guarantee.state,
-      });
-      if (guarantee.state === 'created')
-        // We minted it; a failed creation must not leave an orphan identity
-        // behind. Only ever removes an identity THIS transaction created.
-        tx.record({
-          stage: `ours identity ${effectiveIdentity(o)}`,
-          undo: async () => {
-            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
-          },
-        });
+      const assignment = await preparePermanentAssignment(prepared.role);
+      const guarantee = { state: assignment, evidence: assignment === 'verified' ? 'verified' as const : 'missing' as const };
+      creation.onStage?.('checking_identity', { result: guarantee.evidence, guarantee: guarantee.state });
       const agentRoot = join(splitRootFor(o.configPath ?? defaultConfigPath()), 'agents');
       mkdirSync(agentRoot, { recursive: true });
       creation.onStage?.('writing_role');
@@ -450,6 +438,9 @@ async function spawnTempInner(
     temporaryLoopSource: o.loopSource ?? (temporaryLoops?.length ? 'agent-template' : 'omitted'),
     roomMemberStartup: o.roomMemberStartup,
   };
+  storeTemporaryLaunch(role, o.creationActionId ?? randomUUID());
+  storeRoomSecret(role);
+  if (role.roomMemberStartup) role.roomMemberStartup = { ...role.roomMemberStartup, invite: '' };
   onStage?.('writing_role');
   const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
   const provenance = buildProvenance({

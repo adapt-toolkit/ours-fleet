@@ -1,3 +1,4 @@
+import { preparePermanentAssignment } from '../../src/agent-ours/service.js';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -153,6 +154,7 @@ identity: Temp
         journalDir: join(root, '.ours-fleet', 'web-actions'),
         probeReady: async () => flow.probe,
       });
+      vi.mocked(preparePermanentAssignment).mockResolvedValue('unverified');
       const request = {
         name: `Created_${flow.lifetime}_${flow.session}`,
         harness: flow.harness, session: flow.session, lifetime: flow.lifetime,
@@ -200,19 +202,12 @@ identity: Temp
         root, '.ours-fleet', flow.lifetime === 'permanent' ? 'agents' : 'tmp', request.name,
       );
       const briefing = readFileSync(join(stateDir, 'briefing.md'), 'utf8');
-      if (flow.lifetime === 'permanent') {
-        expect(briefing).toContain('choose_identity');
-        expect(briefing).not.toContain('call **create_identity**');
-        expect(briefing).toContain('It was created when your role');
-      } else {
-        expect(briefing).toContain('create_temporary_identity');
-        expect(briefing).not.toContain('choose_identity');
-        expect(briefing).not.toContain('call **create_identity**');
-      }
+      expect(briefing).toContain('owned and verified by the Fleet supervisor');
+      expect(briefing).not.toMatch(/choose_identity|create_temporary_identity|create_identity/);
       expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
         'identity_bootstrap_pending',
       );
-      expect(mutationCalls).toBe(flow.lifetime === 'permanent' ? 1 : 0);
+      expect(mutationCalls).toBe(0); // Creation is owned by the launched supervisor.
       const written = flow.lifetime === 'permanent'
         ? parse(readFileSync(join(root, 'fleet', 'agents', `${request.name}.yaml`), 'utf8'))
         : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));
@@ -443,3 +438,10 @@ roles: {}
     expect(launches).toBe(3);
   });
 });
+
+vi.mock('../../src/agent-ours/service.js', async importOriginal => ({
+ ...await importOriginal(),
+ preparePermanentAssignment: vi.fn(async () => 'verified'),
+ prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
+ releaseManagedAgent:async()=>{},
+}));

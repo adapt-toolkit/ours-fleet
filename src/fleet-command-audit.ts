@@ -186,7 +186,7 @@ export const fleetProxyTopLevelInventory = Object.freeze({
     'up', 'down', 'restart', 'force-restart', 'attach', 'send', 'loops', 'owner-channel',
     'watchdog-run', 'watchdog-report', 'rm', 'init', 'web',
   ], denied: [...DENIED],
-  hidden: ['_run', '_run-temp', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
+  hidden: ['_run', '_run-temp', '_run-temp-worker', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
 });
 
 const globalValueOptions = new Set(['-c', '--configuration']);

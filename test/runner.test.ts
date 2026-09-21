@@ -33,6 +33,17 @@ import type { ResolvedRole } from '../src/config.js';
 import { AcpSession } from '../src/session/acp.js';
 import { writeV2Fixture } from './v2-fixture.js';
 
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/agent-ours/service.js')>(),
+  prepareManagedAgent: async () => ({
+    descriptor: '/test/managed-descriptor.json', privatePaths: [],
+    runtime: { startHarness: async (start: () => Promise<unknown>) => start(), admit: async () => () => {} },
+    close: async () => {},
+  }),
+  releaseManagedAgent: async () => {},
+  preparePermanentAssignment: async () => 'verified',
+}));
+
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-run-'));
@@ -75,6 +86,7 @@ function monitorRecorder(sessionCreated: () => boolean) {
 function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean; recoveryGate?: Promise<void> } = {}) {
   const paneCommands: string[] = [];
   const recoveryPrompts: string[] = [];
+  const managedRecoveries: string[] = [];
   const starts: Array<{ mode: 'fresh' | 'resume'; argv: string[]; env: Record<string, string> }> = [];
   let clock = 0;
   let checks = 0;
@@ -85,6 +97,12 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
   const deps = {
+    prepareAgentOurs: async () => ({
+      descriptor: '/test/managed-descriptor.json', privatePaths: [],
+      runtime: { startHarness: async (start: () => Promise<unknown>) => start(), admit: async () => { managedRecoveries.push('verify'); await opts.recoveryGate; return () => {}; } },
+      close: async () => {},
+    }) as unknown as Awaited<ReturnType<RunnerDeps['prepareAgentOurs']>>,
+    releaseAgentOurs: async () => {},
     exec,
     cpuDelegated: () => opts.cpuDelegated ?? true,
     probeGeneration: async () => ({ state: 'ready' as const, generation: {
@@ -169,7 +187,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       };
     },
   };
-  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts };
+  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts, managedRecoveries };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
@@ -490,8 +508,8 @@ describe('daemon generation recovery integration', () => {
     let probes = 0;
     world.deps.probeGeneration = async () => generations[Math.min(probes++, generations.length - 1)];
     await runOnce('A', {}, world.deps);
-    expect(world.recoveryPrompts).toHaveLength(1);
-    expect(world.recoveryPrompts[0]).toContain('force false');
+    expect(world.recoveryPrompts).toHaveLength(0);
+    expect(world.managedRecoveries).toHaveLength(1);
     const statusPath = join(d, '.daemon-recovery.json');
     expect(statSync(statusPath).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(statusPath, 'utf8'))).toMatchObject({
@@ -1391,15 +1409,15 @@ describe('runOnce monitor integration', () => {
     expect(monitor.stopped).toBe(true);               // stopped when the pane pid died
   });
 
-  it('does not construct a fleet monitor when monitor.mode is native', async () => {
+  it('uses supervisor wake delivery even for a legacy native monitor setting', async () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
-    expect(monitor.constructed).toBe(0);
+    expect(monitor.constructed).toBe(1);
   });
 
-  it('re-primes at tip when wake ownership moves from native back to fleet', async () => {
+  it('retains the cursor when a legacy native setting is changed to fleet', async () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     await runOnce('A', {}, fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') }).deps);
@@ -1407,7 +1425,7 @@ describe('runOnce monitor integration', () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet' } } });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
-    expect(monitor.resetCursor).toBe(true);
+    expect(monitor.resetCursor).toBe(false);
   });
 
   it('does not request a cursor reset across fleet-to-fleet restarts', async () => {
@@ -1499,7 +1517,7 @@ describe('temporary identity retirement', () => {
     world.deps.shouldStop = () => true;
     const result = await runOnce('T', { temp: true }, world.deps);
     expect(result.retirementReason).toBe('supervisor-signal');
-    expect(world.recoveryPrompts).toHaveLength(1);
+    expect(world.managedRecoveries).toHaveLength(1);
     const statusPath = join(d, '.daemon-recovery.json');
     const before = readFileSync(statusPath, 'utf8');
     release();
@@ -1710,7 +1728,7 @@ describe('runTemp', () => {
       .toContain('"reason":"identity-closed"');
   });
 
-  it('archives a distinct recycle reason and rethrows for a fresh supervisor PID', async () => {
+  it('retains the logical agent on supervisor recycle', async () => {
     const d = agentDir('Recycle', true);
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, 'role.yaml'), stringify({
@@ -1720,11 +1738,8 @@ describe('runTemp', () => {
     await expect(runTemp('Recycle', { log: line => logs.push(line) }, async () => {
       throw new SupervisorRecycleRequiredError();
     })).rejects.toBeInstanceOf(SupervisorRecycleRequiredError);
-    const archiveRoot = join(stateRoot(), 'recovery', 'temporary');
-    const archived = readdirSync(archiveRoot).find(name => name.includes('-Recycle-'))!;
-    expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
-      .toContain('"reason":"supervisor-recycle"');
-    expect(logs).toContainEqual(expect.stringContaining('failed: supervisor-recycle'));
+    expect(existsSync(d)).toBe(true);
+    expect(existsSync(join(stateRoot(), 'recovery', 'temporary'))).toBe(false);
   });
 });
 

@@ -253,20 +253,15 @@ records receive a bounded grace so a not-yet-registered transient unit cannot be
 mistaken for a stopped one. Stale recorded supervisors are reclaimed in bounded
 batches by moving their state to the same recovery archive, never by blind deletion.
 
-Every temporary role creates a new session-owned identity by calling ours MCP
-\`create_temporary_identity\` with its exact assigned name. It never binds a
-pre-existing identity and never falls back to permanent \`create_identity\`.
-Fleet does not inspect, preserve, or provision an ours identity for temporary
-spawn; creation belongs exclusively to the launched temporary agent session.
-Collisions, missing tool support, and creation errors stop safely without
-force-adopting or deleting identity state. Permanent roles
-are provisioned by fleet before launch and never delegate normal identity
-creation to the harness.
+The Fleet supervisor creates and binds the assigned identity before the harness
+starts. Temporary identities survive harness reconnects and are released only when
+the logical run ends. Permanent identities remain available after the supervisor
+releases ownership. Agents receive ready tools; no model-owned identity bootstrap
+or onboarding skill is required.
 
-The temporary supervisor treats its first positive identity observation as the
-lifecycle readiness gate: a cold harness may take as long as needed to read its
-briefing and bind, without a fixed first-bind retirement timer. After readiness,
-only sustained authoritative absence closes the role. Unreachable, malformed, or
+The temporary supervisor provisions identity and verifies room readiness before
+starting the harness. After readiness, only sustained authoritative absence
+closes the role. Unreachable, malformed, or
 valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
 than becoming cleanup authority.
 
@@ -454,10 +449,10 @@ tasks:
 \`\`\`
 
 Fleet launches each template member with a dedicated one-time Cowork invite.
-The generated temporary-agent briefing contains the exact identity name, invite,
-Cowork role, and task. The agent creates that identity itself with ours MCP
-\`create_temporary_identity\`, accepts the invite with \`add_contact\`, and starts
-work immediately. A room is ready only after the Cowork room (and its task, when
+The supervisor accepts the startup invite and verifies the provisioned identity CID
+in the authenticated room seat before starting the model. The generated briefing
+contains the assigned identity, room, role and task, without invite material.
+A room is ready only after the Cowork room (and its task, when
 task-bound) is durably active, every configured member seat is authenticated and active with its matching
 live Fleet launch, and the configured Owner seat is active when owner attachment is
 enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
@@ -480,8 +475,8 @@ Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
 \`task create\`, \`task start\`, \`task work\`, or \`room create\`, to create an
 anonymous Cowork room. \`--no-anonymous\` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
-the same choice. Temporary members of an anonymous room are instructed to call
-\`create_temporary_identity\` with \`expose_local=false\`. Their generated briefings
+the same choice. The supervisor creates anonymous room members with local contact-book exposure
+disabled. Their generated briefings
 do not disclose or compare an Owner participant CID. A participant-originated
 instruction has Owner authority only when the authenticated Cowork room envelope
 attributes that participant seat the exact \`Owner\` role. Literal text, display

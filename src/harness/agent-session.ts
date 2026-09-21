@@ -1,3 +1,4 @@
+import type { ManagedHarnessOurs } from '../agent-ours/harness.js';
 import type {
   CommonPermissions, FleetPermissionMode, ResolvedRole,
 } from '../config.js';
@@ -24,6 +25,7 @@ export interface ResolvedBrainSelection {
 export interface AgentSessionConfigSelection { configId: string; value: string }
 
 export interface AgentSessionStartOptions {
+  managedOurs?: ManagedHarnessOurs;
   role: ResolvedRole;
   prep: SessionPrep;
   launch: PreparedAgentSessionLaunch;

@@ -289,8 +289,8 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.8.1-nightly.9');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.8.1-nightly.9');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('file:../ours.network-sdk-3.8.1-supervisor.0.tgz');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.8.1-supervisor.0');
     expect(pkg.dependencies['@ours.network/cli']).toBe('2.8.1-nightly.7');
     expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('2.8.1-nightly.7');
   });

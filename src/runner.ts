@@ -1,5 +1,8 @@
+import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
+import { prepareManagedHarness } from './agent-ours/harness.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
@@ -16,7 +19,6 @@ import {
   DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration,
   type DaemonGenerationProbe,
 } from './daemon-recovery.js';
-import { recoverAgentIdentity } from './agent-recovery-gate.js';
 import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
@@ -60,6 +62,8 @@ import {
 import { FleetCommandAuditStore } from './fleet-command-audit.js';
 
 export interface RunnerDeps {
+  prepareAgentOurs: typeof prepareManagedAgent;
+  releaseAgentOurs: typeof releaseManagedAgent;
   exec: Exec;
   cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
@@ -106,6 +110,8 @@ export class SupervisorRecycleRequiredError extends Error {
 }
 
 const defaultDeps = (): RunnerDeps => ({
+  prepareAgentOurs: prepareManagedAgent,
+  releaseAgentOurs: releaseManagedAgent,
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
@@ -563,7 +569,7 @@ export function isRecoverableTempStartupCancellation(
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
-  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean } = {},
+  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean; identityLifetime?: 'permanent' | 'temporary' } = {},
   partialDeps: Partial<RunnerDeps> = {},
 ): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
@@ -620,12 +626,13 @@ export async function runOnce(
   writeFileSync(bootedFile, `${new Date(deps.now()).toISOString()} ${mode}\n`);
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
+  role = { ...role, monitor: { ...role.monitor, mode: 'fleet' } };
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
   const sessionBackend = role.session ?? 'acp';
   const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);
 
-  // Isolation is additive: only roles that declare `isolation:` are wrapped.
+  // Preserve the role's existing isolation policy.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
     // Start with the same durable context that config validation and doctor judged,
@@ -635,7 +642,7 @@ export async function runOnce(
     launch = { ...launch, argv: runtime.argv };
     const ctx: WrapContext = {
       ...isolationContextFor(role), stateDir: dir, runCwd,
-      runtimeReadPaths: runtime.readPaths,
+      runtimeReadPaths: [...runtime.readPaths, ...resolveLaunchRuntime([process.execPath, fileURLToPath(new URL('./agent-ours/bridge.js', import.meta.url))]).readPaths],
     };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
@@ -656,6 +663,10 @@ export async function runOnce(
     if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
   }
 
+  const managedService = await deps.prepareAgentOurs(role, dir, opts.identityLifetime ? opts.identityLifetime === 'temporary' : temp);
+  try {
+  const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
+    harnessChildEnv(role, launch.env, dir));
   // Start-stagger: space this launch at least start_stagger_ms after the previous
   // agent launch across the whole host, so a burst of boots (systemd starts every
   // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not
@@ -737,12 +748,13 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    agentSession = await deps.startAgentSession(adapter.agentSession, {
+    agentSession = await managedService.runtime.startHarness(() => deps.startAgentSession(adapter.agentSession, {
+      managedOurs: managedHarness.ours,
       role, prep,
-      launch: { ...launch, argv: wrappedArgv, env: harnessChildEnv(role, launch.env, dir) },
+      launch: { ...launch, argv: wrappedArgv, env: managedHarness.env },
       cwd: runCwd, stateDir: dir, mode, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
-    });
+    }));
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
@@ -860,7 +872,7 @@ export async function runOnce(
     };
     const firstPrompt = mode === 'fresh'
       ? `Read and follow ${join(dir, 'briefing.md')} now.`
-      : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
+      : `Your supervisor has verified your assigned identity and room readiness. Read ${join(dir, 'WORKLOG.md')} and ${join(dir, 'briefing.md')}, then continue using the available ours tools.`;
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
@@ -986,8 +998,8 @@ export async function runOnce(
     role: name, identity: role.identity, stateDir: dir, now: deps.now, sleep: deps.sleep,
     log: deps.log,
     recoverAgent: async () => {
-      const evidence = await recoverAgentIdentity(arbiter!, role.identity);
-      return evidence.ok ? { ok: true } : { ok: false, reason: evidence.reason };
+      try { const release = await managedService.runtime.admit(); release(); return { ok: true }; }
+      catch { return { ok: false, reason: 'SUPERVISOR_IDENTITY_NOT_READY' }; }
     },
     recoverOwner: async epoch => {
       if (!ownerChannel?.recover) return { ok: true };
@@ -1142,6 +1154,9 @@ export async function runOnce(
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
     ...(retirementReason ? { retirementReason } : {}),
   };
+  } finally {
+    await managedService.close(false);
+  }
 }
 
 /**
@@ -1322,6 +1337,7 @@ export async function runSupervised(
     process.off('SIGINT', requestStop);
     // An orderly shutdown clears the marker; an unhandled signal or OOM-kill
     // leaves it so the successor can identify an abrupt termination.
+    if (shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
     releaseSupervisorRun(dir);
   }
 }
@@ -1353,15 +1369,21 @@ export async function runTemp(
   let result: AttemptResult | undefined;
   let failure: unknown;
   try {
-    result = await attempt(name, { temp: true }, {
-      ...deps,
-      shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
-    });
+    for(let recoveryAttempt=0;;recoveryAttempt++) {
+      result = await attempt(name, { temp: true }, {
+        ...deps,
+        shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
+      });
+      if(result.exit.class==='clean'||result.retirementReason||signal||deps.shouldStop?.()||recoveryAttempt>=2)break;
+      await (deps.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms))))(Math.min(5000,1000*(recoveryAttempt+1)));
+    }
   } catch (error) {
     failure = error;
   } finally {
     process.off('SIGTERM', onTerm);
     process.off('SIGINT', onInt);
+    // A recycle replaces the supervisor process, not the logical temporary agent.
+    if (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.()) {
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason
@@ -1376,9 +1398,11 @@ export async function runTemp(
       : result
         ? `${result.exit.detail}; elapsed=${result.elapsedSecs.toFixed(1)}s`
         : 'temporary supervisor ended without an attempt result';
+    await (deps.releaseAgentOurs ?? releaseManagedAgent)(loadTempRole(name));
     const archived = archiveTempState(name, reason, outcome, detail);
     deps.log?.(`[${name}] temporary lifecycle ${outcome}: ${reason}`
       + `${archived ? `; evidence archived at ${archived}` : '; state already archived'}`);
+    }
   }
   if (failure) throw failure;
 }

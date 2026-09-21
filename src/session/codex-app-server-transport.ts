@@ -99,7 +99,7 @@ export class CodexAppServerTransport implements CodexAppServerConnection {
     if (!options.argv.length) throw new Error('Codex app-server command is empty');
     const child = spawn(options.argv[0], options.argv.slice(1), {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env: { ...(options.env?.FLEET_OURS_MANAGED === '1' ? {} : process.env), ...options.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     // `pid` is assigned synchronously on a successful local spawn. Checking it

@@ -48,11 +48,10 @@ const provisioner = { exists: async () => true as const };
 
 function fakeChild(behavior: (runDir: string) => Promise<void>) {
   let killed = false;
-  return (_bin: string, _role: string, runDir: string) => ({
-    kill: () => { killed = true; },
-    exited: behavior(runDir),
-    get killed() { return killed; },
-  });
+  return (_bin: string, _role: string, runDir: string) => {
+    let stop!:()=>void;const stopped=new Promise<void>(resolve=>{stop=resolve;});
+    return {kill:()=>{killed=true;stop();},exited:Promise.race([behavior(runDir),stopped]),get killed(){return killed;}};
+  };
 }
 
 const baseDeps = (launchChild: ReturnType<typeof fakeChild>) => ({

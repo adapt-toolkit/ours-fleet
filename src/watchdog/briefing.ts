@@ -37,21 +37,9 @@ function bindSection(
   heading: string, wd: ResolvedWatchdog, v: BriefingVocab,
   guarantee: 'verified' | 'created' | 'unverified',
 ): string[] {
-  const L: string[] = ['', heading];
-  L.push(`Call the **${v.bindTool}** tool with name "${wd.identity}" force=true (search the`);
-  L.push('deferred tool registry first if needed).');
-  if (guarantee === 'unverified') {
-    L.push(`- This identity was NOT verified when this watchdog was configured, so it may not`);
-    L.push(`  exist yet. If binding reports no such identity, call **${v.createTool}** name`);
-    L.push(`  "${wd.identity}" once to mint it on this first run, then you are bound. Re-binding`);
-    L.push('  your OWN identity is always allowed.');
-  } else {
-    L.push(`- It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when this`);
-    L.push('  watchdog was configured, so binding should succeed. If it unexpectedly reports no');
-    L.push(`  such identity, call **${v.createTool}** name "${wd.identity}" once and report the`);
-    L.push('  discrepancy — something removed it since.');
-  }
-  return L;
+  return ['', '## Assigned identity',
+    `Your supervisor has bound your identity **${wd.identity}**. The ours tools are ready.`,
+    'No identity setup or skill reading is required.'];
 }
 
 /**

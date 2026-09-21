@@ -1,3 +1,4 @@
+import { preparePermanentAssignment } from './agent-ours/service.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -256,21 +257,8 @@ export async function reconcilePermanentRoleIdentities(
   provisioner: IdentityProvisioner = daemonIdentityProvisioner(),
   log: (line: string) => void = () => {},
   knownRoleGuarantee?: IdentityGuarantee['state'],
-): Promise<'verified' | 'created'> {
-  const roleResult = knownRoleGuarantee
-    ? {
-        state: knownRoleGuarantee,
-        evidence: knownRoleGuarantee === 'verified' ? 'verified' : 'missing',
-        detail: `identity was ${knownRoleGuarantee} by the creation transaction`,
-      } as IdentityGuarantee
-    : await ensureIdentity(role.identity, {
-        bio: role.bio,
-        persona: role.persona,
-        exposeLocal: true,
-        localAutoAccept: true,
-      }, provisioner, log);
-  const roleGuarantee = requireGuaranteedIdentity(role, role.identity, roleResult);
-
+): Promise<'verified' | 'created' | 'unverified'> {
+  const guarantee = await preparePermanentAssignment(role);
   if (role.owner_channel) {
     const channelIdentity = role.owner_channel.identity;
     const channel = await ensureIdentity(channelIdentity, {
@@ -280,7 +268,7 @@ export async function reconcilePermanentRoleIdentities(
     }, provisioner, log);
     requireGuaranteedIdentity(role, channelIdentity, channel);
   }
-  return roleGuarantee.state;
+  return guarantee;
 }
 
 /**

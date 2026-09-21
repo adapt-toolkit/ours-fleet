@@ -67,6 +67,7 @@ export class HermesAgentSessionAdapter implements AgentSessionAdapter {
     // composition; no second ambient merge may reintroduce provider secrets.
     const env = hermesChildEnvironment(role, preparedHome(prep), launch.env, launch.env);
     delete env.OURS_AUTOSTART;
+    if(options.managedOurs){for(const key of Object.keys(env))if(key.startsWith('OURS_')&&!key.startsWith('OURS_FLEET_'))delete env[key];Object.assign(env,{FLEET_OURS_MANAGED:'1'});}
     await this.checks.preflight?.(options, env);
     const nativeProvider = await this.checks.expectedProvider(role, prep);
     if (typeof nativeProvider !== 'string' || !nativeProvider.trim())
@@ -82,7 +83,7 @@ export class HermesAgentSessionAdapter implements AgentSessionAdapter {
       permissions: options.permissions, modeId, requireMode: true,
       permissionMode: { fleetMode: options.permissionMode.fleetMode, nativeMode: modeId },
       permissionTimeoutMs: 50_000,
-      mcpServers: hermesMcpServers(role, env),
+      mcpServers: options.managedOurs ? [...hermesMcpServers(role, env).filter(s => s.name !== 'ours'), options.managedOurs.server] : hermesMcpServers(role, env),
       scrubObsoleteOursAutostart: true,
       validateStartupResponse: async (initialized, created) => {
         await this.checks!.validateArtifact(initialized);
