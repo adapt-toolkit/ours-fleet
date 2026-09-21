@@ -7,3 +7,7 @@ Owner (аутентифицированный CID 0941EDDA3F0027484D7E2752D613AF
 Остаются: supervisor владеет identity и MCP; исходные tool-контракты; запрет создания/выбора identity через агентский MCP; готовность identity/room до запуска модели; отсутствие повторного redeem при recovery; корректный permanent/temp lifetime; поддержанные harness/session без второго ours connector; файловые операции с путями и правами агента. Переносимость самого supervisor на поддержанные ОС остается функциональным требованием.
 
 Owner подтвердил цель в 01m32d5bhxr3m9fa6me0xh8ep3: простая, быстрая и детерминированная провизия; агент получает готовую identity и не читает skill для bind. Намеренный обход инструментов вне scope.
+
+## Обязательный root-first контракт
+
+Owner message `01m32khhwf057s2wx0vq60saf1` (2026-09-21 18:27 UTC) отменяет opt-in `requireExistingRoot`: любой permanent/temp non-root create требует существующую Human/root identity по умолчанию. Отсутствие root — ошибка инициализации daemon; автоматическая root promotion запрещена. Явная root initialization остается отдельной операцией. Fleet проверяет capability `root-first-identities-v1` до provisioning.

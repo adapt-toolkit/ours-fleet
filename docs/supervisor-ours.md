@@ -44,7 +44,7 @@ worker process, with at most three replacement attempts.
 
 Use an explicit daemon client profile with endpoint, expected instance UUID and a
 credential-file path. The daemon must advertise `external-sessions-v1` and
-`role-only-create-v1`. Prepare its root through the existing operator workflow.
+`root-first-identities-v1`. Initialize the Human/root explicitly through the existing operator workflow. Permanent and temporary role creation always require that root; an uninitialized daemon returns `NO_ROOT` before creating any identity. No per-call opt-in flag exists.
 Missing capabilities, absent root, CID collisions and failed room admission stop
 startup before the model runs. They do not fall back to a direct connector.
 

@@ -5,7 +5,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 artifact_dir=$(cd -- "${1:-$repo_root/..}" && pwd)
 source_root=$(mktemp -d)
 trap 'rm -rf -- "$source_root"' EXIT
-mcp_revision=ed90573f3d7b8861d02716baede970a4c7e5dd13
+mcp_revision=4c65b519f114440f0411249f6e84f13aa471d5ac
 source_dir="$source_root/ours-mcp"
 git init -q "$source_dir"
 git -C "$source_dir" remote add origin https://github.com/adapt-toolkit/ours-mcp.git
