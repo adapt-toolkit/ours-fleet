@@ -110,7 +110,8 @@ describe('npm pack from a checkout with no dist', () => {
     const shipped = await run('tar', ['-xzOf', packed, 'package/package.json'],
       { maxBuffer: 32 * 1024 * 1024 });
     const pkg = JSON.parse(shipped.stdout) as { dependencies: Record<string, string> };
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.8.1-nightly.9');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('file:../ours.network-sdk-3.8.1-supervisor.0.tgz');
+    expect(pkg.dependencies['@ours.network/mcp']).toBe('file:../ours.network-mcp-1.1.2-supervisor.0.tgz');
     expect(pkg.dependencies['@ours.network/cli']).toBe('2.8.1-nightly.7');
   });
 
