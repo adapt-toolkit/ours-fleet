@@ -90,7 +90,8 @@ try {
     sessionMode: 'local',
     requiredCapabilities: ['local-pid-v1'],
   });
-  await control.createIdentity({
+  await control.createRootIdentity({
+    skipIfRootExists: true,
     name: 'TestRoot',
     bio: 'isolated test',
     exposeLocal: false,
