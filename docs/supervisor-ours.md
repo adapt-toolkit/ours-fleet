@@ -56,6 +56,8 @@ referenced by the review lockfiles. Fleet and MCP share the reviewed SDK; the ex
 operator CLI/dev-daemon packages retain their original dependencies.
 CI runs `scripts/prepare-supervisor-ci.sh` before `npm ci`: it builds these same
 artifacts from immutable MCP and SDK revisions without publishing packages.
+Review archives use gzip stored blocks to keep integrity stable across Node/zlib
+versions; their uncompressed package contents are unchanged.
 
 For release, publish the reviewed SDK and MCP artifacts through the normal release
 process, replace the two Fleet local-file pins and MCP workspace development pin
