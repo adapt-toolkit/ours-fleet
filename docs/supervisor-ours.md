@@ -40,7 +40,7 @@ Watchdog and notifier sessions use permanent assigned identities through the sam
 supervisor path. Temporary supervisor recycle keeps the logical run and replaces the
 worker process, with at most three replacement attempts.
 
-## Migration and review builds
+## Migration and installation
 
 Use an explicit daemon client profile with endpoint, expected instance UUID and a
 credential-file path. The daemon must advertise `external-sessions-v1` and
@@ -48,36 +48,29 @@ credential-file path. The daemon must advertise `external-sessions-v1` and
 Missing capabilities, absent root, CID collisions and failed room admission stop
 startup before the model runs. They do not fall back to a direct connector.
 
-This review uses unpublished local artifacts: SDK `3.8.1-supervisor.0` and MCP
-`1.1.2-supervisor.0`. Check out the three reviewed repositories as siblings named
-`ours-sdk`, `ours-mcp`, and `ours-fleet`, then run
-`scripts/prepare-supervisor-review.sh` from this repository. It builds the tarballs
-referenced by the review lockfiles. Fleet and MCP share the reviewed SDK; the existing
-operator CLI/dev-daemon packages retain their original dependencies.
-CI runs `scripts/prepare-supervisor-ci.sh` before `npm ci`: it builds these same
-artifacts from immutable MCP and SDK revisions without publishing packages.
-Review archives use gzip stored blocks to keep integrity stable across Node/zlib
-versions; their uncompressed package contents are unchanged.
+SDK and MCP dependencies are pinned to published registry versions in the manifest
+and lockfile. `npm ci` and CI install them directly; no sibling repositories, local
+tarballs or dependency source bootstrap are required. Use `npm run build` and
+`npm run test:pack` to validate the installed Fleet package.
 
-For release, publish the reviewed SDK and MCP artifacts through the normal release
-process, replace the two Fleet local-file pins and MCP workspace development pin
-with the released exact versions, regenerate lockfiles, then validate the packed
-consumer. Provision the matching daemon before restarting Fleet agents. This task
-does not publish artifacts, change production configuration, or restart services.
+Provision a daemon supporting the capabilities above before restarting Fleet
+agents. Package installation does not upgrade the running daemon or migrate live
+sessions automatically.
 
 Stop existing direct-connector sessions through the ordinary operator lifecycle
 before migrating their roles. Do not force-transfer a live identity. Preserve
 `private-ours` state across supervisor restarts; if provisioning is uncertain, inspect
 that state and reconcile through the operator workflow rather than deleting it or
 reusing an invite. Updating existing briefings is part of the normal Fleet apply/up
-flow. Manual and interactive ours-mcp sessions retain their original behavior.
+flow. Manual and interactive ours-mcp sessions retain the direct connector workflow;
+creating agent identities still requires an initialized Human/root identity.
 
 ## Verification
 
 - `npm test`: Fleet unit and integration suite, including runner and room orchestration.
-- `node test/agent-ours-daemon.integration.mjs`: isolated built daemon, real SDK,
+- `node test/agent-ours-daemon.integration.mjs`: isolated installed daemon, real SDK,
   service and stdio bridge; temporary reconnect/termination and permanent restart.
-  `FLEET_DAEMON_CLI` can select the reviewed daemon entrypoint.
+  `FLEET_DAEMON_CLI` can override the installed daemon entrypoint.
 - `node test/agent-ours-harness.integration.mjs MODE`: real startup discovery for
   `codex-native`, `codex-acp`, `claude`, or `hermes`, without a model turn. Set
   `FLEET_CODEX_BIN` or `FLEET_HERMES_BIN` for the installed test binaries.

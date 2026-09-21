@@ -50,7 +50,7 @@ for (const key of ['OURS_API_TOKEN', 'OURS_TLS_CERT', 'OURS_TLS_KEY', 'OURS_LIST
 const child = spawn(
   process.execPath,
   [
-    resolve(process.env.FLEET_DAEMON_CLI ?? '../ours-sdk/packages/daemon/dist/cli.js'),
+    resolve(process.env.FLEET_DAEMON_CLI ?? 'node_modules/@ours.network/daemon/dist/cli.js'),
     'daemon',
     'serve',
     '--managed',
