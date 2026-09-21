@@ -80,7 +80,7 @@ The state dir contract:
 |---|---|---|
 | Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
-| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
+| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli@2.8.1-nightly.7 @ours.network/daemon@3.8.1-nightly.1 && ours-daemon start` |
 
 Linux only: `ours-fleet init` enables *linger* so roles run without a login session
 and survive reboots. macOS: launchd agents start **at login** (no linger
@@ -1653,7 +1653,7 @@ After building Fleet with the selected SDK and CLI artifacts installed, run
 `npm run test:v1-recovery` in an isolated Docker container with external networking
 disabled. The existing test covers retry and terminal failure cases using a
 temporary daemon and no authenticated AI harness. By default both daemon and
-token-update commands use `node_modules/@ours.network/cli/dist/cli.js`;
+token-update commands use `node_modules/@ours.network/daemon/dist/cli.js`;
 `FLEET_DAEMON_CLI` and `FLEET_TOKEN_CLI` can select explicitly prepared CLI entries.
 These package checks do not replace native Fleet/harness or platform acceptance.
 
