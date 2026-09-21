@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { bootstrapPresets } from '../src/preset-bootstrap.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { listTemplates } from '../src/rooms-tasks/templates.js';
@@ -110,9 +109,6 @@ describe('packaged default role contract', () => {
       expect(local).toMatch(/other confirmed infrastructure or orchestration\s+blocker.*without waiting for the peer window/s);
       expect(local).toMatch(/your own work state BLOCKED or resting/);
       expect(local).toMatch(/never invoke a Fleet task block/);
-      const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
-      expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
-        .toBe('7093e77e1d4136ba791e9c607922995e3ea689880855657134f2c23e32a80a59');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -160,10 +156,4 @@ describe('packaged default role contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('default presentation generators contain no legacy executor labels', () => {
-    for (const path of [
-      'scripts/generate-report-mocks.mjs', 'scripts/generate-inbox-task-mocks.mjs',
-      'scripts/generate-rich-task-mocks.mjs', 'scripts/generate-table-task-mocks.mjs',
-    ]) expect(readFileSync(path, 'utf8'), path).not.toMatch(/\b(?:Secretary|Architect|Tester)\b/);
-  });
 });

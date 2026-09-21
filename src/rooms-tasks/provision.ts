@@ -1,3 +1,4 @@
+import { readRoomReadiness } from '../agent-ours/service.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
@@ -263,8 +264,7 @@ function launchMatches(
       && (startup.anonymous ?? false) === anonymous
       && sha256Text(startup.task ?? '') === taskSha
       && (expectedInviteId === undefined || startup.invite_id === expectedInviteId)
-      && typeof startup.invite === 'string'
-      && startup.invite.length > 0;
+      && startup.invite === '';
   } catch { return false; }
 }
 
@@ -505,7 +505,10 @@ function reconcileMemberSeats(
       && seat.seat_state === 'active');
   const seats = current.member_seats.map(seat => {
     const member = members.find(candidate => candidate.name === seat.role_name)!;
+    const readiness = readRoomReadiness(current.room_identity_cid!, member.name);
+    if (!readiness || readiness.room !== roomId || readiness.invite !== seat.invite_id) { complete = false; return seat; }
     const found = exactCoworkSeat(observed, member, seat.invite_id);
+    if (found && found.identity_cid !== readiness.cid) throw new Error('Cowork seat CID does not match supervisor provisioned identity');
     if (!found || found.seat_state !== 'active') {
       complete = false;
       return seat;

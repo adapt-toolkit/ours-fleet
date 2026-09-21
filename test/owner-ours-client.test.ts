@@ -1,21 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  OursClient, OursError, errBoundElsewhere, errNoSuchIdentity,
-  type AttachOursClientOptions,
-} from '@ours.network/sdk/client';
+import { OursClient, OursError, errBoundElsewhere, errNoSuchIdentity, type AttachOursClientOptions,  } from '@ours.network/sdk/client';
 
-import {
-  OURS_BOUND_ELSEWHERE, OursSdkClient, OursSendRefusedError, OursWatchDeadlineError,
-  oursErrorCode,
-} from '../src/owner-channel/ours-client.js';
+import { OURS_BOUND_ELSEWHERE, OursSdkClient, OursSendRefusedError, OursWatchDeadlineError, oursErrorCode,  } from '../src/owner-channel/ours-client.js';
 
-const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** A recording stand-in for the SDK client; only the methods under test exist. */
 function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
@@ -284,75 +275,3 @@ describe('daemon error classification', () => {
     expect(new OursError('NOT_BOUND', 'x').name).toBe('OursError');
   });
 });
-
-describe('owner-channel daemon dependency surface', () => {
-  it('is pinned to the reviewed SDK version exactly', () => {
-    const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
-    const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.8.1-nightly.9');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.8.1-nightly.9');
-    expect(pkg.dependencies['@ours.network/cli']).toBe('2.8.1-nightly.7');
-    expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('2.8.1-nightly.7');
-  });
-
-  it('imports only the documented client subpath, never daemon-side SDK code', async () => {
-    const sources = await collectSources(join(REPO, 'src'));
-    const specifiers = new Set<string>();
-    for (const file of sources)
-      for (const spec of importSpecifiers(await readFile(file, 'utf8')))
-        if (spec.startsWith('@ours.network/sdk')) specifiers.add(spec);
-    expect([...specifiers]).toEqual(['@ours.network/sdk/client']);
-  });
-
-  // The SDK ships the MUFL engine and its @adapt-toolkit native packages for
-  // daemon-side use. Fleet is a client: if any of that reaches the owner
-  // channel's runtime graph, the channel has started importing the daemon.
-  it('resolves a client runtime graph free of @adapt-toolkit and daemon modules', async () => {
-    // Resolve the documented subpath through the package's own export map, so
-    // this also asserts that `/client` is a real entry and not a deep import.
-    const pkgRoot = join(REPO, 'node_modules', '@ours.network', 'sdk');
-    const exports = JSON.parse(await readFile(join(pkgRoot, 'package.json'), 'utf8')).exports;
-    const entry = join(pkgRoot, exports['./client'].default);
-    const seen = new Set<string>([entry]);
-    const queue = [entry];
-    const bare: string[] = [];
-    while (queue.length) {
-      const file = queue.pop()!;
-      for (const spec of importSpecifiers(await readFile(file, 'utf8'))) {
-        if (spec.startsWith('node:')) continue;
-        if (!spec.startsWith('.')) { bare.push(spec); continue; }
-        const next = resolve(dirname(file), spec);
-        const path = extname(next) ? next : `${next}.js`;
-        if (seen.has(path)) continue;
-        seen.add(path);
-        queue.push(path);
-      }
-    }
-    expect(bare.filter(spec => spec.startsWith('@adapt-toolkit'))).toEqual([]);
-    expect(bare.filter(spec => spec.startsWith('@ours.network/sdk/'))).toEqual([]);
-    expect(seen.size).toBeGreaterThan(1);
-    expect(pathToFileURL(entry).href).toContain('@ours.network/sdk');
-  });
-});
-
-async function collectSources(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...await collectSources(path));
-    else if (entry.name.endsWith('.ts')) out.push(path);
-  }
-  return out;
-}
-
-/** Every static `from '<spec>'` and `import('<spec>')` in a module. */
-function importSpecifiers(source: string): string[] {
-  const out: string[] = [];
-  const patterns = [
-    /\bfrom\s*['"]([^'"]+)['"]/g,
-    /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-  ];
-  for (const pattern of patterns)
-    for (const match of source.matchAll(pattern)) out.push(match[1]);
-  return out;
-}

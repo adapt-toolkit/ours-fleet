@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { preparePermanentAssignment } from '../src/agent-ours/service.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
 } from 'node:fs';
@@ -196,18 +197,15 @@ describe('up / down / restart', () => {
 
     await up(loadConfig(), ['A'], d);
 
-    expect(order).toEqual(['identity:RoleIdentity', 'identity:RoleOwner', 'install:A']);
+    expect(order).toEqual(['identity:RoleOwner', 'install:A']);
     expect(created).toEqual([
-      { name: 'RoleIdentity', profile: {
-        bio: 'Role bio', persona: 'Role persona', exposeLocal: true, localAutoAccept: true,
-      } },
       { name: 'RoleOwner', profile: {
         bio: 'Authenticated owner channel for the ours-fleet A role.',
         exposeLocal: false, localAutoAccept: false,
       } },
     ]);
     const briefing = readFileSync(join(agentDir('A'), 'briefing.md'), 'utf8');
-    expect(briefing).toContain('It was created when your role');
+    expect(briefing).toContain('owned and verified by the Fleet supervisor');
     expect(briefing).not.toContain('call **create_identity**');
   });
 
@@ -215,9 +213,9 @@ describe('up / down / restart', () => {
     writeCfg({ A: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();
     const { d } = deps(backend);
-    d.identityProvisioner = { exists: async () => 'unknown' };
+    vi.mocked(preparePermanentAssignment).mockRejectedValueOnce(Error('assignment unavailable'));
 
-    await expect(up(loadConfig(), ['A'], d)).rejects.toThrow(/could not establish permanent ours identity/);
+    await expect(up(loadConfig(), ['A'], d)).rejects.toThrow(/assignment unavailable/);
     expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
@@ -709,3 +707,10 @@ describe('rmRole', () => {
     expect(readFileSync(join(tempDir, 'WORKLOG.md'), 'utf8')).toContain('live process evidence');
   });
 });
+
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+ ...await importOriginal(),
+ preparePermanentAssignment: vi.fn(async () => 'verified'),
+ prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
+ releaseManagedAgent:async()=>{},
+}));

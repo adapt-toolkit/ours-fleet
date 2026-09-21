@@ -52,11 +52,10 @@ briefing.md per role  ──►  agent session adapter  ──►  native app-se
 ```
 
 Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing,
-logs, routines, and session markers. On boot the agent reads its briefing: bind
-identity, publish bio/persona, announce to its coordinator, work — while the
+logs, routines, and session markers. Before boot, the supervisor binds the assigned identity and prepares its room.
+The agent then reads its briefing and starts work — while the
 supervisor delivers its mail wakes as `[fleet-monitor]` console lines (see
-[Mail monitor](#mail-monitor)). Set `monitor.mode: native` when the harness
-should own mail wake instead. On crash the supervisor relaunches it and the
+[Mail monitor](#mail-monitor)). Managed ours sessions use supervisor-owned mail wakes. On crash the supervisor relaunches it and the
 harness resumes the same session.
 
 The state dir contract:
@@ -231,15 +230,11 @@ from the current runner generation and excludes adapter `session/load` replay;
 those replay events remain in the durable ledger with `agent_replay` provenance
 for diagnosis and recovery rather than appearing as current work.
 
-For every temporary role, the first-boot instructions call ours MCP
-`create_temporary_identity` with the exact assigned name, so the new identity
-is owned and cleaned up by that connector session lifecycle. Temporary roles
-never bind pre-existing identities or fall back to permanent `create_identity`.
-Fleet does not inspect, preserve, or provision an ours identity for temp spawn.
-A collision, missing tool, or creation error stops for operator review; fleet
-never force-adopts or deletes identity state. Permanent roles are
-provisioned by fleet before launch and never delegate normal identity creation
-to the harness.
+The Fleet supervisor creates and binds the assigned identity before the harness
+starts. Temporary identities survive harness reconnects and are released only when
+the logical run ends. Permanent identities remain available after the supervisor
+releases ownership. Agents receive ready tools; no model-owned identity bootstrap
+or onboarding skill is required.
 
 The web console uses structured ACP activity rather than exposing a raw agent terminal.
 
@@ -649,10 +644,10 @@ originating task. Existing active rooms are not retroactively migrated, and room
 with Owner attachment disabled receive no Owner grant.
 
 Fleet launches each template member with a dedicated one-time Cowork invite.
-The generated temporary-agent briefing contains the exact identity name, invite,
-Cowork role, and task. The agent creates that identity itself with ours MCP
-`create_temporary_identity`, accepts the invite with `add_contact`, and starts
-work immediately. A room is ready only after the Cowork room (and its task, when
+The supervisor accepts the startup invite and verifies the provisioned identity CID
+in the authenticated room seat before starting the model. The generated briefing
+contains the assigned identity, room, role and task, without invite material.
+A room is ready only after the Cowork room (and its task, when
 task-bound) is durably active, every configured member seat is authenticated and active with its matching
 live Fleet launch, and the configured Owner seat is active when owner attachment is
 enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
@@ -675,8 +670,8 @@ Set `room.anonymous: true` on a room template, or pass `--anonymous` to
 `task create`, `task start`, `task work`, or `room create`, to create an
 anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
-the same choice. Temporary members of an anonymous room are instructed to call
-`create_temporary_identity` with `expose_local=false`. Their generated briefings
+the same choice. The supervisor creates anonymous room members with local contact-book exposure
+disabled. Their generated briefings
 do not disclose or compare an Owner participant CID. A participant-originated
 instruction has Owner authority only when the authenticated Cowork room envelope
 attributes that participant seat the exact `Owner` role. Literal text, display
@@ -1697,3 +1692,5 @@ origin directly. UUID/capability checks still precede credential-bearing calls.
 This adds client HTTPS support, not an HTTPS daemon listener, certificate
 provisioning or automatic reverse-proxy configuration. Existing local HTTP and
 SSH-tunnel profiles continue to work.
+
+See [supervisor-owned ours and migration](docs/supervisor-ours.md) for the runtime contract and review build instructions.

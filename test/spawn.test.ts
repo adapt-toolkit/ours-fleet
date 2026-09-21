@@ -1,3 +1,4 @@
+import { preparePermanentAssignment } from '../src/agent-ours/service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -324,10 +325,10 @@ describe('spawnTemp', () => {
       name: 'RoomReviewer', mission: startup.task, roomMemberStartup: startup,
     }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
-    expect(snap.roomMemberStartup).toEqual(startup);
+    expect(snap.roomMemberStartup).toEqual({...startup,invite:''});
     const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
     expect(briefing).toContain('## Room assignment');
-    expect(briefing).toContain('secret-invite');
+    expect(briefing).not.toContain('secret-invite');
     expect(briefing).not.toContain('fleet_room_briefing_ack');
     writeFileSync(join(dir, 'public-gate.yaml'), stringify({
       roles: { Public: { roomMemberStartup: startup } },
@@ -538,102 +539,25 @@ describe('atomic role + identity reservation', () => {
   });
 });
 
-describe('identity is established before launch', () => {
-  const provisioner = (
-    exists: boolean | 'unknown',
-    create?: (n: string, p: { bio?: string; persona?: string }) => Promise<void>,
-  ) => ({ async exists() { return exists; }, ...(create ? { create } : {}) });
-
-  const briefingOf = (name: string) =>
-    readFileSync(join(agentDir(name), 'briefing.md'), 'utf8');
-
-
-
-  it('an existing identity is verified, and the briefing says so', async () => {
-    const { d } = fakeDeps();
-    await spawnPermanent({ name: 'Known', identity: 'Known' }, d,
-      { identityProvisioner: provisioner(true) });
-    expect(briefingOf('Known')).toContain('verified to exist');
-    expect(briefingOf('Known')).not.toContain('predefined');
-  });
-
-  it('a missing identity is CREATED before the service is enabled, with its profile', async () => {
-    writeFileSync(join(dir, 'bio.txt'), 'A public card.');
-    writeFileSync(join(dir, 'persona.txt'), 'An operating contract.');
-    const created: Array<[string, { bio?: string; persona?: string }]> = [];
-    const { d, calls } = fakeDeps();
-    // Record the order: identity creation must precede service registration.
-    const order: string[] = [];
-    const backend = d.backend;
-    backend.install = async n => { order.push(`install:${n}`); calls.push(['install', n]); };
-
-    await spawnPermanent(
-      { name: 'Fresh', identity: 'Fresh', bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt') },
-      d,
-      { identityProvisioner: provisioner(false, async (n, p) => { order.push(`identity:${n}`); created.push([n, p]); }) });
-
-    expect(created).toEqual([['Fresh', { bio: 'A public card.', persona: 'An operating contract.' }]]);
-    expect(order).toEqual(['identity:Fresh', 'install:Fresh']);   // before, not after
-    expect(briefingOf('Fresh')).toContain('It was created when your role');
-  });
-
-  it('a failed identity setup aborts and rolls back before the harness starts', async () => {
-    const { d, calls } = fakeDeps();
-    const err = await spawnPermanent({ name: 'Broken', identity: 'Broken' }, d, {
-      identityProvisioner: provisioner(false, async () => { throw new Error('daemon refused'); }),
-    }).then(() => null, e => e as Error);
-
-    expect(err!.message).toContain('daemon refused');
-    expect(calls.filter(c => c[0] === 'install')).toEqual([]);    // never started
-    expect(existsSync(join(dir, 'fleet', 'agents', 'Broken.yaml'))).toBe(false);
-    expect(existsSync(agentDir('Broken'))).toBe(false);
-  });
-
-  it('a host that cannot create refuses permanent launch before the harness starts', async () => {
-    const logs: string[] = [];
-    const { d, calls } = fakeDeps();
-    d.log = l => logs.push(l);
-    await expect(spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
-      { identityProvisioner: provisioner(false) }))          // exists=false, no create()
-      .rejects.toThrow(/could not establish permanent ours identity/);
-
-    expect(logs.join('\n')).toContain('cannot create one automatically');
-    expect(calls.some(call => call[0] === 'install')).toBe(false);
-  });
-
-  it('an unreachable daemon is never mistaken for absence or delegated to the agent', async () => {
-    const { d, calls } = fakeDeps();
-    let createCalled = false;
-    await expect(spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
-      identityProvisioner: provisioner('unknown', async () => { createCalled = true; }),
-    })).rejects.toThrow(/could not establish permanent ours identity/);
-    expect(createCalled).toBe(false);       // do not create on no evidence
-    expect(calls.some(call => call[0] === 'install')).toBe(false);
-  });
-
-  it('a temp spawn does not inspect or provision a pre-existing identity', async () => {
-    let inspected = false;
-    const d = await spawnTemp({ name: 'TempKnown', identity: 'TempKnown' }, '/b/ours-fleet', () => {},
-      { identityProvisioner: { async exists() { inspected = true; throw new Error('must not inspect'); } } });
-    expect(inspected).toBe(false);
-    const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
-    expect(briefing).toContain('create_temporary_identity');
-    expect(briefing).not.toContain('choose_identity');
-    expect(briefing).toContain('Do not inspect, preserve, adopt, or use any pre-existing');
-  });
-
-  it('a temp spawn writes lifecycle-compatible identity bootstrap instructions', async () => {
-    const d = await spawnTemp(
-      { name: 'TempCompat', identity: 'ExplicitTempIdentity' },
-      '/b/ours-fleet', () => {}, { identityProvisioner: provisioner(false) });
-    const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
-    expect(briefing).toContain('a temporary agent');
-    expect(briefing).toContain('create_temporary_identity');
-    expect(briefing).toContain('name "ExplicitTempIdentity"');
-    expect(briefing).toContain('connector owns its cleanup');
-    expect(briefing).not.toContain('choose_identity');
-    expect(briefing).not.toContain('call **create_identity**');
-  });
+describe('supervisor-owned provisioning', () => {
+ it('checks assignment before service registration and leaves creation to the supervisor',async()=>{
+  const {d,calls}=fakeDeps();const create=vi.fn();
+  await spawnPermanent({name:'Fresh',bio:'public',persona:'contract'},d,{identityProvisioner:{exists:async()=>false,create}});
+  expect(create).not.toHaveBeenCalled();expect(preparePermanentAssignment).toHaveBeenCalledWith(expect.objectContaining({identity:'Fresh',bio:'public',persona:'contract'}));
+  expect(calls).toContainEqual(['install','Fresh']);
+  expect(readFileSync(join(agentDir('Fresh'),'briefing.md'),'utf8')).not.toMatch(/choose_identity|create_identity/);
+ });
+ it('stops before registration when assignment validation fails',async()=>{
+  const {d,calls}=fakeDeps();vi.mocked(preparePermanentAssignment).mockRejectedValueOnce(Error('assignment unavailable'));
+  await expect(spawnPermanent({name:'Offline'},d)).rejects.toThrow('assignment unavailable');
+  expect(calls).toEqual([]);expect(existsSync(join(dir,'fleet','agents','Offline.yaml'))).toBe(false);
+ });
+ it('temporary startup contains no model-owned identity or invite bootstrap',async()=>{
+  const d=await spawnTemp({name:'Temporary',identity:'Assigned'},'/b/ours-fleet',()=>{});
+  const briefing=readFileSync(join(d,'briefing.md'),'utf8');
+  expect(briefing).toContain('Assigned');expect(briefing).toContain('owned and verified by the Fleet supervisor');
+  expect(briefing).not.toMatch(/choose_identity|create_temporary_identity/);
+ });
 });
 
 describe('every failed creation stage rolls back', () => {
@@ -660,7 +584,7 @@ describe('every failed creation stage rolls back', () => {
       const removed: string[] = [];
       const { d, calls } = fakeDeps();
       const p = provisioner(created, removed);
-      if (stage === 'identity') p.create = async () => { throw new Error('inject: identity'); };
+      if (stage === 'identity') vi.mocked(preparePermanentAssignment).mockRejectedValueOnce(Error('inject: identity'));
       if (stage === 'service') d.backend.install = async () => { throw new Error('inject: service'); };
 
       const err = await spawnPermanent({ name: 'Faulted' }, d, { identityProvisioner: p })
@@ -670,8 +594,7 @@ describe('every failed creation stage rolls back', () => {
       expect(calls.filter(c => c[0] === 'install').length === 0 || stage === 'service').toBe(true);
 
       // An identity we minted is removed again; one we never made is not.
-      if (stage === 'identity') expect(removed).toEqual([]);
-      else expect(removed).toEqual(['Faulted']);
+      expect(removed).toEqual([]); // Spawn never owns the runtime identity.
 
       // The names are immediately reusable.
       const { d: ok } = fakeDeps();
@@ -735,19 +658,11 @@ describe('every failed creation stage rolls back', () => {
     expect(calls.filter(c => c[0] === 'uninstall')).toEqual([]);
   });
 
-  it('a rollback failure is reported WITHOUT hiding the original error', async () => {
-    const { d } = fakeDeps();
-    d.backend.install = async () => { throw new Error('the real failure'); };
-    const err = await spawnPermanent({ name: 'Messy' }, d, {
-      identityProvisioner: {
-        async exists() { return false as const; },
-        async create() {},
-        async remove() { throw new Error('and rollback broke too'); },
-      },
-    }).then(() => null, e => e as Error);
-    expect(err!.message).toContain('the real failure');        // the cause survives
-    expect(err!.message).toContain('rollback also failed');
-    expect(err!.message).toContain('and rollback broke too');
+  it('does not attempt identity rollback when service registration fails',async()=>{
+    const {d}=fakeDeps();d.backend.install=async()=>{throw Error('the real failure');};
+    const remove=vi.fn(async()=>{throw Error('must not remove');});
+    await expect(spawnPermanent({name:'Rollback'},d,{identityProvisioner:{exists:async()=>false,create:async()=>{},remove}})).rejects.toThrow('the real failure');
+    expect(remove).not.toHaveBeenCalled();
   });
 });
 
@@ -973,3 +888,10 @@ describe('creationBuildNote', () => {
     expect(note).toContain('unknown');
   });
 });
+
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+ ...await importOriginal(),
+ preparePermanentAssignment: vi.fn(async () => 'verified'),
+ prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
+ releaseManagedAgent:async()=>{},
+}));

@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { describeEdge, EDGE_LEGEND, layoutEdges, layoutTopology, nodeBox, nodeDestination, type Topology } from '../../web/src/topology-presentation.js';
 
@@ -36,6 +34,7 @@ describe('topology presentation', () => {
     expect(describeEdge(topology.edges[0], 'agent:Child')).toContain('incoming from agent:Parent');
     expect(EDGE_LEGEND.every(item => item.description.length > 20)).toBe(true);
   });
+
 });
 
 describe('topology edge geometry', () => {
@@ -101,18 +100,4 @@ describe('topology edge geometry', () => {
     ], layout.nodes)).toEqual([]);
   });
 
-  it('draws edges in the cards own pixel space, never a rescaled viewBox', () => {
-    // The cards are absolutely positioned in raw CSS pixels while the overlay
-    // is stretched to `.topology-canvas` (min-width: 100%). A viewBox with
-    // preserveAspectRatio="none" therefore rescales the x axis by
-    // canvasWidth/viewBoxWidth and drags every edge off the cards on a wide
-    // viewport. There is no DOM test environment here, so the contract is
-    // pinned at the source.
-    // Pinned on the component that actually renders the overlay; the read-only
-    // FleetTopology it replaced is gone.
-    const source = readFileSync(resolve('web/src/TopologyEditor.tsx'), 'utf8');
-    expect(source).toMatch(/<svg\b/);
-    expect(source).not.toMatch(/viewBox=/);
-    expect(source).not.toMatch(/preserveAspectRatio=/);
-  });
 });

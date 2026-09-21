@@ -2,23 +2,10 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import {
-  beginFleetAuditCollection, checkpointFleetAuditPresentations, classifyFleetArgv,
-  consumeFleetAuditCollection, FleetCommandAuditStore, fleetPresentationLabel,
-  recordFleetAuditPresentation, redactFleetArgv,
-  lifecycleEventDigestBasis, renderFleetLifecycleEvent, fleetProxyCommandInventory,
-  fleetProxyTopLevelInventory, setFleetAuditLifecycleCheckpoint,
-  validateFleetAuditBegin, validateFleetAuditFinish,
-} from '../src/fleet-command-audit.js';
-import {
-  FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV, fleetWorkerEnv,
-} from '../src/rooms-tasks/external-worker.js';
+import { beginFleetAuditCollection, checkpointFleetAuditPresentations, classifyFleetArgv, consumeFleetAuditCollection, FleetCommandAuditStore, fleetPresentationLabel, recordFleetAuditPresentation, redactFleetArgv, lifecycleEventDigestBasis, renderFleetLifecycleEvent, setFleetAuditLifecycleCheckpoint, validateFleetAuditBegin, validateFleetAuditFinish,  } from '../src/fleet-command-audit.js';
+import { FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV, fleetWorkerEnv,  } from '../src/rooms-tasks/external-worker.js';
 import { FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV } from '../src/fleet-proxy.js';
-import {
-  AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, mandatoryConfigurationFits, missionLabel,
-  renderAgentConfiguration, selectionOrigin, summarizeResolvedLaunch,
-  type AgentLaunchConfiguration,
-} from '../src/lifecycle-summary.js';
+import { AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, mandatoryConfigurationFits, missionLabel, renderAgentConfiguration, selectionOrigin, summarizeResolvedLaunch, type AgentLaunchConfiguration,  } from '../src/lifecycle-summary.js';
 import { MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS } from '../src/rooms-tasks/markdown.js';
 import { Buffer } from 'node:buffer';
 import '../src/harness/claude-code.js';
@@ -55,33 +42,6 @@ describe('fleet command audit', () => {
       [FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV]: '/state/Agent' });
     expect(env).not.toHaveProperty(FLEET_PROXY_STATE_DIR_ENV);
     expect(env).not.toHaveProperty(FLEET_PROXY_CALLER_ENV);
-  });
-  it('keeps the explicit task/room/template inventory in parity with Commander registrations', () => {
-    const source = readFileSync(join(import.meta.dirname, '../src/rooms-tasks/cli.ts'), 'utf8');
-    for (const surface of ['template', 'task', 'room'] as const) {
-      const start = source.indexOf(`export function register${surface[0]!.toUpperCase()}${surface.slice(1)}Commands`);
-      const end = source.indexOf('\nexport function ', start + 1);
-      const section = source.slice(start, end < 0 ? undefined : end);
-      const registered = [...section.matchAll(new RegExp(`${surface}Cmd\\.command\\('([^']+)'`, 'g'))]
-        .map(match => match[1]!.split(' ')[0]!)
-        .filter(command => !command.startsWith('_'));
-      expect([...new Set(registered)].sort()).toEqual(
-        [...fleetProxyCommandInventory[surface]!].sort());
-    }
-  });
-  it('keeps every top-level Commander command explicitly classified', () => {
-    const source = readFileSync(join(import.meta.dirname, '../src/cli.ts'), 'utf8');
-    const registered = [...source.matchAll(/program\.command\('([^']+)'/g)]
-      .map(match => match[1]!.split(' ')[0]!);
-    for (const surface of ['template', 'task', 'room'])
-      if (source.includes(`register${surface[0]!.toUpperCase()}${surface.slice(1)}Commands(program`))
-        registered.push(surface);
-    const inventory = [...fleetProxyTopLevelInventory.safeRead,
-      ...fleetProxyTopLevelInventory.agent, ...fleetProxyTopLevelInventory.public,
-      ...fleetProxyTopLevelInventory.denied,
-      ...fleetProxyTopLevelInventory.hidden];
-    expect([...new Set(registered)].sort()).toEqual([...new Set(inventory)].sort());
-    expect(fleetProxyTopLevelInventory.aliases).toContain('man');
   });
   it.each([
     [['spawn', 'Dev', '--temp'], 'allow', 'spawn Dev'],

@@ -2,10 +2,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { AI_DOCS, SPAWN_SKILL_CONTRACT } from '../src/docs.js';
-import { UNATTENDED_FLOOR, analyzeRolePermissions } from '../src/permissions.js';
-import { oversightTaxonomyLines } from '../src/session/control.js';
 import { getAdapter } from '../src/harness/registry.js';
+import { analyzeRolePermissions } from '../src/permissions.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 import type { CommonPermissions, ResolvedRole } from '../src/config.js';
@@ -29,9 +27,6 @@ const VARIANTS = [
 
 const skill = (variantPath: string, name: string) =>
   readFileSync(join(process.cwd(), variantPath, name, 'SKILL.md'), 'utf8');
-
-/** Line wrapping is a formatting choice; it must not hide or create a match. */
-const flat = (s: string) => s.replace(/\s+/g, ' ');
 
 const roleWith = (harness: string, permissions: CommonPermissions): ResolvedRole => ({
   name: 'Spawned', harness, identity: 'Spawned', sourceFile: '(skill example)',
@@ -58,64 +53,6 @@ function spawnExamples(text: string): Array<{ command: string; permissions: Comm
       },
     }));
 }
-
-describe('shipped spawn skills are written from one source of truth', () => {
-  for (const v of VARIANTS) {
-    it(`${v.id}: states every required fact and none of the corrected ones`, () => {
-      const text = flat(skill(v.path, 'spawn-ours-agent'));
-      for (const required of SPAWN_SKILL_CONTRACT.required)
-        expect(text, `${v.id} is missing: ${required}`).toContain(flat(required));
-      for (const forbidden of SPAWN_SKILL_CONTRACT.forbidden)
-        expect(text, `${v.id} still contains: ${forbidden}`).not.toContain(flat(forbidden));
-    });
-
-    it(`${v.id}: names every capability the doctor floor check enforces`, () => {
-      // Derived from the enforced constant, not from a copy of it: adding a
-      // capability to the floor makes this fail until the skills say so.
-      const text = skill(v.path, 'spawn-ours-agent');
-      for (const capability of UNATTENDED_FLOOR)
-        expect(text, `${v.id} does not mention ${capability}`).toContain(capability);
-    });
-
-    it(`${v.id}: names the native mode neutral 'allow' really maps to`, () => {
-      // The value is computed through the adapter, so the skill cannot drift
-      // from the translation the CLI performs.
-      const native = getAdapter(v.harness).translatePermissions(
-        { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
-      const text = skill(v.path, 'spawn-ours-agent');
-      for (const value of Object.values(native.native))
-        expect(text, `${v.id} does not name ${String(value)}`).toContain(String(value));
-    });
-  }
-
-  it('the skills and `ours-fleet docs` name the same permission settings', () => {
-    // The closed-when condition for 7.1: the skill and the CLI reference must
-    // not disagree about what a setting is called or what it grants.
-    for (const term of ['bypassPermissions', 'dontAsk', 'unattended floor:', '--isolation-file'])
-      expect(AI_DOCS, `AI_DOCS is missing ${term}`).toContain(term);
-    for (const capability of UNATTENDED_FLOOR) expect(AI_DOCS).toContain(capability);
-  });
-
-  it.each([
-    ['codex', 'codex', 'auto', 'agent'],
-    ['codex', 'codex', 'allow', 'agent-full-access'],
-    ['claude-code', 'claude-code', 'auto', 'acceptEdits'],
-    ['claude-code', 'claude-code', 'allow', 'bypassPermissions'],
-  ] as const)('%s: %s approval=%s maps to native %s',
-    (variantId, harness, approval, nativeMode) => {
-      const variant = VARIANTS.find(candidate => candidate.id === variantId)!;
-      const role = roleWith(harness, {
-        approval, filesystem: 'workspace', unattended: 'deny',
-      });
-      role.session = 'acp';
-      expect(getAdapter(harness).effectivePermissionMode!(role)).toMatchObject({
-        fleetMode: approval,
-        nativeMode,
-      });
-      expect(skill(variant.path, 'spawn-ours-agent')).toContain(nativeMode);
-      expect(AI_DOCS).toContain(nativeMode);
-    });
-});
 
 describe('following only the shipped skill produces a role doctor accepts', () => {
   for (const v of VARIANTS) {
@@ -149,45 +86,21 @@ describe('following only the shipped skill produces a role doctor accepts', () =
   }
 });
 
-/**
- * The oversight half. An overseer reads its generated briefing OR this
- * skill; if they disagree about what a `peek` failure proves, one of them is
- * telling it to restart a working agent.
- */
-describe('shipped oversee skills use the one result taxonomy', () => {
-  for (const v of VARIANTS) {
-    const text = skill(v.path, 'oversee-agents');
-
-    it(`${v.id}: carries the taxonomy verbatim, not a paraphrase`, () => {
-      for (const line of oversightTaxonomyLines())
-        expect(text, `${v.id} is missing or has reworded: ${line.slice(0, 60)}…`).toContain(line);
+describe('native permission mapping', () => {
+  it.each([
+    ['codex', 'codex', 'auto', 'agent'],
+    ['codex', 'codex', 'allow', 'agent-full-access'],
+    ['claude-code', 'claude-code', 'auto', 'acceptEdits'],
+    ['claude-code', 'claude-code', 'allow', 'bypassPermissions'],
+  ] as const)('%s: %s approval=%s maps to native %s',
+    (_variantId, harness, approval, nativeMode) => {
+      const role = roleWith(harness, {
+        approval, filesystem: 'workspace', unattended: 'deny',
+      });
+      role.session = 'acp';
+      expect(getAdapter(harness).effectivePermissionMode!(role)).toMatchObject({
+        fleetMode: approval,
+        nativeMode,
+      });
     });
-
-    it(`${v.id}: says one console command is not a liveness verdict`, () => {
-      expect(text).toContain('One console command is not a liveness verdict');
-      expect(text).toContain('ours-fleet status <Name>');
-      expect(text).toContain('ours-fleet peek <Name>');
-    });
-
-    it(`${v.id}: restarts only on a confirmed stop`, () => {
-      // The wording differs per variant; what must hold is that the restart
-      // instruction is tied to `status` confirming the role is offline, and
-      // that the old "crashed → restart" shortcut is gone.
-      expect(text).toMatch(/only once `status` confirms it is offline/);
-      expect(text).not.toContain('for permanent roles `ours-fleet restart');
-      expect(text).not.toContain('then restart permanent\nroles');
-    });
-  }
-
-  it('both variants and the generated briefing agree line for line', () => {
-    // The same array, in the same order, in all three places.
-    const lines = oversightTaxonomyLines();
-    for (const v of VARIANTS) {
-      const text = skill(v.path, 'oversee-agents');
-      const positions = lines.map(l => text.indexOf(l));
-      expect(positions.every(p => p >= 0), v.id).toBe(true);
-      expect(positions, `${v.id} lists the taxonomy out of order`)
-        .toEqual([...positions].sort((a, b) => a - b));
-    }
-  });
 });

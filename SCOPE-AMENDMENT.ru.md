@@ -1,0 +1,13 @@
+# Уточнение scope, 2026-09-21
+
+Owner (аутентифицированный CID 0941EDDA3F0027484D7E2752D613AF666D147461960E4FA0A608EB5A0759F6DA) в сообщении комнаты 01m32d040b8pgv5q4a4p5bq4jd потребовал не усложнять реализацию изоляцией. Critic уточнил критерии в 01m32d143kc36zdsres6z6nt20; Developer принял уточнение.
+
+Это изменение заменяет требования PLAN.ru.md об обязательной новой OS-границе: существующая конфигурация изоляции Fleet сохраняется. Новый macOS sandbox backend и отдельный macOS security стенд не являются условиями этой задачи. Защита от намеренного обхода MCP через произвольный shell не заявляется.
+
+Остаются: supervisor владеет identity и MCP; исходные tool-контракты; запрет создания/выбора identity через агентский MCP; готовность identity/room до запуска модели; отсутствие повторного redeem при recovery; корректный permanent/temp lifetime; поддержанные harness/session без второго ours connector; файловые операции с путями и правами агента. Переносимость самого supervisor на поддержанные ОС остается функциональным требованием.
+
+Owner подтвердил цель в 01m32d5bhxr3m9fa6me0xh8ep3: простая, быстрая и детерминированная провизия; агент получает готовую identity и не читает skill для bind. Намеренный обход инструментов вне scope.
+
+## Обязательный root-first контракт
+
+Owner message `01m32khhwf057s2wx0vq60saf1` (2026-09-21 18:27 UTC) отменяет opt-in `requireExistingRoot`: любой permanent/temp non-root create требует существующую Human/root identity по умолчанию. Отсутствие root — ошибка инициализации daemon; автоматическая root promotion запрещена. Явная root initialization остается отдельной операцией. Fleet проверяет capability `root-first-identities-v1` до provisioning.

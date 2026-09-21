@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -23,7 +24,7 @@ import { formatDuration } from './duration.js';
 import { redactSensitive, resolvedPlan, resolvedRolePlan } from './resolved-plan.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
-import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { readRestartLedger, runSupervised, runTemp, SupervisorRecycleRequiredError } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
 import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
 import { partitionRestartNames } from './watchdog/config.js';
@@ -1423,7 +1424,13 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
 
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')
   .action(async name => {
-    try { await runTemp(name); } catch (e) { die(e); }
+    try { await runTempSupervisor(name, process.argv[1]); } catch (e) { die(e); }
+  });
+
+program.command('_run-temp-worker <name>', { hidden: true })
+  .action(async name => {
+    try {await runTemp(name);}
+    catch(error){if(error instanceof SupervisorRecycleRequiredError)process.exitCode=TEMP_RECYCLE_EXIT;else die(error);}
   });
 
 program.command('_run-watchdog <name>', { hidden: true })

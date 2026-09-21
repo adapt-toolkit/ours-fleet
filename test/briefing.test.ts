@@ -21,13 +21,13 @@ describe('generateBriefing', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('# Alice — Role Briefing');
     expect(b).toContain('ours identity: **Alice Dev**');
-    expect(b).toContain('choose_identity');
-    expect(b).toContain('"Alice Dev"');
+    expect(b).not.toContain('choose_identity');
+    expect(b).toContain('Alice Dev');
     expect(b).not.toContain('call **create_identity**');
     expect(b).toContain('current_identity');
     expect(b).toContain('set_bio');
     expect(b).toContain('set_persona');
-    expect(b).toContain('ours api watch-notifications');
+    expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('## Charter');
     expect(b).toContain('Own the Alice codebase.');
     expect(b).toContain('## Mission');
@@ -70,7 +70,7 @@ describe('generateBriefing', () => {
     const b = generateBriefing({ ...base }, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
     expect(b).toContain('CUSTOM CURATED TEXT');
     expect(b).not.toContain('## Charter');
-    expect(b).toContain('choose_identity');   // boot steps always appended
+    expect(b).not.toContain('choose_identity');   // boot steps always appended
     expect(b).toContain('## On restart');
     expect(b).toContain('did not declare a profile source');
     expect(b).not.toContain('with the **Charter** section above');
@@ -103,26 +103,19 @@ describe('generateBriefing', () => {
     const b = generateBriefing(roomRole, vocab, opts);
     expect(b).toContain('## Room assignment');
     expect(b).toContain('reviewer-1');
-    expect(b).toContain('secret-invite');
+    expect(b).not.toContain('secret-invite');
     expect(b).toContain('Review the exact implementation.');
-    expect(b).toContain('create_temporary_identity');
-    expect(b).toContain('add_contact');
+    expect(b).not.toContain('create_temporary_identity');
+    expect(b).not.toContain('add_contact');
     expect(b).toContain('A'.repeat(64));
     expect(b).toContain('C'.repeat(64));
-    expect(b).toContain('Start the Task above now');
+    expect(b).toContain('Start the task above');
     expect(b).not.toContain('fleet_room_briefing_ack');
     expect(b).not.toContain('briefing_sha256');
     expect(b).not.toContain('list_history');
     expect(b).not.toContain('get_history_item');
     expect(b).not.toContain('LOCAL BOOTSTRAP ONLY');
-    const create = b.indexOf('create_temporary_identity');
-    const accept = b.indexOf('add_contact');
-    const work = b.indexOf('Start the Task above now');
-    const monitor = b.indexOf('Wakes arrive as [fleet-monitor]');
-    expect(create).toBeGreaterThan(0);
-    expect(accept).toBeGreaterThan(create);
-    expect(work).toBeGreaterThan(accept);
-    expect(monitor).toBeGreaterThan(work);
+    expect(b.indexOf('verified room admission')).toBeLessThan(b.indexOf('Start the task above'));
   });
 
   it.each(['LocalCoordinator', 'Developer', 'Critic'])(
@@ -239,14 +232,14 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('direct ACP');
   });
 
-  it('uses the native harness watch instruction for monitor.mode=native', () => {
+  it('uses supervisor wakes with a legacy native monitor setting', () => {
     const native = {
       ...base,
       monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const },
     };
     const b = generateBriefing(native as ResolvedRole, vocab, opts);
-    expect(b).toContain('ours api watch-notifications');
-    expect(b).not.toContain('[fleet-monitor]');
+    expect(b).toContain('[fleet-monitor]');
+    expect(b).not.toContain('ours api watch-notifications');
   });
 
   it('keeps trusted owner ingress distinct from ordinary peer mail', () => {
@@ -317,88 +310,14 @@ describe('generateBriefing', () => {
   });
 });
 
-describe('the briefing states only what was verified about the identity', () => {
-  const brief = (guarantee?: 'verified' | 'created' | 'unverified') =>
-    generateBriefing(base, vocab, { ...opts, identityGuarantee: guarantee });
-
-  it('never calls the identity "predefined" — the claim that was not checked', () => {
-    for (const g of [undefined, 'verified', 'created', 'unverified'] as const)
-      expect(brief(g), String(g)).not.toContain('predefined');
-  });
-
-  it('an unverified identity is described as possibly absent, with the fallback', () => {
-    const b = brief('unverified');
-    expect(b).toContain('was NOT verified before launch');
-    expect(b).toContain('identity creation belongs to the fleet lifecycle');
-    expect(b).not.toContain('call **create_identity**');
-  });
-
-  it('a verified identity says binding should succeed, and to report it if not', () => {
-    const b = brief('verified');
-    expect(b).toContain('verified to exist');
-    expect(b).toContain('report the infrastructure race');
-    expect(b).not.toContain('NOT verified');
-  });
-
-  it('a created identity says so', () => {
-    expect(brief('created')).toContain('It was created when your role');
-  });
-
-  it('defaults to unverified when the generator was told nothing', () => {
-    // A briefing produced without that knowledge must not invent a guarantee.
-    expect(brief()).toContain('was NOT verified');
-  });
-
-  it('keeps a defensive bind-time check without delegating permanent creation', () => {
-    for (const g of ['verified', 'created', 'unverified'] as const) {
-      expect(brief(g), g).toContain('choose_identity');
-      expect(brief(g), g).not.toContain('call **create_identity**');
-      expect(brief(g), g).toMatch(/STOP/);
+describe('supervisor-provisioned startup briefing', () => {
+  it.each([undefined, 'verified', 'created', 'unverified'] as const)('does not delegate identity setup for prior guarantee %s', guarantee => {
+    for (const temporaryIdentity of [false,true]) {
+      const b=generateBriefing(base,vocab,{...opts,identityGuarantee:guarantee,temporaryIdentity});
+      expect(b).toContain('owned and verified by the Fleet supervisor');
+      expect(b).not.toMatch(/choose_identity|create_identity|create_temporary_identity/);
+      expect(b).toContain('supervisor verifies your identity and room before resuming');
     }
-  });
-});
-
-describe('temporary-role identity compatibility', () => {
-  const temporary = (extra: Partial<Parameters<typeof generateBriefing>[2]> = {}) =>
-    generateBriefing(base, vocab, { ...opts, temporaryIdentity: true, ...extra });
-
-  it('directly creates the assigned session-scoped identity', () => {
-    const b = temporary();
-    expect(b).toContain('CREATE your ours identity now');
-    expect(b).toContain('create_temporary_identity');
-    expect(b).toContain('name "Alice Dev"');
-    expect(b).toContain('connector owns its cleanup');
-  });
-
-  it('never binds or adopts a pre-existing identity, regardless of provisioning evidence', () => {
-    const b = temporary({ identityGuarantee: 'verified' });
-    expect(b).not.toContain('choose_identity');
-    expect(b).not.toContain('BIND the exact');
-    expect(b).toContain('Do not inspect, preserve, adopt, or use any pre-existing');
-    expect(b).not.toMatch(/\bBIND your ours identity\b/);
-  });
-
-  it('states the MCP-owned lifecycle and recreates directly on restart', () => {
-    const b = temporary();
-    expect(b).toContain('connector owns its cleanup when this');
-    expect(b).toContain('create_temporary_identity** with name "Alice Dev" again');
-    expect(b).not.toContain('re-bind');
-  });
-
-  it('fails safely without fallback or deleting identity state', () => {
-    const b = temporary();
-    expect(b).toContain('collision, missing tool, or creation error, STOP');
-    expect(b).toContain('remove an identity');
-    expect(b).not.toContain('call **create_identity**');
-  });
-
-  it('keeps permanent-role creation in the fleet lifecycle', () => {
-    const b = generateBriefing(base, vocab, opts);
-    expect(b).toContain('persistent agent');
-    expect(b).not.toContain('call **create_identity**');
-    expect(b).toContain('fleet lifecycle');
-    expect(b).not.toContain('create_temporary_identity');
-    expect(b).not.toContain('session-owned temporary');
   });
 });
 
