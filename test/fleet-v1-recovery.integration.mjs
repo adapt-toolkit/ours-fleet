@@ -18,8 +18,8 @@ import { createMonitor } from '../dist/monitor.js';
 
 const mode = process.argv[2] ?? 'retry';
 assert(['retry','terminal-after-failure','terminal-release-failure'].includes(mode));
-const daemonCli = process.env.FLEET_DAEMON_CLI ?? 'node_modules/@ours.network/cli/dist/cli.js';
-const tokenUpdateCli = process.env.FLEET_TOKEN_CLI ?? 'node_modules/@ours.network/cli/dist/cli.js';
+const daemonCli = process.env.FLEET_DAEMON_CLI ?? 'node_modules/@ours.network/daemon/dist/cli.js';
+const tokenUpdateCli = process.env.FLEET_TOKEN_CLI ?? 'node_modules/@ours.network/daemon/dist/cli.js';
 const root = mkdtempSync(join(tmpdir(), 'fleet-v1-recovery-'));
 const daemonState = join(root, 'daemon'), fleetState = join(root, 'fleet');
 const hostState = join(root, 'host'), deliveryState = join(root, 'delivery');

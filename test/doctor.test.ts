@@ -122,7 +122,7 @@ describe('doctor', () => {
     }), 'linux', undefined, async () => { throw new TypeError('fetch failed'); });
     const d = rep.checks.find(c => c.name === 'ours daemon')!;
     expect(d.ok).toBe(false);
-    expect(d.detail).toContain('ours daemon start');
+    expect(d.detail).toContain('ours-daemon start');
   });
 
   it('checks the daemon through the SDK without executing the ours CLI', async () => {
@@ -358,7 +358,7 @@ describe('doctor monitor probe', () => {
     const rep = await doctor({}, green(), 'linux', stubFetch('down'));
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m.ok).toBe(false);
-    expect(m.detail).toMatch(/ours daemon start/);
+    expect(m.detail).toMatch(/ours-daemon start/);
   });
 
   it('uses config port and apiToken for the same profile as the runtime monitor', async () => {

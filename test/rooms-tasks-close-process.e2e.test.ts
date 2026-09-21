@@ -131,7 +131,7 @@ describe.skipIf(!enabled)('real process room close', () => {
     }
     if (oursEnv) {
       await runNode(
-        join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js'),
+        join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js'),
         ['daemon', 'stop', '--config', oursEnv.OURS_CONFIG!, '--json'], ROOT, oursEnv, 20_000,
       ).catch(() => {});
     }
@@ -175,7 +175,7 @@ describe.skipIf(!enabled)('real process room close', () => {
     }), { mode: 0o600 });
     oursEnv = { ...process.env, OURS_CONFIG: oursConfig };
     for (const key of ['OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN']) delete oursEnv[key];
-    const oursCli = join(ROOT, 'node_modules', '@ours.network', 'cli', 'dist', 'cli.js');
+    const oursCli = join(ROOT, 'node_modules', '@ours.network', 'daemon', 'dist', 'cli.js');
     const daemonStart = await runNode(
       oursCli, ['daemon', 'start', '--config', oursConfig, '--json'], ROOT, oursEnv,
     );

@@ -329,7 +329,7 @@ export async function doctor(
   } catch (error) {
     checks.push({
       name: 'ours daemon', ok: false,
-      detail: `not reachable through the SDK — start it with: ours daemon start `
+      detail: `not reachable through the SDK — start it with: ours-daemon start `
         + `[${(error as Error)?.message ?? String(error)}]`,
     });
   }
@@ -516,7 +516,7 @@ export async function doctor(
     } catch (e) {
       const target = selected?.endpoint ?? `:${endpoint!.port}`;
       detail = `unreachable on ${target} — monitored roles run degraded until it is up ` +
-        `(start it: ours daemon start) [${(e as Error)?.message ?? e}]`;
+        `(start it: ours-daemon start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
   }
