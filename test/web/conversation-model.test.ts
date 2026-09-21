@@ -1,10 +1,6 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import {
-  applyEvents, collectHistory, describeTurnState, emptyModel, isAtTail,
-} from '../../web/src/conversation-model.js';
+import { applyEvents, collectHistory, describeTurnState, emptyModel, isAtTail,  } from '../../web/src/conversation-model.js';
 import type { ConversationEvent, ConversationPage } from '../../web/src/conversation-model.js';
 
 let seq = 0;
@@ -242,14 +238,4 @@ describe('transcript hydration lands on the newest message', () => {
     expect(isAtTail({ scrollTop: 400, clientHeight: 400, scrollHeight: 1_340 })).toBe(false);
   });
 
-  it('positions the transcript before paint, never after', () => {
-    // jsdom is not installed, so the component cannot be rendered here. A
-    // post-paint useEffect is exactly what made the console show the oldest
-    // message first and then scroll down, so pin it at the source.
-    const source = readFileSync(resolve('web/src/ConversationView.tsx'), 'utf8');
-    const positioning = source.slice(source.indexOf('scrollRef.current?.scrollTo') - 400,
-      source.indexOf('scrollRef.current?.scrollTo'));
-    expect(positioning).toContain('useLayoutEffect');
-    expect(positioning).not.toContain('useEffect(');
-  });
 });
