@@ -150,6 +150,8 @@ export function updateMemberSeats(
   seats: RoomMemberSeat[],
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
+  if (r.state === 'closing' || r.state === 'closed')
+    throw new RoomStateError(`room ${id} is ${r.state}; member provisioning is fenced`);
   r.member_seats = seats;
   writeRoom(r);
   return r;
@@ -185,6 +187,8 @@ export function updateMemberStartup(
   update: { launch?: RoomMemberLaunchState },
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
+  if (r.state === 'closing' || r.state === 'closed')
+    throw new RoomStateError(`room ${id} is ${r.state}; member provisioning is fenced`);
   const seat = r.member_seats.find(candidate => candidate.role_name === roleName);
   if (!seat) throw new RoomStateError(`room ${id} has no recorded member ${roleName}`);
   if (update.launch && seat.launch
@@ -202,6 +206,8 @@ export function updateMemberStartup(
 
 export function activateRoom(id: string): RoomOrchestrationRecord {
   const r = readRoom(id);
+  if (r.state === 'closing' || r.state === 'closed')
+    throw new RoomStateError(`room ${id} is ${r.state}; activation is fenced`);
   r.state = 'active';
   r.saga = { phase: 'completed', step_index: 0 };
   delete r.provisioning_detail;

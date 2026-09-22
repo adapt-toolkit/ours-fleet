@@ -352,7 +352,13 @@ export class TaskRoomApplicationService {
     const ready = task.state === 'active' && room?.state === 'active'
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
-    const nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
+    const nextAction = task.terminal_intent
+      ? `Complete the accepted ${task.terminal_intent.kind} operation; do not restart provisioning.`
+      : room?.state === 'closing' || room?.state === 'closed'
+        ? `Complete room cleanup; do not restart provisioning.`
+      : room?.provisioning_detail === 'member_failed'
+        ? `Inspect the failed launch, then run ours-fleet task start ${task.task_id}.`
+      : room?.provisioning_detail === 'waiting_owner_authorization'
       ? `Ensure ours-cowork 1.3.0 or newer is running and available, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'waiting_owner_invite'
         ? `Rotate rooms.owner.public_invite, then run ours-fleet task start ${task.task_id}.`
@@ -554,7 +560,9 @@ export class TaskRoomApplicationService {
     let task = readTask(input.taskId);
     let room = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const issues: TaskProvisioningContinuationIssue[] = [];
-    if (task.state !== 'provisioning') return {
+    if (task.state !== 'provisioning' || task.terminal_intent
+        || room?.state === 'closing' || room?.state === 'closed'
+        || room?.provisioning_detail === 'member_failed') return {
       kind: 'no_op', task, room, issues,
     };
     if (!room) {

@@ -32,7 +32,7 @@ import {
 } from '../fleet-proxy.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError } from '../session/types.js';
-import { closeManagedRoom } from './close.js';
+import { closeManagedRoom, roomCloseLockPath } from './close.js';
 import { withFileLock } from '../atomic-file.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import { TaskStateError, taskDeletionState } from './task-state.js';
@@ -385,13 +385,17 @@ async function launchMember(input: {
   startup: RoomMemberStartup;
 }): Promise<void> {
   const taskId = input.provision.taskId;
-  if (!taskId) return launchMemberUnlocked(input);
+  const launch = () => withFileLock(roomCloseLockPath(input.provision.roomId), () => {
+    assertProvisioningOpen(input.provision);
+    return launchMemberUnlocked(input);
+  }, {}, TASK_OPERATION_LOCK_STALE_MS);
+  if (!taskId) return launch();
   return withFileLock(taskOperationLockPath(taskId), () => {
     if (taskDeletionState(taskId) !== 'none')
       throw new Error(
         `task ${taskId} is pending deletion; aborting member launch for ${input.member.name}`,
       );
-    return launchMemberUnlocked(input);
+    return launch();
   }, {}, TASK_OPERATION_LOCK_STALE_MS);
 }
 
@@ -532,10 +536,19 @@ function assertCoworkRoomPolicy(
     throw new Error(`Cowork anonymity (${String(room.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(expectedAnonymous)})`);
 }
 
+function assertProvisioningOpen(input: ProvisionMembersInput): void {
+  if (input.taskId && getTask(input.taskId).terminal_intent)
+    throw new Error(`task ${input.taskId} has an accepted terminal intent; refusing to provision members`);
+  const room = getRoomRecord(input.roomId);
+  if (room?.state === 'closing' || room?.state === 'closed')
+    throw new Error(`room ${input.roomId} is ${room.state}; refusing to provision members`);
+}
+
 export async function provisionMembers(
   input: ProvisionMembersInput,
 ): Promise<RoomOrchestrationRecord> {
   const { cfg, cowork, roomId, taskId, template } = input;
+  assertProvisioningOpen(input);
   // Deletion-epoch pre-check; each member launch re-checks under the lock.
   if (taskId && taskDeletionState(taskId) !== 'none')
     throw new Error(`task ${taskId} is pending deletion; refusing to provision members`);
@@ -616,10 +629,11 @@ export async function provisionMembers(
       const issued = await cowork.issueInvite(roomId, {
         mode: 'one_time', role: member.coworkRole, min_accepts: 1,
       });
-      const seats = getRoomRecord(roomId)!.member_seats.map(seat =>
-        seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id } : seat);
-      updateMemberSeats(roomId, seats);
       try {
+        assertProvisioningOpen(input);
+        const seats = getRoomRecord(roomId)!.member_seats.map(seat =>
+          seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id } : seat);
+        updateMemberSeats(roomId, seats);
         await launchMember({
           provision: input,
           member,

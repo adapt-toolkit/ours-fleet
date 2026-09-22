@@ -1125,7 +1125,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           const app = taskRoomService(opts.configuration);
           for (;;) {
             const before = app.taskProvisioningOutcome(id);
-            if (before.kind !== 'in_progress') {
+            if (before.kind !== 'in_progress' || before.next_action) {
               await presentDetachedProvisioningOutcome(before);
               return;
             }

@@ -26,10 +26,13 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
 }));
 
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { roomCloseLockPath } from '../src/rooms-tasks/close.js';
+import { taskOperationLockPath } from '../src/rooms-tasks/terminal.js';
+import { withFileLock } from '../src/atomic-file.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
-import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
+import { beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
+import { beginTaskTerminalIntent, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
 } from '../src/rooms-tasks/cowork-adapter.js';
@@ -232,6 +235,51 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
+  it.each(['room', 'task'])('rechecks terminal ownership after waiting for the %s launch lock', async boundary => {
+    const task = createTask({ title: 'Waiting launch', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-lock-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-lock-race', 'room-cid');
+    const h = coworkHarness();
+    let locked!: () => void, unlock!: () => void, issued!: () => void;
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const release = new Promise<void>(resolve => { unlock = resolve; });
+    const inviteIssued = new Promise<void>(resolve => { issued = resolve; });
+    const held = withFileLock(boundary === 'room' ? roomCloseLockPath('room-lock-race') : taskOperationLockPath(task.task_id), async () => { locked(); await release; });
+    await ready;
+    const issue = h.issueInvite.getMockImplementation()!;
+    h.issueInvite.mockImplementation(async (...args) => { const result = await issue(...args); issued(); return result; });
+    const pending = provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-lock-race', taskId: task.task_id,
+      template: template(1), binPath: '/usr/bin/ours-fleet' });
+    const rejected = expect(pending).rejects.toThrow(/closing|terminal/);
+    try {
+      await inviteIssued;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (boundary === 'room') beginRoomClose('room-lock-race');
+      else beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'room-lock-race' });
+    } finally { unlock(); }
+    await held;
+    await rejected;
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+  });
+
+  it.each(['room-close', 'task-cancel'])('never launches after %s is accepted while issuing an invite', async mode => {
+    const task = createTask({ title: 'Cancel race', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-cancel-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-cancel-race', 'room-cid');
+    const h = coworkHarness();
+    const issue = h.issueInvite.getMockImplementation()!;
+    h.issueInvite.mockImplementation(async (...args) => {
+      const result = await issue(...args);
+      if (mode === 'room-close') beginRoomClose('room-cancel-race');
+      else beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'room-cancel-race' });
+      return result;
+    });
+    await expect(provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-cancel-race', taskId: task.task_id,
+      template: template(1), binPath: '/usr/bin/ours-fleet' })).rejects.toThrow(/closing|terminal/);
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(h.revokeInvite).toHaveBeenCalledWith('room-cancel-race', 'invite-1');
+  });
+
   it('does not become ready until the configured Owner seat is active', async () => {
     createRoomRecord({ room_id: 'room-owner-gate', room_name: 'Room', room_identity_cid: 'room-cid' });
     setOwnerSeat('room-owner-gate', 'owner-cid', 'fingerprint');
