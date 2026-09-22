@@ -7,6 +7,7 @@ const sdk = vi.hoisted(() => ({
   listIdentities: vi.fn(),
   removeIdentity: vi.fn(),
   releaseLease: vi.fn(async () => undefined),
+  close: vi.fn(async () => undefined),
 }));
 
 vi.mock('@ours.network/sdk/client', () => ({

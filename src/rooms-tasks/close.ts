@@ -5,6 +5,7 @@ import { attachOursClient, type OursClient } from '@ours.network/sdk/client';
 
 import { withFileLock } from '../atomic-file.js';
 import { agentDir, stateRoot } from '../paths.js';
+import { readClientProfile } from '../client-profile.js';
 import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
   type TempLifecycleDeps,
@@ -81,13 +82,23 @@ export async function waitForLivenessAbsent(
 }
 
 async function withIdentityClient<T>(work: (client: OursClient) => Promise<T>): Promise<T> {
-  const client = await attachOursClient({
+  const profile = readClientProfile(process.env);
+  const leaseToken = `ours-fleet-room-close-${process.pid}-${randomUUID()}`;
+  const client = await attachOursClient(profile ? {
+    endpoint: profile.endpoint,
+    expectedInstanceId: profile.expectedInstanceId,
+    credentialPath: profile.credentialPath,
+    sessionMode: 'external', env: {}, leaseToken,
+  } : {
     env: process.env,
-    leaseToken: `ours-fleet-room-close-${process.pid}-${randomUUID()}`,
+    leaseToken,
     clientPid: process.pid,
   });
   try { return await work(client); }
-  finally { await client.releaseLease().catch(() => {}); }
+  finally {
+    try { await client.releaseLease().catch(() => {}); }
+    finally { await client.close(); }
+  }
 }
 
 function listedIdentity(
