@@ -127,8 +127,8 @@ describe('explicit client profile', () => {
     };
 
     expect(selected({ endpoint: 'https://server.example:8443/', expectedInstanceId, credentialPath })()).toEqual({ endpoint: 'https://server.example:8443', expectedInstanceId, credentialPath, configPath: path });
-    for (const bad of ['ftp://server.example', 'wss://server.example', 'https://u:p@server.example', 'https://server.example/path', 'https://server.example?q=1', 'https://server.example#fragment']) {
-      expect(selected({ endpoint: bad, expectedInstanceId, credentialPath })).toThrow(/origin/);
+    for (const bad of ['ftp://server.example', 'wss://server.example', 'https://u:p@server.example', 'https://server.example?q=1', 'https://server.example#fragment']) {
+      expect(selected({ endpoint: bad, expectedInstanceId, credentialPath })).toThrow(/base URL/);
     }
     expect(selected({ endpoint })).toThrow(/invalid or missing expectedInstanceId/);
     expect(() => readClientProfile({ OURS_CONFIG: join(dir, 'missing-profile.json') }))
@@ -150,7 +150,7 @@ describe('probeIdentityPresence', () => {
     const credentialPath = join(dir, 'daemon-token');
     const expectedInstanceId = '80947c72-c514-46e8-94e9-c2847bf6e971';
     writeFileSync(profilePath, JSON.stringify({
-      endpoint: 'http://127.0.0.1:43117', expectedInstanceId, credentialPath,
+      endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
     }), { mode: 0o600 });
     const attached: Array<Record<string, unknown>> = [];
     const result = await probeIdentityPresence(
@@ -167,7 +167,7 @@ describe('probeIdentityPresence', () => {
 
     expect(result).toEqual({ state: 'present', temporary: true, stale: false });
     expect(attached).toEqual([{
-      endpoint: 'http://127.0.0.1:43117', expectedInstanceId, credentialPath,
+      endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
       sessionMode: 'external', leaseToken: expect.any(String), env: {},
     }]);
   });

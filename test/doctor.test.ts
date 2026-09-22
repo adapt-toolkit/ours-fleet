@@ -1,3 +1,5 @@
+import { createServer } from 'node:http';
+import { attachOursClient } from '@ours.network/sdk/client';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -56,9 +58,10 @@ const ISOLATED_SCAN = { path: '', argv1: undefined };
 const HEALTHY_DAEMON_INFO = {
   name: 'ours', version: '2.0.1', compat: 2, protocol: 1, pid: 1234, stateDir: '/s',
 };
-type DoctorDaemonClient = Pick<OursClient, 'version'>;
+type DoctorDaemonClient = Pick<OursClient, 'version' | 'close'>;
 const healthyDaemon = async (_options: AttachOursClientOptions): Promise<DoctorDaemonClient> => ({
   version: async () => HEALTHY_DAEMON_INFO,
+  close: async () => {},
 });
 const doctor = (
   opts: Parameters<typeof doctorImpl>[0] = {},
@@ -72,6 +75,76 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
+
+  it('reports one failed daemon check when client cleanup fails', async () => {
+    const report = await doctor({}, execWith({}), 'darwin', undefined, async () => ({
+      version: async () => HEALTHY_DAEMON_INFO,
+      close: async () => { throw new Error('close failed'); },
+    }));
+    const checks = report.checks.filter(c => c.name === 'ours daemon');
+    expect(checks).toHaveLength(1);
+    expect(checks[0].ok).toBe(false);
+  });
+  it.each([true, false])('authenticates the real SDK without legacy /state-dir (valid credential=%s)', async authorized => {
+    delete process.env.OURS_STATE_DIR;
+    const instanceId = '11111111-2222-3333-4444-555555555555';
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(req.url!);
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/base/daemon/selection') {
+        res.end(JSON.stringify({ schema: 1, instanceId, capabilities: ['external-sessions-v1'] }));
+      } else if (req.url === '/base/daemon/version' && req.headers['x-ours-api-token'] === 'test-issued-credential') {
+        res.end(JSON.stringify(HEALTHY_DAEMON_INFO));
+      } else { res.statusCode = 401; res.end(JSON.stringify({ error: 'unauthorized' })); }
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = (server.address() as { port: number }).port;
+      const credentialPath = join(dir, 'credential');
+      writeFileSync(credentialPath, authorized ? 'test-issued-credential' : 'wrong-test-credential', { mode: 0o600 });
+      writeFileSync(process.env.OURS_CONFIG!, JSON.stringify({
+        serverUrl: `http://127.0.0.1:${port}/base`, endpoint: `http://127.0.0.1:${port}/base/daemon`, expectedInstanceId: instanceId, credentialPath,
+      }), { mode: 0o600 });
+      const report = await doctor({}, execWith({}), 'darwin', undefined, attachOursClient);
+      const check = report.checks.find(c => c.name === 'ours daemon')!;
+      expect(check.ok).toBe(authorized);
+      expect(requests).toEqual(['/base/daemon/selection', '/base/daemon/version']);
+      expect(check.detail).not.toContain('ours-daemon start');
+      expect(check.detail).not.toContain('wrong-test-credential');
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it.each(['ok', 'malformed', 'throw'] as const)('uses the managed profile and closes the daemon client on %s', async outcome => {
+    delete process.env.OURS_STATE_DIR;
+    const selection = {
+      endpoint: 'http://127.0.0.1:3050',
+      expectedInstanceId: '11111111-2222-3333-4444-555555555555',
+      credentialPath: join(dir, 'credential'),
+    };
+    writeFileSync(process.env.OURS_CONFIG!, JSON.stringify(selection), { mode: 0o600 });
+    let closed = 0;
+    let attached: AttachOursClientOptions | undefined;
+    const report = await doctor({}, execWith({}), 'darwin', undefined, async options => {
+      attached = options;
+      return {
+        version: async () => {
+          if (outcome === 'throw') throw new Error('HTTP 401');
+          return { ...HEALTHY_DAEMON_INFO, name: outcome === 'malformed' ? 'other' : 'ours' };
+        },
+        close: async () => { closed++; },
+      };
+    });
+    expect(attached).toMatchObject({ ...selection, env: {}, sessionMode: 'external' });
+    expect(closed).toBe(1);
+    const check = report.checks.find(c => c.name === 'ours daemon')!;
+    expect(check.ok).toBe(outcome === 'ok');
+    expect(check.detail).not.toContain('ours-daemon start');
+  });
+
   it('reports the Hermes default executable, selected model and stopped-home prerequisite', async () => {
     writeV2Fixture(join(dir, 'fleet.yaml'),
       `roles:\n  HermesWorker:\n    harness: hermes\n    session: acp\n    model: fixture-model\n    permissions: { approval: ask, filesystem: workspace, unattended: wait }\n    monitor: { mode: fleet }\n`);

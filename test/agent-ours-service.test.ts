@@ -20,7 +20,8 @@ const daemon = vi.hoisted(() => ({
   redeems: 0,
   member: false,
 }));
-vi.mock('@ours.network/sdk/client', () => ({
+vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@ours.network/sdk/client')>(),
   attachOursClient: async (opts: any) => {
     let local: string | undefined;
     const current = () => daemon.rows.get(daemon.owners.get(opts.leaseToken) ?? local);

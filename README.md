@@ -1694,3 +1694,19 @@ provisioning or automatic reverse-proxy configuration. Existing local HTTP and
 SSH-tunnel profiles continue to work.
 
 See [supervisor-owned ours and migration](docs/supervisor-ours.md) for the runtime contract and review build instructions.
+
+### One-server gateway profile
+
+A private client profile may include `serverUrl`, for example
+`https://ours.example/base`, together with `endpoint` set to
+`https://ours.example/base/daemon`, the existing `expectedInstanceId`, and the
+absolute private `credentialPath`. Fleet preserves that daemon prefix for doctor
+and monitoring and derives `/cowork/management/rpc` from `serverUrl` for room
+management. Requests use the issued server credential, reject redirects, have
+bounded bodies/deadlines, and never replay mutations. This capability is declared
+as `cowork.http-management-v1` in the built artifact.
+
+Explicit Cowork socket, config or state-directory overrides continue to select
+local Unix management. Profiles without `serverUrl` retain legacy behavior. The
+HTTP API grants operator room authority; use the installer's supported private
+or authenticated external gateway entry, and keep its backend ports private.

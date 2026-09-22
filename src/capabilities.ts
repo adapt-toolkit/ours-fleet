@@ -15,7 +15,10 @@
 /** `monitor.interrupt: after_tool` — cancel at the next tool boundary (#67). */
 export const CAP_MONITOR_INTERRUPT_AFTER_TOOL = 'monitor.interrupt.after_tool';
 
+export const CAP_HTTP_COWORK = 'cowork.http-management-v1';
+
 export const CAPABILITIES = [
+  CAP_HTTP_COWORK,
   CAP_MONITOR_INTERRUPT_AFTER_TOOL,
 ] as const;
 

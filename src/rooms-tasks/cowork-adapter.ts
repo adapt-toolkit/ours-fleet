@@ -10,6 +10,8 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createConnection } from 'node:net';
 import type { Socket } from 'node:net';
+import { readClientProfile } from '../client-profile.js';
+import { coworkHttpCall } from './cowork-http.js';
 import type { RoomHistoryEvidence } from './types.js';
 
 const RPC_VERSION = 1;
@@ -397,11 +399,16 @@ function rpcCall(
 }
 
 export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkAdapter {
-  const socketPath = resolveCoworkSocketPath(options);
+  const env = options.env ?? process.env;
+  const explicitLocal = options.socketPath !== undefined || options.configPath !== undefined
+    || env.OURS_COWORK_CONFIG !== undefined || !!env.OURS_COWORK_STATE_DIR;
+  const profile = explicitLocal ? undefined : readClientProfile({ ...env, HOME: options.home ?? env.HOME });
+  const remote = profile?.serverUrl ? profile : undefined;
+  const socketPath = remote ? undefined : resolveCoworkSocketPath(options);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const connect = options.connect ?? ((path: string) => createConnection(path));
   const call = (method: string, params: JsonRecord): Promise<unknown> =>
-    rpcCall(socketPath, method, params, timeoutMs, connect);
+    remote ? coworkHttpCall(remote, method, params, timeoutMs) : rpcCall(socketPath!, method, params, timeoutMs, connect);
   return {
     async available() {
       try { await call('room.list', {}); return true; } catch { return false; }
