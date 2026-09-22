@@ -936,6 +936,23 @@ describe('runOnce ACP startup outcome', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('closes the already-started owner channel when the first prompt is refused', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_STOP_REASON: 'refusal' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+    const start = vi.fn(async () => {}), close = vi.fn(async () => {});
+    deps.createOwnerChannel = () => ({ start, close, drain: async () => {}, manage: async () => { throw Error('unused'); } });
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt refused/);
+    expect(start).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(existsSync(join(agentDir('A'), '.control.sock'))).toBe(false);
+    expect(logs.some(line => line.includes('[A] up;'))).toBe(false);
+  });
+
   it('a cancelled startup prompt fails the role too', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
@@ -1179,7 +1196,7 @@ describe('runOnce ACP startup outcome', () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
     } });
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps } = acpDeps();
@@ -1190,7 +1207,11 @@ describe('runOnce ACP startup outcome', () => {
       expect(options.config.identity).toBe('A-owner');
       expect(options.session.backend).toBe('acp');
       return {
-        start: async () => { started++; },
+        start: async () => {
+          const events = readFileSync(join(agentDir('A'), '.session-events.jsonl'), 'utf8');
+          expect(events).not.toContain('"kind":"turn_stop"');
+          started++;
+        },
         drain: async () => {},
         close: async () => {
           expect(existsSync(join(agentDir('A'), '.control.sock'))).toBe(false);

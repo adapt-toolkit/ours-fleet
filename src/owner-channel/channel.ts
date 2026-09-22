@@ -83,6 +83,8 @@ export interface OwnerChannelOptions {
   harness: string;
   config: OwnerChannelConfig;
   session: AgentSession;
+  /** Ordinary owner input must not cancel the initial briefing turn. */
+  startupPending?: () => boolean;
   stateDir: string;
   env?: Record<string, string>;
   log(line: string): void;
@@ -1306,8 +1308,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
-          interrupt: this.options.config.interrupt,
-          ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+          ...this.ownerPromptPolicy(),
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
@@ -1421,8 +1422,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
-        interrupt: this.options.config.interrupt,
-        ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+        ...this.ownerPromptPolicy(),
         origin: { kind: 'owner', requestId, displayText: text },
       });
     } catch (error) {
@@ -1466,6 +1466,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
     this.completionTasks.add(task);
     return true;
+  }
+
+  private ownerPromptPolicy() {
+    if (this.options.startupPending?.()) return { interrupt: false, steer: true };
+    return {
+      interrupt: this.options.config.interrupt,
+      ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+    };
   }
 
   /**
