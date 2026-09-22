@@ -1,3 +1,4 @@
+import { normalizeDaemonEndpoint } from '@ours.network/sdk/client';
 import { lstatSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -12,6 +13,7 @@ export interface ExplicitClientProfile {
   readonly expectedInstanceId: string;
   readonly credentialPath: string;
   readonly configPath: string;
+  readonly serverUrl?: string;
 }
 
 export class ClientProfileError extends Error {
@@ -94,9 +96,9 @@ export function readClientProfile(env: NodeJS.ProcessEnv): ExplicitClientProfile
   let url: URL;
   try { url = new URL(endpoint); }
   catch { throw invalid(configPath, 'has an invalid endpoint'); }
-  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password || url.pathname !== '/'
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password
       || url.search || url.hash)
-    throw invalid(configPath, 'endpoint must be an HTTP or HTTPS origin');
+    throw invalid(configPath, 'endpoint must be an HTTP or HTTPS base URL');
 
   const expectedInstanceId = (row.expectedInstanceId as string).trim();
   if (!LOWERCASE_UUID.test(expectedInstanceId))
@@ -105,8 +107,18 @@ export function readClientProfile(env: NodeJS.ProcessEnv): ExplicitClientProfile
   if (!isAbsolute(credentialPath))
     throw invalid(configPath, 'credentialPath must be absolute');
 
+  let serverUrl: string | undefined;
+  if (Object.hasOwn(row, 'serverUrl')) {
+    if (typeof row.serverUrl !== 'string' || /[\s\\?#]/.test(row.serverUrl))
+      throw invalid(configPath, 'serverUrl must be a safe HTTP or HTTPS base URL');
+    try { serverUrl = normalizeDaemonEndpoint(row.serverUrl); }
+    catch { throw invalid(configPath, 'serverUrl must be a safe HTTP or HTTPS base URL'); }
+    if (normalizeDaemonEndpoint(endpoint) !== serverUrl + '/daemon')
+      throw invalid(configPath, 'endpoint must select serverUrl/daemon');
+  }
   return Object.freeze({
-    endpoint: url.origin, expectedInstanceId, credentialPath, configPath,
+    ...(serverUrl === undefined ? {} : { serverUrl }),
+    endpoint: normalizeDaemonEndpoint(endpoint), expectedInstanceId, credentialPath, configPath,
   });
 }
 

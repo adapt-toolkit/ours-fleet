@@ -92,9 +92,9 @@ describe('doctor', () => {
     const server = createServer((req, res) => {
       requests.push(req.url!);
       res.setHeader('content-type', 'application/json');
-      if (req.url === '/selection') {
+      if (req.url === '/base/daemon/selection') {
         res.end(JSON.stringify({ schema: 1, instanceId, capabilities: ['external-sessions-v1'] }));
-      } else if (req.url === '/version' && req.headers['x-ours-api-token'] === 'test-issued-credential') {
+      } else if (req.url === '/base/daemon/version' && req.headers['x-ours-api-token'] === 'test-issued-credential') {
         res.end(JSON.stringify(HEALTHY_DAEMON_INFO));
       } else { res.statusCode = 401; res.end(JSON.stringify({ error: 'unauthorized' })); }
     });
@@ -104,12 +104,12 @@ describe('doctor', () => {
       const credentialPath = join(dir, 'credential');
       writeFileSync(credentialPath, authorized ? 'test-issued-credential' : 'wrong-test-credential', { mode: 0o600 });
       writeFileSync(process.env.OURS_CONFIG!, JSON.stringify({
-        endpoint: `http://127.0.0.1:${port}`, expectedInstanceId: instanceId, credentialPath,
+        serverUrl: `http://127.0.0.1:${port}/base`, endpoint: `http://127.0.0.1:${port}/base/daemon`, expectedInstanceId: instanceId, credentialPath,
       }), { mode: 0o600 });
       const report = await doctor({}, execWith({}), 'darwin', undefined, attachOursClient);
       const check = report.checks.find(c => c.name === 'ours daemon')!;
       expect(check.ok).toBe(authorized);
-      expect(requests).toEqual(['/selection', '/version']);
+      expect(requests).toEqual(['/base/daemon/selection', '/base/daemon/version']);
       expect(check.detail).not.toContain('ours-daemon start');
       expect(check.detail).not.toContain('wrong-test-credential');
     } finally {
