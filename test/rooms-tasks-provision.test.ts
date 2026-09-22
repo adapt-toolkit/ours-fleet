@@ -1,4 +1,4 @@
-import { privateRuntimeRoot } from '../src/agent-ours/service.js';
+import { privateRuntimeRoot, storeRoomSecret } from '../src/agent-ours/service.js';
 import { atomicPrivateWrite, binderKey } from '../src/agent-ours/state.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -415,6 +415,26 @@ describe('simple Cowork room member startup', () => {
     })).rejects.toThrow('launch failed');
     expect(h.revokeInvite).toHaveBeenCalledWith('room-fail', 'invite-1');
     expect(getRoomRecord('room-fail')?.member_seats[0].launch?.state).toBe('failed');
+  });
+
+  it('retries a failed launch with a new invite without colliding with its retained secret', async () => {
+    createRoomRecord({ room_id: 'room-retry-secret', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    const spawn = mocks.spawnTemp.getMockImplementation()!;
+    let attempt = 0;
+    mocks.spawnTemp.mockImplementation(async (opts: Record<string, any>) => {
+      storeRoomSecret({ name: opts.name, identity: opts.identity, roomMemberStartup: opts.roomMemberStartup } as ResolvedRole);
+      if (++attempt === 1) throw new Error('launch failed before supervisor');
+      return spawn(opts);
+    });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-retry-secret', template: template(1), binPath: '/usr/bin/ours-fleet' };
+    await expect(provisionMembers(input)).rejects.toThrow('launch failed before supervisor');
+    expect(h.revokeInvite).toHaveBeenCalledWith('room-retry-secret', 'invite-1');
+    const result = await provisionMembers(input);
+    expect(result.state).toBe('active');
+    expect(result.member_seats[0].invite_id).toBe('invite-2');
+    expect(result.member_seats[0].launch?.attempt).toBe(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
   });
 
   it('does not persist invite secrets in Fleet room orchestration state', async () => {
