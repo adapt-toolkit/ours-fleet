@@ -227,7 +227,7 @@ export class TaskRoomApplicationService {
         void room;
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
-          persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+          persistBlockTask(task.task_id, 'Cowork management is unavailable');
         // Once the durable Room exists, provisioning errors are resumable
         // saga state. Return that explicit state so the command can launch a
         // continuation and report the durable in-progress outcome.
@@ -926,7 +926,7 @@ export class TaskRoomApplicationService {
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
-          persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+          persistBlockTask(task.task_id, 'Cowork management is unavailable');
         const current = readTask(task.task_id);
         if (!current.room_id || !getRoomRecord(current.room_id)) throw error;
         task = current;
@@ -941,7 +941,7 @@ export class TaskRoomApplicationService {
           room = getRoomRecord(room.room_id);
         } catch (error) {
           if (error instanceof CoworkUnavailableError)
-            persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+            persistBlockTask(task.task_id, 'Cowork management is unavailable');
           task = readTask(task.task_id);
           return { task, status: 'in_progress' };
         }
@@ -957,7 +957,7 @@ export class TaskRoomApplicationService {
           brief: task.brief, goal: task.title });
         task = readTask(task.task_id);
       } catch (error) {
-        if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+        if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management is unavailable');
         task = readTask(task.task_id);
       }
     }

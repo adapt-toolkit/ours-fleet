@@ -912,6 +912,13 @@ describe('task work', () => {
     expect(after.blocked?.reason).toContain('unavailable');
   });
 
+  it('reports HTTP management unavailability without claiming a socket failure', async () => {
+    mocks.createRoom.mockRejectedValue(new CoworkUnavailableError('Cowork HTTP management failed; check the selected server and credential'));
+    const t = backlogTask();
+    await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
+    expect(getTask(t.task_id).blocked?.reason).toBe('Cowork management is unavailable');
+  });
+
   it('retries provisioning for a blocked provisioning task', async () => {
     mocks.createRoom.mockRejectedValueOnce(new CoworkUnavailableError('socket missing'));
     const t = backlogTask();
