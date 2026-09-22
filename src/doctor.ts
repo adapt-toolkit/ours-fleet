@@ -1,4 +1,5 @@
-import { userInfo } from 'node:os';
+import { join } from 'node:path';
+import { userInfo, homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
 import {
   attachOursClient, type AttachOursClientOptions, type OursClient,
@@ -45,7 +46,7 @@ interface MonitorProfile {
   roles: string[];
 }
 
-type DoctorDaemonClient = Pick<OursClient, 'version'>;
+type DoctorDaemonClient = Pick<OursClient, 'version' | 'close'>;
 type AttachDoctorDaemon = (
   options: AttachOursClientOptions,
 ) => Promise<DoctorDaemonClient>;
@@ -316,20 +317,35 @@ export async function doctor(
   }
 
 
+  let managedSelection = false;
   try {
-    const client = await attachDaemon({
-      env: process.env,
+    // Mark explicit selection before validation so a damaged managed profile does
+    // not produce advice to start an unrelated local daemon.
+    managedSelection = process.env.OURS_CONFIG !== undefined
+      || existsSync(join(process.env.HOME || homedir(), '.ours-client', 'profile.json'));
+    const selected = readClientProfile(process.env);
+    managedSelection = selected !== undefined;
+    const client = await attachDaemon(selected ? {
+      endpoint: selected.endpoint, expectedInstanceId: selected.expectedInstanceId,
+      credentialPath: selected.credentialPath, env: {}, sessionMode: 'external',
       leaseToken: `ours-fleet-doctor-${process.pid}`,
-      clientPid: process.pid,
+    } : {
+      env: process.env, leaseToken: `ours-fleet-doctor-${process.pid}`, clientPid: process.pid,
     });
-    const info = await client.version();
-    if (info.name !== 'ours' || typeof info.version !== 'string')
-      throw new Error('the selected endpoint did not return a valid ours daemon identity');
-    checks.push({ name: 'ours daemon', ok: true, detail: `running (${info.version})` });
+    let daemonVersion: string;
+    try {
+      const info = await client.version();
+      if (info.name !== 'ours' || typeof info.version !== 'string')
+        throw new Error('the selected endpoint did not return a valid ours daemon identity');
+      daemonVersion = info.version;
+    } finally { await client.close(); }
+    checks.push({ name: 'ours daemon', ok: true, detail: `running (${daemonVersion})` });
   } catch (error) {
     checks.push({
       name: 'ours daemon', ok: false,
-      detail: `not reachable through the SDK — start it with: ours-daemon start `
+      detail: (managedSelection
+        ? 'selected client profile failed — check its endpoint, instance and issued credential '
+        : 'not reachable through the SDK — start it with: ours-daemon start ')
         + `[${(error as Error)?.message ?? String(error)}]`,
     });
   }
