@@ -529,6 +529,29 @@ describe('simple Cowork room member startup', () => {
     expect(getRoomRecord(roomId)!.member_seats[0].invite_id).toBe(before.invite_id);
   });
 
+  it('revokes the retained invite after asynchronous supervisor failure before replacement', async () => {
+    const roomId = 'room-async-failure';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, template: template(1),
+      binPath: '/fleet', startupWait: { timeoutMs: 0 } };
+    await provisionMembers(input);
+    expect(getRoomRecord(roomId)!.member_seats[0].launch!.state).toBe('launched');
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    mocks.tempLiveness.mockResolvedValueOnce('stopped');
+    h.revokeInvite.mockRejectedValueOnce(new Error('cleanup offline'));
+    await expect(provisionMembers(input)).rejects.toThrow('cleanup offline');
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(getRoomRecord(roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    await provisionMembers(input);
+    expect(h.revokeInvite).toHaveBeenLastCalledWith(roomId, 'invite-1');
+    expect(h.issueInvite).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    const revokeOrder = h.revokeInvite.mock.invocationCallOrder.at(-1)!;
+    expect(revokeOrder).toBeLessThan(h.issueInvite.mock.invocationCallOrder.at(-1)!);
+  });
+
   it('does not overwrite a failed attempt invite until revocation succeeds on retry', async () => {
     createRoomRecord({ room_id: 'room-revoke-retry', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
