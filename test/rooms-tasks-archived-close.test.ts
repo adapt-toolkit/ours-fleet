@@ -83,3 +83,30 @@ it('refuses an archive for a different launch', async () => {
   await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/no live Fleet temp-state identity proof/);
   expect(cowork.closeRoom).not.toHaveBeenCalled();
 });
+it('refuses replacement state created during the daemon absence check', async () => {
+  mocks.listIdentities.mockImplementation(async () => {
+    mkdirSync(join(stateRoot(), 'tmp', 'member-1'), { recursive: true });
+    return [];
+  });
+  await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/changed during archived retirement proof/);
+  expect(cowork.closeRoom).not.toHaveBeenCalled();
+});
+it('refuses a launch changed during the daemon absence check', async () => {
+  mocks.listIdentities.mockImplementation(async () => {
+    const changed = getRoomRecord(roomId)!;
+    changed.member_seats[0].launch!.launch_id = 'replacement';
+    // Simulate an out-of-process writer predating the closing-state fence.
+    writeFileSync(join(stateRoot(), 'rooms', roomId + '.json'), JSON.stringify(changed));
+    return [];
+  });
+  await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/changed during archived retirement proof/);
+  expect(cowork.closeRoom).not.toHaveBeenCalled();
+});
+it('refuses the recorded CID surviving under another name', async () => {
+  const seats = getRoomRecord(roomId)!.member_seats;
+  seats[0].identity_cid = 'ab'.repeat(32);
+  updateMemberSeats(roomId, seats);
+  mocks.listIdentities.mockResolvedValue([{ name: 'other-name', cid: 'ab'.repeat(32) }]);
+  await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/absence is not proven/);
+  expect(cowork.closeRoom).not.toHaveBeenCalled();
+});

@@ -183,6 +183,12 @@ async function retireMember(
         // A terminated launch can archive itself before room retirement begins.
         // Accept its exact durable provenance only when no identity needs removal.
         await assertMemberIdentityAbsent(current);
+        const latest = getRoomRecord(roomId)?.member_seats.find(seat => seat.role_name === current.role_name);
+        if (existsSync(agentDir(current.role_name, true))
+            || latest?.launch?.launch_id !== current.launch.launch_id
+            || latest?.launch?.action_id !== current.launch.action_id
+            || latest?.identity_cid !== current.identity_cid)
+          throw new Error(`room member '${current.role_name}' changed during archived retirement proof`);
         advanceMemberRetirement(roomId, current.role_name, 'identity_absent', current.launch.launch_id, archived);
         return;
       }
