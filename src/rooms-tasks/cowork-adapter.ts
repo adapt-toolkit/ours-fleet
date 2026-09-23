@@ -77,6 +77,7 @@ export interface CoworkAdapter {
     briefing: string;
     quiet_membership?: boolean;
     anonymous?: boolean;
+    activation_requirements?: Array<{ role: string; count: number }>;
   }): Promise<CoworkRoomCreateResult>;
   acceptInvite(roomId: string, invite: string, opts: {
     role: string;
@@ -420,6 +421,7 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
         briefing: opts.briefing,
         ...(opts.quiet_membership === undefined ? {} : { quiet_membership: opts.quiet_membership }),
         ...(opts.anonymous === undefined ? {} : { anonymous: opts.anonymous }),
+        ...(opts.activation_requirements === undefined ? {} : { activation_requirements: opts.activation_requirements }),
       }), 'room.create');
       if (!result.identity_cid)
         throw new CoworkProtocolError('room.create', 'created room did not establish an identity CID');

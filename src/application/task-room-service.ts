@@ -1029,11 +1029,16 @@ export class TaskRoomApplicationService {
             throw new TaskRoomApplicationError('task_deleting',
               `task ${task.task_id} is pending deletion`, { task: task.task_id });
         }
+        const requiredRoles = new Map<string, number>();
+        if (attachOwner) requiredRoles.set(rooms.owner.role, 1);
+        for (const member of launchTemplate?.members ?? [])
+          requiredRoles.set(member.role, (requiredRoles.get(member.role) ?? 0) + member.count);
         const created = await cowork.createRoom({
           room_name: roomName, goal: task.goal?.trim() || task.title,
           briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
           quiet_membership: launchTemplate?.room?.quiet_membership,
           anonymous: policy.anonymous,
+          activation_requirements: [...requiredRoles].map(([role, count]) => ({ role, count })),
         });
         const record = createRoomRecord({
           room_id: created.room_id, room_name: roomName, room_identity_cid: created.identity_cid,

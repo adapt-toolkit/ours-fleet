@@ -81,6 +81,24 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 }
 
 describe('task create/start surface parity', () => {
+  it.each([true, false])('seals planned role counts before any Owner attachment (owner=%s)', async (attachOwner) => {
+    const team: TemplateDefinition = { name: 'planned', version: 1, description: 'Plan', contract: 'Wait.',
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' },
+        { slot: 'extra', role: 'Developer', count: 1, agent_template: 'Dev' }] };
+    const cfg = { ...config(), ownerInvite: 'OWNER-INVITE', roomTemplates: { planned: team },
+      rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: attachOwner } } } as FleetConfig;
+    const h = cowork();
+    vi.mocked(h.adapter.acceptInvite).mockResolvedValue({seat_cid:'owner-cid',seat_state:'active'});
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(async ({roomId}) => getRoomRecord(roomId)!) });
+    await app.createTask({actor:{kind:'local_control',surface:'cli'},title:'Whole team',template:'planned',origin:{type:'cli'}});
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({activation_requirements:
+      [...(attachOwner ? [{role:'Owner',count:1}] : []),{role:'Developer',count:3}]}));
+    if (attachOwner) expect(h.createRoom.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(h.adapter.acceptInvite).mock.invocationCallOrder[0]);
+    else expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+  });
+
   it.each([['single', 1], ['pair', 2], ['team', 3]] as const)(
     'emits one canonical Task-ready lifecycle event for a %s launch',
     async (name, count) => {
