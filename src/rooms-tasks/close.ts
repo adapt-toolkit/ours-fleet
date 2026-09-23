@@ -8,7 +8,7 @@ import { agentDir, stateRoot } from '../paths.js';
 import { readClientProfile } from '../client-profile.js';
 import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
-  type TempLifecycleDeps,
+  tempArchiveForLaunch, tempArchiveForCreationAction, type TempLifecycleDeps,
 } from '../temp-lifecycle.js';
 import { CoworkProtocolError, type CoworkAdapter } from './cowork-adapter.js';
 import {
@@ -172,6 +172,21 @@ async function retireMember(
     return;
   }
   if (!retirement) {
+    if (!existsSync(agentDir(current.role_name, true)) && current.launch?.launch_id && current.launch.action_id) {
+      const archived = tempArchiveForLaunch(current.role_name, current.launch.launch_id);
+      const created = tempArchiveForCreationAction(current.role_name, current.launch.action_id);
+      if (archived && created?.path === archived && created.launchId === current.launch.launch_id) {
+        if (readFileSync(join(archived, '.identity'), 'utf8').trim() !== current.role_name)
+          throw new Error(`room member '${current.role_name}' archive identity mismatch`);
+        if (await tempSupervisorLiveness(archived) !== 'stopped')
+          throw new Error(`room member '${current.role_name}' archived supervisor is not proven stopped`);
+        // A terminated launch can archive itself before room retirement begins.
+        // Accept its exact durable provenance only when no identity needs removal.
+        await assertMemberIdentityAbsent(current);
+        advanceMemberRetirement(roomId, current.role_name, 'identity_absent', current.launch.launch_id, archived);
+        return;
+      }
+    }
     if (current.launch?.state === 'failed' && !existsSync(agentDir(current.role_name, true))) {
       // A failure before applyRole (for example invite-secret validation) has
       // no supervisor to stop or archive. Settle only proven absence; this
