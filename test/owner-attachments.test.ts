@@ -192,6 +192,29 @@ afterEach(() => {
 });
 
 describe('owner-channel attachment ingress', () => {
+  it.each([
+    ['owner', 'hash'], ['owner', 'size'], ['agent', 'hash'], ['agent', 'size'],
+  ])('rejects fetched %s bytes with a %s mismatch before prompting or forwarding', async (sender, mismatch) => {
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    status.client.batches.push([{
+      msg_id: 90, wire_id: '9'.repeat(64), from: { id: OWNER, name: 'Owner' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    const from = { id: sender === 'owner' ? OWNER : AGENT, name: sender };
+    const declared = Buffer.from('hello');
+    status.client.files = [listed({ from })];
+    status.client.retrieved.set(FILE_WIRE, retrieved('/daemon-only/blobs/report', declared, { from }));
+    const fetch = vi.spyOn(status.client, 'fetchFile').mockResolvedValue(
+      Buffer.from(mismatch === 'hash' ? 'wrong' : 'wrong size'));
+    await status.channel.drain();
+    expect(fetch).toHaveBeenCalledWith(FILE_WIRE);
+    expect(status.queuePrompt).not.toHaveBeenCalled();
+    expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
+    expect(status.logs.join(' ')).toMatch(/mismatch/);
+    expect(readdirSync(join(status.dir, '.owner-channel-inbox'))).toEqual([]);
+    await status.channel.close();
+  });
+
   it('fails closed when a journaled file is absent from persistent history', async () => {
     const status = await setup(
       [OWNER], true, attachmentConfig, undefined, undefined, undefined, false);
@@ -199,13 +222,14 @@ describe('owner-channel attachment ingress', () => {
     expect(status.queuePrompt).not.toHaveBeenCalled();
   });
 
-  it('handles a file-only wake, admits bytes privately, and cleans up after exact-wire delivery', async () => {
+  it('fetches file-only ingress bytes when the daemon path is unavailable locally', async () => {
     const status = await setup();
     const bytes = Buffer.from('hello');
     const source = join(status.dir, 'daemon-source');
     writeFileSync(source, bytes);
     status.client.files = [listed()];
-    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes));
+    status.client.retrieved.set(FILE_WIRE, retrieved('/daemon-only/blobs/notes', bytes));
+    vi.spyOn(status.client, 'fetchFile').mockResolvedValue(bytes);
 
     await status.channel.drain();
     expect(status.client.calls).toContainEqual({ name: 'getFiles', args: { wireIds: [FILE_WIRE] } });
@@ -264,14 +288,14 @@ describe('owner-channel attachment ingress', () => {
     const unauthorized = await setup();
     unauthorized.client.files = [listed({ from: { id: OTHER, name: 'Impostor' } })];
     await unauthorized.channel.drain();
-    expect(unauthorized.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(unauthorized.client.calls.some(call => ['getFiles', 'fetchFile'].includes(call.name))).toBe(false);
     expect(unauthorized.client.calls.some(call => call.name === 'sendMessage')).toBe(false);
     await unauthorized.channel.close();
 
     const oversized = await setup();
     oversized.client.files = [listed({ size: 2_000 })];
     await oversized.channel.drain();
-    expect(oversized.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(oversized.client.calls.some(call => ['getFiles', 'fetchFile'].includes(call.name))).toBe(false);
     expect(oversized.client.calls.find(call => call.name === 'sendMessage')?.args)
       .toMatchObject({ contact: OWNER, replyToWireId: FILE_WIRE });
     await oversized.channel.close();
@@ -285,7 +309,7 @@ describe('owner-channel attachment ingress', () => {
       reply_to: { wire_id: CAPTION_WIRE },
     }));
     await overCount.channel.drain();
-    expect(overCount.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(overCount.client.calls.some(call => ['getFiles', 'fetchFile'].includes(call.name))).toBe(false);
     expect(overCount.client.calls.find(call => call.name === 'sendMessage')?.args?.text)
       .toContain('4-file limit');
     await overCount.channel.close();
@@ -416,7 +440,7 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.drain();
     await status.channel.drain();
 
-    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(status.client.calls.some(call => ['getFiles', 'fetchFile'].includes(call.name))).toBe(false);
     expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
     expect(status.client.calls.filter(call => call.name === 'sendMessage')).toEqual([{
       name: 'sendMessage', args: {
@@ -684,12 +708,13 @@ describe('managed-agent attachment egress', () => {
     for (const [index, item] of cases.entries()) {
       const source = join(status.dir, `agent-${index}`);
       writeFileSync(source, item.bytes);
-      status.client.retrieved.set(item.wire, retrieved(source, item.bytes, {
+      status.client.retrieved.set(item.wire, retrieved(`/daemon-only/blobs/${index}`, item.bytes, {
         file_id: 20 + index, wire_id: item.wire, from: { id: AGENT, name: 'Role' },
         filename: item.filename, mime: item.mime, reply_to: { wire_id: captionWire },
       }));
     }
 
+    vi.spyOn(status.client, 'fetchFile').mockImplementation(async wire => cases.find(item => item.wire === wire)!.bytes);
     await status.channel.drain();
     expect(status.queuePrompt).not.toHaveBeenCalled();
     const sends = status.client.calls.filter(call => call.name === 'sendFile');
@@ -732,7 +757,7 @@ describe('managed-agent attachment egress', () => {
       await establishRoute(status);
       status.client.files = [listed(overrides)];
       await status.channel.drain();
-      expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+      expect(status.client.calls.some(call => ['getFiles', 'fetchFile'].includes(call.name))).toBe(false);
       expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
       await status.channel.close();
     }
