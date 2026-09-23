@@ -1033,8 +1033,8 @@ reconcile explicitly; no chain preserves detection-only behavior.
  * \`forbidden\` is the more important half. The old skills prescribed
  * \`--approval ask --filesystem workspace --unattended deny\` as a blanket
  * default while also telling the agent to stop at a failed doctor check — and
- * that combination is exactly what \`doctor\` FAILS, because \`ask\` grants an
- * unattended role nothing but \`read-state\` and \`deny\` makes the shortfall
+ * that combination is exactly what \`doctor\` FAILS, because \`ask\` cannot
+ * guarantee unattended capabilities and \`deny\` makes the shortfall
  * fatal. Following the skill produced a role the CLI then refused.
  */
 export const SPAWN_SKILL_CONTRACT = {
@@ -1063,7 +1063,7 @@ export const SPAWN_SKILL_CONTRACT = {
    */
   forbidden: [
     // The contradictory blanket default both variants used to prescribe.
-    // `ask` grants an unattended role only `read-state`, and `deny` makes the
+    // `ask` cannot guarantee unattended capabilities, and `deny` makes the
     // shortfall a doctor FAILURE — so the skill told you to build a role the
     // CLI then refused, in the same breath as telling you to trust doctor.
     '--approval ask --filesystem workspace --unattended deny',

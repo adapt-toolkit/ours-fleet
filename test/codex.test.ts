@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities, nativeCodexConfig,
 } from '../src/harness/codex.js';
-import { checkUnattendedFloor } from '../src/permissions.js';
+import { analyzeRolePermissions, checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import type { ResolvedRole } from '../src/config.js';
 import type { Exec } from '../src/exec.js';
@@ -458,4 +458,24 @@ describe('Codex neutral permission mapping and the unattended floor', () => {
       .toEqual(['write-state', 'workspace-edit']);
     expect(checkUnattendedFloor(codexCapabilities('never', 'danger-full-access')).meets).toBe(true);
   });
+
+  it.each(['acp', 'codex-app-server'] as const)(
+    '%s reports startup reads as unproven when approval can block them', session => {
+      for (const approval of ['ask', 'auto'] as const) {
+        for (const unattended of ['wait', 'deny'] as const) {
+          const analysis = analyzeRolePermissions(role({
+            session,
+            permissions: { approval, filesystem: 'workspace', unattended },
+          }));
+          expect(analysis.supported).toBe(true);
+          expect(analysis.capabilities).not.toContain('read-state');
+          expect(analysis.floor?.missing).toContain('read-state');
+          expect(analysis.floorSeverity).toBe(unattended === 'wait' ? 'warn' : 'fail');
+          expect(analysis.floorWarning).toContain('read-state');
+          expect(analysis.floorWarning).toContain(
+            unattended === 'wait' ? 'block the turn' : 'be denied silently');
+        }
+      }
+    },
+  );
 });

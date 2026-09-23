@@ -49,11 +49,12 @@ const CODEX_PROXY_MANIFEST_ENV = 'OURS_FLEET_CODEX_ACP_MANIFEST';
 
 /**
  * What an unattended role can actually do under Codex's native settings.
- * `on-request` and `untrusted` stop to ask, and with no console attached that
- * request is refused rather than answered — so the role can only read.
+ * `on-request` and `untrusted` can ask even for startup file reads (for example,
+ * shell reads or files outside the sandbox). Without a controller the request
+ * waits or is denied according to policy. Neither guarantees `read-state`.
  */
 export function codexCapabilities(approval: string, sandbox: string): UnattendedCapability[] {
-  if (approval !== 'never') return ['read-state'];
+  if (approval !== 'never') return [];
   const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
   if (sandbox !== 'read-only') caps.push('write-state', 'workspace-edit');
   return caps;
