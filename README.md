@@ -1739,8 +1739,12 @@ Request arguments and results are excluded from the Fleet audit log.
 
 Both interfaces use the supervisor's existing fixed-identity MCP server and tool
 policy. Identity creation, removal, switching, and binding are not exposed. The
-supervisor must be running and publish current identity metadata; missing,
-ambiguous, stale, or mismatched endpoints fail closed. Closing an operator call
+supervisor must be running. Older descriptors are supported only when a unique
+existing runtime journal, instance record, and identity pin prove the selected
+agent and generation, and the same MCP connection confirms its identity and
+lifetime before the operation. This reads existing state without rewriting the
+descriptor or restarting the agent. Missing, ambiguous, stale, or mismatched
+proofs fail closed. Unknown identity descriptions also fail closed. Closing an operator call
 retains the supervisor's identity. An interrupted mutation can have an unknown
 outcome: inspect state before retrying, because there is no automatic retry or
 exactly-once guarantee. Contact acceptance alone does not prove peer verification

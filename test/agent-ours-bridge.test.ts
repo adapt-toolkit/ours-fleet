@@ -76,3 +76,31 @@ it('real stdio bridge preserves MCP discovery and streams files in bridge cwd; E
     rmSync(root, { recursive: true, force: true });
   }
 }, 20_000);
+
+it.each(['socket', 'capability'])('refuses descriptor %s replacement at the same generation before connecting', async field => {
+  const { createHash } = await import('node:crypto');
+  const root = mkdtempSync(join(tmpdir(), 'fleet-bridge-selection-'));
+  const original = { socket: join(root, 'old.sock'), capability: 'PRIVATE_CAPABILITY_A', generation: 1 };
+  const descriptor = join(root, 'descriptor.json');
+  writeFileSync(descriptor, JSON.stringify({ ...original,
+    [field]: field === 'socket' ? join(root, 'other.sock') : 'PRIVATE_CAPABILITY_B' }));
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [resolve('dist/agent-ours/bridge.js')], stderr: 'pipe',
+    env: { FLEET_OURS_BRIDGE_DESCRIPTOR: descriptor, FLEET_OURS_BRIDGE_EXPECTED: JSON.stringify({
+      generation: 1,
+      transportDigest: createHash('sha256').update(JSON.stringify([original.socket, original.capability, 1])).digest('hex'),
+    }) },
+  });
+  let stderr = '';
+  transport.stderr?.on('data', chunk => { stderr += chunk; });
+  const client = new Client({ name: 'selection-test', version: '1' });
+  try {
+    await expect(client.connect(transport)).rejects.toThrow();
+    expect(stderr).not.toContain('PRIVATE_CAPABILITY');
+    expect(stderr).not.toContain(root);
+  } finally {
+    await client.close();
+    await transport.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

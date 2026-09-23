@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto';
 import { connect } from 'node:net';
 import { access, mkdir, open, readFile, type FileHandle } from 'node:fs/promises';
 import { constants } from 'node:fs';
@@ -17,6 +18,8 @@ export async function runBridge(descriptorPath: string): Promise<void> {
     throw Error('INVALID_BRIDGE_DESCRIPTOR');
   if (process.env.FLEET_OURS_BRIDGE_EXPECTED) {
     const expected = JSON.parse(process.env.FLEET_OURS_BRIDGE_EXPECTED);
+    const digest = createHash('sha256').update(JSON.stringify([descriptor.socket, descriptor.capability, descriptor.generation])).digest('hex');
+    if (expected.transportDigest !== digest) throw Error('SUPERVISOR_TRANSPORT_CHANGED');
     if (['role', 'identity', 'cid', 'generation'].some(key => descriptor[key] !== expected[key]))
       throw Error('SUPERVISOR_SELECTION_CHANGED');
   }

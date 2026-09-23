@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
+import { binderKey } from '../src/agent-ours/state.js';
 import { RoleControlServer } from '../src/session/control.js';
 import { startMcpEndpoint } from '../src/agent-ours/mcp-endpoint.js';
 
@@ -15,14 +16,16 @@ async function fixture(temporary = false) {
   const dir = join(root, '.ours-fleet', temporary ? 'tmp' : 'agents', 'Alpha');
   mkdirSync(join(dir, '.ours-bridge'), { recursive: true });
   writeFileSync(join(dir, '.identity'), 'AlphaIdentity');
+  const liveIdentity = { name: 'AlphaIdentity', cid, described: true, isRoot: false, roleId: 'agent', rootName: 'Root', temporary };
+  let identityHook = () => {};
   let calls = 0;
   let releases = 0;
   const mutations: unknown[] = [];
   const endpoint = await startMcpEndpoint({
-    socket: join(root, 'm.sock'), capability: 'test-private-capability', generation: 7,
+    socket: join(dir, '.ours-bridge', 'g7.sock'), capability: 'test-private-capability', generation: 7,
     runtime: { admit: async () => () => {} } as never,
     client: {
-      currentIdentity: async () => ({ name: 'AlphaIdentity', cid, described: false }),
+      currentIdentity: async () => { identityHook(); return liveIdentity; },
       listContacts: async () => { calls++; return { contacts: [], pending: [], roots: {}, degraded: [], renames: {} }; },
       addContact: async (args: unknown) => { mutations.push(args); return { display: 'Peer', cid: 'B'.repeat(64) }; },
       releaseLease: async () => { releases++; },
@@ -32,7 +35,7 @@ async function fixture(temporary = false) {
   });
   cleanups.push(() => endpoint.close());
   const descriptor = join(dir, '.ours-bridge', 'descriptor.json');
-  const metadata = { socket: join(root, 'm.sock'), capability: 'test-private-capability', generation: 7,
+  const metadata = { socket: join(dir, '.ours-bridge', 'g7.sock'), capability: 'test-private-capability', generation: 7,
     role: 'Alpha', identity: 'AlphaIdentity', cid };
   writeFileSync(descriptor, JSON.stringify(metadata));
   const cliEnv: NodeJS.ProcessEnv = {};
@@ -41,7 +44,7 @@ async function fixture(temporary = false) {
       { env: { ...process.env, ...cliEnv, OURS_FLEET_HOME: root }, timeout: 15_000 },
       (error, stdout, stderr) => done({ code: error ? Number(error.code) || 1 : 0, stdout, stderr }));
   });
-  return { root, dir, descriptor, metadata, cli, cliEnv, mutations, calls: () => calls, releases: () => releases };
+  return { root, dir, descriptor, metadata, cli, cliEnv, mutations, liveIdentity, setIdentityHook: (hook: () => void) => { identityHook = hook; }, calls: () => calls, releases: () => releases };
 }
 
 it.each([false, true])('CLI uses the fixed identity and managed tool policy (temporary=%s)', async temporary => {
@@ -175,3 +178,108 @@ it('managed CLI retains nonzero tool-error exit and records an unsuccessful audi
   expect(outcomes).toEqual([expect.objectContaining({ exitCode: 1, class: 'runtime', effect: 'unknown' })]);
   expect(f.mutations).toEqual([]);
 }, 20_000);
+
+
+function makeLegacy(f: Awaited<ReturnType<typeof fixture>>, temporary = false, daemon = 'daemon-A') {
+  const dir = join(f.root, '.ours-fleet', 'private-ours', binderKey(daemon, 'AlphaIdentity'));
+  mkdirSync(dir, { recursive: true });
+  const state = { version: 1, instance: 'instance-A', generation: 7, daemon, name: 'AlphaIdentity',
+    cid, lifetime: temporary ? 'temporary' : 'permanent', action: 'action-A', phase: 'SERVING' };
+  const instance = { instance: 'instance-A', role: 'Alpha', temporary };
+  const pin = { daemon, name: 'AlphaIdentity', cid };
+  writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
+  writeFileSync(join(dir, 'instance.json'), JSON.stringify(instance));
+  writeFileSync(join(dir, 'identity-pin.json'), JSON.stringify(pin));
+  const { role, identity, cid: unused, ...descriptor } = f.metadata;
+  writeFileSync(f.descriptor, JSON.stringify(descriptor));
+  return { dir, state, instance, pin, descriptor };
+}
+
+it.each([false, true])('legacy supervisor remains live and its descriptor unchanged (temporary=%s)', async temporary => {
+  const f = await fixture(temporary);
+  const legacy = makeLegacy(f, temporary);
+  const before = readFileSync(f.descriptor, 'utf8');
+  expect((await f.cli('tools', 'Alpha')).code).toBe(0);
+  const args = join(f.root, 'args.json');
+  writeFileSync(args, JSON.stringify({ invite: 'PRIVATE_TEST_INVITE' }));
+  const result = await f.cli('call', 'Alpha', 'add_contact', '--args-file', args);
+  expect(result.code, result.stderr).toBe(0);
+  expect(f.mutations).toHaveLength(1);
+  expect(readFileSync(f.descriptor, 'utf8')).toBe(before);
+  expect(JSON.parse(readFileSync(join(legacy.dir, 'state.json'), 'utf8'))).toEqual(legacy.state);
+  expect(f.releases()).toBe(0);
+}, 20_000);
+
+it('legacy proof rejects cross-identity, root, unknown hierarchy, and changed lifetime before mutation', async () => {
+  const f = await fixture();
+  makeLegacy(f);
+  for (const change of [{ cid: 'B'.repeat(64) }, { name: 'Other' }, { isRoot: true }, { described: false }, { temporary: true }]) {
+    const original = { ...f.liveIdentity };
+    Object.assign(f.liveIdentity, change);
+    const result = await f.cli('call', 'Alpha', 'list_contacts');
+    expect(result.code, JSON.stringify(change)).toBe(1);
+    expect(result.stderr).toContain('does not match');
+    Object.assign(f.liveIdentity, original);
+  }
+  expect(f.calls()).toBe(0);
+}, 20_000);
+
+it('legacy journals reject invalid, ambiguous and changing ownership; partial metadata never falls back', async () => {
+  const f = await fixture();
+  const legacy = makeLegacy(f);
+  for (const change of [{ phase: 'RECOVERING' }, { phase: 'RELEASED' }, { generation: 8 }, { cid: 'B'.repeat(64) }, { instance: 'different' }, { lifetime: 'temporary' }, { daemon: 'other' }]) {
+    writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify({ ...legacy.state, ...change }));
+    expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
+  }
+  writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify(legacy.state));
+  for (const patch of [{ role: 'Alpha' }, { role: null }, { identity: 'Wrong', cid, role: 'Alpha' }, { generation: 0 }, { generation: 1.5 }]) {
+    writeFileSync(f.descriptor, JSON.stringify({ ...legacy.descriptor, ...patch }));
+    expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
+  }
+  writeFileSync(f.descriptor, JSON.stringify(legacy.descriptor));
+  let identities = 0;
+  f.setIdentityHook(() => { if (++identities === 2) writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify({ ...legacy.state, action: 'new-action' })); });
+  expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
+  f.setIdentityHook(() => {});
+  writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify(legacy.state));
+  makeLegacy(f, false, 'daemon-B');
+  expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
+  expect(f.calls()).toBe(0);
+}, 30_000);
+
+
+it('valid legacy journal A cannot authorize another live supervisor socket at the same generation', async () => {
+  const a = await fixture();
+  const b = await fixture();
+  b.liveIdentity.cid = 'B'.repeat(64);
+  b.liveIdentity.name = 'Other';
+  const legacy = makeLegacy(a);
+  writeFileSync(a.descriptor, JSON.stringify({ ...legacy.descriptor,
+    socket: b.metadata.socket, capability: b.metadata.capability }));
+  const result = await a.cli('call', 'Alpha', 'list_contacts');
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain('socket does not match');
+  expect(a.calls()).toBe(0);
+  expect(b.calls()).toBe(0);
+});
+
+
+it.each(['identity', 'duplicate', 'descriptor'])('legacy selection %s change during discovery fails before mutation', async change => {
+  const f = await fixture();
+  const legacy = makeLegacy(f);
+  let reads = 0;
+  f.setIdentityHook(() => {
+    if (++reads !== 2) return;
+    if (change === 'identity') writeFileSync(join(f.dir, '.identity'), 'Other');
+    else if (change === 'descriptor') writeFileSync(f.descriptor, JSON.stringify({ ...legacy.descriptor, capability: 'new-capability' }));
+    else {
+      const second = join(f.root, '.ours-fleet', 'tmp', 'Alpha', '.ours-bridge');
+      mkdirSync(second, { recursive: true });
+      writeFileSync(join(second, 'descriptor.json'), JSON.stringify(legacy.descriptor));
+    }
+  });
+  const result = await f.cli('call', 'Alpha', 'list_contacts');
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain('assignment changed');
+  expect(f.calls()).toBe(0);
+});
