@@ -170,6 +170,7 @@ export interface FleetAuditAttempt {
 const SAFE_READ = new Set(['docs', 'version', 'config', 'ls', 'peek', 'logs', 'status', 'doctor']);
 const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
+  ours: new Set(['tools', 'call']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
     'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
@@ -233,7 +234,7 @@ const sensitiveValueFlags = new Set([
   '--identity', '--invite', '--token', '--api-token', '--password', '--password-file',
   '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file', '--loops-file',
   '--configuration', '-c', '--public-invite', '--public-invite-file', '--invite-file',
-  '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
+  '--args-file', '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
   '--identity-cid', '--owner-cid', '--contact-cid', '--codex-config', '--add-dir',
 ]);
 

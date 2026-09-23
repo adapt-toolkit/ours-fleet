@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
 import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -475,6 +476,30 @@ program.command('peek <name> [lines]').description('pane snapshot without attach
       } else throw new SessionControlError('offline', 'agent session is offline');
     }
     catch (e) { die(controlFailure(name, 'peek', e)); }
+  });
+
+const oursToolsCommand = program.command('ours').description('invoke tools through a named agent supervisor and its fixed identity');
+oursToolsCommand.command('tools <agent>').description('list the same tools and schemas exposed to the agent MCP')
+  .action(async (agent: string) => {
+    try { console.log(JSON.stringify(await new SupervisorOursTools().list(agent), null, 2)); }
+    catch (error) { die(error); }
+  });
+oursToolsCommand.command('call <agent> <tool>').description('call a supervisor MCP tool without prompting the agent')
+  .option('--args-file <path>', 'JSON object arguments from a private file; omitted means {}')
+  .action(async (agent: string, tool: string, options: { argsFile?: string }) => {
+    try {
+      let args: Record<string, unknown> = {};
+      if (options.argsFile) {
+        try { args = JSON.parse(readFileSync(options.argsFile, 'utf8')); }
+        catch { throw new Error('cannot read tool arguments: expected a readable JSON object file'); }
+      }
+      const response = await new SupervisorOursTools().call(agent, { tool, arguments: args });
+      console.log(JSON.stringify(response, null, 2));
+      if ('isError' in response.result && response.result.isError) throw new FleetCliExit(1, 'runtime', 'unknown');
+    } catch (error) {
+      if (error instanceof FleetCliExit) throw error;
+      die(error);
+    }
   });
 
 program.command('send <name> [text...]').description("type into the agent's console")
@@ -1461,6 +1486,7 @@ async function parseFleetCli(): Promise<void> {
   }
   try { await program.parseAsync(process.argv); }
   catch (error) {
+    if (error instanceof FleetCliExit) throw error;
     const commander = error as { code?: string; exitCode?: number };
     if (commander.exitCode === 0) return;
     if (typeof commander.exitCode === 'number') throw new FleetCliExit(

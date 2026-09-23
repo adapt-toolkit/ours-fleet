@@ -44,6 +44,8 @@ describe('fleet command audit', () => {
     expect(env).not.toHaveProperty(FLEET_PROXY_CALLER_ENV);
   });
   it.each([
+    [['ours', 'tools', 'Dev'], 'allow', 'ours tools'],
+    [['ours', 'call', 'Dev', 'add_contact'], 'allow', 'ours call'],
     [['spawn', 'Dev', '--temp'], 'allow', 'spawn Dev'],
     [['task', 'create', '--title', 'X'], 'allow', 'task create'],
     [['task', 'work', 't'], 'allow', 'task work'],
@@ -83,6 +85,11 @@ describe('fleet command audit', () => {
     [[], 'unsupported', '<none>'],
   ] as const)('classifies %j', (argv, decision, command) => {
     expect(classifyFleetArgv(argv)).toMatchObject({ decision, command });
+  });
+
+  it('redacts private supervisor tool argument file paths', () => {
+    expect(redactFleetArgv(['ours', 'call', 'Dev', 'add_contact', '--args-file', '/private/secret.json']))
+      .toEqual(['ours', 'call', 'Dev', 'add_contact', '--args-file', '[REDACTED:value]']);
   });
 
   it('preserves argv shape while redacting sensitive values and inline leaves', () => {
