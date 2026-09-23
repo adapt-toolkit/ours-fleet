@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
+import { RoleControlServer } from '../src/session/control.js';
 import { startMcpEndpoint } from '../src/agent-ours/mcp-endpoint.js';
 
 const cleanups: (() => Promise<unknown> | void)[] = [];
@@ -34,12 +35,13 @@ async function fixture(temporary = false) {
   const metadata = { socket: join(root, 'm.sock'), capability: 'test-private-capability', generation: 7,
     role: 'Alpha', identity: 'AlphaIdentity', cid };
   writeFileSync(descriptor, JSON.stringify(metadata));
+  const cliEnv: NodeJS.ProcessEnv = {};
   const cli = (...args: string[]) => new Promise<{ code: number; stdout: string; stderr: string }>(done => {
     execFile(process.execPath, [resolve('dist/cli.js'), 'ours', ...args],
-      { env: { ...process.env, OURS_FLEET_HOME: root }, timeout: 15_000 },
+      { env: { ...process.env, ...cliEnv, OURS_FLEET_HOME: root }, timeout: 15_000 },
       (error, stdout, stderr) => done({ code: error ? Number(error.code) || 1 : 0, stdout, stderr }));
   });
-  return { root, dir, descriptor, metadata, cli, mutations, calls: () => calls, releases: () => releases };
+  return { root, dir, descriptor, metadata, cli, cliEnv, mutations, calls: () => calls, releases: () => releases };
 }
 
 it.each([false, true])('CLI uses the fixed identity and managed tool policy (temporary=%s)', async temporary => {
@@ -141,6 +143,35 @@ it('REST uses the same real bridge, authenticates reads and requires CSRF for ca
     payload: { tool: 'add_contact', arguments: { invite: 'PRIVATE_TEST_INVITE', name: 'Peer' } } });
   expect(mutation.statusCode, mutation.body).toBe(200);
   expect(f.mutations).toEqual([{ invite: 'PRIVATE_TEST_INVITE', name: 'Peer' }]);
-  expect(readFileSync(join(f.root, 'audit', 'audit.jsonl'), 'utf8')).not.toContain('PRIVATE_TEST_INVITE');
+  const failed = await server.app.inject({ method: 'POST', url: call, headers: privateHeaders,
+    payload: { tool: 'add_contact', arguments: {} } });
+  expect(failed.statusCode).toBe(200);
+  expect(failed.json().result.isError).toBe(true);
+  const audit = readFileSync(join(f.root, 'audit', 'audit.jsonl'), 'utf8');
+  expect(audit).not.toContain('PRIVATE_TEST_INVITE');
+  expect(audit.trim().split('\n').map(line => JSON.parse(line)).at(-1))
+    .toMatchObject({ action: 'ours.call', result: 'tool_error' });
   expect(f.releases()).toBe(0);
 }, 30_000);
+
+
+it('managed CLI retains nonzero tool-error exit and records an unsuccessful audit outcome', async () => {
+  const f = await fixture();
+  const outcomes: any[] = [];
+  const control = new RoleControlServer(f.root, {} as never, () => {});
+  control.setFleetAuditor({
+    begin: async () => ({ caller: 'Coordinator', correlationId: 'a468372e-76de-4e68-a049-11d916d72930', classification: {
+      decision: 'allow', command: 'ours call', route: 'supervisor-proxy/ours',
+    } }) as never,
+    finish: async input => { outcomes.push(input); return {} as never; },
+    present: async () => {},
+  });
+  await control.start();
+  cleanups.push(() => control.close());
+  Object.assign(f.cliEnv, { OURS_FLEET_PROXY_STATE_DIR: f.root, OURS_FLEET_PROXY_CALLER: 'Coordinator' });
+  const failed = await f.cli('call', 'Alpha', 'add_contact');
+  expect(failed.code, failed.stderr).toBe(1);
+  expect(JSON.parse(failed.stdout).result.isError).toBe(true);
+  expect(outcomes).toEqual([expect.objectContaining({ exitCode: 1, class: 'runtime', effect: 'unknown' })]);
+  expect(f.mutations).toEqual([]);
+}, 20_000);

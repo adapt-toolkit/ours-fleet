@@ -397,7 +397,7 @@ export async function buildWebServer(
     const session = auth.authenticate(request, true);
     const result = await oursTools.call(request.params.id, request.body);
     await audit.record({ requestId: request.id, browser: session.id,
-      action: 'ours.call', result: 'succeeded' });
+      action: 'ours.call', result: result.result.isError === true ? 'tool_error' : 'succeeded' });
     return result;
   });
 

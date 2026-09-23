@@ -1486,6 +1486,7 @@ async function parseFleetCli(): Promise<void> {
   }
   try { await program.parseAsync(process.argv); }
   catch (error) {
+    if (error instanceof FleetCliExit) throw error;
     const commander = error as { code?: string; exitCode?: number };
     if (commander.exitCode === 0) return;
     if (typeof commander.exitCode === 'number') throw new FleetCliExit(
