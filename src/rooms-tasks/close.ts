@@ -147,7 +147,7 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
   });
 }
 
-async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<void> {
+export async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<void> {
   await withIdentityClient(async client => {
     const rows = await client.listIdentities();
     if (rows.some(row => row.name === seat.role_name ||

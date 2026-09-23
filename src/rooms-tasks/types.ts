@@ -95,6 +95,14 @@ export interface TaskDeletionMemberCursor {
  * evidence. While pending, the task is hidden from normal operation and every
  * lifecycle mutation or room publication is rejected.
  */
+export interface ArchivedMemberAbsence {
+  name: string;
+  launch_id: string;
+  action_id: string;
+  archive_path: string;
+  checked_at: string;
+}
+
 export interface TaskDeletionIntent {
   status: 'pending';
   accepted_at: string;
@@ -102,6 +110,7 @@ export interface TaskDeletionIntent {
   room_id?: string;
   /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
   members: TaskDeletionMemberCursor[];
+  archived_absences?: ArchivedMemberAbsence[];
   error?: string;
   error_at?: string;
   recovery_hint?: string;

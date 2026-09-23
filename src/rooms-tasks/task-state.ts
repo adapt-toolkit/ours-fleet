@@ -1,3 +1,4 @@
+import type { ArchivedMemberAbsence } from './types.js';
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -540,6 +541,7 @@ export interface TaskDeletionReceipt {
   original_state: TaskState;
   room_id?: string;
   member_count: number;
+  archived_absences?: ArchivedMemberAbsence[];
   settled_at?: string;
   result?: 'deleted';
 }
@@ -570,7 +572,8 @@ function writeDeletionReceiptForIntent(stored: StoredTaskRecord): void {
     actor: deletion.actor,
     original_state: stored.state,
     room_id: deletion.room_id,
-    member_count: deletion.members.length,
+    member_count: deletion.members.length + (deletion.archived_absences?.length ?? 0),
+    ...(deletion.archived_absences?.length ? { archived_absences: deletion.archived_absences } : {}),
   };
   replaceFileAtomically(deletionReceiptPath(stored.task_id), JSON.stringify(receipt, null, 2) + '\n');
 }
@@ -733,6 +736,7 @@ export function advanceTaskDeletionMember(
 interface SeatEvidence {
   role_name: string;
   identity_cid?: string;
+  launch?: { launch_id?: string; action_id?: string };
   retirement?: { phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
 }
 
@@ -787,11 +791,11 @@ export function upsertTaskDeletionMembersFromSeats(
  *
  * The room saga is trusted for phase jumps, but partial or corrupt retained
  * records must not become false success: every seat must be identity_absent;
- * a real launch requires archive evidence; an identity-less seat is accepted
- * only via the never-launched proof.
+ * a real launch requires archive evidence; an identity-less seat requires
+ * never-launched proof or a freshly verified archived-absence checkpoint.
  */
 export function importTaskDeletionRetirementEvidence(
-  id: string, seats: ReadonlyArray<SeatEvidence>,
+  id: string, seats: ReadonlyArray<SeatEvidence>, proofs: ReadonlyArray<ArchivedMemberAbsence> = [],
 ): TaskRecord {
   return withTaskLock(id, () => {
   assertCanonicalTaskId(id);
@@ -812,6 +816,17 @@ export function importTaskDeletionRetirementEvidence(
       );
     if (!seat.identity_cid) {
       if (neverLaunched) continue; // provably never held a managed identity
+      const proof = proofs.find(value => value.name === seat.role_name);
+      if (proof && proof.launch_id === evidence.launch_id && proof.archive_path === evidence.archive_path
+          && proof.launch_id === seat.launch?.launch_id && proof.action_id === seat.launch?.action_id) {
+        const existing = stored.deletion.archived_absences?.find(value => value.name === proof.name);
+        if (existing && (existing.launch_id !== proof.launch_id || existing.action_id !== proof.action_id
+            || existing.archive_path !== proof.archive_path))
+          throw new TaskStateError('Archived absence checkpoint ownership is immutable');
+        stored.deletion.archived_absences ??= [];
+        if (!existing) stored.deletion.archived_absences.push({ ...proof });
+        continue;
+      }
       throw new TaskStateError(
         `task ${id} deletion member '${seat.role_name}' has retirement evidence but no identity CID`,
       );
@@ -837,6 +852,7 @@ export function importTaskDeletionRetirementEvidence(
     cursor.updated_at = now;
   }
   writeTask(stored);
+  writeDeletionReceiptForIntent(stored);
   return presentTaskLenient(stored);
   });
 }

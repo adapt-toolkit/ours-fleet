@@ -1,3 +1,4 @@
+import { proveArchivedAbsence, verifyArchivedAbsence } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
 import { withFileLock } from '../atomic-file.js';
@@ -215,10 +216,29 @@ export async function settleTaskDeletion(input: {
         upsertTaskDeletionMembersFromSeats(taskId, record.member_seats);
         await closeManagedRoom({ roomId: record.room_id, cowork: cowork!, deps: deps.roomClose });
         const closed = getRoomRecord(record.room_id);
-        importTaskDeletionRetirementEvidence(taskId, closed?.member_seats ?? record.member_seats);
+        const seats = closed?.member_seats ?? record.member_seats;
+        const proofs = [];
+        for (const seat of seats) {
+          if (!seat.identity_cid && seat.retirement?.launch_id !== 'never-launched')
+            proofs.push(await proveArchivedAbsence(seat));
+        }
+        // No await between the last live-state fence and durable checkpoint.
+        for (const proof of proofs) {
+          const latest = getRoomRecord(record.room_id)?.member_seats.find(seat => seat.role_name === proof.name);
+          if (existsSync(agentDir(proof.name, true)) || latest?.identity_cid
+              || latest?.launch?.launch_id !== proof.launch_id || latest.launch.action_id !== proof.action_id)
+            throw new Error('Archived absence seat changed before checkpoint');
+        }
+        importTaskDeletionRetirementEvidence(taskId, seats, proofs);
         await cowork!.deleteRoom(record.room_id);
+        for (const proof of proofs) await verifyArchivedAbsence(proof);
+        for (const proof of proofs)
+          if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before room unlink');
         deleteRoomRecord(record.room_id);
       }
+
+      for (const proof of getDeletingTask(taskId).deletion!.archived_absences ?? [])
+        await verifyArchivedAbsence(proof);
 
       // Members whose room record is gone (crash after record deletion, or
       // legacy state): resume from the durable cursors.
@@ -248,7 +268,7 @@ export async function settleTaskDeletion(input: {
     return { task_id: taskId, deleted: false };
   }
 
-  const finalize = (): Promise<void> => withFileLock(taskOperationLockPath(taskId), () => {
+  const finalize = (): Promise<void> => withFileLock(taskOperationLockPath(taskId), async () => {
     try {
       const task = getDeletingTask(taskId);
       if (task.deletion?.status !== 'pending')
@@ -257,6 +277,10 @@ export async function settleTaskDeletion(input: {
         throw new TaskStateError(`task ${taskId} room records reappeared during deletion finalization`);
       if (task.deletion.members.some(member => member.phase !== 'identity_absent'))
         throw new TaskStateError(`task ${taskId} has unretired members at deletion finalization`);
+      for (const proof of task.deletion.archived_absences ?? [])
+        await verifyArchivedAbsence(proof);
+      for (const proof of task.deletion.archived_absences ?? [])
+        if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before task unlink');
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
       unlinkDeletedTask(taskId);

@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const mocks = vi.hoisted(() => ({
@@ -14,6 +14,8 @@ vi.mock('../src/temp-lifecycle.js', async original => ({
   ...await original<typeof import('../src/temp-lifecycle.js')>(),
   tempSupervisorLiveness: mocks.liveness,
 }));
+import { createTask, beginTaskDeletionIntent, getDeletingTask, readTaskDeletionReceipt, tasksDir, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
+import { settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
 import { closeManagedRoom } from '../src/rooms-tasks/close.js';
 import { createRoomRecord, updateMemberSeats, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { stateRoot } from '../src/paths.js';
@@ -109,4 +111,44 @@ it('refuses the recorded CID surviving under another name', async () => {
   mocks.listIdentities.mockResolvedValue([{ name: 'other-name', cid: 'ab'.repeat(32) }]);
   await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/absence is not proven/);
   expect(cowork.closeRoom).not.toHaveBeenCalled();
+});
+
+it.each(['none', 'identity', 'archive', 'replacement', 'unknown'])('resumes deletion after room unlink with fresh proof (%s)', async obstruction => {
+  const task = createTask({ title: 'Archived failure cleanup' });
+  updateTaskRoom(task.task_id, roomId);
+  const room = getRoomRecord(roomId)!;
+  room.task_id = task.task_id;
+  writeFileSync(join(stateRoot(), 'rooms', roomId + '.json'), JSON.stringify(room));
+  beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  const remote = { closeRoom: async () => {}, deleteRoom: async () => {} };
+  mocks.listIdentities.mockImplementation(async () => {
+    if (!getRoomRecord(roomId)) throw new Error('simulated crash after room unlink');
+    return [];
+  });
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote }))
+    .rejects.toThrow(/simulated crash after room unlink/);
+  expect(getRoomRecord(roomId)).toBeUndefined();
+  expect(getDeletingTask(task.task_id).deletion?.archived_absences).toEqual([
+    expect.objectContaining({ name: 'member-1', launch_id: 'launch-1', action_id: 'action-1', archive_path: archive }),
+  ]);
+  expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(true);
+  mocks.listIdentities.mockResolvedValue([]);
+  if (obstruction === 'identity') mocks.listIdentities.mockResolvedValue([{ name: 'member-1', cid: 'ab'.repeat(32) }]);
+  if (obstruction === 'archive') writeFileSync(join(archive, '.identity'), 'wrong-owner');
+  if (obstruction === 'replacement') mkdirSync(join(stateRoot(), 'tmp', 'member-1'), { recursive: true });
+  if (obstruction === 'unknown') mocks.liveness.mockResolvedValue('unknown');
+  if (obstruction !== 'none') {
+    await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow();
+    expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(true);
+    expect(readTaskDeletionReceipt(task.task_id)?.result).toBeUndefined();
+    expect(mocks.removeIdentity).not.toHaveBeenCalled();
+    return;
+  }
+  expect((await settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).deleted).toBe(true);
+  expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(false);
+  expect(readTaskDeletionReceipt(task.task_id)).toMatchObject({
+    result: 'deleted',
+    archived_absences: [expect.objectContaining({ name: 'member-1', archive_path: archive })],
+  });
+  expect(mocks.removeIdentity).not.toHaveBeenCalled();
 });
