@@ -626,6 +626,19 @@ export async function provisionMembers(
         provision: input, member, settings: settings.get(member.name)!, task, roomIdentityCid,
       })) continue;
 
+      // A previous failed launch keeps its invite pointer durably. Never
+      // overwrite that requirement until the supported revoke has succeeded;
+      // a transport failure must fence subsequent invite issuance too.
+      if (currentSeat.invite_id) {
+        const observed = await cowork.getRoom(roomId);
+        if (!observed || observed.identity_cid !== roomIdentityCid)
+          throw new Error('cannot verify room before failed-attempt invite cleanup');
+        if (observed.seats.some(seat => seat.invite_id === currentSeat.invite_id
+          && seat.seat_state !== 'removed'))
+          throw new Error('failed-attempt invite has an admitted seat; reconcile before replacing the member');
+        await cowork.revokeInvite(roomId, currentSeat.invite_id);
+      }
+
       const issued = await cowork.issueInvite(roomId, {
         mode: 'one_time', role: member.coworkRole, min_accepts: 1,
       });
@@ -651,7 +664,12 @@ export async function provisionMembers(
           },
         });
       } catch (error) {
-        await cowork.revokeInvite(roomId, issued.invite_id).catch(() => {});
+        try {
+          await cowork.revokeInvite(roomId, issued.invite_id);
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError],
+            'member launch failed and invite cleanup is unresolved; retry must revoke the retained requirement first');
+        }
         throw error;
       }
     }
@@ -676,7 +694,7 @@ export async function provisionMembers(
     const remote = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(remote, roomPolicy.anonymous);
     const reconciled = reconcileMemberSeats(roomId, members, remote.seats, ownerSeatCid ?? undefined);
-    if (reconciled.complete) break;
+    if (reconciled.complete && remote.state === 'active') break;
     if (policy.now() >= deadline) {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;

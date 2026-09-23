@@ -485,6 +485,71 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
   });
 
+  it('does not activate Fleet from admitted seats while Cowork still has unmet requirements', async () => {
+    const task = createTask({ title: 'Wait for activation', origin: { type: 'cli' } });
+    const roomId = 'room-cowork-provisioning';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    const h = coworkHarness();
+    const recover = vi.mocked(h.cowork.recoverRoom).getMockImplementation()!;
+    vi.mocked(h.cowork.recoverRoom).mockImplementation(async id => ({ ...await recover(id), state: 'provisioning' }));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, taskId: task.task_id,
+      template: template(1), binPath: '/fleet', startupWait: { timeoutMs: 0 } };
+    const waiting = await provisionMembers(input);
+    expect(waiting.state).toBe('provisioning');
+    expect(getTask(task.task_id).state).toBe('provisioning');
+    expect(waiting.member_seats[0].seat_state).toBe('active');
+    vi.mocked(h.cowork.recoverRoom).mockImplementation(recover);
+    expect((await provisionMembers(input)).state).toBe('active');
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'active'] as const)('refuses to revoke or replace a failed invite with an admitted %s seat', async seatState => {
+    const roomId = 'room-admitted-cleanup';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed'));
+    h.revokeInvite.mockRejectedValueOnce(new Error('cleanup failed'));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, template: template(1), binPath: '/fleet' };
+    let failure: any;
+    try { await provisionMembers(input); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.errors.map((error: Error) => error.message)).toEqual(['launch failed', 'cleanup failed']);
+    const before = getRoomRecord(roomId)!.member_seats[0];
+    vi.mocked(h.cowork.getRoom).mockResolvedValue(roomInfo(roomId, [{
+      display_name: before.role_name, identity_cid: 'late-admitted-cid', invite_id: before.invite_id,
+      role: before.cowork_role, seat_state: seatState,
+    }]));
+    vi.clearAllMocks();
+    await expect(provisionMembers(input)).rejects.toThrow(/admitted seat/);
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    expect(h.issueInvite).not.toHaveBeenCalled();
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(getRoomRecord(roomId)!.member_seats[0].invite_id).toBe(before.invite_id);
+  });
+
+  it('does not overwrite a failed attempt invite until revocation succeeds on retry', async () => {
+    createRoomRecord({ room_id: 'room-revoke-retry', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed'));
+    h.revokeInvite.mockRejectedValueOnce(new Error('revoke transport unavailable'));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-revoke-retry',
+      template: template(1), binPath: '/fleet' };
+    await expect(provisionMembers(input)).rejects.toThrow();
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    h.revokeInvite.mockRejectedValueOnce(new Error('revoke still unavailable'));
+    await expect(provisionMembers(input)).rejects.toThrow();
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    await provisionMembers(input);
+    expect(h.revokeInvite).toHaveBeenLastCalledWith(input.roomId, 'invite-1');
+    expect(h.issueInvite).toHaveBeenCalledTimes(2);
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-2');
+    expect(getRoomRecord(input.roomId)!.state).toBe('active');
+  });
+
   it('does not persist invite secrets in Fleet room orchestration state', async () => {
     createRoomRecord({ room_id: 'room-secret', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
