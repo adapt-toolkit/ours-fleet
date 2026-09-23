@@ -83,6 +83,8 @@ export interface OwnerChannelOptions {
   harness: string;
   config: OwnerChannelConfig;
   session: AgentSession;
+  /** Ordinary owner input must not cancel the initial briefing turn. */
+  startupPending?: () => boolean;
   stateDir: string;
   env?: Record<string, string>;
   log(line: string): void;
@@ -1291,6 +1293,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
+      // getFiles returns daemon-local paths, which need not exist in Fleet's
+      // filesystem (for example with an HTTP daemon in a container). Fetch
+      // through the bound client and keep the daemon's integrity metadata for
+      // admission below; never trust or remap the returned filesystem path.
+      for (const file of retrieved) {
+        file.path = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
+      }
       for (const file of historyRecovered) {
         if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(
@@ -1306,8 +1316,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
-          interrupt: this.options.config.interrupt,
-          ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+          ...this.ownerPromptPolicy(),
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
@@ -1421,8 +1430,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
-        interrupt: this.options.config.interrupt,
-        ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+        ...this.ownerPromptPolicy(),
         origin: { kind: 'owner', requestId, displayText: text },
       });
     } catch (error) {
@@ -1466,6 +1474,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
     this.completionTasks.add(task);
     return true;
+  }
+
+  private ownerPromptPolicy() {
+    if (this.options.startupPending?.()) return { interrupt: false, steer: true };
+    return {
+      interrupt: this.options.config.interrupt,
+      ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+    };
   }
 
   /**
@@ -1934,6 +1950,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
+      // getFiles returns daemon-local paths, which need not exist in Fleet's
+      // filesystem (for example with an HTTP daemon in a container). Fetch
+      // through the bound client and keep the daemon's integrity metadata for
+      // admission below; never trust or remap the returned filesystem path.
+      for (const file of retrieved) {
+        file.path = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
+      }
       for (const file of historyRecovered) {
         if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(

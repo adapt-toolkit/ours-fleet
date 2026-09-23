@@ -19,19 +19,31 @@ export interface ManagedAgentService {
   privatePaths: string[];
   close(terminal: boolean): Promise<void>;
 }
+function roomSecretPath(role: ResolvedRole): string {
+  const startup = role.roomMemberStartup!;
+  return join(privateRuntimeRoot(), 'room-inputs',
+    binderKey(startup.room_identity_cid, JSON.stringify([role.name, startup.invite_id])) + '.json');
+}
+function matchesRoomSecret(secret: Record<string, unknown>, role: ResolvedRole): boolean {
+  const startup = role.roomMemberStartup!;
+  return secret.room_id === startup.room_id && secret.room_identity_cid === startup.room_identity_cid
+    && secret.invite_id === startup.invite_id && secret.identity_name === role.identity
+    && secret.role === startup.role;
+}
 /** Only trusted launch orchestration may write this descriptor, never the child. */
 export function storeRoomSecret(role: ResolvedRole): void {
   const startup = role.roomMemberStartup;
   if (!startup?.invite) return;
+  if (startup.identity_name !== role.identity) throw Error('ROOM_SECRET_MISMATCH');
   const root = join(privateRuntimeRoot(), 'room-inputs');
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const path = join(root, binderKey(startup.room_identity_cid, role.name) + '.json');
+  // Failed attempts retain private evidence. A new invite must never overwrite
+  // or consume a previous attempt's descriptor.
+  const path = roomSecretPath(role);
   if (existsSync(path)) {
     const old = JSON.parse(readFileSync(path, 'utf8'));
     if (
-      old.room_id !== startup.room_id ||
-      old.invite_id !== startup.invite_id ||
-      old.identity_name !== startup.identity_name
+      !matchesRoomSecret(old, role) || old.invite !== startup.invite
     )
       throw Error('ROOM_SECRET_COLLISION');
     return;
@@ -166,11 +178,13 @@ export async function prepareManagedAgent(
     let room: RoomAdmission | undefined;
     if (role.roomMemberStartup) {
       const startup = role.roomMemberStartup;
-      const path = join(
+      const legacyPath = join(
         root,
         'room-inputs',
         binderKey(startup.room_identity_cid, role.name) + '.json',
       );
+      const currentPath = roomSecretPath(role);
+      const path = existsSync(currentPath) ? currentPath : legacyPath;
       const cowork = createCoworkAdapter();
       room = {
         id: startup.room_id,
@@ -180,9 +194,7 @@ export async function prepareManagedAgent(
         redeem: async (attached) => {
           const secret = JSON.parse(readFileSync(path, 'utf8'));
           if (
-            secret.room_id !== startup.room_id ||
-            secret.invite_id !== startup.invite_id ||
-            secret.identity_name !== role.identity
+            !matchesRoomSecret(secret, role)
           )
             throw Error('ROOM_SECRET_MISMATCH');
           return attached.addContact({ invite: secret.invite });

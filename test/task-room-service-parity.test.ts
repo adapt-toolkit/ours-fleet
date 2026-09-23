@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import {
-  activateTask, completeTask, createTask, getTask, updateTaskMembers, updateTaskRoom,
+  activateTask, beginTaskTerminalIntent, completeTask, createTask, getTask, updateTaskMembers, updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import {
   activateRoom, advanceSaga, closeRoom, createRoomRecord, getRoomRecord, setSagaError,
@@ -81,6 +81,24 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 }
 
 describe('task create/start surface parity', () => {
+  it.each([true, false])('seals planned role counts before any Owner attachment (owner=%s)', async (attachOwner) => {
+    const team: TemplateDefinition = { name: 'planned', version: 1, description: 'Plan', contract: 'Wait.',
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' },
+        { slot: 'extra', role: 'Developer', count: 1, agent_template: 'Dev' }] };
+    const cfg = { ...config(), ownerInvite: 'OWNER-INVITE', roomTemplates: { planned: team },
+      rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: attachOwner } } } as FleetConfig;
+    const h = cowork();
+    vi.mocked(h.adapter.acceptInvite).mockResolvedValue({seat_cid:'owner-cid',seat_state:'active'});
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(async ({roomId}) => getRoomRecord(roomId)!) });
+    await app.createTask({actor:{kind:'local_control',surface:'cli'},title:'Whole team',template:'planned',origin:{type:'cli'}});
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({activation_requirements:
+      [...(attachOwner ? [{role:'Owner',count:1}] : []),{role:'Developer',count:3}]}));
+    if (attachOwner) expect(h.createRoom.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(h.adapter.acceptInvite).mock.invocationCallOrder[0]);
+    else expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+  });
+
   it.each([['single', 1], ['pair', 2], ['team', 3]] as const)(
     'emits one canonical Task-ready lifecycle event for a %s launch',
     async (name, count) => {
@@ -425,6 +443,26 @@ describe('task create/start surface parity', () => {
     })).toMatchObject({ kind: 'no_op', room: { room_name: expected } });
     expect(h.createRoom).not.toHaveBeenCalled();
     expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
+  });
+
+  it('stops background provisioning when a terminal intent has been accepted', async () => {
+    const h = cowork();
+    const app = service(h.adapter);
+    const task = createTask({ title: 'Cancelled provisioning', origin: { type: 'cli' } });
+    updateTaskRoom(task.task_id, 'missing-room', 'room-cid');
+    beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'missing-room' });
+    expect(await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id })).toMatchObject({ kind: 'no_op' });
+    expect(app.taskProvisioningOutcome(task.task_id).next_action).toContain('cancel');
+    expect(h.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('reports a member launch failure as requiring explicit intervention, not an automatic invite retry', () => {
+    const app = service(cowork().adapter);
+    const task = createTask({ title: 'Failed member', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-member-fail', room_name: 'Room', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-member-fail', 'room-cid');
+    setSagaError('room-member-fail', 'launch failure', 'Inspect then retry', 'member_failed');
+    expect(app.taskProvisioningOutcome(task.task_id).next_action).toContain('task start');
   });
 
   it('continues a pre-room title validation failure through the canonical provision boundary', async () => {

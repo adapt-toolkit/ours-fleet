@@ -166,6 +166,7 @@ function setup(messages: unknown[], result = {
 }, options: {
   interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
   configPath?: string;
+  startupPending?: () => boolean;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
   stateDir?: string; client?: FakeClient;
@@ -192,6 +193,7 @@ function setup(messages: unknown[], result = {
       interrupt: options.interrupt ?? false, progress_interval_ms: 0,
     },
     session, stateDir: dir, client, log: () => undefined,
+    startupPending: options.startupPending,
     ...(options.configPath ? { configPath: options.configPath } : {}),
     prepareRestart: options.prepareRestart ?? (async () => undefined),
     ...(options.fleet ? { fleet: options.fleet } : {}),
@@ -760,6 +762,19 @@ describe('OwnerChannel', () => {
         + 'The response will arrive in this channel when ready.',
       replyToWireId: 'wire-preempt',
     });
+  });
+
+  it('steers owner input during startup and restores configured interruption after startup', async () => {
+    let pending = true;
+    const { channel, client, queuePrompt } = setup([{
+      msg_id: 14, wire_id: 'startup-owner', from: { id: OWNER_CID }, text: 'Please continue',
+    }], undefined, { interrupt: true, startupPending: () => pending });
+    await channel.drain();
+    expect(queuePrompt.mock.calls[0][1]).toMatchObject({ interrupt: false, steer: true });
+    pending = false;
+    client.batches.push([{ msg_id: 15, wire_id: 'ready-owner', from: { id: OWNER_CID }, text: 'Now prioritize this' }], []);
+    await channel.drain();
+    expect(queuePrompt.mock.calls[1][1]).toMatchObject({ interrupt: true, interruptSource: 'owner' });
   });
 
   it('does not elevate a peer message merely because it reached the channel', async () => {

@@ -790,6 +790,7 @@ export async function runOnce(
         harness: role.harness,
         config: role.owner_channel,
         session: arbiter,
+        startupPending: () => !sessionStartupComplete,
         stateDir: dir,
         env: role.env,
         log: deps.log,
@@ -881,6 +882,24 @@ export async function runOnce(
     // interruption to steering until this startup turn reaches a terminal
     // success, so there is neither a deaf gap nor a boot-cancellation loop.
     monitorLoop = monitor?.run(pid);
+    // Owner traffic and agent replies must be observed during a long first
+    // turn. Ordinary owner input steers until startup has proved successful.
+    if (ownerChannel) {
+      try {
+        await ownerChannel.start();
+        control.setOwnerChannel(ownerChannel);
+      } catch (error) {
+        monitor?.stop();
+        if (monitorLoop) await monitorLoop;
+        await control.close();
+        await ownerChannel.close().catch(() => undefined);
+        ownerBinder?.release();
+        await agentSession.close();
+        unsubscribeRecovery?.();
+        throw new Error(`[${name}] owner channel failed to start: `
+          + `${(error as Error)?.message ?? String(error)}`);
+      }
+    }
     const started = await starting;
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
@@ -893,6 +912,7 @@ export async function runOnce(
     if (!started.succeeded && !interruptedForWake) {
       monitor?.stop();
       await control.close();
+      await ownerChannel?.close().catch(() => undefined);
       ownerBinder?.release();
       await agentSession.close();
       unsubscribeRecovery?.();
@@ -919,23 +939,6 @@ export async function runOnce(
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
     sessionStartupComplete = true;
-    if (ownerChannel) {
-      try { await ownerChannel.start(); }
-      catch (error) {
-        monitor?.stop();
-        if (monitorLoop) await monitorLoop;
-        await ownerChannel.close().catch(() => undefined);
-        await control.close();
-        ownerBinder?.release();
-        await agentSession.close();
-        unsubscribeRecovery?.();
-        throw new Error(`[${name}] owner channel failed to start: `
-          + `${(error as Error)?.message ?? String(error)}`);
-      }
-    }
-    if (ownerChannel) {
-      control.setOwnerChannel(ownerChannel);
-    }
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];

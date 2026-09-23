@@ -227,7 +227,7 @@ export class TaskRoomApplicationService {
         void room;
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
-          persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+          persistBlockTask(task.task_id, 'Cowork management is unavailable');
         // Once the durable Room exists, provisioning errors are resumable
         // saga state. Return that explicit state so the command can launch a
         // continuation and report the durable in-progress outcome.
@@ -352,7 +352,13 @@ export class TaskRoomApplicationService {
     const ready = task.state === 'active' && room?.state === 'active'
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
-    const nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
+    const nextAction = task.terminal_intent
+      ? `Complete the accepted ${task.terminal_intent.kind} operation; do not restart provisioning.`
+      : room?.state === 'closing' || room?.state === 'closed'
+        ? `Complete room cleanup; do not restart provisioning.`
+      : room?.provisioning_detail === 'member_failed'
+        ? `Inspect the failed launch, then run ours-fleet task start ${task.task_id}.`
+      : room?.provisioning_detail === 'waiting_owner_authorization'
       ? `Ensure ours-cowork 1.3.0 or newer is running and available, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'waiting_owner_invite'
         ? `Rotate rooms.owner.public_invite, then run ours-fleet task start ${task.task_id}.`
@@ -554,7 +560,9 @@ export class TaskRoomApplicationService {
     let task = readTask(input.taskId);
     let room = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const issues: TaskProvisioningContinuationIssue[] = [];
-    if (task.state !== 'provisioning') return {
+    if (task.state !== 'provisioning' || task.terminal_intent
+        || room?.state === 'closing' || room?.state === 'closed'
+        || room?.provisioning_detail === 'member_failed') return {
       kind: 'no_op', task, room, issues,
     };
     if (!room) {
@@ -918,7 +926,7 @@ export class TaskRoomApplicationService {
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
-          persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+          persistBlockTask(task.task_id, 'Cowork management is unavailable');
         const current = readTask(task.task_id);
         if (!current.room_id || !getRoomRecord(current.room_id)) throw error;
         task = current;
@@ -933,7 +941,7 @@ export class TaskRoomApplicationService {
           room = getRoomRecord(room.room_id);
         } catch (error) {
           if (error instanceof CoworkUnavailableError)
-            persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+            persistBlockTask(task.task_id, 'Cowork management is unavailable');
           task = readTask(task.task_id);
           return { task, status: 'in_progress' };
         }
@@ -949,7 +957,7 @@ export class TaskRoomApplicationService {
           brief: task.brief, goal: task.title });
         task = readTask(task.task_id);
       } catch (error) {
-        if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+        if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management is unavailable');
         task = readTask(task.task_id);
       }
     }
@@ -1021,11 +1029,16 @@ export class TaskRoomApplicationService {
             throw new TaskRoomApplicationError('task_deleting',
               `task ${task.task_id} is pending deletion`, { task: task.task_id });
         }
+        const requiredRoles = new Map<string, number>();
+        if (attachOwner) requiredRoles.set(rooms.owner.role, 1);
+        for (const member of launchTemplate?.members ?? [])
+          requiredRoles.set(member.role, (requiredRoles.get(member.role) ?? 0) + member.count);
         const created = await cowork.createRoom({
           room_name: roomName, goal: task.goal?.trim() || task.title,
           briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
           quiet_membership: launchTemplate?.room?.quiet_membership,
           anonymous: policy.anonymous,
+          activation_requirements: [...requiredRoles].map(([role, count]) => ({ role, count })),
         });
         const record = createRoomRecord({
           room_id: created.room_id, room_name: roomName, room_identity_cid: created.identity_cid,

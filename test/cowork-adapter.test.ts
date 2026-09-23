@@ -114,6 +114,7 @@ describe('Cowork management-socket adapter', () => {
           goal: 'Ship',
           briefing: 'Cross-check everything',
           quiet_membership: true,
+          activation_requirements: [{ role: 'Developer', count: 2 }],
         },
       });
       return room();
@@ -124,6 +125,7 @@ describe('Cowork management-socket adapter', () => {
       goal: 'Ship',
       briefing: 'Cross-check everything',
       quiet_membership: true,
+          activation_requirements: [{ role: 'Developer', count: 2 }],
     })).resolves.toEqual({
       room_id: '01ABCDEF0123456789ABCDEFGH',
       identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',

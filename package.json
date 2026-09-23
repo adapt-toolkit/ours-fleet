@@ -41,9 +41,9 @@
     "@agentclientprotocol/sdk": "^1.3.0",
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
-    "@ours.network/cli": "2.8.1-nightly.8",
-    "@ours.network/mcp": "1.2.0-nightly.6",
-    "@ours.network/sdk": "3.8.1-nightly.10",
+    "@ours.network/cli": "2.8.1-nightly.9",
+    "@ours.network/mcp": "1.2.0-nightly.7",
+    "@ours.network/sdk": "3.8.1-nightly.11",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
     "react": "^19.1.1",
@@ -57,7 +57,7 @@
     "@agentclientprotocol/codex-acp": "1.10.0"
   },
   "devDependencies": {
-    "@ours.network/daemon": "3.8.1-nightly.2",
+    "@ours.network/daemon": "3.8.1-nightly.3",
     "@playwright/test": "^1.54.1",
     "@types/node": "^20.14.0",
     "@types/react": "^19.1.9",

@@ -1,13 +1,15 @@
 import { beforeEach, afterEach, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ResolvedRole } from '../src/config.js';
+import { binderKey } from '../src/agent-ours/state.js';
 import {
   prepareManagedAgent,
   releaseManagedAgent,
   storeTemporaryLaunch,
   storeRoomSecret,
+  privateRuntimeRoot,
 } from '../src/agent-ours/service.js';
 const daemon = vi.hoisted(() => ({
   rows: new Map<string, any>(),
@@ -18,6 +20,7 @@ const daemon = vi.hoisted(() => ({
   failCreate: false,
   failRelease: false,
   redeems: 0,
+  invites: [] as string[],
   member: false,
 }));
 vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
@@ -45,8 +48,9 @@ vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
         return row;
       },
       listContacts: async () => ({ contacts: daemon.member ? [{ container_id: 'ROOM' }] : [] }),
-      addContact: async () => {
+      addContact: async ({ invite }: { invite: string }) => {
         daemon.redeems++;
+        daemon.invites.push(invite);
         daemon.member = true;
         return { cid: 'ROOM' };
       },
@@ -121,6 +125,7 @@ beforeEach(() => {
   daemon.rows.clear();
   daemon.owners.clear();
   daemon.created = daemon.releases = daemon.closed = daemon.redeems = 0;
+  daemon.invites = [];
   daemon.failCreate = daemon.failRelease = daemon.member = false;
 });
 afterEach(() => {
@@ -182,6 +187,58 @@ it('uncertain provisioning releases the local connection and binder without repe
     'UNCERTAIN_PROVISIONING',
   );
   expect(daemon.created).toBe(1);
+});
+
+it('keeps each invite attempt private and rejects changed secrets for the same attempt', () => {
+  const startup = { room_id: 'room', room_identity_cid: 'ROOM', identity_name: 'Agent', invite_id: 'first', invite: 'first-secret', role: 'Developer', task: 'test' };
+  role.roomMemberStartup = startup;
+  storeRoomSecret(role);
+  const dir = join(privateRuntimeRoot(), 'room-inputs');
+  const firstPath = join(dir, readdirSync(dir)[0]);
+  const original = readFileSync(firstPath, 'utf8');
+  storeRoomSecret(role);
+  role.roomMemberStartup = { ...startup, invite: 'changed-secret' };
+  expect(() => storeRoomSecret(role)).toThrow('ROOM_SECRET_COLLISION');
+  role.roomMemberStartup = { ...startup, invite_id: 'second', invite: 'second-secret' };
+  storeRoomSecret(role);
+  expect(readFileSync(firstPath, 'utf8')).toBe(original);
+  expect(readdirSync(dir)).toHaveLength(2);
+  role.roomMemberStartup = { ...startup, identity_name: 'Other' };
+  expect(() => storeRoomSecret(role)).toThrow('ROOM_SECRET_MISMATCH');
+});
+
+it('a new launch redeems only its new invite and preserves the failed attempt descriptor', async () => {
+  const startup = { room_id: 'room', room_identity_cid: 'ROOM', identity_name: 'Agent', invite_id: 'failed', invite: 'old-secret', role: 'Developer', task: 'test' };
+  role.roomMemberStartup = startup;
+  storeRoomSecret(role);
+  const dir = join(privateRuntimeRoot(), 'room-inputs');
+  const firstPath = join(dir, readdirSync(dir)[0]);
+  const old = readFileSync(firstPath, 'utf8');
+  role.roomMemberStartup = { ...startup, invite_id: 'seat', invite: 'new-secret' };
+  storeRoomSecret(role);
+  storeTemporaryLaunch(role, 'new-launch');
+  const managed = await prepareManagedAgent(role, stateDir, true);
+  expect(daemon.invites).toEqual(['new-secret']);
+  expect(readFileSync(firstPath, 'utf8')).toBe(old);
+  await managed.close(true);
+});
+
+it.each([false, true])('legacy descriptors are accepted only for their exact assignment (mismatch=%s)', async mismatch => {
+  const startup = { room_id: 'room', room_identity_cid: 'ROOM', identity_name: 'Agent', invite_id: 'seat', invite: '', role: 'Developer', task: 'test' };
+  role.roomMemberStartup = startup;
+  const dir = join(privateRuntimeRoot(), 'room-inputs');
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, binderKey('ROOM', 'Agent') + '.json');
+  writeFileSync(path, JSON.stringify({ ...startup, invite: 'legacy-secret', room_id: mismatch ? 'other-room' : 'room' }), { mode: 0o600 });
+  if (mismatch) {
+    await expect(prepareManagedAgent(role, stateDir, false)).rejects.toThrow('ROOM_SECRET_MISMATCH');
+    expect(daemon.invites).toEqual([]);
+    expect(readFileSync(path, 'utf8')).toContain('other-room');
+  } else {
+    const managed = await prepareManagedAgent(role, stateDir, false);
+    expect(daemon.invites).toEqual(['legacy-secret']);
+    await managed.close(true);
+  }
 });
 it('release failure closes the connection and unlocks for explicit cleanup retry', async () => {
   const managed = await prepareManagedAgent(role, stateDir, false);

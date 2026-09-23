@@ -5,6 +5,7 @@ import { attachOursClient, type OursClient } from '@ours.network/sdk/client';
 
 import { withFileLock } from '../atomic-file.js';
 import { agentDir, stateRoot } from '../paths.js';
+import { readClientProfile } from '../client-profile.js';
 import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
   type TempLifecycleDeps,
@@ -20,7 +21,7 @@ const CLOSE_LOCK_STALE_MS = 5 * 60_000;
 const STOP_POLLS = 50;
 const STOP_POLL_MS = 100;
 
-function roomCloseLockPath(roomId: string): string {
+export function roomCloseLockPath(roomId: string): string {
   return join(stateRoot(), 'locks', 'room-close', encodeURIComponent(roomId));
 }
 
@@ -81,13 +82,23 @@ export async function waitForLivenessAbsent(
 }
 
 async function withIdentityClient<T>(work: (client: OursClient) => Promise<T>): Promise<T> {
-  const client = await attachOursClient({
+  const profile = readClientProfile(process.env);
+  const leaseToken = `ours-fleet-room-close-${process.pid}-${randomUUID()}`;
+  const client = await attachOursClient(profile ? {
+    endpoint: profile.endpoint,
+    expectedInstanceId: profile.expectedInstanceId,
+    credentialPath: profile.credentialPath,
+    sessionMode: 'external', env: {}, leaseToken,
+  } : {
     env: process.env,
-    leaseToken: `ours-fleet-room-close-${process.pid}-${randomUUID()}`,
+    leaseToken,
     clientPid: process.pid,
   });
   try { return await work(client); }
-  finally { await client.releaseLease().catch(() => {}); }
+  finally {
+    try { await client.releaseLease().catch(() => {}); }
+    finally { await client.close(); }
+  }
 }
 
 function listedIdentity(
@@ -136,13 +147,39 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
   });
 }
 
+async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<void> {
+  await withIdentityClient(async client => {
+    const rows = await client.listIdentities();
+    if (rows.some(row => row.name === seat.role_name ||
+        (seat.identity_cid && 'cid' in row && row.cid.toLowerCase() === seat.identity_cid.toLowerCase()))) {
+      throw new Error(`room member '${seat.role_name}' identity absence is not proven; refusing retirement`);
+    }
+  });
+}
+
 async function retireMember(
   roomId: string, seat: RoomMemberSeat, deps: RoomCloseDeps,
 ): Promise<void> {
   let room = getRoomRecord(roomId)!;
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
   let retirement = current.retirement;
+  if (retirement?.phase === 'identity_absent') {
+    if (current.launch?.launch_id && current.launch.launch_id !== retirement.launch_id) {
+      if (existsSync(agentDir(current.role_name, true)))
+        throw new Error(`room member '${current.role_name}' has a replacement launch after retirement; retire that exact temporary role before retrying`);
+      await assertMemberIdentityAbsent(current);
+    }
+    return;
+  }
   if (!retirement) {
+    if (current.launch?.state === 'failed' && !existsSync(agentDir(current.role_name, true))) {
+      // A failure before applyRole (for example invite-secret validation) has
+      // no supervisor to stop or archive. Settle only proven absence; this
+      // path never removes an identity based on missing local evidence.
+      await assertMemberIdentityAbsent(current);
+      advanceMemberRetirement(roomId, current.role_name, 'identity_absent', 'failed-launch-absent');
+      return;
+    }
     if (current.launch?.state === 'pending' && current.launch.attempt === 0) {
       if (existsSync(agentDir(current.role_name, true))) {
         throw new Error(
@@ -229,7 +266,6 @@ export async function closeManagedRoom(input: {
     try {
       if (room.close?.phase === 'retire_members') {
         for (const seat of room.member_seats) {
-          if (seat.retirement?.phase === 'identity_absent') continue;
           await retireMember(input.roomId, seat, deps);
         }
         room = advanceRoomClose(input.roomId, 'close_cowork');

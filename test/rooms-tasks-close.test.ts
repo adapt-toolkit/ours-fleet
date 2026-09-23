@@ -7,6 +7,7 @@ const sdk = vi.hoisted(() => ({
   listIdentities: vi.fn(),
   removeIdentity: vi.fn(),
   releaseLease: vi.fn(async () => undefined),
+  close: vi.fn(async () => undefined),
 }));
 
 vi.mock('@ours.network/sdk/client', () => ({
@@ -70,6 +71,45 @@ function fixture() {
 }
 
 describe('deterministic managed room close', () => {
+  it.each([true, false])('does not trust an old retirement cursor for a replacement launch (live state=%s)', async live => {
+    updateMemberSeats(ROOM_ID, [{ role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer', seat_state: 'active',
+      launch: { state: 'launched', attempt: 2, action_id: 'new-action', launch_id: 'new-launch', updated_at: '2026-08-24T00:00:00.000Z' },
+      retirement: { phase: 'identity_absent', launch_id: 'old-launch', updated_at: '2026-08-24T00:00:00.000Z' } }]);
+    if (live) mkdirSync(join(root, '.ours-fleet', 'tmp', 'member-1'), { recursive: true });
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    if (live) {
+      await expect(closeManagedRoom({ roomId: ROOM_ID, cowork })).rejects.toThrow(/replacement launch/);
+      expect(cowork.closeRoom).not.toHaveBeenCalled();
+    } else {
+      expect((await closeManagedRoom({ roomId: ROOM_ID, cowork })).state).toBe('closed');
+      expect(sdk.listIdentities).toHaveBeenCalledOnce();
+    }
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+  });
+
+  it('settles failed-before-state provisioning only after authoritative identity absence', async () => {
+    updateMemberSeats(ROOM_ID, [{ role_name: 'member-1', slot: 'dev', cowork_role: 'Developer', seat_state: 'pending',
+      launch: { state: 'failed', attempt: 2, action_id: 'failed-action', updated_at: '2026-08-24T00:00:00.000Z' } }]);
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    const room = await closeManagedRoom({ roomId: ROOM_ID, cowork });
+    expect(room.state).toBe('closed');
+    expect(room.member_seats[0].retirement?.phase).toBe('identity_absent');
+    expect(sdk.listIdentities).toHaveBeenCalledOnce();
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['same-name', 'renamed-cid', 'unavailable'])('refuses failed-before-state retirement when absence is not proven: %s', async mode => {
+    updateMemberSeats(ROOM_ID, [{ role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer', seat_state: 'pending',
+      launch: { state: 'failed', attempt: 1, action_id: 'failed-action', updated_at: '2026-08-24T00:00:00.000Z' } }]);
+    if (mode === 'unavailable') sdk.listIdentities.mockRejectedValue(new Error('daemon unavailable'));
+    else sdk.listIdentities.mockResolvedValue([{ name: mode === 'same-name' ? 'member-1' : 'renamed', cid: mode === 'same-name' ? 'cd'.repeat(32) : CID }]);
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork })).rejects.toThrow(/absence|unavailable/);
+    expect(cowork.closeRoom).not.toHaveBeenCalled();
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+    expect(getRoomRecord(ROOM_ID)!.member_seats[0].retirement).toBeUndefined();
+  });
+
   it('checkpoints exact retirement before Cowork and terminal close', async () => {
     const f = fixture();
     const closed = await closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps });

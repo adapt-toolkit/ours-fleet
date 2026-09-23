@@ -1,4 +1,4 @@
-import { privateRuntimeRoot } from '../src/agent-ours/service.js';
+import { privateRuntimeRoot, storeRoomSecret } from '../src/agent-ours/service.js';
 import { atomicPrivateWrite, binderKey } from '../src/agent-ours/state.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -25,11 +25,14 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
   tempArchiveForCreationAction: mocks.archiveForAction,
 }));
 
-import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { provisionMembers, reconcileExistingTaskMembers } from '../src/rooms-tasks/provision.js';
+import { roomCloseLockPath } from '../src/rooms-tasks/close.js';
+import { taskOperationLockPath } from '../src/rooms-tasks/terminal.js';
+import { withFileLock } from '../src/atomic-file.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
-import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
+import { activateRoom, beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
+import { beginTaskTerminalIntent, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
 } from '../src/rooms-tasks/cowork-adapter.js';
@@ -232,6 +235,51 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
+  it.each(['room', 'task'])('rechecks terminal ownership after waiting for the %s launch lock', async boundary => {
+    const task = createTask({ title: 'Waiting launch', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-lock-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-lock-race', 'room-cid');
+    const h = coworkHarness();
+    let locked!: () => void, unlock!: () => void, issued!: () => void;
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const release = new Promise<void>(resolve => { unlock = resolve; });
+    const inviteIssued = new Promise<void>(resolve => { issued = resolve; });
+    const held = withFileLock(boundary === 'room' ? roomCloseLockPath('room-lock-race') : taskOperationLockPath(task.task_id), async () => { locked(); await release; });
+    await ready;
+    const issue = h.issueInvite.getMockImplementation()!;
+    h.issueInvite.mockImplementation(async (...args) => { const result = await issue(...args); issued(); return result; });
+    const pending = provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-lock-race', taskId: task.task_id,
+      template: template(1), binPath: '/usr/bin/ours-fleet' });
+    const rejected = expect(pending).rejects.toThrow(/closing|terminal/);
+    try {
+      await inviteIssued;
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (boundary === 'room') beginRoomClose('room-lock-race');
+      else beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'room-lock-race' });
+    } finally { unlock(); }
+    await held;
+    await rejected;
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+  });
+
+  it.each(['room-close', 'task-cancel'])('never launches after %s is accepted while issuing an invite', async mode => {
+    const task = createTask({ title: 'Cancel race', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-cancel-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-cancel-race', 'room-cid');
+    const h = coworkHarness();
+    const issue = h.issueInvite.getMockImplementation()!;
+    h.issueInvite.mockImplementation(async (...args) => {
+      const result = await issue(...args);
+      if (mode === 'room-close') beginRoomClose('room-cancel-race');
+      else beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'room-cancel-race' });
+      return result;
+    });
+    await expect(provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-cancel-race', taskId: task.task_id,
+      template: template(1), binPath: '/usr/bin/ours-fleet' })).rejects.toThrow(/closing|terminal/);
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(h.revokeInvite).toHaveBeenCalledWith('room-cancel-race', 'invite-1');
+  });
+
   it('does not become ready until the configured Owner seat is active', async () => {
     createRoomRecord({ room_id: 'room-owner-gate', room_name: 'Room', room_identity_cid: 'room-cid' });
     setOwnerSeat('room-owner-gate', 'owner-cid', 'fingerprint');
@@ -415,6 +463,114 @@ describe('simple Cowork room member startup', () => {
     })).rejects.toThrow('launch failed');
     expect(h.revokeInvite).toHaveBeenCalledWith('room-fail', 'invite-1');
     expect(getRoomRecord('room-fail')?.member_seats[0].launch?.state).toBe('failed');
+  });
+
+  it('retries a failed launch with a new invite without colliding with its retained secret', async () => {
+    createRoomRecord({ room_id: 'room-retry-secret', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    const spawn = mocks.spawnTemp.getMockImplementation()!;
+    let attempt = 0;
+    mocks.spawnTemp.mockImplementation(async (opts: Record<string, any>) => {
+      storeRoomSecret({ name: opts.name, identity: opts.identity, roomMemberStartup: opts.roomMemberStartup } as ResolvedRole);
+      if (++attempt === 1) throw new Error('launch failed before supervisor');
+      return spawn(opts);
+    });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-retry-secret', template: template(1), binPath: '/usr/bin/ours-fleet' };
+    await expect(provisionMembers(input)).rejects.toThrow('launch failed before supervisor');
+    expect(h.revokeInvite).toHaveBeenCalledWith('room-retry-secret', 'invite-1');
+    const result = await provisionMembers(input);
+    expect(result.state).toBe('active');
+    expect(result.member_seats[0].invite_id).toBe('invite-2');
+    expect(result.member_seats[0].launch?.attempt).toBe(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not activate Fleet from admitted seats while Cowork still has unmet requirements', async () => {
+    const task = createTask({ title: 'Wait for activation', origin: { type: 'cli' } });
+    const roomId = 'room-cowork-provisioning';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    const h = coworkHarness();
+    const recover = vi.mocked(h.cowork.recoverRoom).getMockImplementation()!;
+    vi.mocked(h.cowork.recoverRoom).mockImplementation(async id => ({ ...await recover(id), state: 'provisioning' }));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, taskId: task.task_id,
+      template: template(1), binPath: '/fleet', startupWait: { timeoutMs: 0 } };
+    const waiting = await provisionMembers(input);
+    expect(waiting.state).toBe('provisioning');
+    expect(getTask(task.task_id).state).toBe('provisioning');
+    expect(waiting.member_seats[0].seat_state).toBe('active');
+    vi.mocked(h.cowork.recoverRoom).mockImplementation(recover);
+    expect((await provisionMembers(input)).state).toBe('active');
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'active'] as const)('refuses to revoke or replace a failed invite with an admitted %s seat', async seatState => {
+    const roomId = 'room-admitted-cleanup';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed'));
+    h.revokeInvite.mockRejectedValueOnce(new Error('cleanup failed'));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, template: template(1), binPath: '/fleet' };
+    let failure: any;
+    try { await provisionMembers(input); } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure.errors.map((error: Error) => error.message)).toEqual(['launch failed', 'cleanup failed']);
+    const before = getRoomRecord(roomId)!.member_seats[0];
+    vi.mocked(h.cowork.getRoom).mockResolvedValue(roomInfo(roomId, [{
+      display_name: before.role_name, identity_cid: 'late-admitted-cid', invite_id: before.invite_id,
+      role: before.cowork_role, seat_state: seatState,
+    }]));
+    vi.clearAllMocks();
+    await expect(provisionMembers(input)).rejects.toThrow(/admitted seat/);
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    expect(h.issueInvite).not.toHaveBeenCalled();
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(getRoomRecord(roomId)!.member_seats[0].invite_id).toBe(before.invite_id);
+  });
+
+  it('revokes the retained invite after asynchronous supervisor failure before replacement', async () => {
+    const roomId = 'room-async-failure';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, template: template(1),
+      binPath: '/fleet', startupWait: { timeoutMs: 0 } };
+    await provisionMembers(input);
+    expect(getRoomRecord(roomId)!.member_seats[0].launch!.state).toBe('launched');
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    mocks.tempLiveness.mockResolvedValueOnce('stopped');
+    h.revokeInvite.mockRejectedValueOnce(new Error('cleanup offline'));
+    await expect(provisionMembers(input)).rejects.toThrow('cleanup offline');
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(getRoomRecord(roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    await provisionMembers(input);
+    expect(h.revokeInvite).toHaveBeenLastCalledWith(roomId, 'invite-1');
+    expect(h.issueInvite).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    const revokeOrder = h.revokeInvite.mock.invocationCallOrder.at(-1)!;
+    expect(revokeOrder).toBeLessThan(h.issueInvite.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it('does not overwrite a failed attempt invite until revocation succeeds on retry', async () => {
+    createRoomRecord({ room_id: 'room-revoke-retry', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed'));
+    h.revokeInvite.mockRejectedValueOnce(new Error('revoke transport unavailable'));
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-revoke-retry',
+      template: template(1), binPath: '/fleet' };
+    await expect(provisionMembers(input)).rejects.toThrow();
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    h.revokeInvite.mockRejectedValueOnce(new Error('revoke still unavailable'));
+    await expect(provisionMembers(input)).rejects.toThrow();
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-1');
+    await provisionMembers(input);
+    expect(h.revokeInvite).toHaveBeenLastCalledWith(input.roomId, 'invite-1');
+    expect(h.issueInvite).toHaveBeenCalledTimes(2);
+    expect(getRoomRecord(input.roomId)!.member_seats[0].invite_id).toBe('invite-2');
+    expect(getRoomRecord(input.roomId)!.state).toBe('active');
   });
 
   it('does not persist invite secrets in Fleet room orchestration state', async () => {
@@ -745,4 +901,96 @@ describe('simple Cowork room member startup', () => {
       monitor: { mode: 'fleet', interrupt: true },
     });
   });
+});
+
+
+describe('existing-member reconciliation without launch effects', () => {
+  async function pending() {
+    const task = createTask({ title: 'Recover', origin: { type: 'cli' } });
+    const roomId = 'room-existing-only';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, roomId, 'room-cid');
+    const h = coworkHarness({ acceptOnSpawn: false });
+    await provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId, taskId: task.task_id,
+      template: template(2), binPath: '/fleet', startupWait: { timeoutMs: 0 } });
+    h.acceptAll();
+    const expectedLaunches = getRoomRecord(roomId)!.member_seats.map(seat => ({
+      role_name: seat.role_name, launch_id: seat.launch!.launch_id!, identity_cid: `cid-${seat.role_name}`,
+    }));
+    vi.clearAllMocks();
+    return { h, roomId, task, input: { taskId: task.task_id, cowork: h.cowork, expectedLaunches } };
+  }
+  function noLifecycle(h: ReturnType<typeof coworkHarness>) {
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(mocks.controlRequest).not.toHaveBeenCalled();
+    expect(mocks.secureArchive).not.toHaveBeenCalled();
+    expect(h.issueInvite).not.toHaveBeenCalled();
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    expect(h.cowork.recoverRoom).not.toHaveBeenCalled();
+  }
+  it('activates only proven existing seats and safely repeats after completion', async () => {
+    const f = await pending();
+    const before = getRoomRecord(f.roomId)!.member_seats.map(seat => seat.launch);
+    const prior = getRoomRecord(f.roomId);
+    await reconcileExistingTaskMembers({ ...f.input, checkOnly: true });
+    expect(getRoomRecord(f.roomId)).toEqual(prior);
+    expect(getTask(f.task.task_id).member_roles).toEqual([]);
+    const result = await reconcileExistingTaskMembers(f.input);
+    expect(result.state).toBe('active');
+    expect(result.member_seats.every(seat => seat.seat_state === 'active')).toBe(true);
+    expect(result.member_seats.map(seat => seat.launch)).toEqual(before);
+    expect(getTask(f.task.task_id).member_roles).toHaveLength(2);
+    expect(getTask(f.task.task_id).state).toBe('active');
+    const completedRoom = getRoomRecord(f.roomId);
+    const completedTask = getTask(f.task.task_id);
+    await reconcileExistingTaskMembers(f.input);
+    expect(getRoomRecord(f.roomId)).toEqual(completedRoom);
+    expect(getTask(f.task.task_id)).toEqual(completedTask);
+    noLifecycle(f.h);
+  });
+  it('resumes interruption after room activation without rewriting activation evidence', async () => {
+    const f = await pending();
+    const active = activateRoom(f.roomId);
+    await reconcileExistingTaskMembers(f.input);
+    expect(getRoomRecord(f.roomId)!.activated_at).toBe(active.activated_at);
+    expect(getRoomRecord(f.roomId)!.saga.phase).toBe('completed');
+    expect(getTask(f.task.task_id).state).toBe('active');
+    noLifecycle(f.h);
+  });
+  it.each(['task', 'room'])('rechecks terminal fences after waiting for the %s lock', async boundary => {
+    const f = await pending();
+    let acquired!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const held = withFileLock(boundary === 'task' ? taskOperationLockPath(f.task.task_id)
+      : roomCloseLockPath(f.roomId), async () => { acquired(); await gate; });
+    await ready;
+    const reconciliation = reconcileExistingTaskMembers(f.input);
+    const rejected = expect(reconciliation).rejects.toThrow(/not open/);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (boundary === 'task') beginTaskTerminalIntent(f.task.task_id, { kind: 'cancelled', roomId: f.roomId });
+    else beginRoomClose(f.roomId);
+    const before = getRoomRecord(f.roomId);
+    release();
+    await held;
+    await rejected;
+    expect(getRoomRecord(f.roomId)).toEqual(before);
+    expect(getTask(f.task.task_id).member_roles).toEqual([]);
+    noLifecycle(f.h);
+  });
+  it.each(['stopped', 'unknown', 'cid', 'launch', 'roster', 'remote', 'terminal'])(
+    'refuses %s evidence without changing room seats or launching replacements', async failure => {
+      const f = await pending();
+      if (failure === 'stopped' || failure === 'unknown') mocks.tempLiveness.mockResolvedValue(failure);
+      if (failure === 'cid') f.input.expectedLaunches[1].identity_cid = 'wrong-cid';
+      if (failure === 'launch') f.input.expectedLaunches[1].launch_id = 'wrong-launch';
+      if (failure === 'roster') f.input.expectedLaunches.pop();
+      if (failure === 'remote') vi.mocked(f.h.cowork.getRoom).mockResolvedValue(undefined);
+      if (failure === 'terminal') beginTaskTerminalIntent(f.task.task_id, { kind: 'cancelled', roomId: f.roomId });
+      const before = getRoomRecord(f.roomId);
+      await expect(reconcileExistingTaskMembers(f.input)).rejects.toThrow();
+      expect(getRoomRecord(f.roomId)).toEqual(before);
+      expect(getTask(f.task.task_id).member_roles).toEqual([]);
+      noLifecycle(f.h);
+    });
 });
