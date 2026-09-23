@@ -25,7 +25,7 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
   tempArchiveForCreationAction: mocks.archiveForAction,
 }));
 
-import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { provisionMembers, reconcileExistingTaskMembers } from '../src/rooms-tasks/provision.js';
 import { roomCloseLockPath } from '../src/rooms-tasks/close.js';
 import { taskOperationLockPath } from '../src/rooms-tasks/terminal.js';
 import { withFileLock } from '../src/atomic-file.js';
@@ -813,4 +813,62 @@ describe('simple Cowork room member startup', () => {
       monitor: { mode: 'fleet', interrupt: true },
     });
   });
+});
+
+
+describe('existing-member reconciliation without launch effects', () => {
+  async function pending() {
+    const task = createTask({ title: 'Recover', origin: { type: 'cli' } });
+    const roomId = 'room-existing-only';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
+    updateTaskRoom(task.task_id, roomId, 'room-cid');
+    const h = coworkHarness({ acceptOnSpawn: false });
+    await provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId, taskId: task.task_id,
+      template: template(2), binPath: '/fleet', startupWait: { timeoutMs: 0 } });
+    h.acceptAll();
+    const expectedLaunches = getRoomRecord(roomId)!.member_seats.map(seat => ({
+      role_name: seat.role_name, launch_id: seat.launch!.launch_id!, identity_cid: `cid-${seat.role_name}`,
+    }));
+    vi.clearAllMocks();
+    return { h, roomId, task, input: { taskId: task.task_id, cowork: h.cowork, expectedLaunches } };
+  }
+  function noLifecycle(h: ReturnType<typeof coworkHarness>) {
+    expect(mocks.spawnTemp).not.toHaveBeenCalled();
+    expect(mocks.controlRequest).not.toHaveBeenCalled();
+    expect(mocks.secureArchive).not.toHaveBeenCalled();
+    expect(h.issueInvite).not.toHaveBeenCalled();
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+    expect(h.cowork.recoverRoom).not.toHaveBeenCalled();
+  }
+  it('activates only proven existing seats and safely repeats after completion', async () => {
+    const f = await pending();
+    const before = getRoomRecord(f.roomId)!.member_seats.map(seat => seat.launch);
+    const prior = getRoomRecord(f.roomId);
+    await reconcileExistingTaskMembers({ ...f.input, checkOnly: true });
+    expect(getRoomRecord(f.roomId)).toEqual(prior);
+    expect(getTask(f.task.task_id).member_roles).toEqual([]);
+    const result = await reconcileExistingTaskMembers(f.input);
+    expect(result.state).toBe('active');
+    expect(result.member_seats.every(seat => seat.seat_state === 'active')).toBe(true);
+    expect(result.member_seats.map(seat => seat.launch)).toEqual(before);
+    expect(getTask(f.task.task_id).member_roles).toHaveLength(2);
+    expect(getTask(f.task.task_id).state).toBe('active');
+    await reconcileExistingTaskMembers(f.input);
+    noLifecycle(f.h);
+  });
+  it.each(['stopped', 'unknown', 'cid', 'launch', 'roster', 'remote', 'terminal'])(
+    'refuses %s evidence without changing room seats or launching replacements', async failure => {
+      const f = await pending();
+      if (failure === 'stopped' || failure === 'unknown') mocks.tempLiveness.mockResolvedValue(failure);
+      if (failure === 'cid') f.input.expectedLaunches[1].identity_cid = 'wrong-cid';
+      if (failure === 'launch') f.input.expectedLaunches[1].launch_id = 'wrong-launch';
+      if (failure === 'roster') f.input.expectedLaunches.pop();
+      if (failure === 'remote') vi.mocked(f.h.cowork.getRoom).mockResolvedValue(undefined);
+      if (failure === 'terminal') beginTaskTerminalIntent(f.task.task_id, { kind: 'cancelled', roomId: f.roomId });
+      const before = getRoomRecord(f.roomId);
+      await expect(reconcileExistingTaskMembers(f.input)).rejects.toThrow();
+      expect(getRoomRecord(f.roomId)).toEqual(before);
+      expect(getTask(f.task.task_id).member_roles).toEqual([]);
+      noLifecycle(f.h);
+    });
 });

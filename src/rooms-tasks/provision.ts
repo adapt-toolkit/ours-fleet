@@ -239,7 +239,7 @@ function roomTask(
 
 function launchMatches(
   dir: string,
-  member: ExpandedMember,
+  member: Pick<ExpandedMember, 'name' | 'coworkRole'>,
   actionId: string,
   taskSha: string,
   roomId: string,
@@ -714,6 +714,79 @@ export async function provisionMembers(
   const record = activateRoom(roomId);
   if (taskId) activateTask(taskId);
   return record;
+}
+
+/** Reconcile proven, admitted launches without any spawn, archive, invite or recovery path. */
+export async function reconcileExistingTaskMembers(input: {
+  taskId: string;
+  checkOnly?: boolean;
+  cowork: Pick<CoworkAdapter, 'getRoom'>;
+  expectedLaunches: ReadonlyArray<{ role_name: string; launch_id: string; identity_cid: string }>;
+}): Promise<RoomOrchestrationRecord> {
+  return withFileLock(taskOperationLockPath(input.taskId), async () => {
+    const task = getTask(input.taskId);
+    if (!['provisioning', 'active'].includes(task.state) || task.terminal_intent || taskDeletionState(input.taskId) !== 'none'
+      || !task.room_id) throw new Error('task is not open for existing-member reconciliation');
+    const roomId = task.room_id;
+    return withFileLock(roomCloseLockPath(roomId), async () => {
+      const current = getRoomRecord(roomId);
+      if (!current || !['provisioning', 'active'].includes(current.state) || current.close
+        || current.task_id !== input.taskId || !current.room_identity_cid
+        || task.room_identity_cid !== current.room_identity_cid)
+        throw new Error('room is not open for existing-member reconciliation');
+      const names = new Set(input.expectedLaunches.map(seat => seat.role_name));
+      if (!names.size || names.size !== input.expectedLaunches.length
+        || current.member_seats.length !== names.size
+        || current.member_seats.some(seat => !names.has(seat.role_name)))
+        throw new Error('expected launch roster does not match the persisted room');
+      const remote = await input.cowork.getRoom(roomId);
+      if (!remote || remote.room_id !== roomId || remote.identity_cid !== current.room_identity_cid
+        || remote.state !== 'active') throw new Error('Cowork room is not the exact active room');
+      assertCoworkRoomPolicy(remote, storedRoomLaunchPolicy(current.room_policy).anonymous);
+      if (current.owner_seat_cid && !remote.seats.some(seat =>
+        seat.identity_cid === current.owner_seat_cid && seat.seat_state === 'active'))
+        throw new Error('expected Owner seat is not active');
+      const seats: RoomMemberSeat[] = [];
+      for (const seat of current.member_seats) {
+        const expected = input.expectedLaunches.find(item => item.role_name === seat.role_name)!;
+        const launch = seat.launch;
+        if (seat.seat_state === 'removed' || !seat.invite_id || launch?.state !== 'launched'
+          || launch.launch_id !== expected.launch_id || !launch.action_id || !launch.mission_sha256
+          || (seat.identity_cid && seat.identity_cid !== expected.identity_cid))
+          throw new Error('persisted member launch does not match reconciliation evidence');
+        const dir = agentDir(seat.role_name, true);
+        if (!launchMatches(dir, { name: seat.role_name, coworkRole: seat.cowork_role },
+          launch.action_id, launch.mission_sha256, roomId, current.room_identity_cid,
+          seat.invite_id, storedRoomLaunchPolicy(current.room_policy).anonymous))
+          throw new Error('member startup provenance mismatch');
+        const supervisor = readTempSupervisor(dir);
+        if (!supervisor || supervisor.role !== seat.role_name || supervisor.launchId !== expected.launch_id
+          || await tempSupervisorLiveness(dir) !== 'running')
+          throw new Error('expected member supervisor is not running');
+        const ready = readRoomReadiness(current.room_identity_cid, seat.role_name);
+        const matches = remote.seats.filter(item => item.display_name === seat.role_name
+          && item.seat_state !== 'removed');
+        const found = matches[0];
+        if (!ready || ready.room !== roomId || ready.invite !== seat.invite_id
+          || ready.cid !== expected.identity_cid || matches.length !== 1 || !found
+          || found.identity_cid !== expected.identity_cid || found.role !== seat.cowork_role
+          || found.seat_state !== 'active' || found.invite_id !== seat.invite_id)
+          throw new Error('member readiness or authenticated Cowork seat mismatch');
+        seats.push({ ...seat, identity_cid: expected.identity_cid, seat_state: 'active' });
+      }
+      if (input.checkOnly) return current;
+      // No mutation until the complete roster has passed; these writes are replayable
+      // under the same task/room lifecycle locks if interrupted between files.
+      updateMemberSeats(roomId, seats);
+      updateTaskMembers(input.taskId, seats.map(seat => ({ name: seat.role_name,
+        identity_cid: seat.identity_cid!, slot: seat.slot, cowork_role: seat.cowork_role })));
+      if (getTask(input.taskId).blocked) unblockTask(input.taskId);
+      if (current.state !== 'active') advanceSaga(roomId, 'activate', 6);
+      const activated = current.state === 'active' ? getRoomRecord(roomId)! : activateRoom(roomId);
+      if (task.state !== 'active') activateTask(input.taskId);
+      return activated;
+    }, {}, TASK_OPERATION_LOCK_STALE_MS);
+  }, {}, TASK_OPERATION_LOCK_STALE_MS);
 }
 
 export async function cleanupMembers(input: {
