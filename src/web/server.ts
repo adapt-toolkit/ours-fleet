@@ -1,3 +1,4 @@
+import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,6 +48,7 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
+  oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
 }
 
 export interface WebServer {
@@ -100,7 +102,11 @@ export async function buildWebServer(
   });
 
   app.setErrorHandler(async (error, request, reply) => {
-    const fleetError = normalizeError(error, request.id);
+    const privateToolParseError = request.routeOptions.url === '/api/v1/roles/:id/ours/call'
+      && error instanceof Error && 'code' in error
+      && typeof error.code === 'string' && error.code.startsWith('FST_ERR_CTP_');
+    const fleetError = normalizeError(privateToolParseError
+      ? new FleetError('invalid_request', 'expected a valid JSON tool request') : error, request.id);
     await audit.record({
       requestId: request.id, action: `${request.method} ${request.routeOptions.url ?? request.url}`,
       result: 'rejected', errorCode: fleetError.code,
@@ -379,6 +385,19 @@ export async function buildWebServer(
     await audit.record({
       requestId: request.id, browser: session.id, action: 'topology.promote', result: 'succeeded',
     });
+    return result;
+  });
+
+  const oursTools = services.oursTools ?? new SupervisorOursTools();
+  app.get<{ Params: { id: string } }>('/api/v1/roles/:id/ours/tools', async request => {
+    auth.authenticate(request);
+    return oursTools.list(request.params.id);
+  });
+  app.post<{ Params: { id: string }; Body: SupervisorToolRequest }>('/api/v1/roles/:id/ours/call', async request => {
+    const session = auth.authenticate(request, true);
+    const result = await oursTools.call(request.params.id, request.body);
+    await audit.record({ requestId: request.id, browser: session.id,
+      action: 'ours.call', result: 'succeeded' });
     return result;
   });
 

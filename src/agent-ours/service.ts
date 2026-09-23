@@ -252,7 +252,7 @@ export async function prepareManagedAgent(
     });
     partialEndpoint = endpoint;
     const descriptor = join(bridgeDir, 'descriptor.json');
-    atomicPrivateWrite(descriptor, { socket, capability, generation });
+    atomicPrivateWrite(descriptor, { socket, capability, generation, role: role.name, identity: role.identity, cid: runtime.snapshot.cid });
     return {
       runtime,
       descriptor,

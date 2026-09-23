@@ -1710,3 +1710,39 @@ Explicit Cowork socket, config or state-directory overrides continue to select
 local Unix management. Profiles without `serverUrl` retain legacy behavior. The
 HTTP API grants operator room authority; use the installer's supported private
 or authenticated external gateway entry, and keep its backend ports private.
+
+### Agent ours tools through the supervisor
+
+Operators can invoke the running agent's ordinary ours MCP tools without sending
+an LLM prompt or binding another session to its identity:
+
+```sh
+ours-fleet ours tools Critic1
+ours-fleet ours call Critic1 current_identity
+ours-fleet ours call Critic1 list_contacts
+ours-fleet ours call Critic1 generate_invite --args-file /private/invite-options.json
+ours-fleet ours call Critic1 add_contact --args-file /private/contact.json
+```
+
+`tools` returns the managed MCP tool names and argument schemas, plus the selected
+agent's identity name, CID, and supervisor generation. `call` returns the same
+identity metadata and the MCP result. The private JSON file contains the tool's
+arguments (for example `{"invite":"…"}` for `add_contact`); omitted arguments mean
+`{}`. Protect files containing invites and protect command output containing a
+new invite. Tool errors set a nonzero CLI exit status.
+
+The authenticated REST equivalents are `GET /api/v1/roles/:id/ours/tools` and
+`POST /api/v1/roles/:id/ours/call`, with the normal Fleet session and CSRF token.
+The POST body is `{"tool":"list_contacts","arguments":{}}`. MCP tool errors
+remain in `result.isError`; transport failures use the normal Fleet error envelope.
+Request arguments and results are excluded from the Fleet audit log.
+
+Both interfaces use the supervisor's existing fixed-identity MCP server and tool
+policy. Identity creation, removal, switching, and binding are not exposed. The
+supervisor must be running and publish current identity metadata; missing,
+ambiguous, stale, or mismatched endpoints fail closed. Closing an operator call
+retains the supervisor's identity. An interrupted mutation can have an unknown
+outcome: inspect state before retrying, because there is no automatic retry or
+exactly-once guarantee. Contact acceptance alone does not prove peer verification
+or message delivery. File tools resolve paths in the invoking CLI process or
+Fleet web server's filesystem context, with that process's access permissions.

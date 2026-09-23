@@ -7,6 +7,7 @@ import { createServer } from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { SupervisorOursTools } from '../dist/application/supervisor-ours-tools.js';
 import { attachOursClient } from '@ours.network/sdk/client';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -104,8 +105,9 @@ try {
     sourceFile: 'test',
     env: { OURS_CONFIG: profile },
   };
-  const dir = join(root, 'agent');
-  mkdirSync(dir);
+  const dir = join(process.env.OURS_FLEET_HOME, '.ours-fleet', 'tmp', 'Agent');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, '.identity'), 'Agent');
   storeTemporaryLaunch(role, 'one');
   managed = await prepareManagedAgent(role, dir, true);
   const cid = managed.runtime.snapshot.cid;
@@ -125,6 +127,12 @@ try {
     assert(JSON.stringify(identity).includes(cid));
   };
   await managed.runtime.startHarness(connect);
+  const tools = new SupervisorOursTools();
+  assert.equal((await tools.list('Agent')).identity.cid, cid);
+  assert.equal((await tools.call('Agent', { tool: 'current_identity' })).result.isError, false);
+  assert.equal((await tools.call('Agent', { tool: 'generate_invite' })).result.isError, false);
+  await assert.rejects(() => tools.call('Agent', { tool: 'choose_identity', arguments: { name: 'TestRoot' } }), /not exposed/);
+  assert.equal((await tools.list('Agent')).identity.cid, cid);
   await mcp.close();
   mcp = undefined;
   await managed.close(false);

@@ -15,6 +15,11 @@ export async function runBridge(descriptorPath: string): Promise<void> {
     !Number.isInteger(descriptor.generation)
   )
     throw Error('INVALID_BRIDGE_DESCRIPTOR');
+  if (process.env.FLEET_OURS_BRIDGE_EXPECTED) {
+    const expected = JSON.parse(process.env.FLEET_OURS_BRIDGE_EXPECTED);
+    if (['role', 'identity', 'cid', 'generation'].some(key => descriptor[key] !== expected[key]))
+      throw Error('SUPERVISOR_SELECTION_CHANGED');
+  }
   const wire = new Wire(connect(descriptor.socket));
   const handles = new Map<string, { file: FileHandle; call: string; write: boolean }>();
   const cleanup = async () => {
