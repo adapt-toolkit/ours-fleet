@@ -31,7 +31,7 @@ import { taskOperationLockPath } from '../src/rooms-tasks/terminal.js';
 import { withFileLock } from '../src/atomic-file.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
+import { activateRoom, beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
 import { beginTaskTerminalIntent, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
@@ -853,7 +853,41 @@ describe('existing-member reconciliation without launch effects', () => {
     expect(result.member_seats.map(seat => seat.launch)).toEqual(before);
     expect(getTask(f.task.task_id).member_roles).toHaveLength(2);
     expect(getTask(f.task.task_id).state).toBe('active');
+    const completedRoom = getRoomRecord(f.roomId);
+    const completedTask = getTask(f.task.task_id);
     await reconcileExistingTaskMembers(f.input);
+    expect(getRoomRecord(f.roomId)).toEqual(completedRoom);
+    expect(getTask(f.task.task_id)).toEqual(completedTask);
+    noLifecycle(f.h);
+  });
+  it('resumes interruption after room activation without rewriting activation evidence', async () => {
+    const f = await pending();
+    const active = activateRoom(f.roomId);
+    await reconcileExistingTaskMembers(f.input);
+    expect(getRoomRecord(f.roomId)!.activated_at).toBe(active.activated_at);
+    expect(getRoomRecord(f.roomId)!.saga.phase).toBe('completed');
+    expect(getTask(f.task.task_id).state).toBe('active');
+    noLifecycle(f.h);
+  });
+  it.each(['task', 'room'])('rechecks terminal fences after waiting for the %s lock', async boundary => {
+    const f = await pending();
+    let acquired!: () => void, release!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const held = withFileLock(boundary === 'task' ? taskOperationLockPath(f.task.task_id)
+      : roomCloseLockPath(f.roomId), async () => { acquired(); await gate; });
+    await ready;
+    const reconciliation = reconcileExistingTaskMembers(f.input);
+    const rejected = expect(reconciliation).rejects.toThrow(/not open/);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (boundary === 'task') beginTaskTerminalIntent(f.task.task_id, { kind: 'cancelled', roomId: f.roomId });
+    else beginRoomClose(f.roomId);
+    const before = getRoomRecord(f.roomId);
+    release();
+    await held;
+    await rejected;
+    expect(getRoomRecord(f.roomId)).toEqual(before);
+    expect(getTask(f.task.task_id).member_roles).toEqual([]);
     noLifecycle(f.h);
   });
   it.each(['stopped', 'unknown', 'cid', 'launch', 'roster', 'remote', 'terminal'])(
