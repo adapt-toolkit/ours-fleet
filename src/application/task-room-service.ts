@@ -771,9 +771,7 @@ export class TaskRoomApplicationService {
     else createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
     const room = getRoomRecord(input.roomId);
     if (!room) {
-      throw new TaskRoomApplicationError(
-        'room_record_not_found', 'room record not found', { room: input.roomId },
-      );
+      return { room: undefined, settlementRequired: true as const };
     }
     return { room: await acceptManagedRoomClose(input.roomId), settlementRequired: true as const };
   }

@@ -1,3 +1,4 @@
+import { eraseMemberArtifacts } from './erasure.js';
 import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
@@ -7,7 +8,7 @@ import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
 import { collectWorkspaceArchives } from './workspace-artifacts.js';
 import { secureStoppedTempArchive, stopTempSupervisor } from '../temp-lifecycle.js';
 import {
-  closeManagedRoom, identityCidPresent, inspectMember, removeExactMemberIdentity,
+  closeManagedRoom, identityCidPresent, inspectMember, assertMemberIdentityAbsent, removeExactMemberIdentity,
   waitForLivenessAbsent, type RoomCloseDeps,
 } from './close.js';
 import { CoworkProtocolError, type CoworkAdapter } from './cowork-adapter.js';
@@ -15,7 +16,7 @@ import { deleteRoomRecord, getRoomRecord, listRoomRecords } from './room-state.j
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshotForDeletingTask } from './launch-snapshot.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import {
-  advanceTaskDeletionMember, beginTaskDeletionIntent, completeTaskDeletionReceipt,
+  advanceTaskDeletionMember, settleAbsentTaskDeletionMember, beginTaskDeletionIntent, completeTaskDeletionReceipt,
   ensureTaskDeletionReceipt, getDeletingTask, importTaskDeletionRetirementEvidence,
   setTaskDeletionError, TaskStateError, beginTaskWorkspaceCleanup,
   unlinkDeletedTask, upsertTaskDeletionMembersFromSeats,
@@ -28,7 +29,7 @@ import type {
 export { DELETION_MEMBER_ABSENT_VERIFIED } from './task-state.js';
 import { DELETION_MEMBER_ABSENT_VERIFIED } from './task-state.js';
 
-type DeletionCowork = Pick<CoworkAdapter, 'closeRoom' | 'deleteRoom'>;
+type DeletionCowork = Pick<CoworkAdapter, 'closeRoom' | 'deleteRoom'> & Partial<Pick<CoworkAdapter, 'getRoom'>>;
 
 export interface TaskDeletionSettleDeps {
   roomClose?: RoomCloseDeps;
@@ -90,6 +91,7 @@ function tolerantCowork(cowork: DeletionCowork): DeletionCowork {
     }
   };
   return {
+    ...(cowork.getRoom ? { getRoom: cowork.getRoom.bind(cowork) } : {}),
     closeRoom: roomId => tolerate(() => cowork.closeRoom(roomId)),
     deleteRoom: roomId => tolerate(() => cowork.deleteRoom(roomId)),
   };
@@ -99,6 +101,7 @@ function cursorSeat(cursor: TaskDeletionMemberCursor): RoomMemberSeat {
   return {
     role_name: cursor.name, identity_cid: cursor.identity_cid,
     slot: cursor.name, cowork_role: 'member', seat_state: 'active',
+    ...(cursor.launch_id ? { retirement: { phase: 'identity_absent' as const, launch_id: cursor.launch_id, archive_path: cursor.archive_path, updated_at: cursor.updated_at } } : {}),
   };
 }
 
@@ -114,7 +117,15 @@ async function retireCursorMember(
 ): Promise<void> {
   let phase = cursor.phase;
   let launchId = cursor.launch_id;
-  if (phase === 'identity_absent') return;
+  if (phase === 'identity_absent') {
+    if (!deps.roomClose?.inspectMember) {
+      if ((deps.hasTempState ?? (name => existsSync(agentDir(name, true))))(cursor.name))
+        throw new Error('Retired deletion member has replacement live state');
+      if (await (deps.identityCidPresent ?? identityCidPresent)(cursor.identity_cid))
+        throw new Error('Retired deletion member identity reappeared');
+    }
+    return;
+  }
   const seat = cursorSeat(cursor);
   const roomClose = deps.roomClose ?? {};
 
@@ -141,7 +152,16 @@ async function retireCursorMember(
     phase = 'stop_requested'; launchId = ownership.launchId;
   }
 
+  if (!roomClose.inspectMember && !existsSync(agentDir(cursor.name, true))) {
+    await (roomClose.removeIdentity ?? removeExactMemberIdentity)(seat);
+    if (existsSync(agentDir(cursor.name, true))) throw new Error('Deletion member acquired replacement state');
+    settleAbsentTaskDeletionMember(taskId, cursor.name);
+    return;
+  }
+
   if (phase === 'stop_requested') {
+    if (!roomClose.inspectMember && (await inspectMember(seat)).launchId !== launchId)
+      throw new Error('Deletion member launch changed before stop');
     await (roomClose.requestStop
       ?? (async (role: string) => { await stopTempSupervisor(role); }))(cursor.name);
     await (roomClose.waitForLivenessAbsent ?? waitForLivenessAbsent)(cursor.name, launchId!);
@@ -209,8 +229,6 @@ export async function settleTaskDeletion(input: {
       // aborts settlement (fail closed).
       ensureTaskDeletionReceipt(taskId);
       const records = listRoomRecords().filter(room => room.task_id === taskId);
-      if (task.deletion.workspace_cleanup_started_at && records.length)
-        throw new TaskStateError(`task ${taskId} room records reappeared after workspace cleanup began`);
       const recordIds = new Set(records.map(room => room.room_id));
       const recordedRoomId = task.deletion.room_id ?? task.room_id;
       const needsCowork = records.length > 0 || recordedRoomId !== undefined;
@@ -223,8 +241,13 @@ export async function settleTaskDeletion(input: {
         const seats = closed?.member_seats ?? record.member_seats;
         const proofs = [];
         for (const seat of seats) {
-          if (!seat.identity_cid && seat.retirement?.launch_id !== 'never-launched')
-            proofs.push(await proveArchivedAbsence(seat));
+          if (!seat.identity_cid && !seat.retirement?.absence_verified && !['never-launched', 'absent-verified'].includes(seat.retirement?.launch_id ?? ''))
+            {
+              const prior = task.deletion.archived_absences?.find(proof => proof.name === seat.role_name);
+              if (task.deletion.workspace_cleanup_started_at && prior && !existsSync(prior.archive_path)) {
+                await verifyArchivedMemberStillAbsent(prior); proofs.push(prior);
+              } else proofs.push(await proveArchivedAbsence(seat));
+            }
         }
         // No await between the last live-state fence and durable checkpoint.
         for (const proof of proofs) {
@@ -235,7 +258,10 @@ export async function settleTaskDeletion(input: {
         }
         importTaskDeletionRetirementEvidence(taskId, seats, proofs);
         await cowork!.deleteRoom(record.room_id);
-        for (const proof of proofs) await verifyArchivedAbsence(proof);
+        for (const proof of proofs)
+          await (task.deletion.workspace_cleanup_started_at && !existsSync(proof.archive_path) ? verifyArchivedMemberStillAbsent : verifyArchivedAbsence)(proof);
+        beginTaskWorkspaceCleanup(taskId);
+        await eraseMemberArtifacts('room', record.room_id, seats, [record.room_id]);
         for (const proof of proofs)
           if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before room unlink');
         deleteRoomRecord(record.room_id);
@@ -286,8 +312,14 @@ export async function settleTaskDeletion(input: {
         await (task.deletion.workspace_cleanup_started_at && !existsSync(proof.archive_path) ? verifyArchivedMemberStillAbsent : verifyArchivedAbsence)(proof);
       for (const proof of task.deletion.archived_absences ?? [])
         if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before task unlink');
+      for (const name of task.deletion.absent_members ?? []) {
+        if (existsSync(agentDir(name, true))) throw new Error('Absent member acquired replacement state');
+        await assertMemberIdentityAbsent({ role_name: name, slot: name, cowork_role: 'member', seat_state: 'removed' });
+      }
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
+      await eraseMemberArtifacts('task', taskId, task.deletion.members.map(cursorSeat),
+        task.deletion.room_id ? [task.deletion.room_id] : []);
       if (task.workspace) {
         assertWorkspaceDeletable(task.workspace, 'task', taskId);
         beginTaskWorkspaceCleanup(taskId);

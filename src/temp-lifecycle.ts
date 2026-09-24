@@ -3,7 +3,7 @@ import {
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
-import { replaceFileAtomically, withFileLock } from './atomic-file.js';
+import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
@@ -184,6 +184,7 @@ function appendTermination(dir: string, record: TempTerminationRecord): void {
 }
 
 function appendGlobalTermination(line: string, checkExisting = false): void {
+  withSynchronousFileLock(join(stateRoot(), 'locks', 'termination-journal'), () => {
   mkdirSync(archiveRoot(), { recursive: true, mode: 0o700 });
   const path = join(archiveRoot(), 'terminations.jsonl');
   // Recovery may revisit a .retiring directory after a crash between the
@@ -193,6 +194,21 @@ function appendGlobalTermination(line: string, checkExisting = false): void {
     catch { /* the journal does not exist yet */ }
   }
   appendFileSync(path, line, { mode: 0o600 });
+  });
+}
+
+/** Explicit erasure removes only exact retired role/launch events. */
+export function eraseTerminationEvents(launches: ReadonlyArray<{ role: string; launchId: string }>): void {
+  withSynchronousFileLock(join(stateRoot(), 'locks', 'termination-journal'), () => {
+    const path = join(archiveRoot(), 'terminations.jsonl');
+    if (!existsSync(path)) return;
+    const lines = readFileSync(path, 'utf8').split('\n').filter(Boolean);
+    const kept = lines.filter(line => {
+      const row = JSON.parse(line);
+      return !launches.some(launch => launch.role === row.role && launch.launchId === row.launchId);
+    });
+    replaceFileAtomically(path, kept.length ? kept.join('\n') + '\n' : '');
+  });
 }
 
 /** Pick a sibling path without overwriting evidence from an earlier attempt. */

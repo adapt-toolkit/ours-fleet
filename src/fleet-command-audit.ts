@@ -1,3 +1,4 @@
+import { erasedArg, redactErasedContent, writePrivacyFilteredLedger } from './erased-resources.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
@@ -118,7 +119,7 @@ export function recordFleetAuditPresentation(value: FleetAuditPresentationInput)
         : value.kind === 'lifecycle_failure'
           ? { label: fleetPresentationLabel(value.label) }
           : {};
-    const presentation = structuredClone({ ...value, ...labels, eventId: basis }) as FleetAuditPresentation;
+    const presentation = redactErasedContent(structuredClone({ ...value, ...labels, eventId: basis })) as FleetAuditPresentation;
     const digest = lifecycleEventDigestBasis(presentation);
     if (!collection.presentations.some(existing => lifecycleEventDigestBasis(existing) === digest))
       collection.presentations.push(presentation);
@@ -148,6 +149,7 @@ export interface FleetCommandClassification {
 }
 
 export interface FleetAuditAttempt {
+  erased?: boolean;
   version: 1;
   correlationId: string;
   requestId: string;
@@ -315,11 +317,12 @@ export class FleetCommandAuditStore {
     }
     if (recovered) this.persist();
   }
-  list(): readonly FleetAuditAttempt[] { return this.attempts.map(item => structuredClone(item)); }
+  list(): readonly FleetAuditAttempt[] { return redactErasedContent(this.attempts).map(item => structuredClone(item)); }
   begin(requestId: string, caller: string, argv: readonly string[]): FleetAuditAttempt {
+    this.attempts = redactErasedContent(this.attempts);
     const existing = this.attempts.find(item => item.caller === caller && item.requestId === requestId);
     if (existing) {
-      if (JSON.stringify(existing.argv) !== JSON.stringify(redactFleetArgv(argv)))
+      if (JSON.stringify(existing.argv) !== JSON.stringify(existing.erased ? redactFleetArgv(argv).map(erasedArg) : redactFleetArgv(argv)))
         throw new Error('fleet command request ID was reused with different argv');
       return structuredClone(existing);
     }
@@ -336,6 +339,8 @@ export class FleetCommandAuditStore {
     return structuredClone(attempt);
   }
   finish(correlationId: string, caller: string, outcome: Omit<NonNullable<FleetAuditAttempt['outcome']>, 'completedAt' | 'delivery'>): FleetAuditAttempt {
+    this.attempts = redactErasedContent(this.attempts);
+    outcome = redactErasedContent({ outcome }).outcome;
     const attempt = this.owned(correlationId, caller);
     if (!attempt.outcome) attempt.outcome = { ...outcome, completedAt: this.deps.now().toISOString(), delivery: 'sending' };
     else {
@@ -361,7 +366,8 @@ export class FleetCommandAuditStore {
     return attempt;
   }
   private persist(): void {
-    replaceFileAtomically(this.path, `${JSON.stringify({ version: 1, attempts: this.attempts } satisfies AuditFile)}\n`, 0o600);
+    this.attempts = redactErasedContent(this.attempts);
+    writePrivacyFilteredLedger(this.path, { version: 1, attempts: this.attempts } satisfies AuditFile);
   }
 }
 

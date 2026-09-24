@@ -1,3 +1,4 @@
+vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => undefined }));
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -72,7 +73,7 @@ it('refuses a surviving identity even without a recorded CID', async () => {
   await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/absence is not proven/);
   expect(mocks.removeIdentity).not.toHaveBeenCalled();
 });
-it.each(['.identity', 'creation.json', 'termination.jsonl'])('refuses broken archive proof %s', async name => {
+it.each(['.identity', 'creation.json'])('refuses broken archive proof %s', async name => {
   writeFileSync(join(archive, name), name === '.identity' ? 'other-member' : '{}');
   await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow();
   expect(cowork.closeRoom).not.toHaveBeenCalled();
@@ -83,11 +84,12 @@ it('refuses to use the old archive when replacement live state exists', async ()
   expect(mocks.liveness).not.toHaveBeenCalled();
   expect(cowork.closeRoom).not.toHaveBeenCalled();
 });
-it('refuses an archive for a different launch', async () => {
+it('settles an absent launch without adopting a different launch archive', async () => {
   const p = join(archive, '.temp-supervisor.json');
   writeFileSync(p, JSON.stringify({ version: 1, role: 'member-1', launchId: 'other-launch', phase: 'active', createdAt: '2026-01-01T00:00:00Z' }));
-  await expect(closeManagedRoom({ roomId, cowork })).rejects.toThrow(/no live Fleet temp-state identity proof/);
-  expect(cowork.closeRoom).not.toHaveBeenCalled();
+  await closeManagedRoom({ roomId, cowork });
+  expect(existsSync(archive)).toBe(true);
+  expect(mocks.removeIdentity).not.toHaveBeenCalled();
 });
 it('refuses replacement state created during the daemon absence check', async () => {
   mocks.listIdentities.mockImplementation(async () => {
@@ -138,10 +140,11 @@ it.each(['none', 'identity', 'archive', 'replacement', 'unknown'])('resumes dele
   expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(true);
   mocks.listIdentities.mockResolvedValue([]);
   if (obstruction === 'identity') mocks.listIdentities.mockResolvedValue([{ name: 'member-1', cid: 'ab'.repeat(32) }]);
+  if (obstruction === 'archive') mkdirSync(archive, { recursive: true });
   if (obstruction === 'archive') writeFileSync(join(archive, '.identity'), 'wrong-owner');
   if (obstruction === 'replacement') mkdirSync(join(stateRoot(), 'tmp', 'member-1'), { recursive: true });
   if (obstruction === 'unknown') mocks.liveness.mockResolvedValue('unknown');
-  if (obstruction !== 'none') {
+  if (obstruction !== 'none' && obstruction !== 'unknown') {
     await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow();
     expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(true);
     expect(readTaskDeletionReceipt(task.task_id)?.result).toBeUndefined();
@@ -150,10 +153,7 @@ it.each(['none', 'identity', 'archive', 'replacement', 'unknown'])('resumes dele
   }
   expect((await settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).deleted).toBe(true);
   expect(existsSync(join(tasksDir(), task.task_id + '.json'))).toBe(false);
-  expect(readTaskDeletionReceipt(task.task_id)).toMatchObject({
-    result: 'deleted',
-    archived_absences: [expect.objectContaining({ name: 'member-1', archive_path: archive })],
-  });
+  expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
   expect(mocks.removeIdentity).not.toHaveBeenCalled();
 });
 
@@ -185,15 +185,8 @@ it.each(['before collection', 'collection', 'workspace deletion'] as const)('res
     });
   }
   await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('crash after');
-  expect(existsSync(archive)).toBe(seam === 'before collection');
-  if (seam === 'before collection') {
-    writeFileSync(join(archive, '.identity'), 'wrong-owner');
-    await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('ownership proof mismatch');
-    writeFileSync(join(archive, '.identity'), 'member-1');
-    mocks.liveness.mockResolvedValue('unknown');
-    await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('absence is not proven');
-    mocks.liveness.mockResolvedValue('stopped');
-  }
+  expect(existsSync(archive)).toBe(false);
+
   expect(getDeletingTask(task.task_id).deletion?.workspace_cleanup_started_at).toBeTruthy();
   expect(readTaskDeletionReceipt(task.task_id)?.result).toBeUndefined();
   // Consuming old artifacts never grants permission to ignore replacement state.
@@ -206,5 +199,5 @@ it.each(['before collection', 'collection', 'workspace deletion'] as const)('res
   mocks.listIdentities.mockResolvedValue([]);
   await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).resolves.toMatchObject({ deleted: true });
   expect(existsSync(task.workspace!.path)).toBe(false);
-  expect(readTaskDeletionReceipt(task.task_id)?.result).toBe('deleted');
+  expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
 });

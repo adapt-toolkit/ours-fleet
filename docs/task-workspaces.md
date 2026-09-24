@@ -52,8 +52,21 @@ matching archived launches, including failed and replaced attempts, using the
 workspace descriptor plus role and termination/launch evidence. It preflights
 these archives and atomically transfers them to `.fleet-retired-agents` in the
 workspace before removal. Unrelated archives are not adopted by a name prefix.
-Fleet audit receipts, creation/termination journals and shared infrastructure
-logs are audit metadata and intentionally outlive Task artifact deletion.
+Explicit deletion also erases legacy archives with exact launch/action or room
+provenance, matching private supervisor journals and admission/launch descriptors,
+and the exact retired-launch rows in the global termination journal. It never
+infers ownership from an Agent's shared `cwd`. Artifact removal uses a durable
+manifest, ownership fingerprints and per-entry rename/removal checkpoints, so
+an interrupted deletion can resume without deleting a replacement at the old path.
+Task deletion acceptance receipts exist only during cleanup and are erased after
+settlement (including retry after a crash between Task unlink and receipt cleanup).
+Shared Fleet command audit and lifecycle delivery ledgers have exactly attributed
+target labels, configuration and command arguments removed; unrelated entries are
+preserved. Delivery/deduplication metadata and a content-free erased-resource ID
+registry remain so a running writer cannot resurrect erased content. Infrastructure
+logs without structured ownership, backups, and copies already delivered to other
+identities are external retention boundaries; this is not a claim to erase every
+external copy.
 
 Provisioning serializes Task operation then Room close locks, including bounded
 seat waits, so concurrent retries cannot publish competing members and deletion
@@ -96,3 +109,22 @@ remote result; this change deduplicates locally recorded rooms and does not clai
 to solve that remote transaction window. Inspect remote room ownership before
 retrying ambiguous remote creation. No services or installed Fleet code are
 changed by building or testing this feature.
+
+
+## Broken provisioning and deletion recovery
+
+Deletion accepts every lifecycle state. Missing temporary directories, identities,
+remote rooms and already-erased artifacts are settled outcomes. Retry the same
+explicit delete after an interruption. A missing local member CID is recovered
+only from a matching authenticated seat in the pinned room (exact invite and
+role, uniquely matched), or a supervisor journal tied to the selected daemon,
+temporary instance and recorded creation action. These sources must agree.
+The recovered CID is persisted before retirement consumes the evidence.
+
+A contradictory CID, replacement launch, ambiguous seat, unreadable/corrupt
+record, or unreachable authority is not evidence of absence. Cleanup retains its
+cursor and reports the conflict instead of deleting an unrelated resource or
+claiming complete erasure. An identity with no recoverable authenticated binding
+requires restoring its actual ownership evidence; a name-only force removal is
+not supported. Room deletion removes the linked Task's dead room/member links and preserves its workspace; use explicit
+Task deletion when the request includes the associated Task and its artifacts.

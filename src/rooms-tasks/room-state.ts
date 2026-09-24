@@ -15,7 +15,10 @@ import { releaseLaunchSnapshot } from './launch-snapshot.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
 
-function roomPath(id: string): string { return join(roomsDir(), `${id}.json`); }
+function roomPath(id: string): string {
+  if (!/^[a-zA-Z0-9_-]{1,120}$/.test(id)) throw new RoomStateError('Invalid room ID');
+  return join(roomsDir(), `${id}.json`);
+}
 
 export class RoomStateError extends Error {}
 
@@ -71,7 +74,10 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
 }
 
 export function getRoomRecord(id: string): RoomOrchestrationRecord | undefined {
-  try { return readRoom(id); } catch { return undefined; }
+  try { return readRoom(id); } catch (error) {
+    if (error instanceof RoomStateError && error.message === `room not found: ${id}`) return undefined;
+    throw error;
+  }
 }
 
 /** Remove a terminal orchestration record from the live room inventory. */
@@ -268,6 +274,7 @@ export function advanceMemberRetirement(
   phase: MemberRetirementPhase,
   launchId: string,
   archivePath?: string,
+  absenceVerified = false,
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
   if (r.state !== 'closing') throw new RoomStateError(`room ${id} is not closing`);
@@ -287,6 +294,7 @@ export function advanceMemberRetirement(
     );
   }
   seat.retirement = {
+    ...(absenceVerified || previous?.absence_verified ? { absence_verified: true } : {}),
     phase,
     launch_id: launchId,
     updated_at: new Date().toISOString(),
@@ -341,4 +349,21 @@ export function setRoomCloseError(
   r.close.recovery_hint = recoveryHint;
   writeRoom(r);
   return r;
+}
+
+/** Settlement-only binding recovery; never publishes a seat or changes a launch. */
+export function recordRetirementMemberCids(id: string, recovered: ReadonlyArray<RoomMemberSeat>): RoomOrchestrationRecord {
+  const room = readRoom(id);
+  if (room.state !== 'closing') throw new RoomStateError('Room is not closing');
+  for (const proof of recovered) {
+    const seat = room.member_seats.find(value => value.role_name === proof.role_name);
+    if (!seat || seat.launch?.action_id !== proof.launch?.action_id || seat.invite_id !== proof.invite_id)
+      throw new RoomStateError('Member changed during identity recovery');
+    if (!proof.identity_cid) continue;
+    if (seat.identity_cid && seat.identity_cid.toLowerCase() !== proof.identity_cid.toLowerCase())
+      throw new RoomStateError('Member identity changed during recovery');
+    seat.identity_cid = proof.identity_cid;
+  }
+  writeRoom(room);
+  return room;
 }

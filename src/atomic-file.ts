@@ -145,3 +145,35 @@ export function replaceFileAtomically(path: string, contents: string, mode = 0o6
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch { /* platform does not allow fsync on a directory */ }
 }
+
+/** Short synchronous file transaction for synchronous journal appenders. */
+export function withSynchronousFileLock<T>(path: string, work: () => T): T {
+  mkdirSync(dirname(path), { recursive: true });
+  const token = randomUUID();
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const claim = `${path}.claim.${process.pid}.${randomUUID()}`;
+    try {
+      mkdirSync(claim, { mode: 0o700 });
+      writeFileSync(join(claim, 'owner.json'), JSON.stringify({ pid: process.pid, token }));
+      renameSync(claim, path);
+      break;
+    } catch (error) {
+      rmSync(claim, { recursive: true, force: true });
+      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      let alive = true;
+      try {
+        const owner = JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8'));
+        try { process.kill(owner.pid, 0); } catch (e) { alive = (e as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      } catch { /* malformed lock is not authority to remove it */ }
+      if (!alive) { rmSync(path, { recursive: true, force: true }); continue; }
+      if (Date.now() >= deadline) throw new Error('Timed out acquiring synchronous journal lock');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try { return work(); }
+  finally {
+    const owner = JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8'));
+    if (owner.token === token) rmSync(path, { recursive: true, force: true });
+  }
+}
