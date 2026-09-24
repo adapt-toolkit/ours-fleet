@@ -665,15 +665,43 @@ describe('OwnerChannel', () => {
     expect(existsSync(join(dir, '.owner-channel-message-recovery.json'))).toBe(false);
   });
 
-  it('fails closed when a journaled message is absent from persistent history', async () => {
+  it('skips a journaled message absent from history and reads a later owner message', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
     dirs.push(dir);
-    new MessageRecoveryState(join(dir, '.owner-channel-message-recovery.json')).claim([{
+    const journalPath = join(dir, '.owner-channel-message-recovery.json');
+    new MessageRecoveryState(journalPath).claim([{
       wireId: 'missing-history-wire', seq: 12, claimedAt: 1_000,
     }]);
-    const { channel, queuePrompt } = liveSetup({ stateDir: dir });
-    await expect(channel.drain()).rejects.toThrow(/missing from persistent history/);
-    expect(queuePrompt).not.toHaveBeenCalled();
+    const next = ownerMessage(13, 'wire-after-missing-history', 'Please respond');
+    const { channel, client, queuePrompt } = setup([next], undefined, { stateDir: dir });
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(String(queuePrompt.mock.calls[0][0])).toContain('Please respond');
+    expect(new MessageRecoveryState(journalPath).list().some(
+      claim => claim.wireId === 'missing-history-wire')).toBe(false);
+    expect(client.calls).toContainEqual({
+      name: 'getHistoryItem', args: { wireId: 'missing-history-wire' },
+    });
+    const restarted = setup([], undefined, { stateDir: dir });
+    await restarted.channel.drain();
+    expect(restarted.client.calls.some(call => call.name === 'getHistoryItem'
+      && call.args?.wireId === 'missing-history-wire')).toBe(false);
+    expect(queuePrompt).toHaveBeenCalledOnce();
+  });
+
+  it('retains a recovery claim when its history lookup fails transiently', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+    dirs.push(dir);
+    const journalPath = join(dir, '.owner-channel-message-recovery.json');
+    new MessageRecoveryState(journalPath).claim([{
+      wireId: 'temporarily-unavailable-wire', seq: 12, claimedAt: 1_000,
+    }]);
+    const { channel, client } = setup([], undefined, { stateDir: dir });
+    client.getHistoryItem = async () => { throw new Error('daemon unavailable'); };
+    await expect(channel.drain()).rejects.toThrow('daemon unavailable');
+    expect(new MessageRecoveryState(journalPath).list()).toEqual([{
+      wireId: 'temporarily-unavailable-wire', seq: 12, claimedAt: 1_000,
+    }]);
   });
 
   it('claims at most 200 oldest metadata rows per SDK transaction', async () => {

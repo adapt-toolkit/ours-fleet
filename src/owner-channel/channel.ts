@@ -1059,8 +1059,15 @@ export class OwnerChannel implements OwnerChannelHandle {
     const recovered: InboundMessage[] = [];
     for (const claim of this.messageRecovery.list()) {
       const item = await this.client.getHistoryItem(claim.wireId);
-      if (!item)
-        throw new Error(`journaled owner message ${claim.wireId} is missing from persistent history`);
+      if (!item) {
+        // The daemon has definitively lost this body. Retrying the claim would
+        // block every later owner message, including after a supervisor restart.
+        // Keep transient lookup errors retryable; only an explicit absence skips.
+        this.messageRecovery.pruneHandled(wireId => wireId === claim.wireId);
+        this.options.log(`[${this.options.role}] skipped journaled owner message ${claim.wireId} `
+          + `(seq=${claim.seq}): missing from persistent history`);
+        continue;
+      }
       recovered.push(this.historyMessage(item, claim));
     }
 
