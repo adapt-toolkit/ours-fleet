@@ -106,10 +106,15 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
 Description=ours-fleet agent %i
 After=default.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ${environmentLines}
+# Wait outside the runner so boot-time daemon unavailability cannot consume
+# the agent crash budget. Selection comes from the same role and profile.
+ExecStartPre=${unitArg(process.execPath)} ${unitArg(binPath)} _wait-daemon %i
+TimeoutStartSec=270
 ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
 # The RUNNER owns the child-session restart loop, with a counted, backed-off
 # circuit breaker. systemd must only recover the runner PROCESS crashing —

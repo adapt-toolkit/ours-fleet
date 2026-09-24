@@ -34,6 +34,9 @@ describe('systemd backend', () => {
     // Anchored: this file now carries `#` comments, and a substring match can be
     // satisfied by one of them rather than by the directive itself.
     expect(unit).toContain(`ExecStart="${process.execPath}" "/usr/local/bin/ours-fleet" _run %i`);
+    expect(unit).toContain(`ExecStartPre="${process.execPath}" "/usr/local/bin/ours-fleet" _wait-daemon %i`);
+    expect(unit).toMatch(/^TimeoutStartSec=270$/m);
+    expect(unit).toMatch(/^StartLimitIntervalSec=0$/m);
     expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
     expect(unit).toContain('/usr/local/bin');
     expect(unit).toMatch(/^Restart=on-failure$/m);   // the runner owns the retry loop
