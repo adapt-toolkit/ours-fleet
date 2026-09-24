@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TaskRoomApplicationService, recordTaskProvisioningOutcome } from '../src/application/task-room-service.js';
 import { activateTask, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
-import { activateRoom, advanceSaga, createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
+import { activateRoom, advanceSaga, createRoomRecord, updateMemberSeats, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import { agentDir } from '../src/paths.js';
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
@@ -141,6 +141,12 @@ describe('current task readiness', () => {
     expect(notices[0]).toMatchObject({ kind: 'lifecycle_failure', resource: 'Task', category: 'readiness_degraded' });
     expect(renderFleetLifecycleEvent(notices[0])).toMatch(/coordinator/i);
     expect(renderFleetLifecycleEvent(notices[0])).not.toMatch(/create it again/i);
+  });
+  it('requires the recorded Owner seat to remain active', async () => {
+    setOwnerSeat(roomId, 'owner-cid', 'fixture');
+    expect(await outcome()).toMatchObject({ kind: 'degraded', launch: { owner_attached: false } });
+    room.seats.push({ identity_cid: 'owner-cid', display_name: 'Owner', invite_id: 'owner', role: 'Owner', seat_state: 'active' });
+    expect(await outcome()).toMatchObject({ kind: 'ready', launch: { owner_attached: true } });
   });
   it('sanitizes Cowork errors and provides recovery guidance', async () => {
     getRoom.mockRejectedValue(new Error('secret-invite /private/path'));
