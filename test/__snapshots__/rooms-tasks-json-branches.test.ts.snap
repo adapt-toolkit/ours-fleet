@@ -59,6 +59,7 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
   "if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
+            ...(provisioning ? { provisioning } : {}),
           }, null, 2));
           return;
         }",
@@ -92,11 +93,9 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           return;
         }",
   "if (opts.json) {
-            console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
-            return;
-          }",
-  "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, task: t, provisioning,
+            ...(result.status === 'already_active' ? { status: 'already_active' } : {}),
+          }, null, 2));
           return;
         }",
   "if (opts.json) {

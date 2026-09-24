@@ -40,7 +40,7 @@ export type FleetAuditPresentation =
       participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string;
         configuration?: AgentLaunchConfiguration }> }
   | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; label?: string; state: string;
-      category: 'provision_failed' | 'provision_pending' | 'readiness_failed' | 'settlement_failed' | 'settlement_pending'
+      category: 'provision_failed' | 'provision_pending' | 'readiness_degraded' | 'readiness_failed' | 'settlement_failed' | 'settlement_pending'
         | 'cleanup_failed' | 'cleanup_pending' };
 
 /** Commands are Owner-silent unless they record one of these semantic lifecycle kinds. */
@@ -550,7 +550,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && ['Agent', 'Task', 'Room'].includes(String(p.resource))
     && safe(p.eventId) && safe(p.id) && safe(p.state)
     && (p.label === undefined || presentationLabel(p.label))
-    && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
+    && ['provision_failed', 'provision_pending', 'readiness_degraded', 'readiness_failed', 'settlement_failed',
       'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
 }
@@ -709,6 +709,11 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
       value.resource === 'Task'
         ? `**Next:** Check member readiness, then run ${markdownCode(`task start ${value.id}`)}.`
         : '**Next:** Check member readiness, then repeat the same Room command.',
+    );
+    if (value.category === 'readiness_degraded') return structuredMessage(
+      `⚠️ Task readiness degraded: ${label}`,
+      [['Lifecycle', markdownProse(value.state)], ['Readiness', 'Degraded'], ['Task ID', markdownCode(value.id)]],
+      '**Next:** Ask the Fleet coordinator to inspect existing room seats and retained temporary recovery context before recovery. Do not respawn or adopt replacements from this observation.',
     );
     if (value.category === 'readiness_failed') return structuredMessage(
       `⚠️ Agent didn’t become ready: ${label}`,

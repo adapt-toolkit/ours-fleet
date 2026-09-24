@@ -321,7 +321,8 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
       ...(room ? [{ label: 'Room', value: `${room.room_id} — ${room.room_name}` }] : []),
       ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
       { label: 'Launch', value: `anonymous=${outcome.launch.anonymous ? 'yes' : 'no'}, owner=${outcome.launch.owner_attached ? 'attached' : 'not-attached'}` },
-      { label: 'Lifecycle', value: outcome.kind },
+      { label: 'Lifecycle', value: outcome.task.state },
+      { label: 'Readiness', value: outcome.kind },
       { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
       ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
       ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
@@ -578,10 +579,10 @@ function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
   return cfg.roomTemplates ?? {};
 }
 
-function coworkFor(cfg: FleetConfig) {
+function coworkFor(cfg: FleetConfig, options?: { timeoutMs: number }) {
   if (!cfg.rooms)
     throw new ConfigError('rooms: configuration is required before creating or querying rooms');
-  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config, ...options });
 }
 
 function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot | undefined {
@@ -742,7 +743,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         });
 
         const provisioning = !opts.backlog && opts.room !== false && record.room_id
-          ? service.taskProvisioningOutcome(record.task_id) : undefined;
+          ? await service.taskProvisioningOutcome(record.task_id) : undefined;
         if (provisioning?.kind === 'in_progress' && !provisioning.next_action)
           await continueProvisioningInBackground(record.task_id, opts.configuration);
         if (provisioning) recordTaskProvisioningOutcome(provisioning);
@@ -847,16 +848,18 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
-  taskCmd.command('show <id>')
+  cOpt(taskCmd.command('show <id>'))
     .description('show task details')
     .option('--json', 'JSON output')
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean; configuration?: string }) => {
       try {
-        const service = taskRoomService();
+        const service = taskRoomService(opts.configuration);
         const { task: t, orchestration: room } = service.getTask(id);
+        const provisioning = t.state === 'active' ? await service.taskProvisioningOutcome(id) : undefined;
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
+            ...(provisioning ? { provisioning } : {}),
           }, null, 2));
           return;
         }
@@ -866,6 +869,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(provisioning ? [{ label: 'Readiness', value: provisioning.kind },
+              ...(provisioning.blocker ? [{ label: 'Blocker', value: provisioning.blocker }] : []),
+              ...(provisioning.next_action ? [{ label: 'Next action', value: provisioning.next_action }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
@@ -916,7 +922,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           template: opts.template, members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
           anonymous: cliAnonymousOverride(commandArgv(command)),
         });
-        const provisioning = service.taskProvisioningOutcome(t.task_id);
+        const provisioning = await service.taskProvisioningOutcome(t.task_id);
         if (provisioning.kind === 'in_progress' && !provisioning.next_action)
           await continueProvisioningInBackground(t.task_id, opts.configuration);
         recordTaskProvisioningOutcome(provisioning);
@@ -1124,7 +1130,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         await withFileLock(taskProvisioningWorkerLockPath(id), async () => {
           const app = taskRoomService(opts.configuration);
           for (;;) {
-            const before = app.taskProvisioningOutcome(id);
+            const before = await app.taskProvisioningOutcome(id);
             if (before.kind !== 'in_progress') {
               await presentDetachedProvisioningOutcome(before);
               return;
@@ -1132,7 +1138,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             await app.continueTaskProvisioning({
               actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
             });
-            const outcome = app.taskProvisioningOutcome(id);
+            const outcome = await app.taskProvisioningOutcome(id);
             if (outcome.kind !== 'in_progress') {
               await presentDetachedProvisioningOutcome(outcome);
               return;
@@ -1193,7 +1199,6 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean; membersFile?: string }, command: Command) => {
       try {
-        const previous = getTask(id).state;
         console.error('warning: `fleet task work` is deprecated; use `fleet task start`');
         const result = await taskRoomService(opts.configuration).ensureTaskWork({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
@@ -1201,31 +1206,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           anonymous: cliAnonymousOverride(commandArgv(command)),
         });
         const t = result.task;
-        auditTask('work', t, previous);
-        if (result.status === 'already_active') {
-          if (opts.json) {
-            console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
-            return;
-          }
-          console.log(taskActionMarkdown('Task already active', t,
-            t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' }] : []));
-          return;
-        }
+        const provisioning = await taskRoomService(opts.configuration).taskProvisioningOutcome(t.task_id);
+        recordTaskProvisioningOutcome(provisioning);
+        if (provisioning.kind === 'in_progress' && !provisioning.next_action)
+          await continueProvisioningInBackground(t.task_id, opts.configuration);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, task: t, provisioning,
+            ...(result.status === 'already_active' ? { status: 'already_active' } : {}),
+          }, null, 2));
           return;
         }
-        console.log(renderMarkdownResult({
-          icon: '🛠️', title: 'Task work ready',
-          fields: [
-            { label: 'ID', value: t.task_id, kind: 'code' },
-            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
-            ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
-            ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
-          ],
-          sections: t.member_roles.length ? [{ heading: 'Agents', markdownItems: t.member_roles.map(m =>
-            `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)}`) }] : [],
-        }));
+        console.log(provisioningMarkdown(provisioning));
       } catch (e) {
         if (e instanceof TaskRoomApplicationError)
           e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);

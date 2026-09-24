@@ -497,6 +497,27 @@ Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
 bytes with structural omission notices. \`--json\` bypasses this presentation layer
 and retains the versioned machine schema and serialization order.
 
+Active task readiness is a current observation, separate from durable lifecycle.
+\`task show\` and \`task start\` report \`degraded\` when Cowork room/seat identities,
+the recorded temporary launch, supervisor liveness or authenticated session control
+cannot be corroborated. External probes use a two-second timeout; member probes
+run concurrently. Busy or permission-waiting live sessions remain available.
+An unavailable control endpoint is not proof of death and does not authorize respawn.
+
+After member loss, the Fleet coordinator inspects current room seats for existing
+replacements and the exact old launch's termination record/worklog in Fleet's
+\`recovery/temporary\` state directory before deliberate recovery. Preserve that
+private context; do not restore archived identity state or reuse consumed invites.
+A new identity's empty inbox does not imply no pending work: paginate scoped room/operator
+history to the end and record the cursor privately. Verify historical Owner authority
+from authenticated identity metadata; compare replies and completed actions before
+resuming. Uncertain authority/completion requires Owner clarification, never blind replay.
+Record verified old/new launch provenance in a private coordinator handover; a same-role
+untracked seat is only a possible replacement. Original slot evidence remains unchanged.
+Repeated active starts never adopt replacement seats, rewrite original slot records,
+launch duplicate sessions or modify archives. Automatic identity restoration and
+replacement-slot reconciliation are not provided.
+
 Every task belongs to a named list. The built-in \`default\` list always exists,
 and legacy tasks or create calls without \`--list\` resolve to it. Use \`task lists\`,
 \`task list-create <name>\`, \`task list-rename <name> <new-name>\`, and

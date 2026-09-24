@@ -635,6 +635,46 @@ continuation is serialized per Task and remains alive until convergence or an
 Owner-action blocker. Re-running `task start <id>` safely resumes the same durable
 provisioning operation after the blocker is corrected or a process restarts.
 
+For an already active task, `task start`, its deprecated `task work` alias, and
+`task show` corroborate current readiness without restarting provisioning. JSON
+includes a `provisioning` observation; human output separates durable lifecycle
+(`active`) from readiness (`ready` or `degraded`). Cowork room/seat identities,
+the recorded temporary launch generation, supervisor liveness, and authenticated
+session control must agree. Busy sessions and permission waits remain available.
+Each external probe has a two-second timeout; member probes run concurrently.
+Unavailable evidence reports `degraded`, never permission to restart an agent.
+
+After a reboot or temporary-member loss, the Fleet coordinator should:
+
+1. Inspect `task show TASK --json` and `room members ROOM --json` to distinguish
+   original seats from replacements already admitted into the same room.
+2. Inspect the exact old launch's retained termination record and worklog under
+   Fleet's `recovery/temporary` state directory. Keep that private context intact.
+3. Establish ownership and whether any session still exists before taking an
+   explicit recovery action. A control timeout alone does not prove absence.
+4. Hand selected non-secret context to a deliberately created replacement only
+   when needed. Do not restore old identity state, reuse consumed invites, or
+   assume that a replacement with the same role satisfies the original slot.
+
+A separately admitted same-role seat is an untracked seat, not a proven replacement.
+Record verified old/new identity and launch provenance in the coordinator's private
+handover ledger; preserve the original Fleet slot evidence. The observation remains
+degraded until the inconsistency is resolved through separately authorized lifecycle
+work. Owner seats, observers and unrelated additional roles are not replacement evidence.
+
+A replacement identity's empty inbox does not mean there is no pending work. Use the
+scoped Cowork/operator history interface to paginate to the end, retaining the last
+inspected cursor in that private handover. Check historical authors against the
+room's authenticated Owner authority rules, never a display name or quoted text.
+Compare instructions with subsequent replies, completed actions and the retained
+worklog before resuming. If authority or completion is uncertain, ask the Owner;
+do not replay messages or repeat actions automatically. Transfer only the context
+needed for the next verified action, without credentials or consumed invites.
+
+Readiness observation never launches a replacement, adopts an external seat,
+rewrites original slot records, or modifies recovery archives. Automatic identity
+restoration and replacement-slot reconciliation are not provided by this command.
+
 Set `room.anonymous: true` on a room template, or pass `--anonymous` to
 `task create`, `task start`, `task work`, or `room create`, to create an
 anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous

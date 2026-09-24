@@ -1,4 +1,16 @@
+import { prepareReadinessMembers, healthyCoworkRoom } from './task-readiness-fixture.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// These presentation/service fixtures model healthy external processes. Actual
+// socket authentication, timeout and missing-control behavior has CLI coverage.
+vi.mock('../src/temp-lifecycle.js', async original => ({
+  ...await original<typeof import('../src/temp-lifecycle.js')>(),
+  tempSupervisorLiveness: async () => 'running',
+}));
+vi.mock('../src/session/control.js', async original => ({
+  ...await original<typeof import('../src/session/control.js')>(),
+  controlRequest: async () => ({ ok: true, result: { alive: true, readiness: 'idle' } }),
+}));
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -270,7 +282,9 @@ beforeEach(() => {
         } }]);
       if (taskId) updateTaskMembers(taskId, [member]);
     }
+    prepareReadinessMembers(roomId);
     const record = activateRoom(roomId);
+    mocks.getRoom.mockImplementation(async (id: string) => healthyCoworkRoom(id));
     if (taskId) activateTask(taskId);
     return record;
   });
@@ -666,7 +680,7 @@ describe('task provisioning command outcomes', () => {
     const task = backlogTask();
     startTask(task.task_id);
     failTask(task.task_id, 'permanent configuration blocker');
-    const outcome = new TaskRoomApplicationService(cfgPath).taskProvisioningOutcome(task.task_id);
+    const outcome = await new TaskRoomApplicationService(cfgPath).taskProvisioningOutcome(task.task_id);
     expect(outcome).toMatchObject({ kind: 'failed', blocker: 'permanent configuration blocker' });
     expect(outcome.next_action).toContain(`task start ${task.task_id}`);
   });
@@ -794,7 +808,7 @@ describe('task work', () => {
     expect(after.state).toBe('active');
     expect(after.room_id).toBe(ROOM_ID);
     expect(getRoomRecord(ROOM_ID)!.task_id).toBe(t.task_id);
-    expect(out.join('\n')).toContain(`**Room:** \`${ROOM_ID}\``);
+    expect(out.join('\n')).toContain(`**Room:** ${ROOM_ID}`);
   });
 
   it('defaults to the single template when none is configured or stored', async () => {
@@ -818,7 +832,8 @@ describe('task work', () => {
     await run('work', t.task_id);
     mocks.createRoom.mockClear();
     await run('work', t.task_id);
-    expect(out.join('\n')).toContain('## 📋 Task already active');
+    expect(out.join('\n')).toContain('Room provisioning needs attention');
+    expect(out.join('\n')).toContain('degraded');
     expect(mocks.createRoom).not.toHaveBeenCalled();
     expect(getTask(t.task_id).room_id).toBe(ROOM_ID);
   });
@@ -832,7 +847,9 @@ describe('task work', () => {
     const payload = JSON.parse(out.join('\n'));
     expect(payload.status).toBe('already_active');
     expect(payload.task.task_id).toBe(t.task_id);
-    expectExactJson({ schema_version: 1, task: getTask(t.task_id), status: 'already_active' });
+    expect(payload.provisioning.kind).toBe('degraded');
+    expectExactJson({ schema_version: 1, task: getTask(t.task_id),
+      provisioning: await new TaskRoomApplicationService(cfgPath).taskProvisioningOutcome(t.task_id), status: 'already_active' });
   });
 
   it('task and room show expose per-seat launch and authenticated seat evidence', async () => {
@@ -862,6 +879,7 @@ describe('task work', () => {
     expect(taskPayload.orchestration.member_seats[0].briefing.state).toBe('relay_queued');
     expectExactJson({
       schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID),
+      provisioning: await new TaskRoomApplicationService(cfgPath).taskProvisioningOutcome(t.task_id),
     });
 
     out = [];
@@ -1025,9 +1043,11 @@ describe('task work', () => {
 
     out = [];
     await run('work', t.task_id, '--template', 'single');
-    expect(out.join('\n')).toContain('## 📋 Task already active');
+    expect(out.join('\n')).toContain('Room provisioning needs attention');
+    expect(out.join('\n')).toContain('degraded');
     await run('work', t.task_id);
-    expect(out.join('\n')).toContain('## 📋 Task already active');
+    expect(out.join('\n')).toContain('Room provisioning needs attention');
+    expect(out.join('\n')).toContain('degraded');
   });
 
   it('reports a non-resumable room instead of silently stranding the task', async () => {
