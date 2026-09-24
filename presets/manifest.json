@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "preset_revision": 6,
-  "brain_catalog_revision": 2,
+  "preset_revision": 7,
+  "brain_catalog_revision": 3,
   "description": "ours-fleet standard configuration presets"
 }

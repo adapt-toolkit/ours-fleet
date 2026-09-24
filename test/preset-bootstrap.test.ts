@@ -19,8 +19,8 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(6);
-    expect(seeded.created).toHaveLength(67);
+    expect(seeded.revision).toBe(7);
+    expect(seeded.created).toHaveLength(89);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
       .toEqual(['pair', 'single', 'team']);
@@ -46,7 +46,7 @@ describe('packaged preset bootstrap', () => {
         expect(definition?.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
       }
     }
-    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(55);
+    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(77);
     for (const [id, brain] of Object.entries(cfg.brainPresets ?? {}))
       expect(() => validateEffectiveAgentTemplate({ role: { inline: {} }, brain: { inline: brain } }, id))
         .not.toThrow();
@@ -62,7 +62,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
-    expect(second.preserved).toHaveLength(66);
+    expect(second.preserved).toHaveLength(88);
   });
 
   it('creates private files and refuses symlink targets', () => {

@@ -68,6 +68,11 @@ const REASONING_EFFORT: Record<ReasoningPreference, 'low' | 'medium' | 'high'> =
   quick: 'low', balanced: 'medium', thorough: 'high',
 };
 const MODEL_LABELS: Record<string, string> = {
+  'gpt-6-sol': 'GPT-6 Sol',
+  'gpt-6-luna': 'GPT-6 Luna',
+  'claude-fable-5-1': 'Claude Fable 5.1',
+  'claude-opus-5-5': 'Claude Opus 5.5',
+  'claude-haiku-4-5-20251001': 'Claude Haiku 4.5',
   'gpt-6-astra': 'GPT-6 Astra',
   'gpt-5.6-sol': 'GPT-5.6 Sol',
   'gpt-5.6-terra': 'GPT-5.6 Terra',
@@ -88,10 +93,10 @@ export function validateCatalog(value: BrainCatalog, path = 'supported model cat
   for (const model of value.models) {
     if (!['codex', 'claude-code'].includes(model.harness) || model.session !== 'acp'
       || typeof model.model !== 'string' || !MODEL_LABELS[model.model]
-      || !Array.isArray(model.efforts) || model.efforts.length === 0
+      || !Array.isArray(model.efforts)
       || new Set(model.efforts).size !== model.efforts.length
       || model.efforts.some(effort => !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort))
-      || !['low', 'medium', 'high'].every(effort => model.efforts.includes(effort)))
+      || (model.efforts.length > 0 && !['low', 'medium', 'high'].every(effort => model.efforts.includes(effort))))
       throw new Error(`unsupported model state in ${path}`);
     const tuple = `${model.harness}\0${model.session}\0${model.model}`;
     if (tuples.has(tuple)) throw new Error(`duplicate supported model in ${path}: ${model.model}`);
@@ -154,7 +159,9 @@ export async function askInitQuestions(
   if (!subscriptions) return undefined;
   if (subscriptions.length === 0) throw new Error('Select at least one subscription.');
 
-  const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model)));
+  // The wizard assigns low/medium/high; no-effort models remain available as named presets.
+  const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model))
+    && model.efforts.length > 0);
   if (!available.length) throw new Error('None of the selected subscriptions has a supported model.');
   prompter.note([
     'These are exact supported catalog IDs, not recommendations or entitlement claims.',
