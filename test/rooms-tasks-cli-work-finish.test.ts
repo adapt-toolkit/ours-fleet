@@ -10,6 +10,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 // ── Mock setup (vi.hoisted runs before vi.mock factories) ────────────────
 
 const mocks = vi.hoisted(() => ({
+  liveReadiness: vi.fn(),
   createRoom: vi.fn(),
   acceptInvite: vi.fn(),
   setRoleCommands: vi.fn(),
@@ -26,6 +27,11 @@ const mocks = vi.hoisted(() => ({
   listRooms: vi.fn(),
   markdownRender: vi.fn(),
 }));
+
+// CLI lifecycle fixtures intentionally stub member provisioning. Live probes are
+// exercised by task-live-readiness and task-room-service-parity; this suite checks
+// their success/failure presentation through the real application/CLI boundary.
+vi.mock('../src/rooms-tasks/live-readiness.js', () => ({ taskLiveReadiness: mocks.liveReadiness }));
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/cowork-adapter.js')>();
@@ -200,6 +206,7 @@ beforeEach(() => {
   vi.spyOn(process.stderr, 'write').mockImplementation((line: unknown) => { out.push(String(line)); return true; });
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
+  mocks.liveReadiness.mockReset().mockResolvedValue(undefined);
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
   mocks.acceptInvite.mockReset().mockResolvedValue({ seat_cid: 'a'.repeat(64) });
   mocks.setRoleCommands.mockReset().mockResolvedValue(undefined);
@@ -1288,5 +1295,24 @@ describe('internal room deletion workers', () => {
     }));
     settle.mockRestore();
     record.mockRestore();
+  });
+});
+
+
+describe('live task readiness CLI failures', () => {
+  it.each(['start', 'work'])('renders %s failure as a safe state diagnostic, never ready', async command => {
+    const task = backlogTask();
+    await run('work', task.task_id);
+    out.length = 0;
+    mocks.provisionMembers.mockClear();
+    mocks.liveReadiness.mockResolvedValue({ state: 'unknown', reason: 'control_unavailable', member: 'dev' });
+    await expect(run(command, task.task_id)).rejects.toBeInstanceOf(ExitError);
+    expect(out.join('\n')).toContain('unknown');
+    expect(out.join('\n')).toContain('control\\_unavailable');
+    expect(out.join('\n')).toContain('Fleet Coordinator');
+    expect(out.join('\n')).not.toContain('already active');
+    expect(out.join('\n')).not.toContain('provisioning complete');
+    expect(mocks.provisionMembers).not.toHaveBeenCalled();
+    expect(getTask(task.task_id).state).toBe('active');
   });
 });

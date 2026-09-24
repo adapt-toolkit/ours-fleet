@@ -51,7 +51,15 @@ function cowork() {
     adapter: {
       createRoom,
       acceptInvite: vi.fn(), issueInvite: vi.fn(), revokeInvite: vi.fn(),
-      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(), listRooms: vi.fn(),
+      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(async (id: string) => {
+        const room = getRoomRecord(id);
+        return room && { ...room, identity_cid: room.room_identity_cid,
+          seats: [...room.member_seats.map(seat => ({ ...seat, display_name: seat.role_name,
+            role: seat.cowork_role })), ...(room.owner_seat_cid ? [{
+              identity_cid: room.owner_seat_cid, seat_state: 'active', role: 'Owner',
+            }] : [])],
+        };
+      }), listRooms: vi.fn(),
       closeRoom: vi.fn(), deleteRoom: vi.fn(), getSeats: vi.fn(), recoverRoom: vi.fn(),
       available: vi.fn(),
     } as unknown as CoworkAdapter,
@@ -413,10 +421,19 @@ describe('task create/start surface parity', () => {
       monitor: { mode: 'fleet' }, session: 'acp' }) } as unknown as FleetConfig;
     const h = cowork();
     const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      updateMemberSeats(roomId, [{ role_name: 'dev', identity_cid: 'dev-cid', invite_id: 'invite',
+        slot: 'dev', cowork_role: 'Developer', seat_state: 'active',
+        launch: { state: 'launched', attempt: 1, launch_id: 'launch', updated_at: new Date().toISOString() } }]);
       const room = activateRoom(roomId); if (taskId) activateTask(taskId); return room;
     });
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
-      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any,
+      liveReadiness: {
+        supervisor: () => ({ version: 1, role: 'dev', launchId: 'launch', phase: 'active', createdAt: '' }),
+        liveness: async () => 'running',
+        readiness: () => ({ room: 'room-shared', invite: 'invite', cid: 'dev-cid', generation: 1 }),
+        control: async () => ({ version: 1, id: 'probe', ok: true, result: { alive: true, readiness: 'idle' } }),
+      } });
     const members = { dev: { approval: 'allow' as const, loops: { progress: {
       interval: '1m', initial_delay: '0s', prompt: 'SEALED_IDEMPOTENT_LOOP',
     } } } };
@@ -446,6 +463,22 @@ describe('task create/start surface parity', () => {
         interval: '2m', prompt: 'DIFFERENT_LOOP',
       } } } } }))
       .rejects.toMatchObject({ code: 'template_mismatch' });
+    const remoteHealthy = await h.adapter.getRoom(active.room_id!);
+    vi.mocked(h.adapter.getRoom).mockResolvedValue({ ...remoteHealthy!, seats: [] });
+    const durableBefore = JSON.stringify([getTask(active.task_id), getRoomRecord(active.room_id!)]);
+    for (const request of [{}, { template: 'member-team' }, { members }]) {
+      await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+        taskId: active.task_id, ...request })).rejects.toMatchObject({ code: 'task_not_ready',
+        fields: { readiness: 'degraded', reason: 'member_seat_mismatch' } });
+    }
+    await expect(app.awaitTaskProvisioning({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id })).rejects.toMatchObject({ code: 'task_not_ready' });
+    expect(JSON.stringify([getTask(active.task_id), getRoomRecord(active.room_id!)])).toBe(durableBefore);
+    expect(provision).toHaveBeenCalledOnce();
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+    expect(h.adapter.issueInvite).not.toHaveBeenCalled();
+    expect(h.adapter.recoverRoom).not.toHaveBeenCalled();
+    vi.mocked(h.adapter.getRoom).mockResolvedValue(remoteHealthy);
     expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, template: 'empty-team' }))
@@ -694,7 +727,8 @@ describe('task create/start surface parity', () => {
     const task = createTask({ title: _case, origin: { type: 'cli' }, start: true,
       room_id: `room-public-${String(withDetail)}`, template: { name: template.name,
         version: template.version, content_hash: template.content_hash } });
-    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title,
+    updateTaskRoom(task.task_id, task.room_id!, 'room-cid');
+    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title, room_identity_cid: 'room-cid',
       task_id: task.task_id, template_snapshot: template, room_policy: { anonymous: false } });
     advanceSaga(room.room_id, 'attach_owner', 2);
     if (withDetail)
