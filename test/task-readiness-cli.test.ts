@@ -21,7 +21,7 @@ beforeEach(async () => {
   oldHome = process.env.OURS_FLEET_HOME;
   root = mkdtempSync(join(tmpdir(), 'fleet-readiness-cli-'));
   process.env.OURS_FLEET_HOME = root;
-  writeV2Fixture(join(root, 'fleet.yaml'), { roles: {}, rooms: { owner: {}, defaults: { attach_owner: false } } });
+  writeV2Fixture(join(root, 'fleet.yaml'), { roles: {}, rooms: { owner: { expected_cid: "a".repeat(64) }, defaults: { attach_owner: false } } });
   taskId = createTask({ title: 'Stale readiness', origin: { type: 'cli' }, start: true }).task_id;
   createRoomRecord({ room_id: roomId, room_name: 'Fixture', room_identity_cid: 'room-cid', task_id: taskId,
     template_snapshot: snapshotTemplate({ name: 'solo', version: 1, description: '',
@@ -67,7 +67,7 @@ function cli(...args: string[]) {
 describe('task readiness CLI with real Cowork socket and isolated state', () => {
   it.each(['start', 'show', 'work'])('%s JSON separates degraded readiness from active lifecycle', async command => {
     const result = await cli(command, taskId, '--json');
-    expect(result.code).toBe(0);
+    expect(result.code, result.stderr).toBe(0);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.task.state).toBe('active');
     expect(parsed.provisioning).toMatchObject({ kind: 'degraded', members: { expected: 1, active: 0, launched: 0 } });
@@ -78,7 +78,7 @@ describe('task readiness CLI with real Cowork socket and isolated state', () => 
   it('shows actionable human output without claiming ready and never mutates during concurrent starts', async () => {
     const results = await Promise.all([cli('start', taskId), cli('start', taskId), cli('show', taskId)]);
     for (const result of results) {
-      expect(result.code).toBe(0);
+      expect(result.code, result.stderr).toBe(0);
       expect(result.stdout).toMatch(/degraded/i);
       expect(result.stdout).toMatch(/coordinator/i);
       expect(result.stdout).not.toContain('Room provisioning complete');
