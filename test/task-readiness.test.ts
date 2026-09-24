@@ -1,8 +1,9 @@
+import { beginFleetAuditCollection, consumeFleetAuditCollection, renderFleetLifecycleEvent } from '../src/fleet-command-audit.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
+import { TaskRoomApplicationService, recordTaskProvisioningOutcome } from '../src/application/task-room-service.js';
 import { activateTask, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import { activateRoom, advanceSaga, createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
@@ -119,6 +120,27 @@ describe('current task readiness', () => {
   it('does not present missing active orchestration as ongoing provisioning', async () => {
     rmSync(join(root, '.ours-fleet/rooms', `${roomId}.json`));
     expect(await outcome()).toMatchObject({ kind: 'degraded' });
+  });
+  it('keeps initial unready provisioning in progress and awaits its continuation', async () => {
+    const path = join(root, '.ours-fleet/tasks', `${taskId}.json`);
+    const task = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(path, JSON.stringify({ ...task, state: 'provisioning' }));
+    advanceSaga(roomId, 'wait_seats', 5);
+    probes.control.mockResolvedValue({ ok: true, result: { alive: true, readiness: 'starting' } });
+    expect(await service.awaitTaskProvisioning({ actor: { kind: 'local_control', surface: 'cli' }, taskId, waitMs: 0 }))
+      .toMatchObject({ kind: 'in_progress' });
+    expect(getRoom).not.toHaveBeenCalled();
+    expect(probes.control).not.toHaveBeenCalled();
+  });
+  it('publishes a degraded audit notice with safe recovery advice instead of ready', async () => {
+    room.seats[0].seat_state = 'removed';
+    beginFleetAuditCollection();
+    recordTaskProvisioningOutcome(await outcome());
+    const notices = consumeFleetAuditCollection().presentations ?? [];
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ kind: 'lifecycle_failure', resource: 'Task', category: 'readiness_degraded' });
+    expect(renderFleetLifecycleEvent(notices[0])).toMatch(/coordinator/i);
+    expect(renderFleetLifecycleEvent(notices[0])).not.toMatch(/create it again/i);
   });
   it('sanitizes Cowork errors and provides recovery guidance', async () => {
     getRoom.mockRejectedValue(new Error('secret-invite /private/path'));
