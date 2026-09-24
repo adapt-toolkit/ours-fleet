@@ -111,6 +111,8 @@ export interface TaskDeletionIntent {
   /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
   members: TaskDeletionMemberCursor[];
   archived_absences?: ArchivedMemberAbsence[];
+  /** Archive proofs were verified before owned workspace cleanup may consume them. */
+  workspace_cleanup_started_at?: string;
   error?: string;
   error_at?: string;
   recovery_hint?: string;

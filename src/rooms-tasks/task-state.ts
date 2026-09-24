@@ -865,6 +865,20 @@ export function importTaskDeletionRetirementEvidence(
   });
 }
 
+/** Settlement-only checkpoint, under the task-operation lock after fresh archive verification.
+ * From here retries still verify live absence, but owned archives may be consumed.
+ */
+export function beginTaskWorkspaceCleanup(id: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending' || !stored.workspace
+        || stored.deletion.members.some(member => member.phase !== 'identity_absent'))
+      throw new TaskStateError('Task is not ready for workspace cleanup');
+    stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
+    writeTask(stored);
+  });
+}
+
 /**
  * Physically remove a deletion-pending task record. Settlement-only: callers
  * must have completed member retirement and room cleanup first. Missing

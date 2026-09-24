@@ -1037,8 +1037,14 @@ export class TaskRoomApplicationService {
           if (fresh.room_id && !existing) throw new Error('recorded task room is missing; refusing duplicate creation');
           if (existing) {
             reusedRoom = true;
-            onCreated(existing);
-            return existing;
+            // Heal a crash between durable room publication and task linkage.
+            // Return a resumable phase, leaving owner admission/member launch to
+            // the existing continuation rather than racing the original creator.
+            const resumable = ['persist_intent', 'create_room'].includes(existing.saga.phase)
+              ? advanceSaga(existing.room_id, attachOwner ? 'attach_owner' : 'create_members', attachOwner ? 2 : 3)
+              : existing;
+            onCreated(resumable);
+            return resumable;
           }
         }
         const requiredRoles = new Map<string, number>();
@@ -1056,8 +1062,10 @@ export class TaskRoomApplicationService {
           room_id: created.room_id, room_name: roomName, room_identity_cid: created.identity_cid,
           task_id: task.task_id, template_snapshot: launchTemplate, room_policy: policy,
         });
-        onCreated(record);
-        return record;
+        const resumable = advanceSaga(record.room_id,
+          attachOwner ? 'attach_owner' : 'create_members', attachOwner ? 2 : 3);
+        onCreated(resumable);
+        return resumable;
       };
       room = task.task_id
         ? await withFileLock(taskOperationLockPath(task.task_id), publishRoom, {}, TASK_OPERATION_LOCK_STALE_MS)
@@ -1069,7 +1077,6 @@ export class TaskRoomApplicationService {
     }
     unlockSnapshot?.();
     if (reusedRoom) return room;
-    room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       room = advanceSaga(room.room_id, 'attach_owner', 2);
       await this.setOwnerRoomCommands(cowork, room.room_id, rooms.owner.role);

@@ -61,8 +61,11 @@ cannot race a member launch. Local published Rooms are reused if the Task link
 write was interrupted. Workspace allocation publishes a marked staging directory;
 restart reuses the durable token. Deletion renames the validated workspace to a
 token-specific sibling tombstone before removal. A crash during removal resumes
-that exact tombstone; the Task record is unlinked last. Failed deletion remains
-retryable with its recorded error.
+that exact tombstone; the Task record is unlinked last. Before collecting archives,
+Task deletion durably checkpoints verified retirement evidence. Retries verify
+any remaining original archive and still refuse replacement live member state
+or a recreated identity even after the archive has been consumed. Failed deletion
+remains retryable with its recorded error.
 
 Deletion rejects traversal, foreign recorded paths, changed markers and symlinked
 workspace ancestors. Ordinary artifact symlinks are unlinked without following

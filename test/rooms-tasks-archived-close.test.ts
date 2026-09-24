@@ -19,6 +19,9 @@ import { settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
 import { closeManagedRoom } from '../src/rooms-tasks/close.js';
 import { createRoomRecord, updateMemberSeats, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { stateRoot } from '../src/paths.js';
+import * as workspaceArtifacts from '../src/rooms-tasks/workspace-artifacts.js';
+import * as workspaceLifecycle from '../src/rooms-tasks/workspace.js';
+import { stringify } from 'yaml';
 const roomId = '01hzyk8m0000000000000000ab';
 let root: string, prior: string | undefined, archive: string;
 const cowork = { closeRoom: vi.fn(async () => {}) };
@@ -46,6 +49,7 @@ beforeEach(() => {
   writeFileSync(join(archive, 'termination.jsonl'), JSON.stringify({ version: 1, role: 'member-1', launchId: 'launch-1', reason: 'startup-failure' }) + '\n');
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   if (prior === undefined) delete process.env.OURS_FLEET_HOME;
   else process.env.OURS_FLEET_HOME = prior;
   rmSync(root, { recursive: true, force: true });
@@ -151,4 +155,56 @@ it.each(['none', 'identity', 'archive', 'replacement', 'unknown'])('resumes dele
     archived_absences: [expect.objectContaining({ name: 'member-1', archive_path: archive })],
   });
   expect(mocks.removeIdentity).not.toHaveBeenCalled();
+});
+
+// Exercise real #179 archived-absence proofs with PR176-owned recovery artifacts.
+it.each(['before collection', 'collection', 'workspace deletion'] as const)('resumes after a crash following %s consumed archive evidence', async seam => {
+  const task = createTask({ title: 'Owned archived failure cleanup' });
+  updateTaskRoom(task.task_id, roomId);
+  const room = getRoomRecord(roomId)!;
+  room.task_id = task.task_id;
+  room.workspace = task.workspace;
+  writeFileSync(join(stateRoot(), 'rooms', roomId + '.json'), JSON.stringify(room));
+  writeFileSync(join(archive, 'role.yaml'), stringify({ name: 'member-1', roomMemberStartup: { workspace: task.workspace } }));
+  writeFileSync(join(archive, 'termination.jsonl'), JSON.stringify({ version: 1, role: 'member-1', launchId: 'launch-1', outcome: 'failed' }) + '\n');
+  beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  const remote = { closeRoom: async () => {}, deleteRoom: async () => {} };
+  if (seam === 'before collection') {
+    vi.spyOn(workspaceArtifacts, 'collectWorkspaceArchives').mockImplementationOnce(() => {
+      throw new Error('crash after checkpoint');
+    });
+  } else if (seam === 'collection') {
+    const collect = workspaceArtifacts.collectWorkspaceArchives;
+    vi.spyOn(workspaceArtifacts, 'collectWorkspaceArchives').mockImplementationOnce(w => {
+      collect(w); throw new Error('crash after collection');
+    });
+  } else {
+    const remove = workspaceLifecycle.deleteWorkspace;
+    vi.spyOn(workspaceLifecycle, 'deleteWorkspace').mockImplementationOnce((...args) => {
+      remove(...args); throw new Error('crash after workspace deletion');
+    });
+  }
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('crash after');
+  expect(existsSync(archive)).toBe(seam === 'before collection');
+  if (seam === 'before collection') {
+    writeFileSync(join(archive, '.identity'), 'wrong-owner');
+    await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('ownership proof mismatch');
+    writeFileSync(join(archive, '.identity'), 'member-1');
+    mocks.liveness.mockResolvedValue('unknown');
+    await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('absence is not proven');
+    mocks.liveness.mockResolvedValue('stopped');
+  }
+  expect(getDeletingTask(task.task_id).deletion?.workspace_cleanup_started_at).toBeTruthy();
+  expect(readTaskDeletionReceipt(task.task_id)?.result).toBeUndefined();
+  // Consuming old artifacts never grants permission to ignore replacement state.
+  const live = join(stateRoot(), 'tmp', 'member-1');
+  mkdirSync(live, { recursive: true });
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('replacement live state');
+  rmSync(live, { recursive: true });
+  mocks.listIdentities.mockResolvedValue([{ name: 'member-1', cid: 'ab'.repeat(32) }]);
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).rejects.toThrow('absence is not proven');
+  mocks.listIdentities.mockResolvedValue([]);
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork: () => remote })).resolves.toMatchObject({ deleted: true });
+  expect(existsSync(task.workspace!.path)).toBe(false);
+  expect(readTaskDeletionReceipt(task.task_id)?.result).toBe('deleted');
 });

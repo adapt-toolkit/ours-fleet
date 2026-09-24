@@ -81,6 +81,68 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 }
 
 describe('task create/start surface parity', () => {
+  it.each(['persist_intent', 'create_room'] as const)('recovers orphan room publication at %s without duplicate creation', async phase => {
+    const cfg = config();
+    const snapshot = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: 'Orphan publication', start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    createRoomRecord({ room_id: 'orphan', room_name: 'Orphan', room_identity_cid: 'room-cid',
+      task_id: task.task_id, template_snapshot: snapshot });
+    if (phase === 'create_room') advanceSaga('orphan', phase, 1);
+    const h = cowork();
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      if (taskId) activateTask(taskId);
+      return activateRoom(roomId);
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
+    await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    expect(getTask(task.task_id).room_id).toBe('orphan');
+    expect(getRoomRecord('orphan')?.saga.phase).toBe('create_members');
+    await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(h.createRoom).not.toHaveBeenCalled();
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
+  it('reuses a published room while the original creator is still attaching its owner', async () => {
+    const cfg = config();
+    cfg.rooms!.defaults!.attach_owner = true;
+    cfg.ownerInvite = 'test-invite';
+    const snapshot = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: 'Concurrent publication', start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    const h = cowork();
+    let attaching!: () => void, release!: () => void;
+    const started = new Promise<void>(r => { attaching = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    vi.mocked(h.adapter.acceptInvite).mockImplementation(async () => {
+      attaching(); await gate; return { seat_cid: 'owner-cid' } as never;
+    });
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      if (taskId) activateTask(taskId);
+      return activateRoom(roomId);
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
+    // The second publisher holds the stale task captured before local linkage.
+    const first = app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    try {
+      await started;
+      // Enter the publication boundary with that stale task, as an independent
+      // process waiting on the snapshot lock would after the creator releases it.
+      await app['provisionRoom'](cfg, task, snapshot, room => {
+        updateTaskRoom(task.task_id, room.room_id, room.room_identity_cid!);
+      });
+      expect(h.createRoom).toHaveBeenCalledOnce();
+      expect(h.adapter.acceptInvite).toHaveBeenCalledOnce();
+      expect(getRoomRecord('room-shared')?.saga.phase).toBe('attach_owner');
+    } finally { release(); }
+    await first;
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
   it.each([true, false])('seals planned role counts before any Owner attachment (owner=%s)', async (attachOwner) => {
     const team: TemplateDefinition = { name: 'planned', version: 1, description: 'Plan', contract: 'Wait.',
       members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' },
