@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,14 @@ import {
 import type { FetchLike, FetchResponse } from '../src/monitor.js';
 
 const stateDir = '/state/ours';
-const env = { OURS_PORT: '3050', OURS_STATE_DIR: stateDir, OURS_API_TOKEN: 'test-token' };
+const env = { OURS_PORT: '3050', OURS_STATE_DIR: stateDir, OURS_API_TOKEN: 'test-token', OURS_CONFIG: '' };
+let legacyFixture: string;
+beforeEach(() => {
+  legacyFixture = mkdtempSync(join(tmpdir(), 'fleet-recovery-legacy-'));
+  env.OURS_CONFIG = join(legacyFixture, 'config.json');
+  writeFileSync(env.OURS_CONFIG, '{}');
+});
+afterEach(() => { rmSync(legacyFixture, { recursive: true, force: true }); });
 const progress = (over: Record<string, unknown> = {}) => JSON.stringify({
   version: 1, pid: 41, bootId: 'boot-41-1000', phase: 'ready',
   startedAt: 1_000, updatedAt: 1_100, ...over,

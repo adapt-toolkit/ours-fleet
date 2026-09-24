@@ -33,19 +33,24 @@ describe('current daemon identity preflight', () => {
   });
 
   it('uses the SDK inventory and exposes deterministic permanent creation', async () => {
-    const identities = vi.fn(async () => [{ name: 'Existing' }]);
-    const attach = vi.fn(async () => ({ identities }));
-    const provider = daemonIdentityProvisioner(
-      { OURS_STATE_DIR: '/operator/state' }, attach,
-    );
-    expect(await provider.exists('Existing')).toBe(true);
-    expect(await provider.exists('Missing')).toBe(false);
-    expect(provider.create).toBeTypeOf('function');
-    expect(provider.remove).toBeUndefined();
-    expect(identities).toHaveBeenCalledTimes(2);
-    expect(attach.mock.calls[0][0]).toMatchObject({
-      env: { OURS_STATE_DIR: '/operator/state' }, clientPid: process.pid,
-    });
+    const legacyFixture = mkdtempSync(join(tmpdir(), 'fleet-identity-legacy-'));
+    const configPath = join(legacyFixture, 'config.json');
+    writeFileSync(configPath, '{}');
+    try {
+      const identities = vi.fn(async () => [{ name: 'Existing' }]);
+      const attach = vi.fn(async () => ({ identities }));
+      const provider = daemonIdentityProvisioner(
+        { OURS_STATE_DIR: '/operator/state', OURS_CONFIG: configPath }, attach,
+      );
+      expect(await provider.exists('Existing')).toBe(true);
+      expect(await provider.exists('Missing')).toBe(false);
+      expect(provider.create).toBeTypeOf('function');
+      expect(provider.remove).toBeUndefined();
+      expect(identities).toHaveBeenCalledTimes(2);
+      expect(attach.mock.calls[0][0]).toMatchObject({
+        env: { OURS_STATE_DIR: '/operator/state', OURS_CONFIG: configPath }, clientPid: process.pid,
+      });
+    } finally { rmSync(legacyFixture, { recursive: true, force: true }); }
   });
 
   it('creates and releases a permanent identity with the requested local policy', async () => {
