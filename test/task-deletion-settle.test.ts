@@ -455,13 +455,12 @@ describe('deletion receipts (durable audit evidence)', () => {
     expect(receipt?.settled_at).toBeUndefined();
   });
 
-  it('completes the receipt on settlement and the receipt outlives the task', async () => {
+  it('erases the receipt on settlement together with the task', async () => {
     const t = makeNoRoomTask();
     beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
     await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached });
     expect(existsSync(taskFile(t.task_id))).toBe(false);
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({ result: 'deleted' });
-    expect(readTaskDeletionReceipt(t.task_id)?.settled_at).toBeDefined();
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
   });
 
   it('backfills a missing acceptance receipt before any cleanup side effect', async () => {
@@ -485,9 +484,7 @@ describe('deletion receipts (durable audit evidence)', () => {
     const result = await settleTaskDeletion({ taskId: t.task_id, cowork: probing });
     expect(result.deleted).toBe(true);
     expect(receiptExistedBeforeCowork).toBe(true); // recreated before Cowork was touched
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({
-      task_id: t.task_id, original_state: 'active', result: 'deleted',
-    });
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
     expect(existsSync(taskFile(t.task_id))).toBe(false);
   });
 
@@ -498,7 +495,7 @@ describe('deletion receipts (durable audit evidence)', () => {
     expect(readTaskDeletionReceipt(t.task_id)?.settled_at).toBeUndefined();
     const result = await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached });
     expect(result).toEqual({ task_id: t.task_id, deleted: false });
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({ result: 'deleted' });
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
   });
 });
 

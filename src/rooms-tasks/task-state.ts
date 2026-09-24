@@ -536,9 +536,8 @@ export function taskDeletionState(id: string): 'none' | 'pending' | 'absent' {
 
 /**
  * Durable, surface-independent audit evidence for a permanent deletion. The
- * receipt outlives the task record: written with the acceptance intent, and
- * completed before settlement is reported. Metadata only — never brief or
- * room content.
+ * receipt supports in-flight recovery only: written with acceptance intent,
+ * then erased before settlement is reported. It may contain a bounded title.
  */
 export interface TaskDeletionReceipt {
   schema_version: 1;
@@ -602,13 +601,10 @@ export function ensureTaskDeletionReceipt(id: string): void {
   });
 }
 
-/** Record settlement on the receipt; idempotent, tolerant of legacy absence. */
+/** Erase the in-flight receipt; also heals a crash after task unlink. */
 export function completeTaskDeletionReceipt(id: string): void {
-  const receipt = readTaskDeletionReceipt(id);
-  if (!receipt || receipt.settled_at) return;
-  receipt.settled_at = new Date().toISOString();
-  receipt.result = 'deleted';
-  replaceFileAtomically(deletionReceiptPath(id), JSON.stringify(receipt, null, 2) + '\n');
+  assertCanonicalTaskId(id);
+  rmSync(deletionReceiptPath(id), { force: true });
 }
 
 export type TaskDeletionAcceptance =
@@ -631,7 +627,10 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
   try {
     stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
   } catch (error) {
-    if (isNotFoundError(error)) return { status: 'already_absent' };
+    if (isNotFoundError(error)) {
+      completeTaskDeletionReceipt(id);
+      return { status: 'already_absent' };
+    }
     throw error;
   }
   if (stored.deletion?.status === 'pending') {
@@ -745,7 +744,7 @@ interface SeatEvidence {
   role_name: string;
   identity_cid?: string;
   launch?: { launch_id?: string; action_id?: string };
-  retirement?: { phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
+  retirement?: { absence_verified?: boolean; phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
 }
 
 function findCursorForSeat(
@@ -817,13 +816,18 @@ export function importTaskDeletionRetirementEvidence(
       throw new TaskStateError(
         `task ${id} deletion cannot checkpoint member '${seat.role_name}' before completed retirement`,
       );
-    const neverLaunched = evidence.launch_id === DELETION_MEMBER_NEVER_LAUNCHED;
+    const neverLaunched = evidence.launch_id === DELETION_MEMBER_NEVER_LAUNCHED
+      || evidence.launch_id === DELETION_MEMBER_ABSENT_VERIFIED || evidence.absence_verified === true;
     if (!neverLaunched && evidence.archive_path === undefined)
       throw new TaskStateError(
         `task ${id} deletion member '${seat.role_name}' retirement evidence lacks its archive`,
       );
     if (!seat.identity_cid) {
-      if (neverLaunched) continue; // provably never held a managed identity
+      if (neverLaunched) {
+        stored.deletion.absent_members ??= [];
+        if (!stored.deletion.absent_members.includes(seat.role_name)) stored.deletion.absent_members.push(seat.role_name);
+        continue;
+      }
       const proof = proofs.find(value => value.name === seat.role_name);
       if (proof && proof.launch_id === evidence.launch_id && proof.archive_path === evidence.archive_path
           && proof.launch_id === seat.launch?.launch_id && proof.action_id === seat.launch?.action_id) {
@@ -871,7 +875,7 @@ export function importTaskDeletionRetirementEvidence(
 export function beginTaskWorkspaceCleanup(id: string): void {
   withTaskLock(id, () => {
     const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
-    if (stored.deletion?.status !== 'pending' || !stored.workspace
+    if (stored.deletion?.status !== 'pending'
         || stored.deletion.members.some(member => member.phase !== 'identity_absent'))
       throw new TaskStateError('Task is not ready for workspace cleanup');
     stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
@@ -903,5 +907,42 @@ export function unlinkDeletedTask(id: string): boolean {
     throw error;
   }
   return true;
+  });
+}
+
+/** Called only after current temp and exact identity absence have been checked. */
+export function settleAbsentTaskDeletionMember(id: string, name: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
+    const member = stored.deletion.members.find(value => value.name === name);
+    if (!member) throw new TaskStateError('Unknown deletion member');
+    member.phase = 'identity_absent';
+    member.launch_id ??= DELETION_MEMBER_ABSENT_VERIFIED;
+    member.updated_at = new Date().toISOString();
+    writeTask(stored);
+  });
+}
+
+/** Room-only erasure keeps the parent Task but removes its dead room/member links. */
+export function detachDeletedRoom(taskId: string, roomId: string): void {
+  withTaskLock(taskId, () => {
+    if (!existsSync(taskPath(taskId))) return;
+    const stored = JSON.parse(readFileSync(taskPath(taskId), 'utf8')) as StoredTaskRecord;
+    if (stored.room_id !== roomId || stored.deletion?.status === 'pending') return;
+    delete stored.room_id;
+    delete stored.room_identity_cid;
+    stored.member_roles = [];
+    writeTask(stored);
+  });
+}
+
+/** A completed room may consume its archives while other task members still retire. */
+export function beginTaskArchiveCleanup(id: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
+    stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
+    writeTask(stored);
   });
 }

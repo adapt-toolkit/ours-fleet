@@ -1118,7 +1118,7 @@ describe('task create/start surface parity', () => {
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: config,
       cowork: construct, binPath: () => '/fleet', provisionMembers: vi.fn() });
     await expect(app.requestRoomDeletion({ actor: { kind: 'local_control', surface: 'cli' },
-      roomId: 'missing-room' })).rejects.toMatchObject({ code: 'room_record_not_found' });
+      roomId: 'missing-room' })).resolves.toMatchObject({ settlementRequired: true });
     expect(construct).toHaveBeenCalledOnce();
 
     const room = createRoomRecord({ room_id: 'room-repeat-delete', room_name: 'Repeat delete' });

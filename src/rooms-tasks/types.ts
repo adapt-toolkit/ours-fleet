@@ -111,6 +111,7 @@ export interface TaskDeletionIntent {
   /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
   members: TaskDeletionMemberCursor[];
   archived_absences?: ArchivedMemberAbsence[];
+  absent_members?: string[];
   /** Archive proofs were verified before owned workspace cleanup may consume them. */
   workspace_cleanup_started_at?: string;
   error?: string;
@@ -252,6 +253,7 @@ export type MemberRetirementPhase =
   | 'identity_absent';
 
 export interface MemberRetirement {
+  absence_verified?: boolean;
   phase: MemberRetirementPhase;
   launch_id: string;
   updated_at: string;
