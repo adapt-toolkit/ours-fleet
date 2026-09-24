@@ -1,5 +1,5 @@
 import {
-  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync,
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -146,34 +146,50 @@ export function replaceFileAtomically(path: string, contents: string, mode = 0o6
   } catch { /* platform does not allow fsync on a directory */ }
 }
 
-/** Short synchronous file transaction for synchronous journal appenders. */
+/** Synchronous Lamport bakery lock: unique claims are never reused, so stale
+ * reclamation cannot remove a successor's lock. Atomic claim replacement keeps
+ * choosing/ticket reads complete. Dead claims can be removed by any contender.
+ */
 export function withSynchronousFileLock<T>(path: string, work: () => T): T {
-  mkdirSync(dirname(path), { recursive: true });
-  const token = randomUUID();
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const token = `${process.pid}-${randomUUID()}.json`;
+  const own = join(path, token);
   const deadline = Date.now() + 10_000;
-  for (;;) {
-    const claim = `${path}.claim.${process.pid}.${randomUUID()}`;
-    try {
-      mkdirSync(claim, { mode: 0o700 });
-      writeFileSync(join(claim, 'owner.json'), JSON.stringify({ pid: process.pid, token }));
-      renameSync(claim, path);
-      break;
-    } catch (error) {
-      rmSync(claim, { recursive: true, force: true });
-      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-      let alive = true;
-      try {
-        const owner = JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8'));
-        try { process.kill(owner.pid, 0); } catch (e) { alive = (e as NodeJS.ErrnoException).code !== 'ESRCH'; }
-      } catch { /* malformed lock is not authority to remove it */ }
-      if (!alive) { rmSync(path, { recursive: true, force: true }); continue; }
+  type Claim = { pid: number; choosing: boolean; ticket: number };
+  const claims = (): Array<{ name: string; value: Claim }> => {
+    const result: Array<{ name: string; value: Claim }> = [];
+    for (const name of readdirSync(path).filter(name => /^[0-9]+-[a-f0-9-]{36}\.json$/.test(name))) {
+      const file = join(path, name);
+      let value: Claim;
+      try { value = JSON.parse(readFileSync(file, 'utf8')); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+      if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || !Number.isSafeInteger(value.ticket) || value.ticket < 0)
+        throw new Error('Invalid synchronous lock claim');
+      if (name !== token) {
+        try { process.kill(value.pid, 0); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+            // This dead contender alone owned this UUID path. Never remove
+            // the namespace or a successor's differently named claim.
+            rmSync(file, { force: true }); continue;
+          }
+        }
+      }
+      result.push({ name, value });
+    }
+    return result;
+  };
+  replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: true, ticket: 0 }));
+  try {
+    const ticket = Math.max(0, ...claims().map(claim => claim.value.ticket)) + 1;
+    if (!Number.isSafeInteger(ticket)) throw new Error('Synchronous lock ticket overflow');
+    replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: false, ticket }));
+    for (;;) {
+      const preceding = claims().some(claim => claim.name !== token && (claim.value.choosing
+        || claim.value.ticket < ticket || (claim.value.ticket === ticket && claim.name < token)));
+      if (!preceding) return work();
       if (Date.now() >= deadline) throw new Error('Timed out acquiring synchronous journal lock');
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
-  }
-  try { return work(); }
-  finally {
-    const owner = JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8'));
-    if (owner.token === token) rmSync(path, { recursive: true, force: true });
-  }
+  } finally { rmSync(own, { force: true }); }
 }

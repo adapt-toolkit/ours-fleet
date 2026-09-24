@@ -18,7 +18,7 @@ import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.
 import {
   advanceTaskDeletionMember, settleAbsentTaskDeletionMember, beginTaskDeletionIntent, completeTaskDeletionReceipt,
   ensureTaskDeletionReceipt, getDeletingTask, importTaskDeletionRetirementEvidence,
-  setTaskDeletionError, TaskStateError, beginTaskWorkspaceCleanup,
+  setTaskDeletionError, TaskStateError, beginTaskWorkspaceCleanup, beginTaskArchiveCleanup,
   unlinkDeletedTask, upsertTaskDeletionMembersFromSeats,
   type TaskDeletionAcceptance,
 } from './task-state.js';
@@ -260,7 +260,7 @@ export async function settleTaskDeletion(input: {
         await cowork!.deleteRoom(record.room_id);
         for (const proof of proofs)
           await (task.deletion.workspace_cleanup_started_at && !existsSync(proof.archive_path) ? verifyArchivedMemberStillAbsent : verifyArchivedAbsence)(proof);
-        beginTaskWorkspaceCleanup(taskId);
+        beginTaskArchiveCleanup(taskId);
         await eraseMemberArtifacts('room', record.room_id, seats, [record.room_id]);
         for (const proof of proofs)
           if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before room unlink');
@@ -322,7 +322,7 @@ export async function settleTaskDeletion(input: {
         task.deletion.room_id ? [task.deletion.room_id] : []);
       if (task.workspace) {
         assertWorkspaceDeletable(task.workspace, 'task', taskId);
-        beginTaskWorkspaceCleanup(taskId);
+        beginTaskArchiveCleanup(taskId);
         collectWorkspaceArchives(task.workspace);
         deleteWorkspace(task.workspace, 'task', taskId);
       }

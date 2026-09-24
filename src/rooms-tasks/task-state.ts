@@ -627,7 +627,10 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
   try {
     stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
   } catch (error) {
-    if (isNotFoundError(error)) return { status: 'already_absent' };
+    if (isNotFoundError(error)) {
+      completeTaskDeletionReceipt(id);
+      return { status: 'already_absent' };
+    }
     throw error;
   }
   if (stored.deletion?.status === 'pending') {
@@ -930,6 +933,16 @@ export function detachDeletedRoom(taskId: string, roomId: string): void {
     delete stored.room_id;
     delete stored.room_identity_cid;
     stored.member_roles = [];
+    writeTask(stored);
+  });
+}
+
+/** A completed room may consume its archives while other task members still retire. */
+export function beginTaskArchiveCleanup(id: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
+    stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
     writeTask(stored);
   });
 }

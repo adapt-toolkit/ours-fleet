@@ -150,3 +150,23 @@ it('resumes task erasure after archives are removed but before room record unlin
   await settleTaskDeletion({ taskId: task.task_id, cowork });
   expect(getRoomRecord(id)).toBeUndefined(); expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
 });
+
+it('settles a task with a room member and an already-absent orphan member cursor', async () => {
+  const task = createTask({ title: 'mixed membership', origin: { type: 'cli' } });
+  createRoomRecord({ room_id: id, room_name: 'r', task_id: task.task_id });
+  updateTaskRoom(task.task_id, id, roomCid);
+  updateMemberSeats(id, [{ ...seat(), identity_cid: cid }]);
+  const taskPath = join(stateRoot(), 'tasks', task.task_id + '.json');
+  const stored = JSON.parse(readFileSync(taskPath, 'utf8'));
+  stored.member_roles = [{ name: 'orphan-member', identity_cid: 'ef'.repeat(32), role: 'Critic' }];
+  write(taskPath, stored);
+  beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  await expect(settleTaskDeletion({ taskId: task.task_id, cowork })).resolves.toMatchObject({ deleted: true });
+});
+it('heals receipt after task unlink through repeated acceptance', async () => {
+  const task = createTask({ title: 'private receipt title', origin: { type: 'cli' } });
+  beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  rmSync(join(stateRoot(), 'tasks', task.task_id + '.json'));
+  expect(beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' }).status).toBe('already_absent');
+  expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
+});

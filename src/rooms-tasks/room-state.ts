@@ -24,8 +24,11 @@ export class RoomStateError extends Error {}
 
 function readRoom(id: string): RoomOrchestrationRecord {
   const p = roomPath(id);
-  if (!existsSync(p)) throw new RoomStateError(`room not found: ${id}`);
-  return JSON.parse(readFileSync(p, 'utf8')) as RoomOrchestrationRecord;
+  try { return JSON.parse(readFileSync(p, 'utf8')) as RoomOrchestrationRecord; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new RoomStateError(`room not found: ${id}`);
+    throw error;
+  }
 }
 
 function writeRoom(record: RoomOrchestrationRecord): void {
