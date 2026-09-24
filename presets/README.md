@@ -53,6 +53,11 @@ Otherwise use a bundled SDK whose runtime advertises these models and efforts.
 The presets do not change your executable or restart agents. An older bundled
 runtime alone is not evidence of support for the new models.
 
+No-prompt ACP startup and `session/set_config_option` probes also verified all
+new GPT and Claude effort combinations, including Sol `ultra` and Claude `max`;
+Haiku startup advertises no effort option. The probes used Codex ACP 1.10.0
+with the installed Codex executable and Claude ACP 0.63.0 with the native override.
+
 ACP builds effort options from the selected model's `supportedEffortLevels` and
 applies the selection through the SDK's session flag settings. This supports
 `max` without writing it to persistent `effortLevel` settings. Fleet verifies
