@@ -1,0 +1,4 @@
+# Generated from presets/brain-catalog.json revision 3.
+harness: claude-code
+session: acp
+model: claude-haiku-4-5-20251001

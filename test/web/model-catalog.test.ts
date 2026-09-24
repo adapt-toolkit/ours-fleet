@@ -20,6 +20,7 @@ describe('local harness model catalogs', () => {
 
   it('exposes exact Claude 2.1 IDs', () => {
     expect(claudeModelCatalog().models.map(model => model.id)).toEqual([
+      'claude-fable-5-1', 'claude-opus-5-5', 'claude-haiku-4-5-20251001',
       'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5',
     ]);
   });

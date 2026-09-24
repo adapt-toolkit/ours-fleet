@@ -1767,3 +1767,5 @@ A `task_not_ready` result distinguishes confirmed degradation from unknown healt
 and member status and choose supported recovery. These checks do not restart agents,
 recreate identities, redeem invites, or rewrite lifecycle state. Temporary room agents
 remain transient across host reboot; retained launch records do not restore them.
+
+See [predefined Brain models and runtime requirements](presets/README.md) for the verified model/effort matrix and regeneration instructions.

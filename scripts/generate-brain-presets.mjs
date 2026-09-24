@@ -15,12 +15,12 @@ for (const entry of catalog.models) {
   const entryKey = JSON.stringify([entry.harness, entry.session, entry.model]);
   if (entries.has(entryKey)) throw new Error(`duplicate Brain catalog entry: ${entry.harness}/${entry.session}/${entry.model}`);
   entries.add(entryKey);
-  for (const effort of entry.efforts) {
-    const id = idFor(entry, effort);
+  for (const effort of entry.efforts.length ? entry.efforts : [null]) {
+    const id = idFor(entry, effort ?? 'default');
     const filename = `${id}.yaml`;
     if (expected.has(filename)) throw new Error(`duplicate derived Brain preset id: ${id}`);
     const body = [`# Generated from presets/brain-catalog.json revision ${catalog.catalog_revision}.`,
-      `harness: ${entry.harness}`, `session: ${entry.session}`, `model: ${entry.model}`, `effort: ${effort}`, ''].join('\n');
+      `harness: ${entry.harness}`, `session: ${entry.session}`, `model: ${entry.model}`, ...(effort === null ? [] : [`effort: ${effort}`]), ''].join('\n');
     expected.set(filename, body);
   }
 }

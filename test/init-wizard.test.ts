@@ -123,9 +123,9 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 8 },
-    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 3 },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 11 },
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 10 },
+    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 5 },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 15 },
   ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
     const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));

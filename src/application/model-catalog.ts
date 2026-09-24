@@ -55,17 +55,20 @@ export function codexModelCatalog(path = join(homedir(), '.codex', 'models_cache
 
 /**
  * Claude Code 2.1 has no typed model-list endpoint. These exact IDs are the
- * versioned adapter contract shipped by the installed 2.1 CLI, not aliases and
+ * versioned adapter contract verified with CLI 2.1.281, not aliases and
  * not a claim about account entitlement (which Claude validates at launch).
  */
 export function claudeModelCatalog(): HarnessModelCatalog {
   const reasoningEfforts = ['low', 'medium', 'high', 'xhigh', 'max'];
   return {
     models: [
+      { id: 'claude-fable-5-1', label: 'Claude Fable 5.1', reasoningEfforts, source: 'claude-adapter-2.1' },
+      { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', reasoningEfforts, source: 'claude-adapter-2.1' },
+      { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', reasoningEfforts: [], source: 'claude-adapter-2.1' },
       { id: 'claude-fable-5', label: 'Claude Fable 5', reasoningEfforts, source: 'claude-adapter-2.1' },
       { id: 'claude-opus-5', label: 'Claude Opus 5', reasoningEfforts, source: 'claude-adapter-2.1' },
       { id: 'claude-sonnet-5', label: 'Claude Sonnet 5', reasoningEfforts, source: 'claude-adapter-2.1' },
     ],
-    warnings: ['Claude Code exposes no typed model-list endpoint; choices are exact 2.1 adapter IDs and entitlement is validated at launch.'],
+    warnings: ['Claude Code exposes no typed model-list endpoint; choices require a current Claude runtime (verified with 2.1.281); older bundled SDKs need CLAUDE_CODE_EXECUTABLE. Entitlement is validated at launch.'],
   };
 }
