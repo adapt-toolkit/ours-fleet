@@ -738,6 +738,20 @@ Override an adapter only when necessary with \`session_options.acp.command\`
 ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 \`claude-agent-acp\`. \`ours-fleet doctor -c FILE\` verifies the resolved adapter.
 
+## Boot-time daemon readiness
+
+Linux permanent-agent services wait for their configured daemon before launching
+Fleet's runner. This uses the role's saved manifest path and environment, including
+host profiles, gateway endpoints and expected daemon identity; no Docker container
+names or default ports are assumed. The read-only probe requires verified startup
+readiness and an available identity index. Unavailable or unauthorized daemons leave
+the service waiting, with a diagnostic code in the journal. Each wait is bounded
+and systemd retries it until the daemon is ready; stopping the service cancels it.
+This does not consume the agent crash budget or discard its session context.
+Once the runner starts, its normal crash circuit breaker still applies.
+After upgrading Fleet, rerun init to refresh the generated service template.
+Temporary agents and macOS services retain their existing lifecycle behavior.
+
 ## Reliable mail wake
 
 \`monitor.mode\` selects exactly one wake owner:

@@ -533,7 +533,7 @@ export function loadTempRole(name: string): ResolvedRole {
  * with "no such role". An empty/missing marker means "use the default", same as
  * no -c was ever given.
  */
-function resolveConfigPath(dir: string, explicit?: string): string | undefined {
+export function resolveConfigPath(dir: string, explicit?: string): string | undefined {
   if (explicit) return explicit;
   const marker = join(dir, '.config-path');
   if (!existsSync(marker)) return undefined;

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { waitForRoleDaemon } from './startup-readiness.js';
 import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
 import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
 import { spawn as spawnChild } from 'node:child_process';
@@ -1438,6 +1439,12 @@ function configureWebAccess(opts: {
 registerTemplateCommands(program, cOpt);
 registerTaskCommands(program, cOpt);
 registerRoomCommands(program, cOpt);
+
+program.command('_wait-daemon <name>', { hidden: true }).description('internal: service startup readiness')
+  .option('-c, --configuration <file>')
+  .action(async (name, opts) => {
+    try { await waitForRoleDaemon(name, opts.configuration); } catch (e) { die(e); }
+  });
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
