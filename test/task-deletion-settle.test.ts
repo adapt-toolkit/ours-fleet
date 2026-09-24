@@ -367,6 +367,7 @@ describe('deletion vs provisioning linearization', () => {
         roomTemplates: { solo: { name: 'solo', version: 1, description: 'solo', members: [] } },
       }) as never,
       cowork: () => ({
+        getRoom: async () => ({ room_id: 'r-race', identity_cid: 'e'.repeat(64), state: 'active', seats: [] }),
         createRoom: async () => {
           // Deletion accepted mid-window: it must block on the operation lock
           // and land only after the room record + task link publish.

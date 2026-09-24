@@ -70,7 +70,7 @@ import { stateRoot } from '../paths.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
-  | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable'
+  | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'task_not_ready'
   | 'template_not_found' | 'template_mismatch' | 'task_template_drift'
   | 'room_filter' | 'room_not_found' | 'room_record_not_found';
 
@@ -107,6 +107,11 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
 } {
   const f = error.fields;
   switch (error.code) {
+    case 'task_not_ready': return {
+      legacy: `task readiness ${f.readiness}: ${f.reason}`, kind: 'state',
+      detail: `Task ${f.task} readiness is ${f.readiness}: ${f.reason}${f.member ? ` (${f.member})` : ''}.`,
+      action: 'Ask Fleet Coordinator to inspect room and member status and choose supported recovery. Do not blindly relaunch agents or reuse invites.',
+    };
     case 'task_confirmation_mismatch': return {
       legacy: 'confirmation ID must match task ID', kind: 'usage',
       detail: 'The two task IDs must match.', action: 'Repeat the same task ID twice.',

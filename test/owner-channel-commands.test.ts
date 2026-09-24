@@ -719,6 +719,21 @@ describe('owner-channel task subcommands', () => {
     expect(retry.replies[0]).toContain(t.task_id);
   });
 
+  it('/task start reports live readiness failure with Coordinator recovery guidance', async () => {
+    const task = await createTestTask();
+    const ctx = context({ startTask: vi.fn(async () => {
+      throw new TaskRoomApplicationError('task_not_ready',
+        'Task readiness is degraded: supervisor_stopped.',
+        { task: task.task_id, readiness: 'degraded', reason: 'supervisor_stopped' });
+    }) });
+    await dispatchOwnerCommand(`/task start ${task.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('supervisor\\_stopped');
+    expect(ctx.replies[0]).toContain('Fleet Coordinator');
+    expect(ctx.replies[0]).not.toContain('Room provisioning complete');
+    expect(ctx.replies[0]).not.toContain('Retry once');
+  });
+
   it('/task start without id returns usage', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/task start', ctx);

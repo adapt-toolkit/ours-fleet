@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { taskLiveReadiness, type LiveReadinessDeps } from '../rooms-tasks/live-readiness.js';
 
 import { ConfigError, loadConfig, type FleetConfig } from '../config.js';
 import {
@@ -110,7 +111,7 @@ export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome):
 export class TaskRoomApplicationError extends Error {
   constructor(readonly code: 'template_not_found' | 'task_template_drift' | 'template_mismatch'
     | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'task_deleting'
-    | 'room_not_found' | 'room_record_not_found', message: string,
+    | 'room_not_found' | 'room_record_not_found' | 'task_not_ready', message: string,
     readonly fields: Readonly<Record<string, string>> = {}) {
     super(message); this.name = 'TaskRoomApplicationError';
   }
@@ -149,6 +150,7 @@ export function resolveRoomLaunchPolicy(
 }
 
 export interface TaskRoomServiceDeps {
+  liveReadiness?: LiveReadinessDeps;
   loadConfiguration?(path?: string): FleetConfig;
   cowork?(config: FleetConfig): CoworkAdapter;
   binPath?(): string;
@@ -341,6 +343,7 @@ export class TaskRoomApplicationService {
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
   }
 
+  /** Durable provisioning progress only; use active task start/work for a live readiness check. */
   taskProvisioningOutcome(taskId: string): TaskProvisioningOutcome {
     const task = readTask(taskId);
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
@@ -392,6 +395,10 @@ export class TaskRoomApplicationService {
     const deadline = now() + (input.waitMs ?? 60_000);
     for (;;) {
       const outcome = this.taskProvisioningOutcome(input.taskId);
+      if (outcome.kind === 'ready') {
+        const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+        await this.assertTaskLiveReadiness(outcome.task, outcome.room, cfg);
+      }
       if (outcome.kind !== 'in_progress' || now() >= deadline) {
         recordTaskProvisioningOutcome(outcome);
         return outcome;
@@ -798,6 +805,18 @@ export class TaskRoomApplicationService {
     return this.acceptTerminal(task.task_id, 'done', task.room_id, input.outcome);
   }
 
+  private async assertTaskLiveReadiness(
+    task: TaskRecord, room: RoomOrchestrationRecord | undefined, cfg: FleetConfig,
+  ): Promise<void> {
+    const cowork = this.deps.cowork ? this.deps.cowork(cfg)
+      : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config });
+    const issue = await taskLiveReadiness(task, room, cowork, this.deps.liveReadiness);
+    if (issue) throw new TaskRoomApplicationError('task_not_ready',
+      `Task readiness is ${issue.state}: ${issue.reason}. Ask Fleet Coordinator to inspect the room and member status and choose supported recovery; do not blindly relaunch or reuse invites.`,
+      { task: task.task_id, room: task.room_id ?? 'missing', readiness: issue.state,
+        reason: issue.reason, ...(issue.member ? { member: issue.member } : {}) });
+  }
+
   async ensureTaskWork(input: {
     actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
   }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' | 'in_progress' }> {
@@ -826,7 +845,10 @@ export class TaskRoomApplicationService {
         const pinned = durableTemplate;
         if (!pinned) throw new TaskRoomApplicationError('template_mismatch',
           'active task has no durable execution plan', { room: task.room_id });
-        if (durableRequestMatches) return { task, status: 'already_active' };
+        if (durableRequestMatches) {
+          await this.assertTaskLiveReadiness(task, recordedRoom, cfg);
+          return { task, status: 'already_active' };
+        }
         const templateName = input.template ?? pinned.name;
         const definition = resolveTemplate(templateName, cfg.roomTemplates ?? {});
         if (!definition) throw new TaskRoomApplicationError('template_not_found',
@@ -838,6 +860,7 @@ export class TaskRoomApplicationService {
             requested: `${requested.snapshot.name}@${requested.snapshot.version}`, room: task.room_id,
             provisioned: `${pinned.name}@${pinned.version}` });
       }
+      await this.assertTaskLiveReadiness(task, recordedRoom, cfg);
       return { task, status: 'already_active' };
     }
     let room = task.room_id ? getRoomRecord(task.room_id) : undefined;
@@ -962,7 +985,11 @@ export class TaskRoomApplicationService {
       }
     }
     const resultingRoom = getRoomRecord(task.room_id!);
-    return { task, status: task.state === 'active' && resultingRoom?.state === 'active' ? 'ready' : 'in_progress' };
+    if (task.state === 'active' && resultingRoom?.state === 'active') {
+      await this.assertTaskLiveReadiness(task, resultingRoom, cfg);
+      return { task, status: 'ready' };
+    }
+    return { task, status: 'in_progress' };
   }
 
   private createTemplate(

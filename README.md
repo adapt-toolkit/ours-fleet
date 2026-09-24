@@ -1752,3 +1752,18 @@ or message delivery. File tools resolve paths in the invoking CLI process or
 Fleet web server's filesystem context, with that process's access permissions.
 
 Task workspace ownership, retention, safe deletion and legacy migration are documented in [Task workspaces](docs/task-workspaces.md).
+
+### Active task readiness after interruption
+
+Task and room list states, and `taskProvisioningOutcome`, describe durable lifecycle
+and provisioning progress; they are not live health checks. Retrying `task start`
+or `task work` on an active task checks the current Cowork room identity and seats,
+member launch ownership, supervisor liveness, and authenticated session status
+before reporting success. Waiting for provisioning completion also checks live
+readiness. This is a point-in-time observation, not proof of an agent-authored reply.
+
+A `task_not_ready` result distinguishes confirmed degradation from unknown health
+(for example, an unavailable control socket). Ask Fleet Coordinator to inspect room
+and member status and choose supported recovery. These checks do not restart agents,
+recreate identities, redeem invites, or rewrite lifecycle state. Temporary room agents
+remain transient across host reboot; retained launch records do not restore them.

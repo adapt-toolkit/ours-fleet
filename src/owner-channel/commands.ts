@@ -170,6 +170,10 @@ function isKnownOwnerRoomState(message: string): boolean {
 function ownerTaskFailure(error: unknown): {
   kind: 'not_found' | 'state' | 'usage' | 'unexpected'; detail?: string; action: string;
 } {
+  if (error instanceof TaskRoomApplicationError && error.code === 'task_not_ready') return {
+    kind: 'state', detail: error.message,
+    action: 'Ask Fleet Coordinator to inspect room and member status and choose supported recovery.',
+  };
   if (error instanceof TaskListError) return {
     kind: error.code === 'list_not_found' ? 'not_found'
       : error.code === 'invalid_name' ? 'usage' : 'state',
