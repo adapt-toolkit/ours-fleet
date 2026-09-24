@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { storeRoomSecret, storeTemporaryLaunch, preparePermanentAssignment } from './agent-ours/service.js';
+import { ensureWorkspace } from './rooms-tasks/workspace.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -405,6 +406,12 @@ export async function spawnTemp(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
+  if (o.roomMemberStartup?.workspace) {
+    const workspace = o.roomMemberStartup.workspace;
+    if (prepared.role.cwd !== workspace.path)
+      throw new Error('room member cwd must equal its recorded owned workspace');
+    ensureWorkspace(workspace);
+  }
   // Retire only supervisors whose recorded owner is definitively stopped. This
   // bounded pass keeps the active roster clean without deleting old evidence.
   await reclaimStaleTempState();

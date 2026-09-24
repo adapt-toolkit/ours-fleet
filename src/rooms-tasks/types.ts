@@ -111,6 +111,8 @@ export interface TaskDeletionIntent {
   /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
   members: TaskDeletionMemberCursor[];
   archived_absences?: ArchivedMemberAbsence[];
+  /** Archive proofs were verified before owned workspace cleanup may consume them. */
+  workspace_cleanup_started_at?: string;
   error?: string;
   error_at?: string;
   recovery_hint?: string;
@@ -119,6 +121,7 @@ export interface TaskDeletionIntent {
 }
 
 export interface TaskRecord {
+  workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
   list_id: string;
@@ -279,6 +282,7 @@ export interface RoomMemberSeat {
 }
 
 export interface RoomOrchestrationRecord {
+  workspace?: import('./workspace.js').OwnedWorkspace;
   room_id: string;
   room_identity_cid?: string;
   room_name: string;

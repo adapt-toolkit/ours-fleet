@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
+import { planWorkspace, ensureWorkspace } from './workspace.js';
+import { getTask } from './task-state.js';
 import type {
   RoomOrchestrationRecord, RoomOrchestrationState, SagaCursor, SagaPhase,
   RoomMemberSeat, ProvisioningDetail,
@@ -45,6 +47,7 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
     const requested = storedRoomLaunchPolicy(input.room_policy);
     if (JSON.stringify(before) !== JSON.stringify(requested))
       throw new RoomStateError(`room ${input.room_id} launch policy mismatch`);
+    if (existing.workspace) ensureWorkspace(existing.workspace);
     return existing;
   }
 
@@ -61,7 +64,9 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
     state: 'provisioning',
     created_at: new Date().toISOString(),
   };
+  record.workspace = input.task_id ? getTask(input.task_id).workspace : planWorkspace('room', input.room_id);
   writeRoom(record);
+  if (record.workspace) ensureWorkspace(record.workspace);
   return record;
 }
 

@@ -1750,3 +1750,5 @@ outcome: inspect state before retrying, because there is no automatic retry or
 exactly-once guarantee. Contact acceptance alone does not prove peer verification
 or message delivery. File tools resolve paths in the invoking CLI process or
 Fleet web server's filesystem context, with that process's access permissions.
+
+Task workspace ownership, retention, safe deletion and legacy migration are documented in [Task workspaces](docs/task-workspaces.md).

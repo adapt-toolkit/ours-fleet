@@ -57,7 +57,7 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
     sleep: async (ms: number) => { clock += ms; await new Promise(r => setImmediate(r)); },
     now: () => clock,
     log: () => {},
-    env: {},
+    env: hermetic(),
     timers: { set: () => 0 as unknown as ReturnType<typeof setTimeout>, clear: () => {} },
     ...over,
   };

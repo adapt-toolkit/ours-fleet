@@ -1,8 +1,10 @@
-import { proveArchivedAbsence, verifyArchivedAbsence } from './archived-absence.js';
+import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
 import { withFileLock } from '../atomic-file.js';
 import { agentDir } from '../paths.js';
+import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
+import { collectWorkspaceArchives } from './workspace-artifacts.js';
 import { secureStoppedTempArchive, stopTempSupervisor } from '../temp-lifecycle.js';
 import {
   closeManagedRoom, identityCidPresent, inspectMember, removeExactMemberIdentity,
@@ -15,7 +17,7 @@ import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.
 import {
   advanceTaskDeletionMember, beginTaskDeletionIntent, completeTaskDeletionReceipt,
   ensureTaskDeletionReceipt, getDeletingTask, importTaskDeletionRetirementEvidence,
-  setTaskDeletionError, TaskStateError,
+  setTaskDeletionError, TaskStateError, beginTaskWorkspaceCleanup,
   unlinkDeletedTask, upsertTaskDeletionMembersFromSeats,
   type TaskDeletionAcceptance,
 } from './task-state.js';
@@ -207,6 +209,8 @@ export async function settleTaskDeletion(input: {
       // aborts settlement (fail closed).
       ensureTaskDeletionReceipt(taskId);
       const records = listRoomRecords().filter(room => room.task_id === taskId);
+      if (task.deletion.workspace_cleanup_started_at && records.length)
+        throw new TaskStateError(`task ${taskId} room records reappeared after workspace cleanup began`);
       const recordIds = new Set(records.map(room => room.room_id));
       const recordedRoomId = task.deletion.room_id ?? task.room_id;
       const needsCowork = records.length > 0 || recordedRoomId !== undefined;
@@ -237,8 +241,9 @@ export async function settleTaskDeletion(input: {
         deleteRoomRecord(record.room_id);
       }
 
-      for (const proof of getDeletingTask(taskId).deletion!.archived_absences ?? [])
-        await verifyArchivedAbsence(proof);
+      const deletion = getDeletingTask(taskId).deletion!;
+      for (const proof of deletion.archived_absences ?? [])
+        await (deletion.workspace_cleanup_started_at && !existsSync(proof.archive_path) ? verifyArchivedMemberStillAbsent : verifyArchivedAbsence)(proof);
 
       // Members whose room record is gone (crash after record deletion, or
       // legacy state): resume from the durable cursors.
@@ -278,11 +283,17 @@ export async function settleTaskDeletion(input: {
       if (task.deletion.members.some(member => member.phase !== 'identity_absent'))
         throw new TaskStateError(`task ${taskId} has unretired members at deletion finalization`);
       for (const proof of task.deletion.archived_absences ?? [])
-        await verifyArchivedAbsence(proof);
+        await (task.deletion.workspace_cleanup_started_at && !existsSync(proof.archive_path) ? verifyArchivedMemberStillAbsent : verifyArchivedAbsence)(proof);
       for (const proof of task.deletion.archived_absences ?? [])
         if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member replacement before task unlink');
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
+      if (task.workspace) {
+        assertWorkspaceDeletable(task.workspace, 'task', taskId);
+        beginTaskWorkspaceCleanup(taskId);
+        collectWorkspaceArchives(task.workspace);
+        deleteWorkspace(task.workspace, 'task', taskId);
+      }
       unlinkDeletedTask(taskId);
     } catch (error) {
       setTaskDeletionError(taskId, errorText(error), recoveryHint);

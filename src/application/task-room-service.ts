@@ -1014,6 +1014,7 @@ export class TaskRoomApplicationService {
     const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
     let launchTemplate: TemplateSnapshot | undefined;
     let room: RoomOrchestrationRecord;
+    let reusedRoom = false;
     try {
       launchTemplate = template ? (template.launch_snapshot_hash ? template
         : sealTemplateSnapshot(template, cfg.agentTemplates ?? {}, launchDefinitions)) : undefined;
@@ -1028,6 +1029,23 @@ export class TaskRoomApplicationService {
           if (fresh.deletion?.status === 'pending')
             throw new TaskRoomApplicationError('task_deleting',
               `task ${task.task_id} is pending deletion`, { task: task.task_id });
+          // A concurrent caller or a restart after local Room publication must
+          // reuse the task's one durable room, never create a second workspace/room.
+          const candidates = listRoomRecords().filter(record => record.task_id === task.task_id);
+          if (candidates.length > 1) throw new Error('ambiguous task room ownership');
+          const existing = fresh.room_id ? getRoomRecord(fresh.room_id) : candidates[0];
+          if (fresh.room_id && !existing) throw new Error('recorded task room is missing; refusing duplicate creation');
+          if (existing) {
+            reusedRoom = true;
+            // Heal a crash between durable room publication and task linkage.
+            // Return a resumable phase, leaving owner admission/member launch to
+            // the existing continuation rather than racing the original creator.
+            const resumable = ['persist_intent', 'create_room'].includes(existing.saga.phase)
+              ? advanceSaga(existing.room_id, attachOwner ? 'attach_owner' : 'create_members', attachOwner ? 2 : 3)
+              : existing;
+            onCreated(resumable);
+            return resumable;
+          }
         }
         const requiredRoles = new Map<string, number>();
         if (attachOwner) requiredRoles.set(rooms.owner.role, 1);
@@ -1044,8 +1062,10 @@ export class TaskRoomApplicationService {
           room_id: created.room_id, room_name: roomName, room_identity_cid: created.identity_cid,
           task_id: task.task_id, template_snapshot: launchTemplate, room_policy: policy,
         });
-        onCreated(record);
-        return record;
+        const resumable = advanceSaga(record.room_id,
+          attachOwner ? 'attach_owner' : 'create_members', attachOwner ? 2 : 3);
+        onCreated(resumable);
+        return resumable;
       };
       room = task.task_id
         ? await withFileLock(taskOperationLockPath(task.task_id), publishRoom, {}, TASK_OPERATION_LOCK_STALE_MS)
@@ -1056,7 +1076,7 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
-    room = advanceSaga(room.room_id, 'create_room', 1);
+    if (reusedRoom) return room;
     if (attachOwner) {
       room = advanceSaga(room.room_id, 'attach_owner', 2);
       await this.setOwnerRoomCommands(cowork, room.room_id, rooms.owner.role);

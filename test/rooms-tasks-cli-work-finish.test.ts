@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -314,6 +314,10 @@ describe('room delete', () => {
     const { createRoomRecord, closeRoom } = await import('../src/rooms-tasks/room-state.js');
     createRoomRecord({ room_id: legacyId, room_name: 'Legacy closed room' });
     closeRoom(legacyId);
+    const legacyPath = join(dir, '.ours-fleet', 'rooms', `${legacyId}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace;
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     mocks.listRooms.mockResolvedValue([
       {
         room_id: active.room_id, identity_name: 'active-room', identity_cid: 'c'.repeat(64),

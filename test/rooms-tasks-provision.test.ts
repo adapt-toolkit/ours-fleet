@@ -196,6 +196,7 @@ beforeEach(() => {
     writeFileSync(join(dir, 'role.yaml'), JSON.stringify({
       name: opts.name,
       identity: opts.identity,
+      cwd: definition.cwd,
       harness: definition.brain?.inline?.harness ?? 'codex',
       session: 'acp',
       ...(definition.brain?.inline?.model !== undefined ? { model: definition.brain.inline.model } : {}),
@@ -235,30 +236,28 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
-  it.each(['room', 'task'])('rechecks terminal ownership after waiting for the %s launch lock', async boundary => {
+  it.each(['room', 'task'])('rechecks terminal ownership after waiting for the %s provisioning lock', async boundary => {
     const task = createTask({ title: 'Waiting launch', origin: { type: 'cli' } });
     createRoomRecord({ room_id: 'room-lock-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
     updateTaskRoom(task.task_id, 'room-lock-race', 'room-cid');
     const h = coworkHarness();
-    let locked!: () => void, unlock!: () => void, issued!: () => void;
+    let locked!: () => void, unlock!: () => void;
     const ready = new Promise<void>(resolve => { locked = resolve; });
     const release = new Promise<void>(resolve => { unlock = resolve; });
-    const inviteIssued = new Promise<void>(resolve => { issued = resolve; });
     const held = withFileLock(boundary === 'room' ? roomCloseLockPath('room-lock-race') : taskOperationLockPath(task.task_id), async () => { locked(); await release; });
     await ready;
-    const issue = h.issueInvite.getMockImplementation()!;
-    h.issueInvite.mockImplementation(async (...args) => { const result = await issue(...args); issued(); return result; });
     const pending = provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-lock-race', taskId: task.task_id,
       template: template(1), binPath: '/usr/bin/ours-fleet' });
     const rejected = expect(pending).rejects.toThrow(/closing|terminal/);
     try {
-      await inviteIssued;
       await new Promise<void>(resolve => setImmediate(resolve));
+      expect(h.issueInvite).not.toHaveBeenCalled();
       if (boundary === 'room') beginRoomClose('room-lock-race');
       else beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'room-lock-race' });
     } finally { unlock(); }
     await held;
     await rejected;
+    expect(h.issueInvite).not.toHaveBeenCalled();
     expect(mocks.spawnTemp).not.toHaveBeenCalled();
   });
 
@@ -608,6 +607,20 @@ describe('simple Cowork room member startup', () => {
     expect(state).toContain('permissions');
   });
 
+  it('serializes concurrent member provisioning into one workspace and one launch per member', async () => {
+    const room = createRoomRecord({ room_id: 'room-concurrent', room_name: 'r', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: room.room_id, template: template(2), binPath: '/fleet' };
+    await Promise.all([provisionMembers(input), provisionMembers(input)]);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(h.issueInvite).toHaveBeenCalledTimes(2);
+    for (const [spawn] of mocks.spawnTemp.mock.calls) {
+      expect(spawn.agentDefinition.cwd).toBe(room.workspace!.path);
+      expect(spawn.roomMemberStartup.workspace).toEqual(room.workspace);
+      expect(spawn.roomMemberStartup.task).toContain(room.workspace!.path);
+    }
+  });
+
   it('preserves the canonical room Agent definition', async () => {
     createRoomRecord({ room_id: 'room-override', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
@@ -622,7 +635,7 @@ describe('simple Cowork room member startup', () => {
     });
     expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({
       agentDefinition: { brain: { inline: { harness: 'codex', model: 'gpt-test' } },
-        role: { inline: { persona: 'Review carefully.' } }, cwd: '/workspace' },
+        role: { inline: { persona: 'Review carefully.' } }, cwd: getRoomRecord('room-override')!.workspace!.path },
     });
     expect(mocks.spawnTemp.mock.calls[0][0].roomMemberStartup.task)
       .toContain('Role persona:\nReview carefully.');
@@ -848,7 +861,7 @@ describe('simple Cowork room member startup', () => {
     const spawn = mocks.spawnTemp.mock.calls[0][0];
     expect(spawn).toMatchObject({
       agentDefinition: { brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
-        cwd: '/explicit', permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } },
+        cwd: getRoomRecord('room-explicit')!.workspace!.path, permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } },
     });
     expect(spawn.inheritedFromCaller).toEqual([]);
   });

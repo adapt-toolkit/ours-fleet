@@ -19,6 +19,17 @@ export async function verifyArchivedAbsence(proof: ArchivedMemberAbsence): Promi
     throw new Error('Archived member absence ownership proof mismatch');
   if (await tempSupervisorLiveness(archive) !== 'stopped')
     throw new Error('Archived member supervisor absence is not proven');
+  await verifyArchivedMemberStillAbsent(proof);
+}
+
+/** After the verified archive has been consumed by explicit workspace deletion,
+ * still fence replacement live state and a recreated daemon identity on every retry.
+ */
+export async function verifyArchivedMemberStillAbsent(proof: ArchivedMemberAbsence): Promise<void> {
+  const absent = () => {
+    if (existsSync(agentDir(proof.name, true))) throw new Error('Archived member has replacement live state');
+  };
+  absent();
   await assertMemberIdentityAbsent({
     role_name: proof.name, slot: 'archived', cowork_role: 'archived', seat_state: 'removed',
   });
