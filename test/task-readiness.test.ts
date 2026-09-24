@@ -148,6 +148,21 @@ describe('current task readiness', () => {
     room.seats.push({ identity_cid: 'owner-cid', display_name: 'Owner', invite_id: 'owner', role: 'Owner', seat_state: 'active' });
     expect(await outcome()).toMatchObject({ kind: 'ready', launch: { owner_attached: true } });
   });
+  it('identifies separately admitted members without adopting their bookkeeping', async () => {
+    room.seats.push({ ...room.seats[0], identity_cid: 'replacement-cid' });
+    const result = await outcome();
+    expect(result).toMatchObject({ kind: 'degraded' });
+    expect(result.blocker).toContain('untracked_member_seats');
+  });
+  it('degrades a two-member room when only one original member remains available', async () => {
+    const path = join(root, '.ours-fleet/rooms', `${roomId}.json`);
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    stored.template_snapshot.members[0].count = 2;
+    stored.member_seats.push({ ...stored.member_seats[0], role_name: 'member-2', identity_cid: 'second-cid' });
+    writeFileSync(path, JSON.stringify(stored));
+    room.seats.push({ ...room.seats[0], identity_cid: 'second-cid', seat_state: 'removed' });
+    expect(await outcome()).toMatchObject({ kind: 'degraded', members: { expected: 2, active: 1, launched: 1 } });
+  });
   it('sanitizes Cowork errors and provides recovery guidance', async () => {
     getRoom.mockRejectedValue(new Error('secret-invite /private/path'));
     const result = await outcome();

@@ -53,7 +53,7 @@ beforeEach(async () => {
         room_id: roomId, identity_name: 'fixture', identity_cid: 'room-cid', room_name: 'Fixture', state: 'active',
         seats: [
           { identity: 'original-cid', display_name: 'original-member', invite_id: 'old', role: 'Developer', state: originalActive ? 'active' : 'removed' },
-          { identity: 'replacement-cid', display_name: 'replacement', invite_id: 'new', role: 'Developer', state: 'active' },
+          ...(!originalActive ? [{ identity: 'replacement-cid', display_name: 'replacement', invite_id: 'new', role: 'Developer', state: 'active' }] : []),
         ],
       } }) + '\n');
     });

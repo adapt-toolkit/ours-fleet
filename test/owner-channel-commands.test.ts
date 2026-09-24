@@ -575,6 +575,23 @@ describe('owner-channel task subcommands', () => {
     expect(getTask).toHaveBeenCalledWith(t.task_id);
   });
 
+  it.each(['show', 'start', 'create'])('/task %s awaits and displays degraded current readiness', async command => {
+    const task = { ...await createTestTask(), state: 'active' as const, room_id: 'fixture-room' };
+    const outcome = { kind: 'degraded' as const, task,
+      launch: { anonymous: false, owner_attached: false },
+      members: { expected: 1, active: 0, launched: 0 },
+      blocker: 'member_seats_unavailable', next_action: 'Ask the Fleet coordinator to inspect retained context.' };
+    const observe = vi.fn(async () => outcome);
+    const ctx = context({ getTask: () => ({ task, orchestration: undefined }),
+      createTask: async () => task, startTask: async () => outcome, taskProvisioningOutcome: observe });
+    await dispatchOwnerCommand(command === 'create' ? '/task create Fixture' : `/task ${command} ${task.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('degraded');
+    expect(ctx.replies[0]).toContain('coordinator');
+    expect(ctx.replies[0]).not.toContain('Room provisioning complete');
+    if (command !== 'start') expect(observe).toHaveBeenCalledWith(task.task_id);
+  });
+
   it('/task start <id> transitions backlog → provisioning', async () => {
     const t = await createTestTask();
     const ctx = context();
