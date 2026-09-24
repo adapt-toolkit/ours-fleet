@@ -163,6 +163,15 @@ describe('current task readiness', () => {
     room.seats.push({ ...room.seats[0], identity_cid: 'second-cid', seat_state: 'removed' });
     expect(await outcome()).toMatchObject({ kind: 'degraded', members: { expected: 2, active: 1, launched: 1 } });
   });
+  it('does not classify unrelated Owner or observer seats as replacements', async () => {
+    room.seats.push({ ...room.seats[0], identity_cid: 'observer-cid', role: 'Observer' },
+      { ...room.seats[0], identity_cid: 'external-owner-cid', role: 'Owner' });
+    expect(await outcome()).toMatchObject({ kind: 'ready' });
+  });
+  it.each(['acp', 'codex-app-server'])('uses backend-neutral status for %s', async backend => {
+    probes.control.mockResolvedValue({ ok: true, result: { backend, alive: true, readiness: 'running' } });
+    expect(await outcome()).toMatchObject({ kind: 'ready' });
+  });
   it('sanitizes Cowork errors and provides recovery guidance', async () => {
     getRoom.mockRejectedValue(new Error('secret-invite /private/path'));
     const result = await outcome();

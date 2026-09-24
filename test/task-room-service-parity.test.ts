@@ -1,4 +1,16 @@
+import { prepareReadinessMembers, healthyCoworkRoom } from './task-readiness-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// These presentation/service fixtures model healthy external processes. Actual
+// socket authentication, timeout and missing-control behavior has CLI coverage.
+vi.mock('../src/temp-lifecycle.js', async original => ({
+  ...await original<typeof import('../src/temp-lifecycle.js')>(),
+  tempSupervisorLiveness: async () => 'running',
+}));
+vi.mock('../src/session/control.js', async original => ({
+  ...await original<typeof import('../src/session/control.js')>(),
+  controlRequest: async () => ({ ok: true, result: { alive: true, readiness: 'idle' } }),
+}));
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,7 +63,7 @@ function cowork() {
     adapter: {
       createRoom,
       acceptInvite: vi.fn(), issueInvite: vi.fn(), revokeInvite: vi.fn(),
-      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(), listRooms: vi.fn(),
+      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(async roomId => healthyCoworkRoom(roomId)), listRooms: vi.fn(),
       closeRoom: vi.fn(), deleteRoom: vi.fn(), getSeats: vi.fn(), recoverRoom: vi.fn(),
       available: vi.fn(),
     } as unknown as CoworkAdapter,
@@ -98,7 +110,8 @@ describe('task create/start surface parity', () => {
         updateTaskMembers(taskId, seats.map(seat => ({ name: seat.role_name,
           identity_cid: seat.identity_cid, slot: seat.slot, cowork_role: seat.cowork_role })));
         activateTask(taskId);
-        return activateRoom(roomId);
+        prepareReadinessMembers(roomId);
+      return activateRoom(roomId);
       });
       const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
         cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
@@ -130,6 +143,7 @@ describe('task create/start surface parity', () => {
           state: 'launched', attempt: 1, updated_at: new Date().toISOString() } }]);
       updateTaskMembers(taskId, [{ name: 'dev-1', identity_cid: 'cid-dev', slot: 'dev', cowork_role: 'Developer' }]);
       activateTask(taskId);
+      prepareReadinessMembers(roomId);
       return activateRoom(roomId);
     });
     try {
@@ -230,6 +244,7 @@ describe('task create/start surface parity', () => {
       updateTaskMembers(taskId, [{ name: 'member-dev', identity_cid: 'cid-member-dev',
         slot: 'dev', cowork_role: 'Developer' }]);
       activateTask(taskId);
+      prepareReadinessMembers(roomId);
       return activateRoom(roomId);
     });
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,

@@ -77,7 +77,7 @@ export interface OwnerCommandContext {
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
   startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
-  taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome;
+  taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome | Promise<TaskProvisioningOutcome>;
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
   groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
   listTaskLists(): TaskListRecord[];
@@ -241,6 +241,7 @@ const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
     outcome.task, [
       ...(outcome.room ? [{ label: 'Room', value: `${outcome.room.room_id} — ${outcome.room.room_name}` }] : []),
       ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
+      { label: 'Readiness', value: outcome.kind },
       { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
       ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
       ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
@@ -435,6 +436,7 @@ export const ownerCommands: OwnerCommand[] = [
 
       const showTask = async (id: string) => {
         const { task: t } = ctx.getTask(id);
+        const provisioning = t.state === 'active' ? await ctx.taskProvisioningOutcome?.(id) : undefined;
         await ctx.reply(renderMarkdownResult({
           icon: '📋', title: 'Task details',
           fields: [
@@ -442,6 +444,9 @@ export const ownerCommands: OwnerCommand[] = [
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
             { label: 'List', value: t.list_name ?? 'default', kind: 'code' },
+            ...(provisioning ? [{ label: 'Readiness', value: provisioning.kind },
+              ...(provisioning.blocker ? [{ label: 'Blocker', value: provisioning.blocker }] : []),
+              ...(provisioning.next_action ? [{ label: 'Next action', value: provisioning.next_action }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
@@ -469,7 +474,7 @@ export const ownerCommands: OwnerCommand[] = [
               backlog, template, noRoom, brief: trailingLines, list,
             });
             const provisioning = !backlog && !noRoom && t.room_id
-              ? ctx.taskProvisioningOutcome?.(t.task_id) : undefined;
+              ? await ctx.taskProvisioningOutcome?.(t.task_id) : undefined;
             if (provisioning) {
               await ctx.reply(taskProvisioningAction(provisioning));
               break;

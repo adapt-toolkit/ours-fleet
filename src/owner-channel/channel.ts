@@ -1514,7 +1514,7 @@ export class OwnerChannel implements OwnerChannelHandle {
           actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
         });
         if (!input.backlog && !input.noRoom && task.room_id) {
-          const outcome = service.taskProvisioningOutcome(task.task_id);
+          const outcome = await service.taskProvisioningOutcome(task.task_id);
           if (outcome.kind === 'in_progress' && !outcome.next_action)
             await this.fleetOps.provisionTask(task.task_id);
         }

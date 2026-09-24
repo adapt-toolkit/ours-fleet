@@ -27,6 +27,13 @@ start, work alias, detached workers and owner messages. Task lifecycle and origi
 member records are unchanged by observation. Extra/replacement seats never substitute
 for the exact expected CID. Repeated/concurrent starts never respawn, recover invites,
 adopt replacement identities, or copy archived identity state into live directories.
+Additional single-member incident evidence reinforces the same backend-neutral failure.
+Untracked same-role seats are reported without inferred adoption; Owner/observer seats
+are not replacements. Recovery handover preserves verified old/new provenance privately.
+A new inbox does not backfill history: page scoped history to the end, authenticate
+historical Owner instructions and compare completed actions/replies before resuming;
+uncertainty requires clarification rather than replay.
+
 Recovery consists of detection/guardrails and a documented coordinator procedure to
 inspect retained context and existing replacements before a deliberate new session.
 Automatic replacement/rebinding is not part of this change.
@@ -51,11 +58,11 @@ closed without authorizing cleanup or replacement. Existing archives remain priv
 - AC1: `task-readiness.test.ts`: synthetic active/launched member with removed seat.
 - AC2: same suite: healthy, busy, permission wait; absent/mismatched room, removed or
   mismatched seat, failed/unknown supervisor, dead/unavailable session, launch race,
-  invalid role and sanitized diagnostic cases.
+  invalid role, Owner-seat loss, partial two-member loss, untracked/extra seats and sanitized diagnostic cases.
 - AC3: same suite plus CLI integration: repeated/concurrent active starts with existing
   replacement, retained archive byte preservation, no provisioning/mutation calls.
 - AC4: `task-readiness-cli.test.ts`: real command/service with isolated state and local
-  socket fixtures, JSON and human output. Relevant existing task/owner suites.
+  socket fixtures, healthy authenticated control, absent control and bounded timeout, JSON and human output. Owner commands await the same observation. Relevant existing task/owner suites.
   Red tests committed first; mutate 1–3 critical checks, observe failures, restore.
 - AC5: manual gate 6 exact-head independent code/tests/security review, dependency
   audit and public-diff secret scan; gate 9 per-criterion evidence audit.
@@ -65,6 +72,10 @@ closed without authorizing cleanup or replacement. Existing archives remain priv
 ## Delivery gates
 
 0–3 complete: isolated branch, scope, threat baseline, design challenge and usage
-simulation. 4: this spec commit. 5–9 pending tests, implementation, review, docs and
-acceptance evidence. 10: issue + PR only. 11–12: no merge/deploy/runtime mutation
+simulation. 4: spec committed before implementation. 5: test-first coverage, cleanup
+and three caught mutations (room CID, launch generation, live control); final relevant
+suite 636 passed, zero failed, one optional Cowork-checkout-dependent close test
+skipped. Typecheck passes; all 30 readiness unit cases pass after mutation restoration.
+6: independent exact-head review pending. 7–8: implementation and docs committed.
+9: evidence audit and Owner human QA pending. 10: issue + PR only. 11–12: no merge/deploy/runtime mutation
 authorized. Keep private host details and room messages outside this repository.

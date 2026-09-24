@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { observeRoomReadiness, READINESS_TIMEOUT_MS, ROOM_RECOVERY_ACTION } from '../rooms-tasks/readiness.js';
 
 import { ConfigError, loadConfig, type FleetConfig } from '../config.js';
 import {
@@ -71,7 +72,7 @@ export interface TaskProvisioningContinuationResult {
   reason?: 'missing_room' | 'missing_durable_template' | 'non_resumable_phase';
 }
 export interface TaskProvisioningOutcome {
-  kind: 'ready' | 'in_progress' | 'failed';
+  kind: 'ready' | 'in_progress' | 'failed' | 'degraded';
   task: TaskRecord;
   room?: RoomOrchestrationRecord;
   launch: { template?: string; anonymous: boolean; owner_attached: boolean };
@@ -80,7 +81,7 @@ export interface TaskProvisioningOutcome {
   next_action?: string;
 }
 
-/** Repairable terminal observation derived entirely from durable Task/Room state. */
+/** Repairable presentation of a corroborated readiness observation. */
 export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
   const room = outcome.room;
   recordFleetAuditResource('task', outcome.task.task_id);
@@ -93,6 +94,11 @@ export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome):
     template: outcome.launch.template,
     agents: room.member_seats.map(member => ({ name: member.role_name, role: member.cowork_role,
       configuration: member.launch?.presentation })),
+  });
+  if (outcome.kind === 'degraded') recordFleetAuditPresentation({
+    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    label: outcome.task.title, state: outcome.task.state, category: 'readiness_degraded',
+    eventId: `task-degraded:${room?.activated_at ?? outcome.task.created_at}`,
   });
   if (outcome.kind === 'failed') recordFleetAuditPresentation({
     kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
@@ -150,7 +156,7 @@ export function resolveRoomLaunchPolicy(
 
 export interface TaskRoomServiceDeps {
   loadConfiguration?(path?: string): FleetConfig;
-  cowork?(config: FleetConfig): CoworkAdapter;
+  cowork?(config: FleetConfig, options?: { timeoutMs: number }): CoworkAdapter;
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
   moveTaskToList?: typeof moveTaskToList;
@@ -237,7 +243,7 @@ export class TaskRoomApplicationService {
       }
     }
     if (!request.backlog && !request.noRoom && task.room_id)
-      recordTaskProvisioningOutcome(this.taskProvisioningOutcome(task.task_id));
+      recordTaskProvisioningOutcome(await this.taskProvisioningOutcome(task.task_id));
     return task;
   }
 
@@ -269,7 +275,7 @@ export class TaskRoomApplicationService {
   }): Promise<TaskRecord> {
     const result = await this.ensureTaskWork(input);
     if (result.status !== 'already_active')
-      recordTaskProvisioningOutcome(this.taskProvisioningOutcome(result.task.task_id));
+      recordTaskProvisioningOutcome(await this.taskProvisioningOutcome(result.task.task_id));
     return result.task;
   }
 
@@ -341,18 +347,17 @@ export class TaskRoomApplicationService {
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
   }
 
-  taskProvisioningOutcome(taskId: string): TaskProvisioningOutcome {
+  async taskProvisioningOutcome(taskId: string): Promise<TaskProvisioningOutcome> {
     const task = readTask(taskId);
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const expected = room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
       ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0;
-    const active = room?.member_seats.filter(seat => seat.seat_state === 'active').length ?? 0;
-    const launched = room?.member_seats.filter(seat => seat.launch?.state === 'launched').length ?? 0;
+    let active = room?.member_seats.filter(seat => seat.seat_state === 'active').length ?? 0;
+    let launched = room?.member_seats.filter(seat => seat.launch?.state === 'launched').length ?? 0;
     const failed = task.state === 'failed' || room?.saga.phase === 'failed';
-    const ready = task.state === 'active' && room?.state === 'active'
-      && active === expected && launched === expected;
-    const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
-    const nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
+    let ready = false;
+    let blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
+    let nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
       ? `Ensure ours-cowork 1.3.0 or newer is running and available, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'waiting_owner_invite'
         ? `Rotate rooms.owner.public_invite, then run ours-fleet task start ${task.task_id}.`
@@ -363,14 +368,40 @@ export class TaskRoomApplicationService {
           : failed
             ? `Correct the blocker, then run ours-fleet task start ${task.task_id}.`
             : undefined;
+    let degraded = false;
+    let ownerAttached = Boolean(room?.owner_seat_cid);
+    if (task.state === 'active') {
+      let issues = ['room_record_missing'];
+      active = 0; launched = 0; ready = false; ownerAttached = false;
+      if (room) {
+        try {
+          const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+          const options = { timeoutMs: READINESS_TIMEOUT_MS };
+          const cowork = this.deps.cowork ? this.deps.cowork(cfg, options)
+            : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config, ...options });
+          const observation = await observeRoomReadiness(room, expected, cowork);
+          ({ active, launched, issues, ownerAttached } = observation);
+          if (JSON.stringify(getRoomRecord(room.room_id)) !== JSON.stringify(room)
+              || readTask(taskId).state !== task.state) issues = [...issues, 'records_changed'];
+          if (room.state !== 'active' || task.room_identity_cid?.toLowerCase() !== room.room_identity_cid?.toLowerCase())
+            issues = [...issues, 'room_records_inconsistent'];
+        } catch { issues = ['readiness_unavailable']; }
+      }
+      degraded = issues.length > 0;
+      ready = !degraded;
+      if (degraded) {
+        blocker = `Current readiness could not be verified: ${issues.join(', ')}.`;
+        nextAction = ROOM_RECOVERY_ACTION;
+      }
+    }
     return {
-      kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room,
+      kind: failed ? 'failed' : degraded ? 'degraded' : ready ? 'ready' : 'in_progress', task, room,
       launch: {
         ...(room?.template_snapshot
           ? { template: `${room.template_snapshot.name}@${room.template_snapshot.version}` }
           : task.template ? { template: `${task.template.name}@${task.template.version}` } : {}),
         anonymous: storedRoomLaunchPolicy(room?.room_policy ?? task.execution_plan?.room_policy).anonymous,
-        owner_attached: Boolean(room?.owner_seat_cid),
+        owner_attached: ownerAttached,
       },
       members: { expected, active, launched },
       ...(blocker ? { blocker } : {}),
@@ -385,7 +416,7 @@ export class TaskRoomApplicationService {
     const sleep = this.deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const deadline = now() + (input.waitMs ?? 60_000);
     for (;;) {
-      const outcome = this.taskProvisioningOutcome(input.taskId);
+      const outcome = await this.taskProvisioningOutcome(input.taskId);
       if (outcome.kind !== 'in_progress' || now() >= deadline) {
         recordTaskProvisioningOutcome(outcome);
         return outcome;
