@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -168,5 +170,15 @@ it('heals receipt after task unlink through repeated acceptance', async () => {
   beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
   rmSync(join(stateRoot(), 'tasks', task.task_id + '.json'));
   expect(beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' }).status).toBe('already_absent');
+  expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
+});
+
+it('actual CLI repeated deletion heals a receipt left after task unlink', async () => {
+  const task = createTask({ title: 'private CLI receipt', origin: { type: 'cli' } });
+  beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  rmSync(join(stateRoot(), 'tasks', task.task_id + '.json'));
+  await promisify(execFile)(process.execPath, ['dist/cli.js', 'task', 'delete', task.task_id, task.task_id, '--json'], {
+    env: { ...process.env, OURS_FLEET_HOME: home }, timeout: 15000,
+  });
   expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();
 });
