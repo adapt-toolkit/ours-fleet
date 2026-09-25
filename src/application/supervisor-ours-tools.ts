@@ -71,16 +71,8 @@ export class SupervisorOursTools {
       await client.connect(transport);
       const verify = async () => {
         if (!legacy) { verifySelection(); return; }
-        const actual = await client.callTool({ name: 'current_identity', arguments: {} });
-        const blocks = actual.content as { type: string; text?: string }[] | undefined;
-        const lines = blocks?.length === 1 && blocks[0].type === 'text' ? blocks[0].text?.split('\n') : undefined;
-        const prefix = `Bound to "${identity.name}" (${identity.cid})`;
-        const suffix = lines?.[0].startsWith(prefix) ? lines[0].slice(prefix.length) : undefined;
-        const roleSuffix = typeof suffix === 'string' && /^ — role "[^"\r\n]+" under root "[^"\r\n]+"\.$/.test(suffix);
-        const temporaryLine = 'TEMPORARY identity owned by the Fleet supervisor for this logical agent instance. Bridge or harness disconnect retains it; terminal supervisor release deletes local state with best-effort peer notices.';
-        if (actual.isError || !(roleSuffix || (selected.temporary && suffix === '.'))
-            || (selected.temporary ? lines?.[1] !== temporaryLine : lines?.[1]?.startsWith('TEMPORARY')))
-          throw new FleetError('capability_unavailable', 'connected supervisor identity does not match legacy ownership proof');
+        // The supervisor owns the binding. The authenticated bridge and pinned local
+        // assignment are authoritative; current_identity is display text, not a protocol.
         const fresh = legacySupervisorIdentity(role, identityName, selected.temporary, descriptor.generation);
         if (!('proof' in identity) || fresh.proof !== identity.proof) throw new FleetError('capability_unavailable', 'legacy supervisor identity changed');
         verifySelection();

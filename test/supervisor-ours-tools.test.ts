@@ -1,8 +1,9 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
+import { Wire } from '../src/agent-ours/wire.js';
 import { binderKey } from '../src/agent-ours/state.js';
 import { RoleControlServer } from '../src/session/control.js';
 import { startMcpEndpoint } from '../src/agent-ours/mcp-endpoint.js';
@@ -17,7 +18,14 @@ async function fixture(temporary = false) {
   mkdirSync(join(dir, '.ours-bridge'), { recursive: true });
   writeFileSync(join(dir, '.identity'), 'AlphaIdentity');
   const liveIdentity = { name: 'AlphaIdentity', cid, described: true, isRoot: false, roleId: 'agent', rootName: 'Root', temporary };
-  let identityHook = () => {};
+  let discoveryHook = () => {};
+  let identityReads = 0;
+  const send = Wire.prototype.send;
+  const sendSpy = vi.spyOn(Wire.prototype, 'send').mockImplementation(function (this: Wire, frame: any) {
+    if (frame?.kind === 'mcp' && Array.isArray(frame.value?.result?.tools)) discoveryHook();
+    return send.call(this, frame);
+  });
+  cleanups.push(() => sendSpy.mockRestore());
   let calls = 0;
   let releases = 0;
   const mutations: unknown[] = [];
@@ -25,7 +33,7 @@ async function fixture(temporary = false) {
     socket: join(dir, '.ours-bridge', 'g7.sock'), capability: 'test-private-capability', generation: 7,
     runtime: { admit: async () => () => {} } as never,
     client: {
-      currentIdentity: async () => { identityHook(); return liveIdentity; },
+      currentIdentity: async () => { identityReads++; return liveIdentity; },
       listContacts: async () => { calls++; return { contacts: [], pending: [], roots: {}, degraded: [], renames: {} }; },
       addContact: async (args: unknown) => { mutations.push(args); return { display: 'Peer', cid: 'B'.repeat(64) }; },
       releaseLease: async () => { releases++; },
@@ -44,7 +52,7 @@ async function fixture(temporary = false) {
       { env: { ...process.env, ...cliEnv, OURS_FLEET_HOME: root }, timeout: 15_000 },
       (error, stdout, stderr) => done({ code: error ? Number(error.code) || 1 : 0, stdout, stderr }));
   });
-  return { root, dir, descriptor, metadata, cli, cliEnv, mutations, liveIdentity, setIdentityHook: (hook: () => void) => { identityHook = hook; }, calls: () => calls, releases: () => releases };
+  return { root, dir, descriptor, metadata, cli, cliEnv, mutations, liveIdentity, identityReads: () => identityReads, setDiscoveryHook: (hook: () => void) => { discoveryHook = hook; }, calls: () => calls, releases: () => releases };
 }
 
 it.each([false, true])('CLI uses the fixed identity and managed tool policy (temporary=%s)', async temporary => {
@@ -210,18 +218,22 @@ it.each([false, true])('legacy supervisor remains live and its descriptor unchan
   expect(f.releases()).toBe(0);
 }, 20_000);
 
-it('legacy proof rejects cross-identity, root, unknown hierarchy, and changed lifetime before mutation', async () => {
-  const f = await fixture();
-  makeLegacy(f);
-  for (const change of [{ cid: 'B'.repeat(64) }, { name: 'Other' }, { isRoot: true }, { described: false }, { temporary: true }]) {
-    const original = { ...f.liveIdentity };
+it.each([false, true])('legacy binding does not depend on identity display or hierarchy (temporary=%s)', async temporary => {
+  const f = await fixture(temporary);
+  makeLegacy(f, temporary);
+  // Undescribed/root identities produce different human-readable current_identity text.
+  // The supervisor's existing binding remains authoritative in both cases.
+  for (const change of [{ isRoot: true }, { described: false }, { rootName: 'Корень', roleId: 'роль' }]) {
     Object.assign(f.liveIdentity, change);
     const result = await f.cli('call', 'Alpha', 'list_contacts');
-    expect(result.code, JSON.stringify(change)).toBe(1);
-    expect(result.stderr).toContain('does not match');
-    Object.assign(f.liveIdentity, original);
+    expect(result.code, result.stderr).toBe(0);
   }
-  expect(f.calls()).toBe(0);
+  const args = join(f.root, 'args.json');
+  writeFileSync(args, JSON.stringify({ invite: 'PRIVATE_TEST_INVITE' }));
+  expect((await f.cli('call', 'Alpha', 'add_contact', '--args-file', args)).code).toBe(0);
+  expect(f.mutations).toHaveLength(1);
+  expect(f.identityReads()).toBe(0);
+  expect(f.calls()).toBe(3);
 }, 20_000);
 
 it('legacy journals reject invalid, ambiguous and changing ownership; partial metadata never falls back', async () => {
@@ -237,10 +249,9 @@ it('legacy journals reject invalid, ambiguous and changing ownership; partial me
     expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
   }
   writeFileSync(f.descriptor, JSON.stringify(legacy.descriptor));
-  let identities = 0;
-  f.setIdentityHook(() => { if (++identities === 2) writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify({ ...legacy.state, action: 'new-action' })); });
+  f.setDiscoveryHook(() => { writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify({ ...legacy.state, action: 'new-action' })); });
   expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
-  f.setIdentityHook(() => {});
+  f.setDiscoveryHook(() => {});
   writeFileSync(join(legacy.dir, 'state.json'), JSON.stringify(legacy.state));
   makeLegacy(f, false, 'daemon-B');
   expect((await f.cli('call', 'Alpha', 'list_contacts')).code).toBe(1);
@@ -267,9 +278,7 @@ it('valid legacy journal A cannot authorize another live supervisor socket at th
 it.each(['identity', 'duplicate', 'descriptor'])('legacy selection %s change during discovery fails before mutation', async change => {
   const f = await fixture();
   const legacy = makeLegacy(f);
-  let reads = 0;
-  f.setIdentityHook(() => {
-    if (++reads !== 2) return;
+  f.setDiscoveryHook(() => {
     if (change === 'identity') writeFileSync(join(f.dir, '.identity'), 'Other');
     else if (change === 'descriptor') writeFileSync(f.descriptor, JSON.stringify({ ...legacy.descriptor, capability: 'new-capability' }));
     else {
