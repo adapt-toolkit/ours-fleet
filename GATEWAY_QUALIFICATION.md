@@ -23,7 +23,9 @@ npm run build
 npm test
 ```
 
-Fleet additionally runs `npm run test:pack`. For machines running other suites
+Fleet additionally runs `OURS_TEST_GATEWAY_SDK_SOURCE="$PWD/.source-deps/sdk" npm run test:pack`,
+which applies the same explicit candidate to the two clean package installations.
+Without that opt-in the pack test qualifies only published dependencies. For machines running other suites
 concurrently, Fleet's equivalent bounded run is
 `npm test -- --maxWorkers=2 --minWorkers=1`.
 

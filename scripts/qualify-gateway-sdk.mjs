@@ -18,6 +18,6 @@ function overlay(directory) {
     } else overlay(path);
   }
 }
-overlay(resolve('node_modules'));
+overlay(resolve(process.argv[3] ?? '.', 'node_modules'));
 if (!count) throw new Error('No installed SDK consumers found');
 console.log(`Source qualification: SDK ${expected}, ${count} installed SDK copies`);

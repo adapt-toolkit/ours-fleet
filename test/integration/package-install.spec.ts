@@ -6,7 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 
@@ -44,10 +44,18 @@ describe('packed root package', () => {
         timeout: 180_000,
       });
 
+      // Draft source qualification must follow the same explicit SDK candidate
+      // into clean installs. Without this opt-in, the published lockfile is tested.
+      const qualifySourceSdk = (directory: string) => {
+        if (process.env.OURS_TEST_GATEWAY_SDK_SOURCE) execFileSync(process.execPath, [
+          resolve('scripts/qualify-gateway-sdk.mjs'), process.env.OURS_TEST_GATEWAY_SDK_SOURCE, directory,
+        ], { stdio: 'inherit' });
+      };
+      qualifySourceSdk(consumerDir);
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -147,9 +155,10 @@ describe('packed root package', () => {
         timeout: 180_000,
       });
 
+      qualifySourceSdk(consumerWithoutOptionalDir);
       const fallbackProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -199,7 +208,7 @@ describe('packed root package', () => {
       // this checkout and with both dependency installation postures.
       const hermesProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { makeHermesAdapter, hermesAdapter, getAdapter } from '@ours.network/fleet';
         const adapter = makeHermesAdapter();
         process.stdout.write(JSON.stringify({
