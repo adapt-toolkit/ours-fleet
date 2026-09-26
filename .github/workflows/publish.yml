@@ -42,6 +42,8 @@ jobs:
       # from a build step, so packing it is a gate in its own right. Sequential
       # and separate: it runs tsc and Vite, which would starve the suite above.
       - run: npm run test:pack
+      - name: Verify real daemon recovery through the shared gateway profile
+        run: npm run test:v1-recovery
       - run: npm pack --dry-run
         working-directory: integrations/claude-code
       - run: npm pack --dry-run
