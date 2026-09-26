@@ -83,7 +83,7 @@ describe('live task readiness observations', () => {
       if (result === 'throw') throw Error('socket timeout');
       return { version: 1, id: 'probe', ok: result !== 'negative' };
     };
-    await expect(f.check()).resolves.toMatchObject({ state: 'unknown' });
+    await expect(f.check()).resolves.toMatchObject({ state: 'unknown', reason: result === 'throw' ? 'control_unavailable' : result === 'negative' ? 'control_unavailable' : 'agent_readiness_unknown' });
   });
   it.each([false, true])('rejects dead/failed agent beneath a live supervisor (alive=%s)', async alive => {
     const f = fixture(); f.deps.control = async () => ({ version: 1, id: 'probe', ok: true,
