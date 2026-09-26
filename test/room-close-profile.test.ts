@@ -3,6 +3,8 @@ import { createServer, type Server } from 'node:http';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { preparePermanentAssignment } from '../src/agent-ours/service.js';
+import type { ResolvedRole } from '../src/config.js';
 import { identityCidPresent, removeExactMemberIdentity } from '../src/rooms-tasks/close.js';
 
 const roots: string[] = [], servers: Server[] = [];
@@ -21,13 +23,15 @@ async function fixture(wrongInstance = false) {
   const id = '11111111-2222-3333-4444-555555555555';
   const cid = 'ab'.repeat(32);
   const requests: { path: string; credential?: string }[] = [];
+  const apiHeaders: { mode?: string; lease?: string }[] = [];
   let present = true;
   const server = createServer((req, res) => {
     requests.push({ path: req.url!, credential: req.headers['x-ours-api-token'] as string | undefined });
     res.setHeader('content-type', 'application/json');
     if (req.url === '/base/daemon/selection') {
-      return res.end(JSON.stringify({ schema: 1, instanceId: wrongInstance ? 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' : id, capabilities: ['external-sessions-v1'] }));
+      return res.end(JSON.stringify({ schema: 1, instanceId: wrongInstance ? 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' : id, capabilities: ['external-sessions-v1', 'root-first-identities-v1'] }));
     }
+    apiHeaders.push({mode:req.headers['x-ours-session-mode'] as string,lease:req.headers['x-ours-lease-token'] as string});
     if (req.headers['x-ours-api-token'] !== 'fixture-issued') { res.statusCode = 401; return res.end('{}'); }
     if (req.url === '/base/daemon/api/v1/listIdentities') return res.end(JSON.stringify(present ? [{ name: 'member', cid, kind: 'role', temp: null, session: null }] : []));
     if (req.url === '/base/daemon/api/v1/removeIdentity') { present = false; return res.end(JSON.stringify({})); }
@@ -43,8 +47,9 @@ async function fixture(wrongInstance = false) {
   const profilePath = join(root, '.ours-client/profile.json');
   writeFileSync(profilePath, JSON.stringify({ serverUrl: origin + '/base', endpoint: origin + '/base/daemon', expectedInstanceId: id, credentialPath }), { mode: 0o600 });
   vi.stubEnv('HOME', root);
+  vi.stubEnv('OURS_FLEET_HOME', root);
   for (const key of ['OURS_CONFIG', 'OURS_PORT', 'OURS_API_TOKEN', 'OURS_STATE_DIR', 'OURS_DAEMON_ID']) vi.stubEnv(key, undefined);
-  return { cid, requests, profilePath };
+  return { cid, requests, profilePath, apiHeaders };
 }
 
 test('room retirement uses the managed daemon profile for inventory, exact removal and release', async () => {
@@ -68,4 +73,17 @@ test('room retirement refuses an incomplete selected profile without legacy fall
   writeFileSync(f.profilePath, '{}');
   await expect(identityCidPresent(f.cid)).rejects.toThrow('serverUrl');
   expect(f.requests).toEqual([]);
+});
+
+test('permanent assignment inventory uses an external lease through an external-only gateway', async () => {
+  const f = await fixture();
+  const role = {name:'member', identity:'member', env:{}} as ResolvedRole;
+  await expect(preparePermanentAssignment(role)).resolves.toBe('verified');
+  expect(f.requests.map(row => row.path)).toEqual([
+    '/base/daemon/selection', '/base/daemon/api/v1/listIdentities', '/base/daemon/api/v1/releaseLease',
+  ]);
+  expect(f.apiHeaders).toHaveLength(2);
+  expect(f.apiHeaders.every(row => row.mode === 'external')).toBe(true);
+  expect(f.apiHeaders[0].lease).toMatch(/^[0-9a-f-]{36}$/);
+  expect(f.apiHeaders[1].lease).toBe(f.apiHeaders[0].lease);
 });
