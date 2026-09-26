@@ -36,41 +36,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # Draft source qualification only. Push/release gates still use the npm
-      # lockfile, and cannot pass until published dependency pins are updated.
-      - name: Read-only access to private SDK source candidate
-        if: github.event_name == 'pull_request'
-        id: source-sdk-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
-          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ours-sdk
-          permission-contents: read
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
-        with:
-          repository: adapt-toolkit/ours-sdk
-          ref: 37bd5c481c5781cb9af44f51570222a4897955af
-          path: .source-deps/sdk
-          token: ${{ steps.source-sdk-token.outputs.token }}
-          persist-credentials: false
-      - name: Build pinned SDK source candidate
-        if: github.event_name == 'pull_request'
-        run: npm ci --ignore-scripts && npm run build
-        working-directory: .source-deps/sdk
-      - name: Qualify consumer against pinned SDK source
-        if: github.event_name == 'pull_request'
-        run: node scripts/qualify-gateway-sdk.mjs
       - run: npm run build
       - run: npm test
       # The root package is the only one whose bin target and build stamp come
       # from a build step, so packing it is a gate in its own right. Sequential
       # and separate: it runs tsc and Vite, which would starve the suite above.
       - run: npm run test:pack
-        env:
-          OURS_TEST_GATEWAY_SDK_SOURCE: ${{ github.event_name == 'pull_request' && format('{0}/.source-deps/sdk', github.workspace) || '' }}
       - run: npm pack --dry-run
         working-directory: integrations/claude-code
       - run: npm pack --dry-run

@@ -44,14 +44,6 @@ describe('packed root package', () => {
         timeout: 180_000,
       });
 
-      // Draft source qualification must follow the same explicit SDK candidate
-      // into clean installs. Without this opt-in, the published lockfile is tested.
-      const qualifySourceSdk = (directory: string) => {
-        if (process.env.OURS_TEST_GATEWAY_SDK_SOURCE) execFileSync(process.execPath, [
-          resolve('scripts/qualify-gateway-sdk.mjs'), process.env.OURS_TEST_GATEWAY_SDK_SOURCE, directory,
-        ], { stdio: 'inherit' });
-      };
-      qualifySourceSdk(consumerDir);
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
@@ -155,7 +147,6 @@ describe('packed root package', () => {
         timeout: 180_000,
       });
 
-      qualifySourceSdk(consumerWithoutOptionalDir);
       const fallbackProbe = `
         import { existsSync } from 'node:fs';
         import { join, resolve } from 'node:path';
