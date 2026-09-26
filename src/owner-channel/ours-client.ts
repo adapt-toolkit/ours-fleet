@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
-import { readDaemonConfig, resolveEndpoint } from '../monitor.js';
 import { readClientProfile } from '../client-profile.js';
 
 import {
@@ -223,27 +222,10 @@ export class OursSdkClient implements OursOps {
     if (this.client) return;
     const environment = { ...process.env, ...this.env };
     const profile = readClientProfile(environment);
-    // Reuse existing connection configuration. Identity selection checks the
-    // daemon capability before reading the client's protected token delivery file.
-    const endpoint = !profile && environment.OURS_DAEMON_ID
-      ? resolveEndpoint(environment, false) : undefined;
-    const token = endpoint ? environment.OURS_API_TOKEN?.trim() || readDaemonConfig(environment).apiToken : undefined;
-    const options: AttachOursClientOptions = profile ? {
+    const options: AttachOursClientOptions = {
       endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
       credentialPath: profile.credentialPath,
       sessionMode: 'external', leaseToken: this.leaseToken, env: {},
-    } : endpoint ? {
-      endpoint: endpoint.origin, expectedInstanceId: environment.OURS_DAEMON_ID,
-      sessionMode: 'external', leaseToken: this.leaseToken,
-      ...(token ? {token} : {credentialPath: join(endpoint.stateDir, 'daemon-token')}),
-    } : {
-      env: environment,
-      leaseToken: this.leaseToken,
-      clientPid: process.pid,
-      fetch: notificationDeadlineFetch(
-        this.deps.fetch ?? globalThis.fetch,
-        this.deps.notificationRequestDeadlineMs ?? NOTIFICATION_REQUEST_DEADLINE_MS,
-      ),
     };
     this.client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
     this.terminalReleasePending = true;

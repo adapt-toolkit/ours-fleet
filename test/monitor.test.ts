@@ -1,14 +1,24 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  resolveEndpoint, resolveApiToken, readDaemonConfig, filterEvents, formatNotificationLine,
-  looksModal, looksApiError, looksRunning, createMonitor, probeIdentityPresence,
+  filterEvents, formatNotificationLine,
+  looksModal, looksApiError, looksRunning, createMonitor, probeIdentityPresence as probeIdentityPresenceImpl,
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
 import { readClientProfile } from '../src/client-profile.js';
+
+const probeIdentityPresence: typeof probeIdentityPresenceImpl = (name, fetch, env, deps) =>
+  probeIdentityPresenceImpl(name, fetch, deps ? env : gatewayFixture(dir).env, deps ?? {
+    attachClient: async () => ({ identities: async () => {
+      const response = await fetch('https://gateway.test/daemon/identities');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return (await response.json()).identities;
+    }, close: async () => {} }),
+  });
 
 const CFG = (over: Partial<MonitorConfig> = {}): MonitorConfig => ({
   mode: 'fleet',
@@ -57,7 +67,14 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
     sleep: async (ms: number) => { clock += ms; await new Promise(r => setImmediate(r)); },
     now: () => clock,
     log: () => {},
-    env: hermetic(),
+    env: gatewayFixture(dir).env,
+    attachClient: async options => ({
+      readNotificationPage: async (identity, optionsPage) => {
+        const response = await fetch(`${options.endpoint}/identities/${encodeURIComponent(identity)}/notifications?since=${optionsPage.since}`, { signal: optionsPage.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      }, close: async () => {},
+    }),
     timers: { set: () => 0 as unknown as ReturnType<typeof setTimeout>, clear: () => {} },
     ...over,
   };
@@ -73,74 +90,16 @@ const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => {
   };
 };
 
-describe('resolveEndpoint', () => {
-  it('defaults to port 3050 and sends no token header when unset', () => {
-    const ep = resolveEndpoint(hermetic());
-    expect(ep.url('Alice')).toBe('http://127.0.0.1:3050/identities/Alice/notifications');
-    expect(ep.headers).toEqual({});
-  });
-  it('honors OURS_PORT and sends the token header when set', () => {
-    const ep = resolveEndpoint(hermetic({ OURS_PORT: '4000', OURS_API_TOKEN: 'sek' }));
-    expect(ep.url('A')).toContain(':4000/');
-    expect(ep.headers).toEqual({ 'x-ours-api-token': 'sek' });
-  });
-  it('url-encodes the identity name', () => {
-    expect(resolveEndpoint(hermetic()).url('a b')).toContain('/identities/a%20b/');
-  });
-});
-
-describe('explicit client profile', () => {
-  it('selects the managed default, preserves overrides and rejects broken managed selection', () => {
-    const managedDir = join(dir, '.ours-client');
-    mkdirSync(managedDir, { mode: 0o700 });
-    const path = join(managedDir, 'profile.json');
-    const tuple = { endpoint: 'http://127.0.0.1:43118', expectedInstanceId: '1b8c7fce-f39d-4a78-b72c-e0a772889988', credentialPath: join(dir, 'credential') };
-    writeFileSync(path, JSON.stringify(tuple), { mode: 0o600 });
-    expect(readClientProfile({ HOME: dir })).toEqual({ ...tuple, configPath: path });
-    const explicit = join(dir, 'explicit.json');
-    writeFileSync(explicit, '{}', { mode: 0o600 });
-    expect(readClientProfile({ HOME: dir, OURS_CONFIG: explicit })).toBeUndefined();
-    for (const invalid of ['{}', '{broken', JSON.stringify({ composeFile: '/not-a-fallback' })]) {
-      writeFileSync(path, invalid);
-      expect(() => readClientProfile({ HOME: dir })).toThrow(/client profile/);
+describe('explicit gateway profile', () => {
+  it('requires shared gateway metadata and rejects missing, malformed or local selections', () => {
+    const { profile, env } = gatewayFixture(dir);
+    expect(readClientProfile(env)).toEqual({ ...profile, configPath: env.OURS_CONFIG });
+    for (const value of ['{}', '{broken', JSON.stringify({ endpoint: profile.endpoint })]) {
+      writeFileSync(env.OURS_CONFIG, value);
+      expect(() => readClientProfile(env)).toThrow(/gateway client profile/);
     }
-    writeFileSync(path, JSON.stringify(tuple));
-    chmodSync(path, 0);
-    expect(() => readClientProfile({ HOME: dir })).toThrow(/could not be read/);
-    chmodSync(path, 0o600);
-    chmodSync(managedDir, 0);
-    try { expect(() => readClientProfile({ HOME: dir })).toThrow(/could not be read/); }
-    finally { chmodSync(managedDir, 0o700); }
-    rmSync(path);
-    expect(readClientProfile({ HOME: dir })).toBeUndefined();
-  });
-
-  it('fails closed for partial, malformed, or legacy-conflicted explicit selection', () => {
-    const path = join(dir, 'client-profile.json');
-    const credentialPath = join(dir, 'daemon-token');
-    const endpoint = 'http://127.0.0.1:43118';
-    const expectedInstanceId = '1b8c7fce-f39d-4a78-b72c-e0a772889988';
-    const selected = (value: unknown) => {
-      writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value), { mode: 0o600 });
-      chmodSync(path, 0o600);
-      return () => readClientProfile({ OURS_CONFIG: path });
-    };
-
-    expect(selected({ endpoint: 'https://server.example:8443/', expectedInstanceId, credentialPath })()).toEqual({ endpoint: 'https://server.example:8443', expectedInstanceId, credentialPath, configPath: path });
-    for (const bad of ['ftp://server.example', 'wss://server.example', 'https://u:p@server.example', 'https://server.example?q=1', 'https://server.example#fragment']) {
-      expect(selected({ endpoint: bad, expectedInstanceId, credentialPath })).toThrow(/base URL/);
-    }
-    expect(selected({ endpoint })).toThrow(/invalid or missing expectedInstanceId/);
-    expect(() => readClientProfile({ OURS_CONFIG: join(dir, 'missing-profile.json') }))
-      .toThrow(/could not be read/);
-    expect(selected('{broken')).toThrow(/not valid JSON/);
-    expect(selected({ endpoint, expectedInstanceId: expectedInstanceId.toUpperCase(), credentialPath }))
-      .toThrow(/lowercase UUID/);
-    expect(selected({ endpoint, expectedInstanceId, credentialPath, apiToken: 'must-not-be-read' }))
-      .toThrow(/cannot combine apiToken/);
-    selected({ endpoint, expectedInstanceId, credentialPath });
-    expect(() => readClientProfile({ OURS_CONFIG: path, OURS_PORT: '43118' }))
-      .toThrow(/cannot combine OURS_PORT/);
+    rmSync(env.OURS_CONFIG);
+    expect(() => readClientProfile(env)).toThrow(/selected profile is missing/);
   });
 });
 
@@ -150,7 +109,7 @@ describe('probeIdentityPresence', () => {
     const credentialPath = join(dir, 'daemon-token');
     const expectedInstanceId = '80947c72-c514-46e8-94e9-c2847bf6e971';
     writeFileSync(profilePath, JSON.stringify({
-      endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
+      serverUrl: 'http://127.0.0.1:43117/base', endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
     }), { mode: 0o600 });
     const attached: Array<Record<string, unknown>> = [];
     const result = await probeIdentityPresence(
@@ -212,111 +171,6 @@ describe('probeIdentityPresence', () => {
     expect(transport.state).toBe('unknown');
     expect(auth.state).toBe('unknown');
     expect(malformed.state).toBe('unknown');
-  });
-});
-
-describe('token resolution (issue #17)', () => {
-  // Precedence chain: env OURS_API_TOKEN (trimmed) > config apiToken (trimmed)
-  // > <stateDir>/daemon-token. Config & daemon-token live under the temp `dir`.
-  const cfgPath = () => join(dir, 'config.json');
-  const writeCfg = (o: unknown) => writeFileSync(cfgPath(), JSON.stringify(o));
-  const writeToken = (sd: string, t: string) => { mkdirSync(sd, { recursive: true }); writeFileSync(join(sd, 'daemon-token'), t); };
-  const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv =>
-    ({ OURS_CONFIG: cfgPath(), OURS_STATE_DIR: join(dir, 'state'), ...over });
-  const tokenOf = (env: NodeJS.ProcessEnv) =>
-    resolveEndpoint(env).headers['x-ours-api-token'];
-
-  it('env token present → header uses env token', () => {
-    writeCfg({ apiToken: 'from-config' });
-    writeToken(join(dir, 'state'), 'from-file');
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: 'from-env' }))).toBe('from-env');
-  });
-
-  it('env token whitespace-only → falls through to config', () => {
-    writeCfg({ apiToken: 'from-config' });
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '   ' }))).toBe('from-config');
-  });
-
-  it('env token trimmed of surrounding whitespace', () => {
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '  padded  ' }))).toBe('padded');
-  });
-
-  it('no env → config apiToken (trimmed) wins over daemon-token', () => {
-    writeCfg({ apiToken: '  cfg-token  ' });
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('cfg-token');
-  });
-
-  it('config apiToken whitespace-only → ignored → falls through to daemon-token', () => {
-    writeCfg({ apiToken: '   ' });
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('file-token');
-  });
-
-  it('no env, no config → reads <stateDir>/daemon-token (trimmed)', () => {
-    writeToken(join(dir, 'state'), '  daemon-tok\n');
-    expect(tokenOf(baseEnv())).toBe('daemon-tok');
-  });
-
-  it('malformed config JSON → treated as absent → daemon-token', () => {
-    writeFileSync(cfgPath(), '{ this is not json ');
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('file-token');
-  });
-
-  it('nothing present anywhere → no token header', () => {
-    expect(resolveEndpoint(baseEnv()).headers).toEqual({});
-    expect(resolveApiToken(baseEnv())).toBeUndefined();
-  });
-
-  it('stateDir precedence: OURS_STATE_DIR wins over config.stateDir for daemon-token', () => {
-    const envSd = join(dir, 'env-state');
-    const cfgSd = join(dir, 'cfg-state');
-    writeCfg({ stateDir: cfgSd });
-    writeToken(envSd, 'from-env-statedir');
-    writeToken(cfgSd, 'from-cfg-statedir');
-    expect(tokenOf(baseEnv({ OURS_STATE_DIR: envSd }))).toBe('from-env-statedir');
-  });
-
-  it('stateDir precedence: config.stateDir used when OURS_STATE_DIR unset', () => {
-    const cfgSd = join(dir, 'cfg-state2');
-    writeCfg({ stateDir: cfgSd });
-    writeToken(cfgSd, 'from-cfg-statedir');
-    expect(tokenOf({ OURS_CONFIG: cfgPath() })).toBe('from-cfg-statedir');
-  });
-
-  it('port precedence: OURS_PORT > config.port > 3050', () => {
-    writeCfg({ port: 4100 });
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200' })).url('A')).toContain(':4200/');
-    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':4100/');
-    writeCfg({});
-    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
-  });
-
-  it('matches the daemon parseInt + nullish port semantics', () => {
-    writeCfg({ port: 4100 });
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200suffix' })).port).toBe(4200);
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: 'not-a-port' })).port).toBe(4100);
-    writeCfg({ port: 0 });
-    expect(resolveEndpoint(baseEnv()).port).toBe(0);
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '0' })).port).toBe(0);
-  });
-
-  it('unreadable daemon-token (chmod 000) → no throw, no token', () => {
-    const sd = join(dir, 'locked-state');
-    writeToken(sd, 'secret');
-    chmodSync(join(sd, 'daemon-token'), 0o000);
-    try {
-      expect(() => resolveApiToken(baseEnv({ OURS_STATE_DIR: sd }))).not.toThrow();
-      // On most CI runners chmod 000 blocks the read → undefined; if root can still
-      // read it, the token comes back — either way the call must not throw.
-    } finally {
-      chmodSync(join(sd, 'daemon-token'), 0o600);
-    }
-  });
-
-  it('readDaemonConfig returns {} on a missing file', () => {
-    expect(readDaemonConfig({ OURS_CONFIG: join(dir, 'nope.json') })).toEqual({});
   });
 });
 
@@ -493,7 +347,7 @@ describe('Monitor.prime', () => {
     const profilePath = join(dir, 'client-profile.json');
     const credentialPath = join(dir, 'daemon-token');
     writeFileSync(profilePath, JSON.stringify({
-      endpoint: 'http://127.0.0.1:43116',
+      serverUrl: 'http://127.0.0.1:43116', endpoint: 'http://127.0.0.1:43116/daemon',
       expectedInstanceId: '7f970f0d-0d93-49c7-b6b5-b6cd94415187', credentialPath,
     }), { mode: 0o600 });
     let pageCalls = 0;
@@ -528,7 +382,7 @@ describe('Monitor.prime', () => {
     const credentialPath = join(dir, 'daemon-token');
     const expectedInstanceId = '1b8c7fce-f39d-4a78-b72c-e0a772889988';
     writeFileSync(profilePath, JSON.stringify({
-      endpoint: 'http://127.0.0.1:43119', expectedInstanceId, credentialPath,
+      serverUrl: 'http://127.0.0.1:43119', endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
     }), { mode: 0o600 });
     writeFileSync(credentialPath, 'first-credential\n', { mode: 0o600 });
 
@@ -575,7 +429,7 @@ describe('Monitor.prime', () => {
     await mon.run(1);
 
     expect(attached).toEqual([{
-      endpoint: 'http://127.0.0.1:43119', expectedInstanceId, credentialPath,
+      endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
       sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
     }]);
     expect(pages).toEqual([
@@ -600,6 +454,7 @@ describe('Monitor.prime', () => {
     });
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
     const priming = mon.prime();
+    await new Promise(resolve => setImmediate(resolve));
     timeout?.();
     await priming;
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
@@ -651,18 +506,19 @@ describe('Monitor.prime', () => {
       .toMatchObject({ observedCursor: 128, deliveredCursor: 128, pending: null });
   });
 
-  it('marks failed and never injects on a 401', async () => {
+  it('marks gateway auth degraded so a repaired credential can recover', async () => {
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await mon.prime();
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/failed/);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded: auth/);
+    mon.stop();
     await mon.run(1);                       // must return immediately, no throw
   });
 
   it('names the selected config and token-file paths on a 401 without exposing the token', async () => {
     const configPath = join(dir, 'selected-profile.json');
     const stateDir = join(dir, 'selected-state');
-    writeFileSync(configPath, JSON.stringify({ apiToken: 'super-secret', stateDir }));
+    writeFileSync(configPath, JSON.stringify({ ...gatewayFixture(dir).profile, credentialPath: join(stateDir, 'daemon-token') }), { mode: 0o600 });
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const deps = makeDeps(fetch, { env: { OURS_CONFIG: configPath } });
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });

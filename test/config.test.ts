@@ -725,8 +725,6 @@ describe('rooms-tasks split-config backward compat', () => {
       '  owner:',
       `    expected_cid: ${cid}`,
       '    public_invite: test-invite-string',
-      '  cowork:',
-      '    config: /tmp/cowork.toml',
       '',
     ].join('\n'));
     const cfg = loadConfig();

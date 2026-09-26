@@ -1,3 +1,4 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import { createServer } from 'node:http';
 import { attachOursClient } from '@ours.network/sdk/client';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -34,9 +35,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-'));
   process.env.OURS_FLEET_HOME = dir;   // empty config → no harness checks unless --harness
   savedProfileEnv = Object.fromEntries(PROFILE_ENV_KEYS.map(k => [k, process.env[k]]));
-  process.env.OURS_CONFIG = join(dir, 'ours-config.json');
-  writeFileSync(process.env.OURS_CONFIG, '{}', { mode: 0o600 });
-  process.env.OURS_STATE_DIR = join(dir, 'missing-ours-state');
+  process.env.OURS_CONFIG = gatewayFixture(dir).env.OURS_CONFIG;
+  delete process.env.OURS_STATE_DIR;
   delete process.env.OURS_PORT;
   delete process.env.OURS_API_TOKEN;
 });
@@ -58,9 +58,10 @@ const ISOLATED_SCAN = { path: '', argv1: undefined };
 const HEALTHY_DAEMON_INFO = {
   name: 'ours', version: '2.0.1', compat: 2, protocol: 1, pid: 1234, stateDir: '/s',
 };
-type DoctorDaemonClient = Pick<OursClient, 'version' | 'close'>;
+type DoctorDaemonClient = Pick<OursClient, 'version' | 'close' | 'identities'>;
 const healthyDaemon = async (_options: AttachOursClientOptions): Promise<DoctorDaemonClient> => ({
   version: async () => HEALTHY_DAEMON_INFO,
+  identities: async () => [],
   close: async () => {},
 });
 const doctor = (
@@ -68,7 +69,15 @@ const doctor = (
   exec?: Parameters<typeof doctorImpl>[1],
   platform?: Parameters<typeof doctorImpl>[2],
   fetchImpl?: Parameters<typeof doctorImpl>[3],
-  attachDaemon: Parameters<typeof doctorImpl>[4] = healthyDaemon,
+  attachDaemon: Parameters<typeof doctorImpl>[4] = fetchImpl ? async options => ({
+    version: async () => HEALTHY_DAEMON_INFO,
+    identities: async () => {
+      const response = await fetchImpl(options.endpoint + '/identities', {});
+      if (!response.ok) throw new Error('gateway HTTP ' + response.status);
+      return (await response.json()).identities ?? [];
+    },
+    close: async () => {},
+  }) : healthyDaemon,
 ) => doctorImpl({ installScan: ISOLATED_SCAN, ...opts }, exec, platform, fetchImpl, attachDaemon);
 
 const execWith = (table: Record<string, ExecResult>): Exec =>
@@ -121,7 +130,7 @@ describe('doctor', () => {
   it.each(['ok', 'malformed', 'throw'] as const)('uses the managed profile and closes the daemon client on %s', async outcome => {
     delete process.env.OURS_STATE_DIR;
     const selection = {
-      endpoint: 'http://127.0.0.1:3050',
+      serverUrl: 'http://127.0.0.1:3050', endpoint: 'http://127.0.0.1:3050/daemon',
       expectedInstanceId: '11111111-2222-3333-4444-555555555555',
       credentialPath: join(dir, 'credential'),
     };
@@ -138,7 +147,7 @@ describe('doctor', () => {
         close: async () => { closed++; },
       };
     });
-    expect(attached).toMatchObject({ ...selection, env: {}, sessionMode: 'external' });
+    expect(attached).toMatchObject({ endpoint: selection.endpoint, expectedInstanceId: selection.expectedInstanceId, credentialPath: selection.credentialPath, env: {}, sessionMode: 'external' });
     expect(closed).toBe(1);
     const check = report.checks.find(c => c.name === 'ours daemon')!;
     expect(check.ok).toBe(outcome === 'ok');
@@ -195,7 +204,7 @@ describe('doctor', () => {
     }), 'linux', undefined, async () => { throw new TypeError('fetch failed'); });
     const d = rep.checks.find(c => c.name === 'ours daemon')!;
     expect(d.ok).toBe(false);
-    expect(d.detail).toContain('ours-daemon start');
+    expect(d.detail).toContain('issued credential');
   });
 
   it('checks the daemon through the SDK without executing the ours CLI', async () => {
@@ -422,7 +431,7 @@ describe('doctor monitor probe', () => {
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m.ok).toBe(false);
     expect(m.detail).toMatch(/401/);
-    expect(m.detail).toMatch(/OURS_API_TOKEN/);
+    expect(m.detail).toMatch(/issued credential/);
     expect(rep.ok).toBe(false);
   });
 
@@ -431,67 +440,39 @@ describe('doctor monitor probe', () => {
     const rep = await doctor({}, green(), 'linux', stubFetch('down'));
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m.ok).toBe(false);
-    expect(m.detail).toMatch(/ours-daemon start/);
+    expect(m.detail).toMatch(/configured gateway/);
   });
 
-  it('uses config port and apiToken for the same profile as the runtime monitor', async () => {
+  it('rejects legacy token and port configuration without direct requests', async () => {
     const oursConfig = join(dir, 'ours-profile.json');
-    writeFileSync(oursConfig, JSON.stringify({ port: 4111, apiToken: 'config-token' }));
+    writeFileSync(oursConfig, JSON.stringify({ port: 4111, apiToken: 'never-print-me' }), { mode: 0o600 });
     process.env.OURS_CONFIG = oursConfig;
-    const calls: Array<{ url: string; headers?: Record<string, string> }> = [];
-    const fetch: FetchLike = async (url, init) => {
-      calls.push({ url, headers: init?.headers });
-      return { status: 200, ok: true, json: async () => ({}) };
-    };
+    let calls = 0;
+    const fetch: FetchLike = async () => { calls++; throw new Error('must not call'); };
     withRole('');
     const rep = await doctor({}, green(), 'linux', fetch);
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
-    expect(m.ok).toBe(true);
-    expect(calls.map(c => c.url)).toEqual([
-      'http://127.0.0.1:4111/state-dir',
-      'http://127.0.0.1:4111/identities',
-    ]);
-    expect(calls[1].headers).toEqual({ 'x-ours-api-token': 'config-token' });
+    expect(m.ok).toBe(false);
+    expect(m.detail).toContain('gateway');
+    expect(m.detail).not.toContain('never-print-me');
+    expect(calls).toBe(0);
   });
 
-  it('uses the owner daemon-token when no explicit token is configured', async () => {
-    const stateDir = join(dir, 'owner-state');
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, 'daemon-token'), 'owner-token\n');
-    process.env.OURS_STATE_DIR = stateDir;
-    let authHeaders: Record<string, string> | undefined;
-    const fetch: FetchLike = async (url, init) => {
-      if (url.endsWith('/identities')) authHeaders = init?.headers;
-      return { status: 200, ok: true, json: async () => ({}) };
-    };
+  it('rejects ambient local state rather than reading its owner token', async () => {
+    process.env.OURS_STATE_DIR = join(dir, 'owner-state');
     withRole('');
-    const rep = await doctor({}, green(), 'linux', fetch);
-    expect(rep.checks.find(c => c.name === 'monitor: daemon API')?.ok).toBe(true);
-    expect(authHeaders).toEqual({ 'x-ours-api-token': 'owner-token' });
+    const rep = await doctor({}, green(), 'linux');
+    expect(rep.checks.find(c => c.name === 'monitor: daemon API')?.ok).toBe(false);
   });
 
-  it('deduplicates identical role profiles and probes distinct role.env profiles separately', async () => {
+  it('deduplicates identical gateway profiles across roles', async () => {
     registerAdapter(fakeAdapter);
-    writeV2Fixture(join(dir, 'fleet.yaml'), {
-      roles: {
-        A: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
-        B: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
-        C: { harness: 'fake', env: { OURS_PORT: '4202', OURS_API_TOKEN: 'other' } },
-      },
-    });
-    const calls: Array<{ url: string; token?: string }> = [];
-    const fetch: FetchLike = async (url, init) => {
-      calls.push({ url, token: init?.headers?.['x-ours-api-token'] });
-      return { status: 200, ok: true, json: async () => ({}) };
-    };
-    const rep = await doctor({}, green(), 'linux', fetch);
-    expect(calls).toHaveLength(4); // two requests per distinct profile, not per role
-    expect(calls.filter(c => c.url.includes(':4201/'))).toHaveLength(2);
-    expect(calls.filter(c => c.url.includes(':4202/'))).toHaveLength(2);
-    expect(calls.find(c => c.url === 'http://127.0.0.1:4201/identities')?.token).toBe('shared');
-    expect(calls.find(c => c.url === 'http://127.0.0.1:4202/identities')?.token).toBe('other');
-    expect(rep.checks.some(c => c.name === 'monitor: daemon API (A, B)')).toBe(true);
-    expect(rep.checks.some(c => c.name === 'monitor: daemon API (C)')).toBe(true);
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {
+      A: { harness: 'fake' }, B: { harness: 'fake' },
+    } });
+    const rep = await doctor({}, green(), 'linux');
+    expect(rep.checks.filter(c => c.name.startsWith('monitor: daemon API'))).toHaveLength(1);
+    expect(rep.checks.find(c => c.name === 'monitor: daemon API')?.ok).toBe(true);
   });
 
   it('probes selected profiles with different credential paths separately', async () => {
@@ -500,11 +481,11 @@ describe('doctor monitor probe', () => {
     const profileA = join(dir, 'ours-a.json');
     const profileB = join(dir, 'ours-b.json');
     writeFileSync(profileA, JSON.stringify({
-      endpoint: 'http://127.0.0.1:1', expectedInstanceId,
+      serverUrl: 'http://127.0.0.1:1', endpoint: 'http://127.0.0.1:1/daemon', expectedInstanceId,
       credentialPath: join(dir, 'credential-a'),
     }), { mode: 0o600 });
     writeFileSync(profileB, JSON.stringify({
-      endpoint: 'http://127.0.0.1:1', expectedInstanceId,
+      serverUrl: 'http://127.0.0.1:1', endpoint: 'http://127.0.0.1:1/daemon', expectedInstanceId,
       credentialPath: join(dir, 'credential-b'),
     }), { mode: 0o600 });
     registerAdapter(fakeAdapter);
@@ -525,12 +506,12 @@ describe('doctor monitor probe', () => {
 
   it('uses the selected config path in its 401 hint without exposing the token', async () => {
     const oursConfig = join(dir, 'custom-profile.json');
-    writeFileSync(oursConfig, JSON.stringify({ apiToken: 'never-print-me' }));
+    writeFileSync(oursConfig, JSON.stringify(gatewayFixture(dir).profile), { mode: 0o600 });
     process.env.OURS_CONFIG = oursConfig;
     withRole('');
     const rep = await doctor({}, green(), 'linux', stubFetch('401'));
     const detail = rep.checks.find(c => c.name === 'monitor: daemon API')!.detail;
-    expect(detail).toContain(oursConfig);
+    expect(detail).toContain('issued credential');
     expect(detail).not.toContain('never-print-me');
     expect(detail).not.toContain('~/.ours/config.json');
   });
@@ -1008,7 +989,7 @@ describe('doctor rooms-tasks checks', () => {
     const rep = await run();
     const cw = rep.checks.find(c => c.name === 'cowork')!;
     expect(cw).toBeTruthy();
-    expect(cw.detail).toMatch(/management socket/);
+    expect(cw.detail).toMatch(/gateway management/);
   });
 
   it('warns on template Agent ref referencing an unknown Agent', async () => {
@@ -1064,10 +1045,10 @@ describe('doctor rooms-tasks checks', () => {
     registerAdapter(fakeAdapter);
     writeCfg(ROOMS_YAML(CID_64, '  cowork:\n    config: /nonexistent/cowork-config.json\n'));
     const rep = await run();
-    const cfg = rep.checks.find(c => c.name === 'rooms: cowork config')!;
+    const cfg = rep.checks.find(c => !c.ok && c.detail.includes('rooms.cowork.config'))!;
     expect(cfg).toBeTruthy();
     expect(cfg.ok).toBe(false);
-    expect(cfg.detail).toContain('not found');
+    expect(cfg.detail).toContain('~/.ours-client/profile.json');
   });
 
   it('emits capability check when rooms config is present', async () => {

@@ -86,7 +86,9 @@ export function validateRoomsConfig(
     if (!isPlainObject(raw.cowork))
       throw new RoomsTasksConfigError(path, 'rooms.cowork: must be a mapping');
     rejectUnknown(raw.cowork, RCK as unknown as string[], path, 'rooms.cowork');
-    cowork = { config: raw.cowork.config as string | undefined };
+    if (raw.cowork.config !== undefined)
+      throw new RoomsTasksConfigError(path, 'rooms.cowork.config is no longer supported; remove it and configure ~/.ours-client/profile.json for all services');
+    cowork = {};
   }
 
   if (!isPlainObject(raw.owner))

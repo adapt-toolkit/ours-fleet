@@ -1,3 +1,4 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
@@ -45,13 +46,18 @@ vi.mock('../src/agent-ours/service.js', async importOriginal => ({
 }));
 
 let dir: string;
+let savedProfile: string | undefined;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-run-'));
   process.env.OURS_FLEET_HOME = dir;
+  savedProfile = process.env.OURS_CONFIG;
+  process.env.OURS_CONFIG = gatewayFixture(dir).env.OURS_CONFIG;
   registerAdapter(fakeAdapter);
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
+  if (savedProfile === undefined) delete process.env.OURS_CONFIG;
+  else process.env.OURS_CONFIG = savedProfile;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -97,6 +103,10 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
   const deps = {
+    identityProbeDeps: { attachClient: async () => ({
+      identities: async () => (await (await deps.fetch('http://fixture/identities')).json()).identities,
+      close: async () => {},
+    }) },
     prepareAgentOurs: async () => ({
       descriptor: '/test/managed-descriptor.json', privatePaths: [],
       runtime: { startHarness: async (start: () => Promise<unknown>) => start(), admit: async () => { managedRecoveries.push('verify'); await opts.recoveryGate; return () => {}; } },

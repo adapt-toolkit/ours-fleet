@@ -57,9 +57,8 @@ test('oversized request is rejected before contacting the server',async()=>{
   await expect(createCoworkAdapter({env:f.env,home:f.root}).createRoom({room_name:'fixture',goal:'x'.repeat(1024*1024),briefing:''})).rejects.toThrow('request exceeded');
   expect(f.requests).toEqual([]);
 });
-test('explicit local socket override skips malformed remote profile',async()=>{
+test('explicit local socket override cannot bypass malformed gateway profile',async()=>{
   const f=await fixture();writeFileSync(f.env.OURS_CONFIG,'not-json',{mode:0o600});
-  const adapter=createCoworkAdapter({env:f.env,home:f.root,socketPath:join(f.root,'missing.sock')});
-  await expect(adapter.listRooms()).rejects.toThrow('socket');
+  expect(()=>createCoworkAdapter({env:f.env,home:f.root,socketPath:join(f.root,'missing.sock')})).toThrow('Local Cowork selectors');
   expect(f.requests).toEqual([]);
 });

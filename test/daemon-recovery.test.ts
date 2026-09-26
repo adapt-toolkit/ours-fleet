@@ -7,15 +7,15 @@ import {
   DAEMON_RECOVERY_DEADLINE_MS, DAEMON_RECOVERY_MAX_ATTEMPTS, DAEMON_RECOVERY_MAX_BACKOFF_MS,
   DaemonGenerationObserver, RoleRecoveryController, daemonRecoveryBackoff, probeDaemonGeneration,
 } from '../src/daemon-recovery.js';
-import type { FetchLike, FetchResponse } from '../src/monitor.js';
+import type { FetchLike } from '../src/monitor.js';
+import { gatewayFixture } from './gateway-fixture.js';
 
 const stateDir = '/state/ours';
-const env = { OURS_PORT: '3050', OURS_STATE_DIR: stateDir, OURS_API_TOKEN: 'test-token', OURS_CONFIG: '' };
+let env: NodeJS.ProcessEnv;
 let legacyFixture: string;
 beforeEach(() => {
   legacyFixture = mkdtempSync(join(tmpdir(), 'fleet-recovery-legacy-'));
-  env.OURS_CONFIG = join(legacyFixture, 'config.json');
-  writeFileSync(env.OURS_CONFIG, '{}');
+  env = gatewayFixture(legacyFixture).env;
 });
 afterEach(() => { rmSync(legacyFixture, { recursive: true, force: true }); });
 const progress = (over: Record<string, unknown> = {}) => JSON.stringify({
@@ -140,16 +140,17 @@ describe('role recovery controller', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
-const response = (body: unknown, status = 200): FetchResponse => ({
-  status, ok: status >= 200 && status < 300, json: async () => body as never,
-});
-const fetchInfo = (body: unknown, identities: unknown = [{ name: 'Root' }]): FetchLike => async (url, init) => {
-  expect(init?.headers).toEqual({ 'x-ours-api-token': 'test-token' });
-  return response(url.endsWith('/identities') ? { identities } : body);
-};
-const deps = (text: string, paths: string[] = []) => ({
-  readText: (path: string) => { paths.push(path); return text; },
-  canonicalize: (path: string) => path.replace('/alias', ''),
+// The gateway SDK performs transport/auth selection. These unit tests exercise
+// generation validation with remote metadata, without consulting server files.
+const fetchInfo: FetchLike = async () => { throw new Error('direct transport forbidden'); };
+const deps = (text: string, paths: string[] = [], identities: unknown = [{ name: 'Root' }]) => ({
+  readText: (path: string) => { paths.push(path); throw new Error('local server state forbidden'); },
+  attachClient: async () => ({
+    version: async () => ({ name: 'ours', version: '3', compat: 1, protocol: 1,
+      pid: 41, stateDir, startup: JSON.parse(text) }),
+    identities: async () => identities as Array<{ name: string }>,
+    close: async () => undefined,
+  }),
 });
 
 describe('daemon generation observation', () => {
@@ -160,7 +161,7 @@ describe('daemon generation observation', () => {
       const credentialPath = join(dir, 'daemon-token');
       const expectedInstanceId = '768ebdc7-4f69-4d8f-b174-0285d070f9fa';
       writeFileSync(profilePath, JSON.stringify({
-        endpoint: 'http://127.0.0.1:43121', expectedInstanceId, credentialPath,
+        serverUrl: 'http://127.0.0.1:43121', endpoint: 'http://127.0.0.1:43121/daemon', expectedInstanceId, credentialPath,
       }), { mode: 0o600 });
       const attached: Array<Record<string, unknown>> = [];
       const result = await probeDaemonGeneration(
@@ -187,21 +188,19 @@ describe('daemon generation observation', () => {
         bootId: 'selected-boot', pid: 57, startedAt: 1_000, stateDir: '/opaque/daemon-state',
       } });
       expect(attached).toEqual([{
-        endpoint: 'http://127.0.0.1:43121', expectedInstanceId, credentialPath,
+        endpoint: 'http://127.0.0.1:43121/daemon', expectedInstanceId, credentialPath,
         sessionMode: 'external', leaseToken: expect.any(String), env: {},
       }]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('corroborates loopback info, credentialed identity readiness, and a strict boot record', async () => {
+  it('validates remote startup metadata and identity readiness without local state', async () => {
     const paths: string[] = [];
-    const result = await probeDaemonGeneration(fetchInfo({
-      name: 'ours', pid: 41, stateDir: '/alias/state/ours', version: '3', compat: 1,
-    }), env, deps(progress(), paths));
+    const result = await probeDaemonGeneration(fetchInfo, env, deps(progress(), paths));
     expect(result).toEqual({ state: 'ready', generation: {
       bootId: 'boot-41-1000', pid: 41, startedAt: 1_000, stateDir,
     } });
-    expect(paths).toEqual(['/state/ours/startup-progress.json']);
+    expect(paths).toEqual([]);
   });
 
   it.each([
@@ -212,29 +211,37 @@ describe('daemon generation observation', () => {
     [progress({ completed: 3, total: 2 }), 'DAEMON_PROGRESS_INVALID'],
     [progress({ startedAt: 2_000, updatedAt: 1_999 }), 'DAEMON_PROGRESS_INVALID'],
   ])('rejects stale or malformed progress without treating it as ready', async (text, reason) => {
-    const result = await probeDaemonGeneration(fetchInfo({
-      name: 'ours', pid: 41, stateDir, version: '3', compat: 1,
-    }), env, deps(text));
+    const result = await probeDaemonGeneration(fetchInfo, env, deps(text));
     expect(result).toEqual({ state: 'unavailable', reason });
   });
 
-  it('rejects a stale ready file when live info is unavailable or names another state root', async () => {
-    const offline = await probeDaemonGeneration(async () => { throw new Error('offline'); }, env, deps(progress()));
-    expect(offline).toEqual({ state: 'unavailable', reason: 'DAEMON_INFO_UNREACHABLE' });
-    const mismatch = await probeDaemonGeneration(fetchInfo({
-      name: 'ours', pid: 41, stateDir: '/other', version: '3', compat: 1,
-    }), env, deps(progress()));
-    expect(mismatch).toEqual({ state: 'unavailable', reason: 'DAEMON_STATE_DIR_MISMATCH' });
+  it('rejects offline selection without consulting stale local state', async () => {
+    const options = deps(progress());
+    options.attachClient = async () => { throw new Error('gateway offline'); };
+    expect(await probeDaemonGeneration(fetchInfo, env, options))
+      .toEqual({ state: 'unavailable', reason: 'DAEMON_SELECTED_PROBE_UNAVAILABLE' });
   });
 
   it('requires the credential-capable identity index to finish loading', async () => {
-    const info = { name: 'ours', pid: 41, stateDir, version: '3', compat: 1 };
-    const unauthorized: FetchLike = async url => url.endsWith('/identities')
-      ? response({}, 401) : response(info);
-    expect(await probeDaemonGeneration(unauthorized, env, deps(progress())))
-      .toEqual({ state: 'unavailable', reason: 'DAEMON_IDENTITIES_UNAUTHORIZED' });
-    expect(await probeDaemonGeneration(fetchInfo(info, []), env, deps(progress())))
+    const options = deps(progress());
+    const client = await options.attachClient();
+    client.identities = async () => { throw new Error('unauthorized'); };
+    options.attachClient = async () => client;
+    expect(await probeDaemonGeneration(fetchInfo, env, options))
+      .toEqual({ state: 'unavailable', reason: 'DAEMON_SELECTED_PROBE_UNAVAILABLE' });
+    expect(await probeDaemonGeneration(fetchInfo, env, deps(progress(), [], [])))
       .toEqual({ state: 'unavailable', reason: 'DAEMON_IDENTITIES_NOT_READY' });
+    expect(await probeDaemonGeneration(fetchInfo, env, deps(progress(), [], {})))
+      .toEqual({ state: 'unavailable', reason: 'DAEMON_IDENTITIES_INVALID' });
+  });
+
+  it('rejects missing or conflicting gateway configuration before attaching', async () => {
+    const attachClient = vi.fn();
+    expect(await probeDaemonGeneration(fetchInfo, { OURS_CONFIG: '/missing' }, { attachClient }))
+      .toEqual({ state: 'unavailable', reason: 'CLIENT_GATEWAY_PROFILE_INVALID' });
+    expect(await probeDaemonGeneration(fetchInfo, { ...env, OURS_PORT: '3050' }, { attachClient }))
+      .toEqual({ state: 'unavailable', reason: 'CLIENT_GATEWAY_PROFILE_INVALID' });
+    expect(attachClient).not.toHaveBeenCalled();
   });
 
   it('distinguishes loss, availability, stable duplicates, and PID-reuse generations', () => {

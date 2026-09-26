@@ -295,8 +295,10 @@ export async function preparePermanentAssignment(
     endpoint: profile.endpoint,
     expectedInstanceId: profile.expectedInstanceId,
     credentialPath: profile.credentialPath,
-    sessionMode: 'local',
-    requiredCapabilities: ['local-pid-v1', 'root-first-identities-v1'],
+    sessionMode: 'external',
+    leaseToken: randomUUID(),
+    requiredCapabilities: ['external-sessions-v1', 'root-first-identities-v1'],
+    env: {},
   });
   try {
     const rows = await client.listIdentities(),
@@ -323,7 +325,7 @@ export async function preparePermanentAssignment(
       });
     return 'verified';
   } finally {
-    await client.close();
+    try { await client.releaseLease(); } finally { await client.close(); }
   }
 }
 export function readRoomReadiness(

@@ -13,7 +13,6 @@ const LIFECYCLE_RETRY_MS = 250;
 export function fleetWorkerEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const inheritedKeys = [
     'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'OURS_CONFIG',
-    'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN', 'OURS_COWORK_CONFIG',
   ];
   const env = Object.fromEntries(inheritedKeys.flatMap(key =>
     source[key] === undefined ? [] : [[key, source[key]!] as const]));

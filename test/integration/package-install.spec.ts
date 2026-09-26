@@ -6,7 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 
@@ -47,7 +47,7 @@ describe('packed root package', () => {
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -149,7 +149,7 @@ describe('packed root package', () => {
 
       const fallbackProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -199,7 +199,7 @@ describe('packed root package', () => {
       // this checkout and with both dependency installation postures.
       const hermesProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { makeHermesAdapter, hermesAdapter, getAdapter } from '@ours.network/fleet';
         const adapter = makeHermesAdapter();
         process.stdout.write(JSON.stringify({
