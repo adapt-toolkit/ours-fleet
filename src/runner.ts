@@ -72,6 +72,7 @@ export interface RunnerDeps {
   log(line: string): void;
   /** HTTP transport for the monitor's daemon long-poll (injectable for tests). */
   fetch: FetchLike;
+  identityProbeDeps?: Parameters<typeof probeIdentityPresence>[3];
   probeGeneration(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
@@ -1050,7 +1051,7 @@ export async function runOnce(
     if (temp && now >= nextIdentityPollAt) {
       nextIdentityPollAt = now + TEMP_IDENTITY_POLL_MS;
       const presence = await probeIdentityPresence(
-        role.identity, deps.fetch, resolvedMonitorDeps.env);
+        role.identity, deps.fetch, resolvedMonitorDeps.env, deps.identityProbeDeps);
       if (presence.state === 'present') {
         identityObserved = true;
         identityAbsentSince = undefined;

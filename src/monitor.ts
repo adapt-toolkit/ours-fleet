@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { attachOursClient, type AttachOursClientOptions } from '@ours.network/sdk/client';
 import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
@@ -144,7 +143,7 @@ export type StatusCause =
   | 'offline'         // the session is gone            → the run loop ends
   | 'turns-failing'   // delivered wakes keep dying     → cleared by a completed turn
   | 'safe-boundary'   // after_tool fell back            → cleared by an exact/direct delivery
-  | 'auth';           // token rejected; legacy is fatal, file-backed profile retries
+  | 'auth';           // issued credential rejected; profile retries
 
 interface StatusEntry {
   level: 'degraded' | 'failed';
@@ -152,94 +151,10 @@ interface StatusEntry {
   at: string;
 }
 
-/** Best-effort daemon config (issue #17): the fields the MCP client reads. */
-interface DaemonConfig {
-  apiToken?: string;
-  port?: number;
-  stateDir?: string;
-}
-
-/** Path to the daemon config the MCP client uses: OURS_CONFIG ?? real ~/.ours/config.json. */
-const daemonConfigPath = (env: NodeJS.ProcessEnv): string =>
-  env.OURS_CONFIG ?? join(homedir(), '.ours', 'config.json');
-
-/** Preserve the daemon's legacy env integer semantics: parseInt, invalid → absent. */
-function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
-  const raw = env[name];
-  if (raw === undefined) return undefined;
-  const n = parseInt(raw, 10);
-  return Number.isNaN(n) ? undefined : n;
-}
-
-/**
- * Read the daemon config the way the MCP client does — best-effort. Any missing,
- * malformed, or unreadable config yields `{}` so token resolution falls through
- * (issue #17). Only the well-typed fields we consume are surfaced.
- */
-export function readDaemonConfig(env: NodeJS.ProcessEnv): DaemonConfig {
-  try {
-    const p = JSON.parse(readFileSync(daemonConfigPath(env), 'utf8'));
-    const o: DaemonConfig = {};
-    if (typeof p.apiToken === 'string' && p.apiToken.trim()) o.apiToken = p.apiToken.trim();
-    if (typeof p.port === 'number' && Number.isFinite(p.port)) o.port = p.port;
-    if (typeof p.stateDir === 'string') o.stateDir = p.stateDir;
-    return o;
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Resolve the daemon API token exactly like the MCP client (issue #17), a 3-step
- * chain: `OURS_API_TOKEN` (trimmed) → config `apiToken` (trimmed) → the 0600 owner
- * token at `<stateDir>/daemon-token`. Never generates a token; a failed read of
- * any source (missing/unreadable) silently falls through to the next.
- */
-export function resolveApiToken(
-  env: NodeJS.ProcessEnv, file: DaemonConfig = readDaemonConfig(env),
-): string | undefined {
-  const e = env.OURS_API_TOKEN?.trim();
-  if (e) return e;
-  if (file.apiToken) return file.apiToken;
-  const sd = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
-  try {
-    const t = readFileSync(join(sd, 'daemon-token'), 'utf8').trim();
-    if (t) return t;
-  } catch { /* missing/unreadable (e.g. cross-user 0600) → fall through */ }
-  return undefined;
-}
-
-export interface DaemonEndpoint {
-  origin: string;
-  port: number;
-  configPath: string;
-  stateDir: string;
-  url(name: string): string;
-  headers: Record<string, string>;
-}
-
 export type IdentityPresence =
   | { state: 'present'; temporary: boolean; stale: boolean }
   | { state: 'absent' }
   | { state: 'unknown'; detail: string };
-
-/** Resolve the daemon endpoint + auth header from env → config → defaults. */
-export function resolveEndpoint(env: NodeJS.ProcessEnv, includeToken = true): DaemonEndpoint {
-  const file = readDaemonConfig(env);
-  const port = envInt(env, 'OURS_PORT') ?? file.port ?? DEFAULT_PORT;
-  const configPath = daemonConfigPath(env);
-  const stateDir = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
-  const token = includeToken ? resolveApiToken(env, file) : undefined;
-  const origin = `http://127.0.0.1:${port}`;
-  return {
-    origin,
-    port,
-    configPath,
-    stateDir,
-    url: (name: string) => `${origin}/identities/${encodeURIComponent(name)}/notifications`,
-    headers: token ? { 'x-ours-api-token': token } : {},
-  };
-}
 
 /**
  * Ask the daemon's authoritative identity index. The notifications endpoint is
@@ -249,43 +164,19 @@ export function resolveEndpoint(env: NodeJS.ProcessEnv, includeToken = true): Da
 export async function probeIdentityPresence(
   name: string, fetch: FetchLike, env: NodeJS.ProcessEnv, deps: IdentityProbeDeps = {},
 ): Promise<IdentityPresence> {
-  const profile = readClientProfile(env);
-  if (profile) {
-    let client: IdentityProbeClient | undefined;
-    try {
-      client = await (deps.attachClient?.({
-        endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
-        credentialPath: profile.credentialPath,
-        sessionMode: 'external', leaseToken: randomUUID(), env: {},
-      }) ?? attachOursClient({
-        endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
-        credentialPath: profile.credentialPath,
-        sessionMode: 'external', leaseToken: randomUUID(), env: {},
-      }));
-      return classifyIdentityPresence(name, await client.identities());
-    } catch {
-      return { state: 'unknown', detail: 'selected identity index is unavailable' };
-    } finally { await client?.close().catch(() => undefined); }
-  }
-  const ep = resolveEndpoint(env);
-  let response: FetchResponse;
+  let client: IdentityProbeClient | undefined;
   try {
-    response = await fetch(`${ep.origin}/identities`, { headers: ep.headers });
-  } catch (error) {
-    return { state: 'unknown', detail: `identity index unreachable (${msg(error)})` };
-  }
-  if (!response.ok) return {
-    state: 'unknown',
-    detail: response.status === 401
-      ? `daemon rejected the API token (401) — ${authResolutionHint(ep)}`
-      : `identity index returned HTTP ${response.status}`,
-  };
-  try {
-    const body = await response.json();
-    return classifyIdentityPresence(name, body.identities);
-  } catch (error) {
-    return { state: 'unknown', detail: `identity index response is unreadable (${msg(error)})` };
-  }
+    const profile = readClientProfile(env);
+    const options: AttachOursClientOptions = {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: randomUUID(), env: {},
+    };
+    client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+    return classifyIdentityPresence(name, await client.identities());
+  } catch {
+    return { state: 'unknown', detail: 'gateway identity index unavailable; check the shared client profile and issued credential' };
+  } finally { await client?.close().catch(() => undefined); }
 }
 
 function classifyIdentityPresence(name: string, identities: unknown): IdentityPresence {
@@ -311,13 +202,6 @@ function classifyIdentityPresence(name: string, identities: unknown): IdentityPr
       temporary: (found as { temporary?: unknown }).temporary === true,
       stale: (found as { stale?: unknown }).stale === true,
     };
-}
-
-/** Actionable, secret-free description of every token source for this profile. */
-export function authResolutionHint(ep: DaemonEndpoint): string {
-  const tokenPath = join(ep.stateDir, 'daemon-token');
-  return `set OURS_API_TOKEN, set apiToken in ${JSON.stringify(ep.configPath)}, or ensure ` +
-    `${JSON.stringify(tokenPath)} is readable by the fleet supervisor`;
 }
 
 /** Keep only the events whose type the role asked to wake on. */
@@ -550,8 +434,7 @@ export class Monitor {
   private readonly identity: string;
   private readonly cfg: MonitorConfig;
   private readonly deps: MonitorDeps;
-  private readonly ep?: ReturnType<typeof resolveEndpoint>;
-  private readonly profile?: ExplicitClientProfile;
+  private readonly profile: ExplicitClientProfile;
   private readonly profileKey: string;
   private readonly monitorLeaseToken = `ours-fleet-monitor-${process.pid}-${randomUUID()}`;
   private profileClientPromise?: Promise<MonitorPageClient>;
@@ -578,8 +461,7 @@ export class Monitor {
     this.cfg = o.cfg;
     this.deps = o.deps;
     this.profile = readClientProfile(o.deps.env);
-    this.ep = this.profile ? undefined : resolveEndpoint(o.deps.env);
-    this.profileKey = this.profile ? clientProfileKey(this.profile) : this.ep!.origin;
+    this.profileKey = clientProfileKey(this.profile);
     this.statusPath = join(o.agentDir, '.monitor-status');
     this.cursorPath = join(o.agentDir, '.notify-cursor');
     this.statePath = join(o.agentDir, '.monitor-state.json');
@@ -607,13 +489,8 @@ export class Monitor {
       this.writeStatus();
     } catch (e) {
       if (e instanceof AuthError) {
-        if (this.profile) {
-          this.cursor = null;
-          this.degrade('auth', e.message);
-        } else {
-          this.fatal = true;
-          this.degrade('auth', e.message, 'failed');
-        }
+        this.cursor = null;
+        this.degrade('auth', e.message);
       } else {
         this.cursor = null;
         this.degrade('connectivity', `prime failed (${msg(e)})`);
@@ -637,11 +514,6 @@ export class Monitor {
         this.recover('connectivity', 'auth');
       } catch (e) {
         if (this.stopped) return;
-        if (e instanceof AuthError && !this.profile) {
-          this.fatal = true;
-          this.degrade('auth', e.message, 'failed');
-          return;
-        }
         backoff = Math.min(backoff + BACKOFF_STEP_MS, BACKOFF_MAX_MS);
         if (e instanceof AuthError) this.degrade('auth', e.message);
         else this.degrade('connectivity', `stream hiccup (${msg(e)})`);
@@ -754,23 +626,18 @@ export class Monitor {
     this.currentAbort = ctrl;
     let timedOut = false;
     const timer = this.deps.timers.set(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
-    let resp: FetchResponse | undefined;
     try {
-      if (this.profile) {
-        const client = await this.profileClient();
+      const client = await this.profileClient();
         const page = await client.readNotificationPage(this.identity, {
           since: since === 'tip' ? 'tip' : Number.parseInt(since, 10),
           signal: ctrl.signal,
           requestTimeoutMs: timeoutMs,
         });
         return { cursor: page.cursor, events: page.events as NotifyEvent[] };
-      }
-      resp = await this.deps.fetch(`${this.ep!.url(this.identity)}?since=${since}`,
-        { headers: this.ep!.headers, signal: ctrl.signal });
     } catch (error) {
       if (timedOut && timeoutKind === 'stall')
         throw new Error(`notification stream stalled for ${Math.round(timeoutMs / 1000)}s`);
-      if (this.profile && /(?:HTTP\s*401|unauthori[sz]ed|API token)/i.test(msg(error)))
+      if (/(?:HTTP\s*401|unauthori[sz]ed|API token)/i.test(msg(error)))
         throw new AuthError(
           `daemon rejected the API token (401) — verify the credential file `
           + `${JSON.stringify(this.profile.credentialPath)} selected by `
@@ -780,15 +647,10 @@ export class Monitor {
       this.deps.timers.clear(timer);
       this.currentAbort = null;
     }
-    if (resp!.status === 401)
-      throw new AuthError(
-        `daemon rejected the API token (401) — ${authResolutionHint(this.ep!)}`);
-    if (!resp!.ok) throw new Error(`daemon returned HTTP ${resp!.status}`);
-    return resp!.json();
+
   }
 
   private profileClient(): Promise<MonitorPageClient> {
-    if (!this.profile) throw new Error('explicit client profile is not selected');
     if (!this.profileClientPromise) {
       const { endpoint, expectedInstanceId, credentialPath } = this.profile;
       const options: AttachOursClientOptions = {

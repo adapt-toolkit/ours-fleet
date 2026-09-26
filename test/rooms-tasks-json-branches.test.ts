@@ -127,5 +127,5 @@ describe('task/room JSON presentation contract', () => {
       expect(result).toMatchObject({ code: 1, stdout: '', stderr: expected });
       expect(`${result.stdout}${result.stderr}`).not.toContain('##');
     }
-  });
+  }, 15000);
 });

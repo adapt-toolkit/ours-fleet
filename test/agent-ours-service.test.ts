@@ -108,7 +108,7 @@ beforeEach(() => {
   writeFileSync(
     profile,
     JSON.stringify({
-      endpoint: 'http://127.0.0.1:1',
+      serverUrl: 'http://127.0.0.1:1', endpoint: 'http://127.0.0.1:1/daemon',
       expectedInstanceId: '11111111-1111-1111-1111-111111111111',
       credentialPath: join(root, 'token'),
     }),

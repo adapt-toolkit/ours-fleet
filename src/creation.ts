@@ -357,10 +357,10 @@ export function daemonIdentityProvisioner(
 ): IdentityProvisioner {
   const connect = (leaseToken: string) => {
     const profile = readClientProfile(env);
-    return attachClient(profile ? {
+    return attachClient({
       endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
       credentialPath: profile.credentialPath, sessionMode: 'external', leaseToken, env: {},
-    } : { env, leaseToken, clientPid: process.pid });
+    });
   };
   const provisioner: IdentityProvisioner = {
     async exists(name: string) {

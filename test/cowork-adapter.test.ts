@@ -3,12 +3,11 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer, type Server, type Socket } from 'node:net';
+import { createServer, type Server } from 'node:http';
 
 import {
   CoworkProtocolError,
   createCoworkAdapter,
-  resolveCoworkSocketPath,
 } from '../src/rooms-tasks/cowork-adapter.js';
 
 const roots: string[] = [];
@@ -16,7 +15,7 @@ const servers: Server[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
-  await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+  await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()); })));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -35,77 +34,37 @@ function room(overrides: Record<string, unknown> = {}) {
   };
 }
 
-async function rpcServer(
-  handler: (request: Record<string, unknown>) => unknown,
-): Promise<string> {
+async function rpcServer(handler: (request: Record<string, unknown>) => unknown): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), 'fleet-cowork-adapter-'));
   roots.push(root);
-  const socketPath = join(root, 'management.sock');
-  const server = createServer((socket: Socket) => {
-    socket.setEncoding('utf8');
+  const instanceId = '11111111-2222-3333-4444-555555555555';
+  const server = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/prefix/daemon/selection') {
+      res.end(JSON.stringify({ schema: 1, instanceId, capabilities: ['external-sessions-v1'] })); return;
+    }
+    expect(req.url).toBe('/prefix/cowork/management/rpc');
+    expect(req.headers['x-ours-api-token']).toBe('fixture-token');
     let input = '';
-    socket.on('data', chunk => {
-      input += chunk;
-      const newline = input.indexOf('\n');
-      if (newline < 0) return;
-      const request = JSON.parse(input.slice(0, newline)) as Record<string, unknown>;
-      try {
-        socket.end(`${JSON.stringify({ version: 1, id: request.id, result: handler(request) })}\n`);
-      } catch (error) {
-        socket.end(`${JSON.stringify({
-          version: 1,
-          id: request.id,
-          error: { code: 'invalid_state', message: error instanceof Error ? error.message : String(error) },
-        })}\n`);
-      }
+    req.on('data', chunk => { input += chunk; });
+    req.on('end', () => {
+      const request = JSON.parse(input);
+      try { res.end(JSON.stringify({ version: 1, id: request.id, result: handler(request) })); }
+      catch (error) { res.end(JSON.stringify({ version: 1, id: request.id, error: { code: 'invalid_state', message: String(error) } })); }
     });
   });
   servers.push(server);
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(socketPath, () => resolve());
-  });
-  return socketPath;
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const serverUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/prefix/`;
+  const configPath = join(root, 'profile.json'), credentialPath = join(root, 'credential');
+  writeFileSync(credentialPath, 'fixture-token', { mode: 0o600 });
+  writeFileSync(configPath, JSON.stringify({ serverUrl, expectedInstanceId: instanceId, credentialPath }), { mode: 0o600 });
+  return configPath;
 }
 
-describe('Cowork management-socket adapter', () => {
-  it('uses a 30-second default RPC timeout', async () => {
-    vi.useFakeTimers();
-    const socket = Object.assign(new EventEmitter(), {
-      setEncoding: () => undefined,
-      write: () => true,
-      destroy: () => undefined,
-    }) as unknown as Socket;
-    let settled = false;
-    const available = createCoworkAdapter({
-      socketPath: '/tmp/cowork-timeout-test.sock',
-      connect: () => socket,
-    }).available().finally(() => { settled = true; });
-
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(20_000);
-    await expect(available).resolves.toBe(false);
-  });
-
-  it('resolves Cowork v1 config and state-dir override', () => {
-    const root = mkdtempSync(join(tmpdir(), 'fleet-cowork-config-'));
-    roots.push(root);
-    const configPath = join(root, 'cowork.json');
-    writeFileSync(configPath, JSON.stringify({
-      version: 1,
-      stateDir: join(root, 'from-config'),
-      rest: { enabled: false, port: 3052 },
-    }));
-    expect(resolveCoworkSocketPath({ configPath })).toBe(join(root, 'from-config', 'management.sock'));
-    expect(resolveCoworkSocketPath({
-      configPath,
-      env: { OURS_COWORK_STATE_DIR: join(root, 'from-env') },
-    })).toBe(join(root, 'from-env', 'management.sock'));
-  });
-
+describe('Cowork gateway adapter', () => {
   it('creates a real Cowork room with the exact v1 RPC envelope', async () => {
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       expect(request).toMatchObject({
         version: 1,
         method: 'room.create',
@@ -119,7 +78,7 @@ describe('Cowork management-socket adapter', () => {
       });
       return room();
     });
-    const adapter = createCoworkAdapter({ socketPath });
+    const adapter = createCoworkAdapter({ env: { OURS_CONFIG: profilePath } });
     await expect(adapter.createRoom({
       room_name: 'Release room',
       goal: 'Ship',
@@ -133,8 +92,8 @@ describe('Cowork management-socket adapter', () => {
     });
   });
 
-  it('accepts the Messenger owner invite through the Unix-only room.accept route', async () => {
-    const socketPath = await rpcServer(request => {
+  it('accepts the Messenger owner invite through the gateway room.accept route', async () => {
+    const profilePath = await rpcServer(request => {
       expect(request).toMatchObject({
         method: 'room.accept',
         params: {
@@ -146,7 +105,7 @@ describe('Cowork management-socket adapter', () => {
       });
       return { identity: 'B'.repeat(64), state: 'pending' };
     });
-    await expect(createCoworkAdapter({ socketPath }).acceptInvite(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).acceptInvite(
       '01ABCDEF0123456789ABCDEFGH',
       'secret-public-invite',
       { role: 'Owner', expected_cid: 'B'.repeat(64) },
@@ -155,7 +114,7 @@ describe('Cowork management-socket adapter', () => {
 
   it.each([['Owner', ['*']], ['Reviewer', ['list-members', 'remove-member']]] as const)(
     'sets the exact durable %s command policy through Cowork', async (role, commands) => {
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       expect(request).toMatchObject({
         method: 'room.command.role.set',
         params: {
@@ -165,7 +124,7 @@ describe('Cowork management-socket adapter', () => {
       });
       return [{ role, commands: [...commands] }];
     });
-    await expect(createCoworkAdapter({ socketPath }).setRoleCommands(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).setRoleCommands(
       '01ABCDEF0123456789ABCDEFGH',
       { role, commands: [...commands] },
     )).resolves.toBeUndefined();
@@ -173,7 +132,7 @@ describe('Cowork management-socket adapter', () => {
 
   it('returns Cowork invite IDs and revokes through the existing room.revoke route', async () => {
     const methods: string[] = [];
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       methods.push(String(request.method));
       if (request.method === 'room.invite') {
         expect(request.params).toEqual({
@@ -194,7 +153,7 @@ describe('Cowork management-socket adapter', () => {
       }
       throw new Error(`unexpected ${String(request.method)}`);
     });
-    const adapter = createCoworkAdapter({ socketPath });
+    const adapter = createCoworkAdapter({ env: { OURS_CONFIG: profilePath } });
 
     await expect(adapter.issueInvite('01ABCDEF0123456789ABCDEFGH', {
       mode: 'one_time', role: 'Developer', min_accepts: 1,
@@ -209,7 +168,7 @@ describe('Cowork management-socket adapter', () => {
 
   it('uses Cowork as source of truth for list, participants, recovery, close, and delete', async () => {
     const methods: string[] = [];
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       const method = String(request.method);
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
@@ -232,7 +191,7 @@ describe('Cowork management-socket adapter', () => {
       }
       throw new Error(`unexpected ${method}`);
     });
-    const adapter = createCoworkAdapter({ socketPath });
+    const adapter = createCoworkAdapter({ env: { OURS_CONFIG: profilePath } });
     expect((await adapter.listRooms())[0]?.state).toBe('active');
     expect(await adapter.getSeats('01ABCDEF0123456789ABCDEFGH')).toEqual([
       {
@@ -254,7 +213,7 @@ describe('Cowork management-socket adapter', () => {
   });
 
   it('authors an exact role briefing and returns its durable version', async () => {
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       expect(request).toMatchObject({
         method: 'room.briefing.role.set',
         params: {
@@ -272,7 +231,7 @@ describe('Cowork management-socket adapter', () => {
         },
       });
     });
-    await expect(createCoworkAdapter({ socketPath }).setRoleBriefing(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).setRoleBriefing(
       '01ABCDEF0123456789ABCDEFGH',
       { role: 'Reviewer', text: 'Review the exact diff.' },
     )).resolves.toEqual({
@@ -282,7 +241,7 @@ describe('Cowork management-socket adapter', () => {
   });
 
   it('projects only normalized room briefing, chat, and relay history evidence', async () => {
-    const socketPath = await rpcServer(request => {
+    const profilePath = await rpcServer(request => {
       expect(request).toMatchObject({
         method: 'room.history',
         params: {
@@ -306,7 +265,7 @@ describe('Cowork management-socket adapter', () => {
         kind: 'file', seq: 16, record_id: 'room:16', at: '2026-08-24T00:00:03Z',
       }];
     });
-    await expect(createCoworkAdapter({ socketPath }).getHistory(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).getHistory(
       '01ABCDEF0123456789ABCDEFGH', { after: 12, limit: 50 },
     )).resolves.toEqual({
       raw_count: 4,
@@ -320,7 +279,7 @@ describe('Cowork management-socket adapter', () => {
   });
 
   it('preserves raw pagination progress when every record is filtered out', async () => {
-    const socketPath = await rpcServer(() => [
+    const profilePath = await rpcServer(() => [
       {
         kind: 'membership_intent', seq: 40, record_id: 'room:40',
         at: '2026-08-24T00:00:00Z', action: 'remove',
@@ -330,25 +289,25 @@ describe('Cowork management-socket adapter', () => {
         at: '2026-08-24T00:00:01Z', file_id: 'file-1',
       },
     ]);
-    await expect(createCoworkAdapter({ socketPath }).getHistory(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).getHistory(
       '01ABCDEF0123456789ABCDEFGH', { after: 39, limit: 2 },
     )).resolves.toEqual({ records: [], raw_count: 2, next_after: 41 });
   });
 
   it('fails closed on malformed room history author provenance', async () => {
-    const socketPath = await rpcServer(() => [{
+    const profilePath = await rpcServer(() => [{
       kind: 'message', seq: 1, record_id: 'room:1', at: 'now', message_id: 'm',
       category: 'chat', author: { display_name: 'forged', role: 'Owner' },
       text: '{}', recipient_identities: [],
     }]);
-    await expect(createCoworkAdapter({ socketPath }).getHistory(
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).getHistory(
       '01ABCDEF0123456789ABCDEFGH',
     )).rejects.toThrow(/author.identity/);
   });
 
   it('fails closed on Cowork RPC errors', async () => {
-    const socketPath = await rpcServer(() => { throw new Error('owner CID mismatch'); });
-    await expect(createCoworkAdapter({ socketPath }).acceptInvite(
+    const profilePath = await rpcServer(() => { throw new Error('owner CID mismatch'); });
+    await expect(createCoworkAdapter({ env: { OURS_CONFIG: profilePath } }).acceptInvite(
       '01ABCDEF0123456789ABCDEFGH',
       'invite',
       { role: 'Owner', expected_cid: 'D'.repeat(64) },

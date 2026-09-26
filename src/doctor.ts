@@ -15,8 +15,7 @@ import { resolveIsolation, harnessRuntimeDir } from './isolation/policy.js';
 import { hermesConfiguredProvider } from './harness/hermes-startup.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
 import {
-  authResolutionHint, resolveEndpoint,
-  type DaemonEndpoint, type FetchLike,
+  type FetchLike,
 } from './monitor.js';
 import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
@@ -41,12 +40,12 @@ function cgroupDelegationDetail(): string {
 }
 
 interface MonitorProfile {
-  endpoint?: DaemonEndpoint;
   client?: ExplicitClientProfile;
   roles: string[];
+  error?: string;
 }
 
-type DoctorDaemonClient = Pick<OursClient, 'version' | 'close'>;
+type DoctorDaemonClient = Pick<OursClient, 'version' | 'close'> & Partial<Pick<OursClient, 'identities'>>;
 type AttachDoctorDaemon = (
   options: AttachOursClientOptions,
 ) => Promise<DoctorDaemonClient>;
@@ -56,22 +55,14 @@ function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   const profiles: MonitorProfile[] = [];
   for (const role of roles.filter(r => r.monitor?.mode === 'fleet')) {
     const env = { ...process.env, ...(role.env ?? {}) };
-    const client = readClientProfile(env);
-    if (client) {
-      const existing = profiles.find(p => p.client?.endpoint === client.endpoint
-        && p.client.expectedInstanceId === client.expectedInstanceId
-        && p.client.credentialPath === client.credentialPath);
-      if (existing) existing.roles.push(role.name);
-      else profiles.push({ client, roles: [role.name] });
-      continue;
-    }
-    const endpoint = resolveEndpoint(env);
-    const token = endpoint.headers['x-ours-api-token'];
-    const existing = profiles.find(p =>
-      p.endpoint?.origin === endpoint.origin
-      && p.endpoint.headers['x-ours-api-token'] === token);
+    let client: ExplicitClientProfile;
+    try { client = readClientProfile(env); }
+    catch (error) { profiles.push({ roles: [role.name], error: error instanceof Error ? error.message : 'Invalid gateway profile' }); continue; }
+    const existing = profiles.find(p => p.client?.endpoint === client.endpoint
+      && p.client.expectedInstanceId === client.expectedInstanceId
+      && p.client.credentialPath === client.credentialPath);
     if (existing) existing.roles.push(role.name);
-    else profiles.push({ endpoint, roles: [role.name] });
+    else profiles.push({ client, roles: [role.name] });
   }
   return profiles;
 }
@@ -192,7 +183,7 @@ export async function doctor(
   if (loaded.ok && loaded.rooms) {
     const rooms = loaded.rooms;
 
-    // Cowork socket reachability
+    // Cowork gateway reachability
     const coworkConfig = rooms.cowork?.config;
     try {
       const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
@@ -201,13 +192,13 @@ export async function doctor(
       checks.push({
         name: 'cowork', ok: reachable,
         detail: reachable
-          ? 'management socket reachable'
-          : `management socket unreachable${coworkConfig ? ` (config: ${coworkConfig})` : ''}`,
+          ? 'gateway management reachable'
+          : `gateway management unreachable${coworkConfig ? ` (config: ${coworkConfig})` : ''}`,
       });
     } catch (e) {
       checks.push({
         name: 'cowork', ok: false,
-        detail: `management socket error${coworkConfig ? ` (config: ${coworkConfig})` : ''}: ${(e as Error)?.message ?? e}`,
+        detail: `gateway management error${coworkConfig ? ` (config: ${coworkConfig})` : ''}: ${(e as Error)?.message ?? e}`,
       });
     }
 
@@ -259,18 +250,6 @@ export async function doctor(
       });
     }
 
-    // Shared-daemon selection coherence
-    if (rooms.cowork?.config) {
-      const { existsSync: exists } = await import('node:fs');
-      const configOk = exists(rooms.cowork.config);
-      checks.push({
-        name: 'rooms: cowork config', ok: configOk,
-        detail: configOk
-          ? `cowork config at ${rooms.cowork.config}`
-          : `cowork config not found: ${rooms.cowork.config}`,
-      });
-    }
-
     // Hard room-management capability check
     try {
       const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
@@ -317,20 +296,17 @@ export async function doctor(
   }
 
 
-  let managedSelection = false;
+  let managedSelection = true;
   try {
     // Mark explicit selection before validation so a damaged managed profile does
     // not produce advice to start an unrelated local daemon.
-    managedSelection = process.env.OURS_CONFIG !== undefined
-      || existsSync(join(process.env.HOME || homedir(), '.ours-client', 'profile.json'));
+    managedSelection = true;
     const selected = readClientProfile(process.env);
     managedSelection = selected !== undefined;
-    const client = await attachDaemon(selected ? {
+    const client = await attachDaemon({
       endpoint: selected.endpoint, expectedInstanceId: selected.expectedInstanceId,
       credentialPath: selected.credentialPath, env: {}, sessionMode: 'external',
       leaseToken: `ours-fleet-doctor-${process.pid}`,
-    } : {
-      env: process.env, leaseToken: `ours-fleet-doctor-${process.pid}`, clientPid: process.pid,
     });
     let daemonVersion: string;
     try {
@@ -488,14 +464,15 @@ export async function doctor(
   // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
   const monitorProfiles = resolveMonitorProfiles(roles);
   for (const profile of monitorProfiles) {
-    const { endpoint, client: selected } = profile;
+    const selected = profile.client!;
     const checkName = monitorProfiles.length === 1
       ? 'monitor: daemon API'
       : `monitor: daemon API (${profile.roles.join(', ')})`;
-    let ok = false, detail: string;
+    let ok = false, detail = 'gateway profile unavailable';
+    if (profile.error) { checks.push({ name: checkName, ok: false, detail: profile.error }); continue; }
     try {
       if (selected) {
-        const daemon = await attachOursClient({
+        const daemon = await attachDaemon({
           endpoint: selected.endpoint,
           expectedInstanceId: selected.expectedInstanceId,
           credentialPath: selected.credentialPath,
@@ -504,7 +481,7 @@ export async function doctor(
         });
         try {
           const [info, identities] = await Promise.all([
-            daemon.version(), daemon.identities(),
+            daemon.version(), daemon.identities?.(),
           ]);
           if (info.name !== 'ours' || !Array.isArray(identities))
             throw new Error('selected daemon metadata is invalid');
@@ -514,25 +491,10 @@ export async function doctor(
         checks.push({ name: checkName, ok, detail });
         continue;
       }
-      const live = await fetchImpl(`${endpoint!.origin}/state-dir`, {});
-      if (!live.ok) {
-        detail = `daemon on :${endpoint!.port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
-      } else {
-        const auth = await fetchImpl(`${endpoint!.origin}/identities`, { headers: endpoint!.headers });
-        if (auth.status === 401)
-          detail = `reachable on :${endpoint!.port} but the API token was rejected (401) — ` +
-            authResolutionHint(endpoint!);
-        else if (!auth.ok)
-          detail = `reachable on :${endpoint!.port} but /identities returned HTTP ${auth.status}`;
-        else {
-          ok = true;
-          detail = `reachable on :${endpoint!.port}, authorized — supervisor wake stream available`;
-        }
-      }
     } catch (e) {
-      const target = selected?.endpoint ?? `:${endpoint!.port}`;
+      const target = selected.endpoint;
       detail = `unreachable on ${target} — monitored roles run degraded until it is up ` +
-        `(start it: ours-daemon start) [${(e as Error)?.message ?? e}]`;
+        `(check the configured gateway and issued credential) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
   }

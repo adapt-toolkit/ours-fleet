@@ -27,7 +27,7 @@ const cowork = () => ({ closeRoom: vi.fn(async () => {}), deleteRoom: vi.fn(asyn
 function write(path: string, value: unknown) { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, JSON.stringify(value)); }
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'fleet-erase-')); prior = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = home;
-  sdk.profile.mockReset().mockReturnValue(undefined);
+  sdk.profile.mockReset().mockReturnValue(({ serverUrl: 'http://gateway.test', endpoint: 'http://gateway.test/daemon', expectedInstanceId: '11111111-2222-3333-4444-555555555555', credentialPath: '/fixture/credential' }));
   sdk.listIdentities.mockReset().mockResolvedValue([]); sdk.removeIdentity.mockReset().mockResolvedValue(undefined);
   sdk.releaseLease.mockResolvedValue(undefined); sdk.close.mockResolvedValue(undefined);
 });
@@ -148,6 +148,7 @@ it('resumes task erasure after archives are removed but before room record unlin
   await expect(settleTaskDeletion({ taskId: task.task_id, cowork })).rejects.toThrow('crash before room unlink');
   expect(existsSync(path)).toBe(false); expect(getRoomRecord(id)).toBeDefined();
   vi.restoreAllMocks();
+  sdk.profile.mockReturnValue({ serverUrl: 'http://gateway.test', endpoint: 'http://gateway.test/daemon', expectedInstanceId: '11111111-2222-3333-4444-555555555555', credentialPath: '/fixture/credential' });
   sdk.releaseLease.mockResolvedValue(undefined); sdk.close.mockResolvedValue(undefined); sdk.listIdentities.mockResolvedValue([]);
   await settleTaskDeletion({ taskId: task.task_id, cowork });
   expect(getRoomRecord(id)).toBeUndefined(); expect(readTaskDeletionReceipt(task.task_id)).toBeUndefined();

@@ -79,7 +79,7 @@ The state dir contract:
 |---|---|---|
 | Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
-| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli@2.8.1-nightly.7 @ours.network/daemon@3.8.1-nightly.1 && ours-daemon start` |
+| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `ours-install client --config /absolute/private/profile.json --integrations fleet --fleet-settings /absolute/fleet-settings.json` |
 
 Linux only: `ours-fleet init` enables *linger* so roles run without a login session
 and survive reboots. macOS: launchd agents start **at login** (no linger
@@ -1348,8 +1348,9 @@ The command override is exact: Fleet does not append `--profile`, `--search`, or
 
 One-off/permanent spawn selects a Brain that owns model, reasoning, native permission,
 sandbox, profile, launcher, search, monitor consent, native config, and additional roots.
-Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
-role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
+All roles use the shared gateway profile `~/.ours-client/profile.json`.
+`OURS_CONFIG` selects an alternate whole profile. Legacy port/token/state-dir
+overrides are rejected. See the [gateway setup guide](https://github.com/adapt-toolkit/ours-network/blob/prerelease/packages/installer/GATEWAY_SETUP.md).
 
 ## Agent isolation
 

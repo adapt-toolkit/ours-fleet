@@ -39,9 +39,9 @@ async function fixture(wrongInstance = false) {
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const credentialPath = join(root, 'credential');
   writeFileSync(credentialPath, 'fixture-issued', { mode: 0o600 });
-  mkdirSync(join(root, '.ours-client'));
+  mkdirSync(join(root, '.ours-client'), { mode: 0o700 });
   const profilePath = join(root, '.ours-client/profile.json');
-  writeFileSync(profilePath, JSON.stringify({ endpoint: origin + '/base/daemon', expectedInstanceId: id, credentialPath }), { mode: 0o600 });
+  writeFileSync(profilePath, JSON.stringify({ serverUrl: origin + '/base', endpoint: origin + '/base/daemon', expectedInstanceId: id, credentialPath }), { mode: 0o600 });
   vi.stubEnv('HOME', root);
   for (const key of ['OURS_CONFIG', 'OURS_PORT', 'OURS_API_TOKEN', 'OURS_STATE_DIR', 'OURS_DAEMON_ID']) vi.stubEnv(key, undefined);
   return { cid, requests, profilePath };
@@ -66,6 +66,6 @@ test('room retirement refuses an unexpected daemon before sending its credential
 test('room retirement refuses an incomplete selected profile without legacy fallback', async () => {
   const f = await fixture();
   writeFileSync(f.profilePath, '{}');
-  await expect(identityCidPresent(f.cid)).rejects.toThrow('complete client profile');
+  await expect(identityCidPresent(f.cid)).rejects.toThrow('serverUrl');
   expect(f.requests).toEqual([]);
 });

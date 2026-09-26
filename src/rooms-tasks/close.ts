@@ -98,15 +98,11 @@ export async function waitForLivenessAbsent(
 async function withIdentityClient<T>(work: (client: OursClient) => Promise<T>): Promise<T> {
   const profile = readClientProfile(process.env);
   const leaseToken = `ours-fleet-room-close-${process.pid}-${randomUUID()}`;
-  const client = await attachOursClient(profile ? {
+  const client = await attachOursClient({
     endpoint: profile.endpoint,
     expectedInstanceId: profile.expectedInstanceId,
     credentialPath: profile.credentialPath,
     sessionMode: 'external', env: {}, leaseToken,
-  } : {
-    env: process.env,
-    leaseToken,
-    clientPid: process.pid,
   });
   try { return await work(client); }
   finally {

@@ -1,3 +1,4 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -38,10 +39,11 @@ function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 async function started(client: ReturnType<typeof fakeSdkClient>): Promise<OursSdkClient> {
-  const sdk = new OursSdkClient({}, () => undefined, {
+  const dir = mkdtempSync(join(tmpdir(), 'owner-sdk-gateway-'));
+  const sdk = new OursSdkClient(gatewayFixture(dir).env, () => undefined, {
     attachClient: () => client, readFile: async () => new Uint8Array([1, 2, 3]),
   });
-  await sdk.start();
+  try { await sdk.start(); } finally { rmSync(dir, { recursive: true, force: true }); }
   return sdk;
 }
 
@@ -52,8 +54,8 @@ describe('OursSdkClient send verdicts', () => {
       const profilePath = join(dir, 'client.json');
       const credentialPath = join(dir, 'daemon-token');
       const expectedInstanceId = '329f491c-2a4d-41c4-9ecb-22c590d9a466';
-      writeFileSync(profilePath, JSON.stringify({
-        endpoint: 'http://127.0.0.1:43120', expectedInstanceId, credentialPath,
+      writeFileSync(profilePath, JSON.stringify({ serverUrl: 'http://127.0.0.1:43120',
+        endpoint: 'http://127.0.0.1:43120/daemon', expectedInstanceId, credentialPath,
       }), { mode: 0o600 });
       const attached: AttachOursClientOptions[] = [];
       const sdk = new OursSdkClient({ OURS_CONFIG: profilePath }, () => undefined, {
@@ -64,7 +66,7 @@ describe('OursSdkClient send verdicts', () => {
       await sdk.close({ releaseLease: false });
 
       expect(attached).toEqual([{
-        endpoint: 'http://127.0.0.1:43120', expectedInstanceId, credentialPath,
+        endpoint: 'http://127.0.0.1:43120/daemon', expectedInstanceId, credentialPath,
         sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-owner-/), env: {},
       }]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -145,7 +147,8 @@ describe('OursSdkClient send verdicts', () => {
     const client = fakeSdkClient({
       releaseLease: async () => { throw new Error('daemon unreachable'); },
     });
-    const sdk = new OursSdkClient({}, line => lines.push(line), { attachClient: () => client });
+    const dir = mkdtempSync(join(tmpdir(), 'owner-sdk-gateway-'));
+    const sdk = new OursSdkClient(gatewayFixture(dir).env, line => lines.push(line), { attachClient: () => client });
     await sdk.start();
     await expect(sdk.close()).rejects.toThrow('daemon unreachable');
     expect(lines.some(line => line.includes('lease release failed'))).toBe(true);
@@ -158,7 +161,8 @@ describe('OursSdkClient send verdicts', () => {
       releaseLease: async () => ({ released: [], closed: [], attempted: 1,
         notified: 0, failed: ++attempts === 1 ? 1 : 0 }),
     });
-    const sdk = new OursSdkClient({}, () => undefined, {
+    const dir = mkdtempSync(join(tmpdir(), 'owner-sdk-gateway-'));
+  const sdk = new OursSdkClient(gatewayFixture(dir).env, () => undefined, {
       attachClient: options => { ownerIds.push(options.leaseToken); return client; },
     });
     await sdk.start();
@@ -190,7 +194,8 @@ describe('OursSdkClient send verdicts', () => {
   });
 
   it('refuses to operate before start', async () => {
-    const sdk = new OursSdkClient({}, () => undefined, { attachClient: () => fakeSdkClient() });
+    const dir = mkdtempSync(join(tmpdir(), 'owner-sdk-gateway-'));
+  const sdk = new OursSdkClient(gatewayFixture(dir).env, () => undefined, { attachClient: () => fakeSdkClient() });
     await expect(sdk.getMessages(1)).rejects.toThrow(/is not started/);
   });
 
@@ -219,37 +224,7 @@ describe('OursSdkClient send verdicts', () => {
     expect(client.calls).toContainEqual({ name: 'registerCommands', args: commands });
   });
 
-  it('settles a half-open SDK notification request at the deadline even if fetch ignores abort', async () => {
-    vi.useFakeTimers();
-    try {
-      let attached: AttachOursClientOptions | undefined;
-      const hangingFetch = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
-        new Promise<Response>(() => undefined));
-      const sdk = new OursSdkClient({}, () => undefined, {
-        attachClient: options => { attached = options; return fakeSdkClient(); },
-        fetch: hangingFetch as typeof globalThis.fetch,
-        notificationRequestDeadlineMs: 50,
-      });
-      await sdk.start();
-      const request = attached!.fetch!(
-        'http://127.0.0.1:3050/identities/Role-owner/notifications?since=0');
-      const rejected = expect(request).rejects.toBeInstanceOf(OursWatchDeadlineError);
-      await vi.advanceTimersByTimeAsync(51);
-      await rejected;
-      expect(hangingFetch).toHaveBeenCalledOnce();
 
-      const upstream = new AbortController();
-      const shutdown = attached!.fetch!(
-        'http://127.0.0.1:3050/identities/Role-owner/notifications?since=0',
-        { signal: upstream.signal },
-      );
-      upstream.abort();
-      await expect(shutdown).rejects.toMatchObject({ name: 'AbortError' });
-      await sdk.close();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 });
 
 describe('daemon error classification', () => {

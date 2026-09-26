@@ -1,4 +1,4 @@
-vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => undefined }));
+vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ serverUrl: 'http://gateway.test', endpoint: 'http://gateway.test/daemon', expectedInstanceId: '11111111-2222-3333-4444-555555555555', credentialPath: '/fixture/credential' }) }));
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

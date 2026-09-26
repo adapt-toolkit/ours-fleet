@@ -70,14 +70,15 @@ describe('systemd backend', () => {
 
   // Backwards compatibility, and it is the whole safety argument: an init with no
   // daemon selection writes exactly the unit it always wrote.
-  it('init with no daemon selection writes no OURS_ line at all', async () => {
+  it('init without override persists the shared managed client profile', async () => {
     const { exec } = recorder();
     const before = process.env.OURS_CONFIG;
     delete process.env.OURS_CONFIG;
     try {
       await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
       const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
-      expect(unit).not.toContain('OURS_');
+      expect(unit).toContain('.ours-client/profile.json');
+      expect(unit).not.toContain('OURS_PORT');
       expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
     } finally {
       if (before !== undefined) process.env.OURS_CONFIG = before;
@@ -123,8 +124,8 @@ describe('launchd backend', () => {
       delete process.env.OURS_CONFIG;
       await makeLaunchdBackend(exec, 501).install('B', '/usr/local/bin/ours-fleet');
       const defaulted = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.B.plist'), 'utf8');
-      expect(defaulted).not.toContain('OURS_CONFIG');
-      expect(defaulted).not.toContain('EnvironmentVariables');
+      expect(defaulted).toContain('OURS_CONFIG');
+      expect(defaulted).toContain('.ours-client/profile.json');
     } finally {
       delete process.env.OURS_CONFIG;
     }

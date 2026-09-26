@@ -1,3 +1,4 @@
+import { clientConfigPath } from '../client-profile.js';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { home, logsRoot } from '../paths.js';
@@ -55,7 +56,7 @@ const xml = (value: string) => value
 
 function plist(name: string, binPath: string): string {
   const log = join(logsRoot(), `${name}.log`);
-  const config = process.env.OURS_CONFIG;
+  const config = clientConfigPath(process.env);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

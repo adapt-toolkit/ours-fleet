@@ -1,3 +1,4 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
@@ -1392,6 +1393,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-close-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000aa';
     const configPath = join(fleetHome, 'fleet.yaml');
@@ -1415,6 +1418,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     try {
       await channel.drain();
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1434,6 +1439,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000ab';
     const configPath = join(fleetHome, 'fleet.yaml');
@@ -1448,6 +1455,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     );
     try { await channel.drain(); }
     finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1487,6 +1496,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const task = createTask({
       title: 'Owner terminal', origin: { type: 'owner_channel' }, start: false,
@@ -1519,6 +1530,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       persistedTask = getTask(task.task_id);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1541,6 +1554,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     // Provisioning state — deletion must accept without any terminal transition.
@@ -1564,6 +1579,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: OWNER_CID },
       });
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1582,6 +1599,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-fail-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({ title: 'Owner delete fail', origin: { type: 'owner_channel' }, start: false });
@@ -1596,6 +1615,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       expect(hidden.deletion?.error).toContain('systemd launch failed');
       expect(hidden.deletion?.recovery_hint).toContain(`/task delete ${task.task_id} ${task.task_id}`);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1609,6 +1630,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-no-close-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const configPath = join(fleetHome, 'fleet.yaml');
     writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: false\n');
@@ -1626,6 +1649,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       expect(getTask(task.task_id).state).toBe('done');
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1640,6 +1665,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-fail-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({
@@ -1658,6 +1685,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       persistedTask = getTask(task.task_id);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
