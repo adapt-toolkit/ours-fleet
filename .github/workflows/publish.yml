@@ -36,6 +36,21 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Draft source qualification only. Push/release gates still use the npm
+      # lockfile, and cannot pass until published dependency pins are updated.
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          repository: adapt-toolkit/ours-sdk
+          ref: 37bd5c481c5781cb9af44f51570222a4897955af
+          path: .source-deps/sdk
+      - name: Build pinned SDK source candidate
+        if: github.event_name == 'pull_request'
+        run: npm ci --ignore-scripts && npm run build
+        working-directory: .source-deps/sdk
+      - name: Qualify consumer against pinned SDK source
+        if: github.event_name == 'pull_request'
+        run: node scripts/qualify-gateway-sdk.mjs
       - run: npm run build
       - run: npm test
       # The root package is the only one whose bin target and build stamp come

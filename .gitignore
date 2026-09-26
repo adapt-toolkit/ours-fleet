@@ -8,3 +8,6 @@ playwright-report/
 *.tgz
 docs/superpowers/
 .env
+
+# Pinned cross-repository source qualification checkout
+.source-deps/
