@@ -1,5 +1,5 @@
 // Actual OwnerChannel + OursSdkClient + installed V1 SDK + packed CLI daemon.
-// Network-disabled Docker only. Session seam never invokes an authenticated AI harness.
+// Isolated local daemon only. Session seam never invokes an authenticated AI harness.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -84,14 +84,17 @@ try {
   let dropUpdateResponse = true;
   proxy = createHttpServer(async (request, response) => {
     try {
+      const prefix = '/base/daemon';
+      if (!request.url?.startsWith(prefix + '/')) { response.writeHead(404).end(); return; }
+      const upstreamPath = request.url.slice(prefix.length);
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
-      const upstream = await fetch(daemonEndpoint + request.url, {
+      const upstream = await fetch(daemonEndpoint + upstreamPath, {
         method: request.method, headers: request.headers,
         body: chunks.length ? Buffer.concat(chunks) : undefined, redirect: 'manual',
       });
       const bytes = Buffer.from(await upstream.arrayBuffer());
-      if (request.url === '/api-token/update' && upstream.status === 200 && dropUpdateResponse) {
+      if (upstreamPath === '/api-token/update' && upstream.status === 200 && dropUpdateResponse) {
         dropUpdateResponse = false;
         request.socket.destroy();
         return;
@@ -106,8 +109,9 @@ try {
     }
   });
   await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
-  const endpoint = 'http://127.0.0.1:' + proxy.address().port;
-  writeFileSync(profilePath, JSON.stringify({ endpoint, expectedInstanceId, credentialPath }) + '\n',
+  const serverUrl = 'http://127.0.0.1:' + proxy.address().port + '/base';
+  const endpoint = serverUrl + '/daemon';
+  writeFileSync(profilePath, JSON.stringify({ serverUrl, endpoint, expectedInstanceId, credentialPath }) + '\n',
     { mode: 0o600 });
   const runTokenUpdate = async (extra = []) => {
     const env = { ...process.env, OURS_CONFIG: profilePath };
@@ -218,7 +222,7 @@ try {
 
   const wrongProfilePath=join(hostState,'wrong-client.json');
   writeFileSync(wrongProfilePath,JSON.stringify({
-    endpoint,expectedInstanceId:randomUUID(),credentialPath,
+    serverUrl,endpoint,expectedInstanceId:randomUUID(),credentialPath,
   })+'\n',{mode:0o600});
   const wrongClient=new OursSdkClient({OURS_CONFIG:wrongProfilePath},()=>undefined);
   await assert.rejects(()=>wrongClient.start(),/selection metadata.*mismatch/i);
