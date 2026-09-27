@@ -328,10 +328,11 @@ function sandboxMode(policy: unknown): string | undefined {
  */
 function rewriteMessage(
   value: unknown, approval: string, expectedSandbox: string, disableInheritedMcp: boolean,
+  managedOursTools?: JsonObject,
 ): unknown {
   if (Array.isArray(value))
     return value.map(candidate =>
-      rewriteMessage(candidate, approval, expectedSandbox, disableInheritedMcp));
+      rewriteMessage(candidate, approval, expectedSandbox, disableInheritedMcp, managedOursTools));
   if (!isObject(value) || !isObject(value.params)) return value;
   if (value.method === 'turn/start') {
     if (sandboxMode(value.params.sandboxPolicy) !== expectedSandbox) return value;
@@ -345,18 +346,51 @@ function rewriteMessage(
       params: { ...value.params, config: { ...config, mcp_servers: {} } },
     };
   }
+  if (managedOursTools
+      && (value.method === 'thread/start' || value.method === 'thread/resume')) {
+    const config = isObject(value.params.config) ? value.params.config : {};
+    const servers = isObject(config.mcp_servers) ? config.mcp_servers : {};
+    const ours = servers.ours;
+    // Policy cannot create or re-enable a connector that ACP did not inject.
+    if (!isObject(ours) || ours.enabled === false) return value;
+    const tools = isObject(ours.tools) ? { ...ours.tools } : {};
+    for (const [name, policy] of Object.entries(managedOursTools)) {
+      if (isObject(policy)) tools[name] = {
+        ...(isObject(tools[name]) ? tools[name] : {}), ...policy,
+      };
+    }
+    return { ...value, params: { ...value.params, config: { ...config,
+      mcp_servers: { ...servers, ours: { ...ours, tools } },
+    } } };
+  }
   return value;
 }
 
 /** Transform one app-server NDJSON request; malformed input passes through. */
 export function rewriteCodexAppServerRequest(
   line: string, approval: string, expectedSandbox: string, disableInheritedMcp = false,
+  managedOursTools?: JsonObject,
 ): string {
   try {
     return JSON.stringify(
-      rewriteMessage(JSON.parse(line), approval, expectedSandbox, disableInheritedMcp));
+      rewriteMessage(JSON.parse(line), approval, expectedSandbox, disableInheritedMcp, managedOursTools));
   } catch {
     return line;
+  }
+}
+
+/** ACP only carries transport fields; read policy from Fleet's complete config. */
+export function managedCodexToolPolicy(env: NodeJS.ProcessEnv): JsonObject | undefined {
+  if (env.FLEET_OURS_MANAGED !== '1') return undefined;
+  try {
+    const config: unknown = JSON.parse(env.CODEX_CONFIG ?? '{}');
+    const servers = isObject(config) ? config.mcp_servers : undefined;
+    const ours = isObject(servers) ? servers.ours : undefined;
+    return isObject(ours) && ours.enabled !== false && isObject(ours.tools)
+      ? ours.tools : undefined;
+  } catch {
+    // Invalid config never grants tool approval. ACP owns config diagnostics.
+    return undefined;
   }
 }
 
@@ -386,6 +420,7 @@ export function runCodexAppServerProxy(): void {
   const approval = requiredChoice(APPROVAL_ENV, APPROVAL_POLICIES);
   const expectedSandbox = requiredChoice(SANDBOX_ENV, SANDBOX_MODES);
   const disableInheritedMcp = process.env[DISABLE_INHERITED_MCP_ENV] === '1';
+  const managedOursTools = managedCodexToolPolicy(process.env);
   const launch = realCodexLaunch();
   const env = { ...process.env };
   delete env.CODEX_PATH;
@@ -477,7 +512,7 @@ export function runCodexAppServerProxy(): void {
   input.on('line', line => {
     if (finished) return;
     const rewritten = rewriteCodexAppServerRequest(
-      line, approval, expectedSandbox, disableInheritedMcp);
+      line, approval, expectedSandbox, disableInheritedMcp, managedOursTools);
     recovery.observeClientLine(rewritten);
     writeToChild(rewritten);
   });

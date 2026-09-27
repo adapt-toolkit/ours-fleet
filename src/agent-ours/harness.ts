@@ -32,12 +32,19 @@ export function prepareManagedHarness(
     args: [bridge],
     env: [{ name: 'FLEET_OURS_BRIDGE_DESCRIPTOR', value: descriptor }],
   };
+  // Portable allow covers bound identity messaging, not all tools on the server.
+  const tools = role.harness === 'codex' && role.permissions?.approval === 'allow'
+    ? Object.fromEntries([
+      'current_identity', 'get_messages', 'list_history', 'list_contacts', 'send_message',
+    ].map(name => [name, { approval_mode: 'approve' }]))
+    : undefined;
   const native = {
     mcp_servers: {
       ours: {
         command: process.execPath,
         args: [bridge],
         env: { FLEET_OURS_BRIDGE_DESCRIPTOR: descriptor },
+        ...(tools ? { tools } : {}),
       },
     },
     plugins: { 'ours@ours-codex-marketplace': { enabled: false } },
@@ -47,6 +54,7 @@ export function prepareManagedHarness(
     const config = child.CODEX_CONFIG ? JSON.parse(child.CODEX_CONFIG) : {};
     child.CODEX_CONFIG = JSON.stringify({
       ...config,
+      mcp_servers: { ...config.mcp_servers, ...native.mcp_servers },
       plugins: { ...config.plugins, ...native.plugins },
     });
     // codex-acp otherwise prefers a same-name connector from the user's config.
