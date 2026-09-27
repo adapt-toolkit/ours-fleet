@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { taskLiveReadiness, type LiveReadinessDeps } from '../rooms-tasks/live-readiness.js';
+import { taskLiveReadiness, type LiveReadinessDeps, type TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
 
 import { ConfigError, loadConfig, type FleetConfig } from '../config.js';
 import {
@@ -152,7 +152,7 @@ export function resolveRoomLaunchPolicy(
 export interface TaskRoomServiceDeps {
   liveReadiness?: LiveReadinessDeps;
   loadConfiguration?(path?: string): FleetConfig;
-  cowork?(config: FleetConfig): CoworkAdapter;
+  cowork?(config: FleetConfig, options?: { timeoutMs: number }): CoworkAdapter;
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
   moveTaskToList?: typeof moveTaskToList;
@@ -803,12 +803,32 @@ export class TaskRoomApplicationService {
     return this.acceptTerminal(task.task_id, 'done', task.room_id, input.outcome);
   }
 
+  /** Point-in-time health, separate from durable provisioning and lifecycle. */
+  async observeTaskReadiness(taskId: string): Promise<{ state: 'ready' } | TaskReadinessIssue> {
+    const task = readTask(taskId);
+    const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    try {
+      const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+      return await this.observeLiveReadiness(task, room, cfg) ?? { state: 'ready' };
+    } catch { return { state: 'unknown', reason: 'readiness_unavailable' }; }
+  }
+
+  private async observeLiveReadiness(
+    task: TaskRecord, room: RoomOrchestrationRecord | undefined, cfg: FleetConfig,
+  ): Promise<TaskReadinessIssue | undefined> {
+    const cowork = this.deps.cowork ? this.deps.cowork(cfg, { timeoutMs: 2_000 })
+      : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config, timeoutMs: 2_000 });
+    const issue = await taskLiveReadiness(task, room, cowork, this.deps.liveReadiness);
+    if (issue) return issue;
+    if (JSON.stringify(readTask(task.task_id)) !== JSON.stringify(task)
+        || (room && JSON.stringify(getRoomRecord(room.room_id)) !== JSON.stringify(room)))
+      return { state: 'unknown', reason: 'records_changed' };
+  }
+
   private async assertTaskLiveReadiness(
     task: TaskRecord, room: RoomOrchestrationRecord | undefined, cfg: FleetConfig,
   ): Promise<void> {
-    const cowork = this.deps.cowork ? this.deps.cowork(cfg)
-      : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config });
-    const issue = await taskLiveReadiness(task, room, cowork, this.deps.liveReadiness);
+    const issue = await this.observeLiveReadiness(task, room, cfg);
     if (issue) throw new TaskRoomApplicationError('task_not_ready',
       `Task readiness is ${issue.state}: ${issue.reason}. Ask Fleet Coordinator to inspect the room and member status and choose supported recovery; do not blindly relaunch or reuse invites.`,
       { task: task.task_id, room: task.room_id ?? 'missing', readiness: issue.state,

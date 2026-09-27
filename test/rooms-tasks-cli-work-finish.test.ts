@@ -11,6 +11,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 
 const mocks = vi.hoisted(() => ({
   liveReadiness: vi.fn(),
+  coworkOptions: vi.fn(),
   createRoom: vi.fn(),
   acceptInvite: vi.fn(),
   setRoleCommands: vi.fn(),
@@ -37,7 +38,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/cowork-adapter.js')>();
   return {
     ...actual,
-    createCoworkAdapter: () => ({
+    createCoworkAdapter: (options: unknown) => { mocks.coworkOptions(options); return ({
       createRoom: mocks.createRoom,
       acceptInvite: mocks.acceptInvite,
       setRoleCommands: mocks.setRoleCommands,
@@ -47,7 +48,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
       getRoom: mocks.getRoom,
       listRooms: mocks.listRooms,
       getSeats: mocks.getSeats,
-    }),
+    }); },
   };
 });
 
@@ -872,7 +873,7 @@ describe('task work', () => {
     const taskPayload = JSON.parse(out.join('\n'));
     expect(taskPayload.orchestration.member_seats[0].briefing.state).toBe('relay_queued');
     expectExactJson({
-      schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID),
+      schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID), readiness: { state: 'ready' },
     });
 
     out = [];
@@ -1315,4 +1316,20 @@ describe('live task readiness CLI failures', () => {
     expect(mocks.provisionMembers).not.toHaveBeenCalled();
     expect(getTask(task.task_id).state).toBe('active');
   });
+});
+
+it.each(['ready', 'unknown', 'degraded'])('task show exposes %s health separately from active lifecycle', async state => {
+  const t = backlogTask(); startTask(t.task_id); activateTask(t.task_id);
+  mocks.liveReadiness.mockResolvedValue(state === 'ready' ? undefined : { state, reason: 'control_unavailable' });
+  out.length = 0;
+  await run('show', t.task_id, '--json');
+  const value = JSON.parse(out.join('\n'));
+  expect(value.task.state).toBe('active');
+  expect(value.readiness.state).toBe(state);
+  expect(mocks.coworkOptions).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: 2000 }));
+  expect(getTask(t.task_id).state).toBe('active');
+  out.length = 0;
+  await run('show', t.task_id);
+  expect(out.join('\n')).toContain('Readiness');
+  expect(out.join('\n')).toContain(state);
 });

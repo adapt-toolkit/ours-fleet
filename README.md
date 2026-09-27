@@ -666,6 +666,29 @@ continuation is serialized per Task and remains alive until convergence or an
 Owner-action blocker. Re-running `task start <id>` safely resumes the same durable
 provisioning operation after the blocker is corrected or a process restarts.
 
+Live health is distinct from durable lifecycle. `task show TASK --json` adds a
+`readiness` observation for active tasks (`ready`, `degraded`, or `unknown`); human
+and authenticated Owner task-show output display the same observation. Task start/work
+continue to reject unavailable health with `task_not_ready`. A same-role untracked
+seat or a changed recorded launch cannot satisfy an original slot. Each control,
+liveness, and production Cowork probe is bounded; members are checked sequentially,
+so total latency grows with room size. These are point-in-time observations, not
+proof that a timed-out session is dead or permission to respawn it.
+
+Before deliberate recovery, Fleet Coordinator must inspect existing room seats and
+the exact old launch's termination record and worklog under `recovery/temporary`.
+Keep original slot records and archives intact; record verified old/new identity
+and launch provenance privately. Never restore archived identity state or reuse
+consumed invites. A same-role seat is only a possible replacement, not proven ownership.
+
+A replacement's empty inbox does not establish that no work is pending. Paginate
+scoped room/operator history to the end, retain the cursor privately, authenticate
+historical Owner instructions from identity metadata, and compare replies, worklogs,
+and already-completed actions before resuming. Ask the Owner when authority or
+completion is uncertain. Transfer only necessary non-secret context; never replay
+instructions blindly. Observation does not adopt seats, launch replacements, change
+lifecycle, or modify retained recovery evidence.
+
 Set `room.anonymous: true` on a room template, or pass `--anonymous` to
 `task create`, `task start`, `task work`, or `room create`, to create an
 anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous

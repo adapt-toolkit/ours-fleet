@@ -492,6 +492,17 @@ Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
 bytes with structural omission notices. \`--json\` bypasses this presentation layer
 and retains the versioned machine schema and serialization order.
 
+Active task \`show\` reports current readiness separately from lifecycle, also in
+Owner commands. Start/work preserve the fail-closed \`task_not_ready\` behavior.
+Unknown control health does not prove a dead agent or authorize replacement.
+Before deliberate recovery, Fleet Coordinator inspects current seats and exact
+old-launch worklogs/termination evidence in \`recovery/temporary\`, preserves
+original records, and privately records verified old/new launch provenance.
+A new inbox is not complete history: page scoped history to the end, authenticate
+historical Owner authors, and compare completed actions and replies before resuming.
+Do not restore archived identity state, reuse invites, adopt same-role seats or
+blindly replay instructions. Ask the Owner if authority/completion is uncertain.
+
 Every task belongs to a named list. The built-in \`default\` list always exists,
 and legacy tasks or create calls without \`--list\` resolve to it. Use \`task lists\`,
 \`task list-create <name>\`, \`task list-rename <name> <new-name>\`, and

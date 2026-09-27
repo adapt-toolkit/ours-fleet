@@ -583,10 +583,10 @@ function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
   return cfg.roomTemplates ?? {};
 }
 
-function coworkFor(cfg: FleetConfig) {
+function coworkFor(cfg: FleetConfig, options?: { timeoutMs: number }) {
   if (!cfg.rooms)
     throw new ConfigError('rooms: configuration is required before creating or querying rooms');
-  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config, ...options });
 }
 
 function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot | undefined {
@@ -852,16 +852,18 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
-  taskCmd.command('show <id>')
+  cOpt(taskCmd.command('show <id>'))
     .description('show task details')
     .option('--json', 'JSON output')
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean; configuration?: string }) => {
       try {
-        const service = taskRoomService();
+        const service = taskRoomService(opts.configuration);
         const { task: t, orchestration: room } = service.getTask(id);
+        const readiness = t.state === 'active' ? await service.observeTaskReadiness(id) : undefined;
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
+            ...(readiness ? { readiness } : {}),
           }, null, 2));
           return;
         }
@@ -871,6 +873,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(readiness ? [{ label: 'Readiness', value: readiness.state },
+              ...('reason' in readiness ? [{ label: 'Reason', value: readiness.reason }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
