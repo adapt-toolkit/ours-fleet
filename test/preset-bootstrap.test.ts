@@ -20,12 +20,12 @@ describe('packaged preset bootstrap', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
     expect(seeded.revision).toBe(7);
-    expect(seeded.created).toHaveLength(89);
+    expect(seeded.created).toHaveLength(92);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
-      .toEqual(['pair', 'single', 'team']);
+      .toEqual(['engineering', 'pair', 'single', 'team']);
     expect(cfg.sourceDocuments?.filter(source => source.kind === 'RoomTemplate'))
-      .toHaveLength(3);
+      .toHaveLength(4);
     const continuity = cfg.agentTemplates?.LocalCoordinator.loops?.continuity;
     expect(continuity).toMatchObject({ interval: '15m' });
     expect(continuity?.prompt).toMatch(/scheduled_at minus 15 minutes/);
@@ -62,7 +62,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
-    expect(second.preserved).toHaveLength(88);
+    expect(second.preserved).toHaveLength(91);
   });
 
   it('creates private files and refuses symlink targets', () => {

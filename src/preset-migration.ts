@@ -81,8 +81,11 @@ const V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
 
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
+  'roles/Engineer.yaml',
   'agent_templates/LocalCoordinator.yaml', 'agent_templates/Developer.yaml', 'agent_templates/Critic.yaml',
+  'agent_templates/Engineer.yaml',
   'room_templates/single.yaml', 'room_templates/pair.yaml', 'room_templates/team.yaml',
+  'room_templates/engineering.yaml',
   'agents/FleetCoordinator.yaml',
 ]);
 
@@ -281,6 +284,19 @@ export function migratePackagedRoleDefaults(
       mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
       if (existsSync(target)) unlinkSync(target);
       copyFileSync(join(source, relative), target, constants.COPYFILE_EXCL); chmodSync(target, 0o600);
+      // New Engineer seats use the existing Developer's selected brain. This
+      // preserves wizard/custom provider choices without copying permissions.
+      if (relative === 'agent_templates/Engineer.yaml' && classified.additions.includes(path)) {
+        const developer = join(root, 'agent_templates/Developer.yaml');
+        if (existsSync(developer)) {
+          const value = parseFleetDocument(developer, readFileSync(developer, 'utf8'), 'strict').value as Record<string, unknown>;
+          if (value.brain !== undefined && JSON.stringify(value.brain) !== JSON.stringify({ ref: 'claude-default' })) {
+            const bytes = readFileSync(target, 'utf8').replace('brain: { ref: claude-default }',
+              () => `brain: ${JSON.stringify(value.brain)}`);
+            writeFileSync(target, bytes, { mode: 0o600 });
+          }
+        }
+      }
       fsyncPath(target);
     }
     for (const kind of ['roles', 'agent_templates', 'room_templates', 'agents'])
