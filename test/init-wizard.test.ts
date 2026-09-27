@@ -765,3 +765,21 @@ it('adds engineering to an existing wizard install with the selected development
   for (const [path, bytes] of Object.entries(before)) expect(after[path], path).toBe(bytes);
   expect(migratePackagedRoleDefaults(config, { write: true }).additions).toEqual([]);
 });
+
+it('preserves literal inline brain data and existing custom Engineer files on migration', async () => {
+  const config = join(root, 'fleet.yaml');
+  await publishSetup(config, generateSetup(answers()));
+  const split = splitRootFor(config);
+  const developer = join(split, 'agent_templates/Developer.yaml');
+  const brain = { inline: { harness: 'codex', session: 'acp', model: "custom-$&-$`-$'-model" } };
+  writeFileSync(developer, readFileSync(developer, 'utf8').replace('brain: { ref: development }',
+    () => `brain: ${JSON.stringify(brain)}`));
+  const engineer = join(split, 'agent_templates/Engineer.yaml');
+  rmSync(engineer);
+  migratePackagedRoleDefaults(config, { write: true });
+  expect(loadConfig(config).agentTemplates?.Engineer.brain).toEqual(loadConfig(config).agentTemplates?.Developer.brain);
+  const custom = readFileSync(engineer, 'utf8') + '# owner customization\n';
+  writeFileSync(engineer, custom);
+  expect(migratePackagedRoleDefaults(config, { write: true }).preserved).toContain(engineer);
+  expect(readFileSync(engineer, 'utf8')).toBe(custom);
+});

@@ -292,7 +292,7 @@ export function migratePackagedRoleDefaults(
           const value = parseFleetDocument(developer, readFileSync(developer, 'utf8'), 'strict').value as Record<string, unknown>;
           if (value.brain !== undefined && JSON.stringify(value.brain) !== JSON.stringify({ ref: 'claude-default' })) {
             const bytes = readFileSync(target, 'utf8').replace('brain: { ref: claude-default }',
-              `brain: ${JSON.stringify(value.brain)}`);
+              () => `brain: ${JSON.stringify(value.brain)}`);
             writeFileSync(target, bytes, { mode: 0o600 });
           }
         }
