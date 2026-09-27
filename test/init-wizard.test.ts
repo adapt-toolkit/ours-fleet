@@ -14,6 +14,7 @@ import {
   type CatalogModel, type Choice, type InitAnswers, type InitPrompter, type ReasoningPreference,
   type Subscription, type WorkKind,
 } from '../src/init-wizard.js';
+import { migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
@@ -745,4 +746,22 @@ describe('locked replacement transaction', () => {
     expect(created.some(name => name.includes('init-recovery'))).toBe(true);
     expect(created.some(name => name.includes('init-stage'))).toBe(true);
   });
+});
+
+it('adds engineering to an existing wizard install with the selected development brain', async () => {
+  const config = join(root, 'fleet.yaml');
+  await publishSetup(config, generateSetup(answers()));
+  const split = splitRootFor(config);
+  for (const relative of ['roles/Engineer.yaml', 'agent_templates/Engineer.yaml', 'room_templates/engineering.yaml'])
+    rmSync(join(split, relative));
+  const before = treeSnapshot(split);
+  const result = migratePackagedRoleDefaults(config, { write: true });
+  expect(result.removals).toEqual([]);
+  expect(result.replacements).toEqual([]);
+  const cfg = loadConfig(config, { yamlMode: 'strict' });
+  expect(cfg.agentTemplates?.Engineer.brain).toEqual(cfg.agentTemplates?.Developer.brain);
+  expect(cfg.agentTemplates?.Engineer.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
+  const after = treeSnapshot(split);
+  for (const [path, bytes] of Object.entries(before)) expect(after[path], path).toBe(bytes);
+  expect(migratePackagedRoleDefaults(config, { write: true }).additions).toEqual([]);
 });

@@ -19,7 +19,7 @@ const answers: InitAnswers = {
 };
 
 describe('packaged default role contract', () => {
-  it('fresh bootstrap exposes only the three executor roles and exact room layouts', () => {
+  it('fresh bootstrap exposes the four executor roles and exact room layouts', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-default-roles-'));
     try {
       const config = join(root, 'fleet.yaml');

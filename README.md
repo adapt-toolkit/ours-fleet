@@ -546,6 +546,12 @@ gated seat is never mistaken for a plain `Developer`. To make it the default for
 development tasks, set `tasks: { default_room_template: engineering }` in
 `fleet.yaml`.
 
+The `engineering` starter expresses a prompt-level workflow mandate; Fleet does not enforce
+the gates at runtime or install pipeline skills. The Engineer label identifies that mandate,
+not a completed review. When migrating an existing install, a newly added Engineer uses
+the existing Developer template's brain selection and keeps the packaged restrictive permissions.
+Existing customized Engineer files are preserved.
+
 The default `team` gives only its LocalCoordinator Agent Template a 15-minute
 continuity loop. Each idle-only pass uses authenticated assigned-room evidence,
 posts at most one missing interval update or status request, and reports `STALLED`
