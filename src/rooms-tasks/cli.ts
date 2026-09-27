@@ -583,10 +583,10 @@ function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
   return cfg.roomTemplates ?? {};
 }
 
-function coworkFor(cfg: FleetConfig) {
+function coworkFor(cfg: FleetConfig, options?: { timeoutMs: number }) {
   if (!cfg.rooms)
     throw new ConfigError('rooms: configuration is required before creating or querying rooms');
-  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config, ...options });
 }
 
 function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot | undefined {

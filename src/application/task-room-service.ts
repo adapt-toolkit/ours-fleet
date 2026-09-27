@@ -152,7 +152,7 @@ export function resolveRoomLaunchPolicy(
 export interface TaskRoomServiceDeps {
   liveReadiness?: LiveReadinessDeps;
   loadConfiguration?(path?: string): FleetConfig;
-  cowork?(config: FleetConfig): CoworkAdapter;
+  cowork?(config: FleetConfig, options?: { timeoutMs: number }): CoworkAdapter;
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
   moveTaskToList?: typeof moveTaskToList;
@@ -816,7 +816,7 @@ export class TaskRoomApplicationService {
   private async observeLiveReadiness(
     task: TaskRecord, room: RoomOrchestrationRecord | undefined, cfg: FleetConfig,
   ): Promise<TaskReadinessIssue | undefined> {
-    const cowork = this.deps.cowork ? this.deps.cowork(cfg)
+    const cowork = this.deps.cowork ? this.deps.cowork(cfg, { timeoutMs: 2_000 })
       : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config, timeoutMs: 2_000 });
     const issue = await taskLiveReadiness(task, room, cowork, this.deps.liveReadiness);
     if (issue) return issue;

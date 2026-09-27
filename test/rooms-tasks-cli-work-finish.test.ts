@@ -11,6 +11,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 
 const mocks = vi.hoisted(() => ({
   liveReadiness: vi.fn(),
+  coworkOptions: vi.fn(),
   createRoom: vi.fn(),
   acceptInvite: vi.fn(),
   setRoleCommands: vi.fn(),
@@ -37,7 +38,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/cowork-adapter.js')>();
   return {
     ...actual,
-    createCoworkAdapter: () => ({
+    createCoworkAdapter: (options: unknown) => { mocks.coworkOptions(options); return ({
       createRoom: mocks.createRoom,
       acceptInvite: mocks.acceptInvite,
       setRoleCommands: mocks.setRoleCommands,
@@ -47,7 +48,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
       getRoom: mocks.getRoom,
       listRooms: mocks.listRooms,
       getSeats: mocks.getSeats,
-    }),
+    }); },
   };
 });
 
@@ -1325,6 +1326,7 @@ it.each(['ready', 'unknown', 'degraded'])('task show exposes %s health separatel
   const value = JSON.parse(out.join('\n'));
   expect(value.task.state).toBe('active');
   expect(value.readiness.state).toBe(state);
+  expect(mocks.coworkOptions).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: 2000 }));
   expect(getTask(t.task_id).state).toBe('active');
   out.length = 0;
   await run('show', t.task_id);
