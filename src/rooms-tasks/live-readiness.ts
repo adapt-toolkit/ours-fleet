@@ -31,19 +31,20 @@ export async function taskLiveReadiness(
     return degraded('room_record_mismatch');
   const expected = room.template_snapshot?.members.reduce((n, member) => n + member.count, 0);
   if (expected === undefined || room.member_seats.length !== expected
-      || new Set(room.member_seats.map(seat => seat.role_name)).size !== expected)
+      || new Set(room.member_seats.map(seat => seat.role_name)).size !== expected
+      || new Set(room.member_seats.map(seat => seat.identity_cid)).size !== expected)
     return degraded('member_roster_mismatch');
   let remote;
   try { remote = await cowork.getRoom(room.room_id); }
   catch { return unknown('room_probe_unavailable'); }
   if (!remote || remote.room_id !== room.room_id || remote.identity_cid !== room.room_identity_cid
       || remote.state !== 'active') return degraded('room_identity_or_state_mismatch');
-  if (room.owner_seat_cid && !remote.seats.some(seat =>
-    seat.identity_cid === room.owner_seat_cid && seat.seat_state === 'active'))
+  if (room.owner_seat_cid && remote.seats.filter(seat =>
+    seat.identity_cid === room.owner_seat_cid && seat.seat_state === 'active').length !== 1)
     return degraded('owner_seat_missing');
   for (const seat of room.member_seats) {
     const member = seat.role_name;
-    if (seat.seat_state !== 'active' || !seat.identity_cid || !seat.invite_id
+    if (!/^[A-Za-z0-9_-]+$/.test(member) || seat.seat_state !== 'active' || !seat.identity_cid || !seat.invite_id
         || seat.launch?.state !== 'launched' || !seat.launch.launch_id || seat.retirement)
       return degraded('member_record_incomplete', member);
     const matches = remote.seats.filter(item => item.display_name === member && item.seat_state !== 'removed');
@@ -66,12 +67,20 @@ export async function taskLiveReadiness(
         return degraded('member_readiness_mismatch', member);
     } catch { return unknown('supervisor_probe_unavailable', member); }
     try {
-      const response = await (deps.control ?? controlRequest)(dir, { command: 'status' }, 2_000);
+      const response = await (deps.control ?? controlRequest)(dir, { command: 'status', controller: false }, 2_000);
       if (!response.ok) return unknown('control_unavailable', member);
       const status = response.result as { alive?: boolean; readiness?: string } | undefined;
       if (status?.alive === false || status?.readiness === 'failed') return degraded('agent_not_ready', member);
       if (status?.alive !== true || !['idle', 'running', 'awaiting_permission'].includes(status.readiness ?? ''))
         return unknown('agent_readiness_unknown', member);
+      const after = (deps.supervisor ?? readTempSupervisor)(dir);
+      if (!after || after.role !== member || after.launchId !== seat.launch.launch_id)
+        return degraded('supervisor_launch_changed', member);
     } catch { return unknown('control_unavailable', member); }
   }
+  const memberCids = new Set(room.member_seats.map(seat => seat.identity_cid));
+  const memberRoles = new Set(room.member_seats.map(seat => seat.cowork_role));
+  if (remote.seats.some(seat => seat.seat_state === 'active' && memberRoles.has(seat.role)
+      && !memberCids.has(seat.identity_cid) && seat.identity_cid !== room.owner_seat_cid))
+    return degraded('untracked_member_seats');
 }

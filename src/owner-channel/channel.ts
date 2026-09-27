@@ -1560,6 +1560,8 @@ export class OwnerChannel implements OwnerChannelHandle {
           await this.fleetOps.provisionTask(task.task_id);
         return outcome;
       }),
+      observeTaskReadiness: taskId =>
+        new TaskRoomApplicationService(this.options.configPath).observeTaskReadiness(taskId),
       taskProvisioningOutcome: taskId =>
         new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),

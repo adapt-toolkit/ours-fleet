@@ -1,3 +1,4 @@
+import type { TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
 import { execFile, spawn } from 'node:child_process';
 
 import type { InterruptOutcome, SessionEvent, SessionSnapshot } from '../session/types.js';
@@ -77,6 +78,7 @@ export interface OwnerCommandContext {
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
   startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
+  observeTaskReadiness?(taskId: string): Promise<{ state: 'ready' } | TaskReadinessIssue>;
   taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome;
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
   groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
@@ -439,6 +441,7 @@ export const ownerCommands: OwnerCommand[] = [
 
       const showTask = async (id: string) => {
         const { task: t } = ctx.getTask(id);
+        const readiness = t.state === 'active' ? await ctx.observeTaskReadiness?.(id) : undefined;
         await ctx.reply(renderMarkdownResult({
           icon: '📋', title: 'Task details',
           fields: [
@@ -446,6 +449,8 @@ export const ownerCommands: OwnerCommand[] = [
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
             { label: 'List', value: t.list_name ?? 'default', kind: 'code' },
+            ...(readiness ? [{ label: 'Readiness', value: readiness.state },
+              ...('reason' in readiness ? [{ label: 'Reason', value: readiness.reason }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),

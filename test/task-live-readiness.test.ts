@@ -34,7 +34,7 @@ describe('live task readiness observations', () => {
     const f = fixture();
     f.deps.control = vi.fn(async () => ({ version: 1, id: 'probe', ok: true, result: { alive: true, readiness } }));
     await expect(f.check()).resolves.toBeUndefined();
-    expect(f.deps.control).toHaveBeenCalledWith(expect.any(String), { command: 'status' }, 2000);
+    expect(f.deps.control).toHaveBeenCalledWith(expect.any(String), { command: 'status', controller: false }, 2000);
   });
   it.each(['stopped', 'unknown'] as const)('does not trust active launch metadata when liveness is %s', async live => {
     const f = fixture(); f.deps.liveness = vi.fn(async () => live);
@@ -126,4 +126,37 @@ it('rejects an active saved systemd launch when its pre-reboot unit no longer ex
     expect(f.deps.control).not.toHaveBeenCalled();
     expect(readFileSync(path, 'utf8')).toBe(record);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('does not trust a supervisor generation changed during the control probe', async () => {
+  const f = fixture();
+  f.deps.control = async () => {
+    f.deps.supervisor = () => ({ version: 1, role: 'dev', launchId: 'replacement', phase: 'active', createdAt: '' });
+    return { version: 1, id: 'probe', ok: true, result: { alive: true, readiness: 'idle' } };
+  };
+  await expect(f.check()).resolves.toMatchObject({ state: 'degraded', reason: 'supervisor_launch_changed' });
+});
+it('rejects a traversal role before opening any local state', async () => {
+  const f = fixture(); f.room.member_seats[0].role_name = '../outside';
+  f.remote.seats[0].display_name = '../outside';
+  await expect(f.check()).resolves.toMatchObject({ reason: 'member_record_incomplete' });
+  expect(f.deps.supervisor).not.toHaveBeenCalled();
+});
+it('reports an untracked same-role seat without adopting it, but allows unrelated observers', async () => {
+  const f = fixture();
+  f.remote.seats.push({ ...f.remote.seats[0], display_name: 'replacement', identity_cid: 'replacement', invite_id: 'other' });
+  await expect(f.check()).resolves.toMatchObject({ reason: 'untracked_member_seats' });
+  f.remote.seats[1].role = 'Observer';
+  await expect(f.check()).resolves.toBeUndefined();
+});
+it('rejects duplicate recorded identities even when role names differ', async () => {
+  const f = fixture(); f.room.template_snapshot!.members[0].count = 2;
+  f.room.member_seats.push({ ...f.room.member_seats[0], role_name: 'dev2' });
+  await expect(f.check()).resolves.toMatchObject({ reason: 'member_roster_mismatch' });
+});
+it('does not accept duplicate active Owner seats', async () => {
+  const f = fixture(); f.room.owner_seat_cid = 'owner';
+  const owner = { ...f.remote.seats[0], display_name: 'Owner', identity_cid: 'owner', role: 'Owner' };
+  f.remote.seats.push(owner, { ...owner });
+  await expect(f.check()).resolves.toMatchObject({ reason: 'owner_seat_missing' });
 });

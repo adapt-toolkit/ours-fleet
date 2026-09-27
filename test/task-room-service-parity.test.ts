@@ -440,6 +440,7 @@ describe('task create/start surface parity', () => {
     const active = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
       title: 'Active plan', template: 'member-team', members, origin: { type: 'cli' } });
     expect(active.state).toBe('active');
+    await expect(app.observeTaskReadiness(active.task_id)).resolves.toEqual({ state: 'ready' });
     const sealedHash = active.execution_plan!.snapshot.launch_snapshot_hash!;
     expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
@@ -473,6 +474,7 @@ describe('task create/start surface parity', () => {
     }
     await expect(app.awaitTaskProvisioning({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id })).rejects.toMatchObject({ code: 'task_not_ready' });
+    await expect(app.observeTaskReadiness(active.task_id)).resolves.toMatchObject({ state: 'degraded', reason: 'member_seat_mismatch' });
     expect(JSON.stringify([getTask(active.task_id), getRoomRecord(active.room_id!)])).toBe(durableBefore);
     expect(provision).toHaveBeenCalledOnce();
     expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
@@ -1156,4 +1158,19 @@ describe('task create/start surface parity', () => {
     expect(result.room_id).toBeUndefined();
     expect(h.createRoom).not.toHaveBeenCalled();
   });
+});
+
+it('task health rejects persisted records changed while probing and sanitizes unavailable config', async () => {
+  const task = createTask({ title: 'Observe', start: true, room_id: 'observe-room' });
+  const template = snapshotTemplate(definition, config().agentTemplates);
+  createRoomRecord({ room_id: 'observe-room', room_name: 'Observe', task_id: task.task_id,
+    room_identity_cid: 'room-cid', template_snapshot: template });
+  updateTaskRoom(task.task_id, 'observe-room', 'room-cid');
+  activateRoom('observe-room'); activateTask(task.task_id);
+  const h = cowork(); const read = h.adapter.getRoom;
+  h.adapter.getRoom = async id => { const value = await read(id); reviewTaskForProbe(); return value; };
+  function reviewTaskForProbe() { beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'observe-room' }); }
+  await expect(service(h.adapter).observeTaskReadiness(task.task_id)).resolves.toMatchObject({ reason: 'records_changed' });
+  const unavailable = new TaskRoomApplicationService(undefined, { loadConfiguration: () => { throw Error('private detail'); } });
+  await expect(unavailable.observeTaskReadiness(task.task_id)).resolves.toEqual({ state: 'unknown', reason: 'readiness_unavailable' });
 });
