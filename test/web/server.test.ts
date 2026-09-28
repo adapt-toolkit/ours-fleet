@@ -262,6 +262,13 @@ describe('secure local web host', () => {
       actionId: 'restart-action', confirmation: undefined });
     await server.close();
   });
+  it.each([false,true])('marks lifecycle rejection not accepted only without prior receipt (%s)', async prior => {
+    const { server,cookie,csrf }=await authenticated({commands:{execute:vi.fn(async()=>{throw Error('validation refused');}),get:vi.fn(()=>prior?{actionId:'same-action',state:'running'}:undefined)}});
+    const response=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/actions',headers:{host:boundary.host,origin:boundary.origin,cookie,'x-csrf-token':csrf},payload:{action:'restart_resume',actionId:'same-action'}});
+    if(prior)expect(response.json().accepted).toBeUndefined();
+    else {expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({accepted:false,error:{code:'action_not_accepted'}});}
+    await server.close();
+  });
   it('does not register room or template query routes', async () => {
     const { server, cookie } = await authenticated();
     for (const url of ['/api/v1/rooms', '/api/v1/rooms/room-id', '/api/v1/templates']) {

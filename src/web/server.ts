@@ -618,10 +618,21 @@ export async function buildWebServer(
     const body = request.body as { action?: LifecycleAction; actionId?: string; confirmation?: string };
     if (!body.action || !['start', 'stop', 'restart_resume', 'restart_fresh'].includes(body.action))
       throw new FleetError('invalid_request', 'invalid lifecycle action');
-    const receipt = await services.commands.execute({
-      roleId: request.params.id, action: body.action!,
-      actionId: body.actionId, confirmation: body.confirmation,
-    });
+    let receipt;
+    try {
+      receipt = await services.commands.execute({
+        roleId: request.params.id, action: body.action!,
+        actionId: body.actionId, confirmation: body.confirmation,
+      });
+    } catch (error) {
+      // An existing receipt always wins: a conflicting/repeated action is not a
+      // proof that the original operation was never admitted.
+      if (typeof body.actionId === 'string' && !services.commands.get(body.actionId)) {
+        const normalized = normalizeError(error);
+        return reply.code(409).send({error:{code:'action_not_accepted',message:normalized.message},accepted:false});
+      }
+      throw error;
+    }
     events.publish('action.changed', receipt, request.params.id);
     reply.code(202);
     return receipt;

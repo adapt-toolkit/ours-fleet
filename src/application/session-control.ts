@@ -1,3 +1,4 @@
+import {resumedConversationPage} from './conversation-history.js';
 import type { AgentHistoryQuery } from '../agent-ours/correspondence.js';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
@@ -134,9 +135,16 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
   }
 
   async conversationPage(request: { after?: string; limit?: number } = {}): Promise<ConversationPageView> {
-    return await this.call('conversation_page', {
+    const live = await this.call('conversation_page', {
       after: request.after, limit: request.limit,
     }) as ConversationPageView;
+    const snapshot = await this.snapshot();
+    if(snapshot.backend!=='acp'||!snapshot.sessionId)return live;
+    try{
+      const history=await resumedConversationPage(this.stateDir,request,live,snapshot.sessionId);
+      const check=await this.call('conversation_page',{limit:1}) as ConversationPageView;
+      return check.snapshot.sessionGeneration===live.snapshot.sessionGeneration?history:await this.call('conversation_page',request) as ConversationPageView;
+    }catch{return live;}
   }
 
   async submitPromptV2(request: {
