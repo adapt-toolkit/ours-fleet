@@ -211,6 +211,7 @@ export async function buildWebServer(
             ? 'conflict' : 'invalid_request';
         throw new FleetError(code, error.message);
       }
+      if (error instanceof TaskStateError && 'accepted' in error && error.accepted === false) return Promise.reject(Object.assign(new FleetError('invalid_request',error.message),{memberNotAccepted:true}));
       if (error instanceof TaskStateError) {
         throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'conflict', error.message);
       }
@@ -319,8 +320,13 @@ export async function buildWebServer(
   app.post('/api/v1/tasks/:id/members', async (request, reply) => {
     auth.authenticate(request, true);
     const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
-    const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
-    reply.code(result.state==='running'?202:200);return result;
+    try {
+      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+      reply.code(result.state==='running'?202:200);return result;
+    } catch(error) {
+      if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});
+      throw error;
+    }
   });
   app.get('/api/v1/tasks/:id/member-additions/:requestId', async request => {
     auth.authenticate(request);

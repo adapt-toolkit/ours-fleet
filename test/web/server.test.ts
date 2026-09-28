@@ -109,6 +109,10 @@ describe('secure local web host', () => {
       expect(taskRooms.memberAddition).toHaveBeenCalledWith('selected','request-1');
       expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers:{host:boundary.host,cookie},payload})).statusCode).toBe(403);
       expect(taskRooms.addMember).toHaveBeenCalledTimes(1);
+      const {MemberAdditionRejected}=await import('../../src/rooms-tasks/add-member.js');
+      taskRooms.addMember.mockRejectedValueOnce(new MemberAdditionRejected('Slot exists'));
+      const rejected=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,payload});
+      expect(rejected.statusCode).toBe(409);expect(rejected.json()).toMatchObject({accepted:false,error:{code:'member_not_accepted'}});
     } finally {await server.close();}
   });
   it('routes authenticated correspondence GETs to the selected supervisor without MCP',async()=>{
