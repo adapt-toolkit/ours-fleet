@@ -291,6 +291,7 @@ export interface RoomOrchestrationRecord {
   goal?: string;
   task_id?: string;
   template_snapshot?: TemplateSnapshot;
+  additional_member_templates?: TemplateSnapshot[];
   /** Resolved once at launch; legacy absence means non-anonymous. */
   room_policy?: RoomLaunchPolicy;
   saga: SagaCursor;

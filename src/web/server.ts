@@ -316,6 +316,17 @@ export async function buildWebServer(
     auth.authenticate(request);
     return taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id));
   });
+  app.post('/api/v1/tasks/:id/members', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
+    const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+    reply.code(result.state==='running'?202:200);return result;
+  });
+  app.get('/api/v1/tasks/:id/member-additions/:requestId', async request => {
+    auth.authenticate(request);
+    const {id,requestId}=request.params as {id:string;requestId:string};
+    return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
+  });
   app.get('/api/v1/task-templates', async request => {
     auth.authenticate(request); return { templates: requireTaskRooms().listTemplates() };
   });

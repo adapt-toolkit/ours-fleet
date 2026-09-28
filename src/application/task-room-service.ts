@@ -1,3 +1,4 @@
+import type { AddMemberRequest } from '../rooms-tasks/add-member.js';
 import { readFileSync } from 'node:fs';
 import { taskLiveReadiness, type LiveReadinessDeps, type TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
 
@@ -167,6 +168,14 @@ export class TaskRoomApplicationService {
     private readonly configurationPath?: string,
     private readonly deps: TaskRoomServiceDeps = {},
   ) {}
+
+  async addMember(taskId: string, request: AddMemberRequest) {
+    const {requestMemberAddition}=await import('../rooms-tasks/add-member.js');
+    const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+    return requestMemberAddition({taskId,request,cfg,configPath:this.configurationPath,
+      cowork:(this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers});
+  }
+  async memberAddition(taskId:string,requestId:string) { const {memberAddition}=await import('../rooms-tasks/add-member.js');return memberAddition(taskId,requestId); }
 
   async createTask(request: CreateTaskRequest): Promise<TaskRecord> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
@@ -347,8 +356,9 @@ export class TaskRoomApplicationService {
   taskProvisioningOutcome(taskId: string): TaskProvisioningOutcome {
     const task = readTask(taskId);
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-    const expected = room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
-      ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0;
+    const expected = (room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
+      ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0)
+      + (room?.additional_member_templates ?? []).reduce((n,t)=>n+t.members.reduce((m,s)=>m+s.count,0),0);
     const active = room?.member_seats.filter(seat => seat.seat_state === 'active').length ?? 0;
     const launched = room?.member_seats.filter(seat => seat.launch?.state === 'launched').length ?? 0;
     const failed = task.state === 'failed' || room?.saga.phase === 'failed';

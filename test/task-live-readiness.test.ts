@@ -30,6 +30,16 @@ function fixture() {
 }
 
 describe('live task readiness observations', () => {
+  it('counts additional member templates and requires their live admitted seats',async()=>{
+    const f=fixture();f.room.additional_member_templates=[{members:[{count:1}]} as any];
+    await expect(f.check()).resolves.toMatchObject({reason:'member_roster_mismatch'});
+    f.room.member_seats.push({...f.room.member_seats[0],role_name:'reviewer',identity_cid:'reviewer-cid',invite_id:'invite2'});
+    f.remote.seats.push({...f.remote.seats[0],display_name:'reviewer',identity_cid:'reviewer-cid',invite_id:'invite2'});
+    f.deps.supervisor=(dir)=>({version:1,role:dir.endsWith('/reviewer')?'reviewer':'dev',launchId:'launch',phase:'active',createdAt:''});
+    f.deps.readiness=(_room,name)=>({room:'room',invite:name==='reviewer'?'invite2':'invite',cid:name==='reviewer'?'reviewer-cid':'dev-cid',generation:1});
+    await expect(f.check()).resolves.toBeUndefined();
+  });
+
   it.each(['idle', 'running', 'awaiting_permission'])('accepts healthy %s agents without confusing busy with offline', async readiness => {
     const f = fixture();
     f.deps.control = vi.fn(async () => ({ version: 1, id: 'probe', ok: true, result: { alive: true, readiness } }));

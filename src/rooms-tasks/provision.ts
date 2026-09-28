@@ -60,6 +60,8 @@ export interface ProvisionMembersInput {
   brief?: string;
   goal?: string;
   startupWait?: Partial<StartupWaitPolicy>;
+  /** Append only the supplied new slots to an already active room. */
+  append?: boolean;
 }
 
 export interface StartupWaitPolicy {
@@ -233,7 +235,7 @@ function roomTask(
       cowork_role: member.coworkRole,
       persona: settings.persona,
     },
-    roster: members.map(candidate => ({
+    roster: [...(input.append ? (getRoomRecord(input.roomId)?.member_seats ?? []).filter(seat => !members.some(m => m.name === seat.role_name)).map(seat => ({name:seat.role_name,coworkRole:seat.cowork_role})) : []), ...members].map(candidate => ({
       role_name: candidate.name,
       cowork_role: candidate.coworkRole,
     })),
@@ -490,6 +492,7 @@ function reconcileMemberSeats(
       && seat.seat_state === 'active');
   const seats = current.member_seats.map(seat => {
     const member = members.find(candidate => candidate.name === seat.role_name)!;
+    if (!member) return seat;
     const readiness = readRoomReadiness(current.room_identity_cid!, member.name);
     if (!readiness || readiness.room !== roomId || readiness.invite !== seat.invite_id) { complete = false; return seat; }
     const found = exactCoworkSeat(observed, member, seat.invite_id);
@@ -530,6 +533,18 @@ export async function provisionMembers(input: ProvisionMembersInput): Promise<Ro
   // and standalone retirement as well as member publication. Seat waits are bounded.
   const run = () => withFileLock(roomCloseLockPath(input.roomId), () => {
     assertProvisioningOpen(input);
+    if (input.append) {
+      const task = input.taskId ? getTask(input.taskId) : undefined;
+      const room = getRoomRecord(input.roomId);
+      if (!task || !['active', 'review'].includes(task.state) || task.blocked || room?.state !== 'active'
+          || room.task_id !== task.task_id || room.room_identity_cid !== task.room_identity_cid)
+        throw new Error('Adding an agent requires the exact active, unblocked task room');
+      const names = expandMembers(input.template, shortId(task.task_id)).map(m => m.name);
+      if (room.member_seats.some(seat => names.includes(seat.role_name)))
+        throw new Error('Member slot is already recorded; inspect its existing launch');
+      if (room.member_seats.some(seat => seat.seat_state !== 'active'))
+        throw new Error('Existing member admission must finish before adding an agent');
+    }
     if (!getRoomRecord(input.roomId))
       throw new Error(`room ${input.roomId} is missing; refusing provisioning`);
     return provisionMembersUnlocked(input);
@@ -566,8 +581,8 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
   const resuming = members.length > 0
     && members.every(member => persistedNames.has(member.name));
   if (!resuming) {
-    advanceSaga(roomId, 'create_members', 3);
-    updateMemberSeats(roomId, members.map(member => {
+    if (!input.append) advanceSaga(roomId, 'create_members', 3);
+    updateMemberSeats(roomId, [...(input.append ? existing.member_seats : []), ...members.map(member => {
       const memberSettings = settings.get(member.name)!;
       const evidence = launchDefinition(memberSettings.definition);
       return ({
@@ -580,7 +595,7 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
         agent_template: memberSettings.template,
         agent_template_hash: memberSettings.templateHash,
         updated_at: new Date().toISOString() },
-    }); }));
+    }); })], input.append ? template : undefined);
   } else {
     for (const member of members) {
       const seat = existing.member_seats.find(candidate => candidate.role_name === member.name)!;
@@ -602,7 +617,7 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
     sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
   };
 
-  advanceSaga(roomId, 'join_role_groups', 4);
+  if (!input.append) advanceSaga(roomId, 'join_role_groups', 4);
   try {
     const initialRoom = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(initialRoom, roomPolicy.anonymous);
@@ -685,7 +700,7 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
     throw error;
   }
 
-  advanceSaga(roomId, 'wait_seats', 5);
+  if (!input.append) advanceSaga(roomId, 'wait_seats', 5);
   const deadline = policy.now() + policy.timeoutMs;
   let delay = policy.initialDelayMs;
   for (;;) {
@@ -694,10 +709,10 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
     const reconciled = reconcileMemberSeats(roomId, members, remote.seats, ownerSeatCid ?? undefined);
     if (reconciled.complete && remote.state === 'active') break;
     if (policy.now() >= deadline) {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+      if (!input.append) advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;
     }
-    advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+    if (!input.append) advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
     await policy.sleep(delay);
     delay = Math.min(policy.maxDelayMs, Math.max(delay + 1, delay * 2));
   }
@@ -723,9 +738,10 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
       };
     });
     updateTaskMembers(taskId, taskMembers);
-    if (getTask(taskId).blocked) unblockTask(taskId);
+    if (!input.append && getTask(taskId).blocked) unblockTask(taskId);
   }
 
+  if (input.append) return getRoomRecord(roomId)!;
   advanceSaga(roomId, 'activate', 6);
   const record = activateRoom(roomId);
   if (taskId) activateTask(taskId);

@@ -162,11 +162,13 @@ export function setOwnerSeat(
 export function updateMemberSeats(
   id: string,
   seats: RoomMemberSeat[],
+  additionalTemplate?: import('./types.js').TemplateSnapshot,
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
   if (r.state === 'closing' || r.state === 'closed')
     throw new RoomStateError(`room ${id} is ${r.state}; member provisioning is fenced`);
   r.member_seats = seats;
+  if (additionalTemplate) r.additional_member_templates = [...(r.additional_member_templates ?? []), additionalTemplate];
   writeRoom(r);
   return r;
 }

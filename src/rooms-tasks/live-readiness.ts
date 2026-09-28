@@ -29,7 +29,8 @@ export async function taskLiveReadiness(
       || room.task_id !== task.task_id || !room.room_identity_cid
       || task.room_identity_cid !== room.room_identity_cid)
     return degraded('room_record_mismatch');
-  const expected = room.template_snapshot?.members.reduce((n, member) => n + member.count, 0);
+  const baseExpected = room.template_snapshot?.members.reduce((n, member) => n + member.count, 0);
+  const expected = baseExpected === undefined ? undefined : baseExpected + (room.additional_member_templates ?? []).reduce((n,t)=>n+t.members.reduce((m,s)=>m+s.count,0),0);
   if (expected === undefined || room.member_seats.length !== expected
       || new Set(room.member_seats.map(seat => seat.role_name)).size !== expected
       || new Set(room.member_seats.map(seat => seat.identity_cid)).size !== expected)
