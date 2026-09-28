@@ -50,6 +50,10 @@ function cachedConfigProvider(configPath: string | undefined): () => FleetConfig
 
 export interface StartWebOptions {
   configPath?: string;
+  /** Separate console state for an independently launched gateway. */
+  webStateDir?: string;
+  control?: boolean;
+  staticRoot?: string;
   port?: number;
   open?: boolean;
   binPath: string;
@@ -67,8 +71,8 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
-  const lock = acquireWebServerLock();
-  const webDir = resolve(stateRoot(), 'web');
+  const webDir = options.webStateDir ?? resolve(stateRoot(), 'web');
+  const lock = acquireWebServerLock(webDir);
   const bind = options.bind ?? '127.0.0.1';
   const publicOrigin = options.publicOrigin ? validatePublicOrigin(options.publicOrigin) : undefined;
   if (!isLoopback(bind) && !publicOrigin) {
@@ -179,7 +183,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
-    taskRooms: new TaskRoomApplicationService(options.configPath),
+    taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
     topology: readTopology, topologyDrafts, topologyPromote,
     async session(roleId) {
       const role = await repository.get(roleId);
@@ -192,7 +196,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       }
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
-    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth });
+    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth, staticRoot: options.staticRoot });
   } catch (error) {
     lock.release();
     throw error;
@@ -212,9 +216,9 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   } : {
     hosts: [`localhost:${actual.port}`], origins: [`http://localhost:${actual.port}`],
   });
-  let control: WebControlServer;
+  let control: WebControlServer | undefined;
   try {
-    control = await startWebControlServer({
+    if (options.control !== false) control = await startWebControlServer({
       dir: webDir,
       onOpen() {
         const url = access.mode === 'pairing'
@@ -233,7 +237,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await control.close(); await server.close(); }
+      try { await control?.close(); await server.close(); }
       finally { lock.release(); }
     },
   };

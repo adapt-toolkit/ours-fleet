@@ -68,7 +68,7 @@ const statusFor = (code: string): number => ({
 export async function buildWebServer(
   services: WebServices,
   boundary: { origin: string; host: string },
-  options: { auth?: WebAuth } = {},
+  options: { auth?: WebAuth; staticRoot?: string } = {},
 ): Promise<WebServer> {
   const app = Fastify({
     trustProxy: false, bodyLimit: 512 * 1024, logger: false,
@@ -86,14 +86,14 @@ export async function buildWebServer(
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
-    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    reply.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
     reply.header('X-Frame-Options', 'DENY');
     reply.header('Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ` +
+      `default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; ` +
       `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
       `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
-    try { auth.validateBoundary(request, false); }
+    try { auth.validateBoundary(request, false, !request.url.startsWith('/api/')); }
     catch (error) {
       if (request.url.startsWith('/api/')) throw error;
       const message = normalizeError(error).message;
@@ -196,7 +196,8 @@ export async function buildWebServer(
 
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
-    return { roles: await services.query.list() };
+    const query = request.query as { includeTemporary?: string };
+    return { roles: await services.query.list(query.includeTemporary === 'true') };
   });
 
   const taskApi = async <T>(fn: () => T | Promise<T>): Promise<T> => {
@@ -298,7 +299,9 @@ export async function buildWebServer(
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
     }));
-    reply.code(201); return { task };
+    const provisioning = task.room_id
+      ? await taskApi(() => requireTaskRooms().launchTaskProvisioning(task.task_id)) : undefined;
+    reply.code(201); return { task, ...(provisioning ? { provisioning } : {}) };
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);
@@ -307,11 +310,51 @@ export async function buildWebServer(
     return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
   });
 
+  app.get('/api/v1/tasks/:id', async request => {
+    auth.authenticate(request);
+    return taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id));
+  });
+  app.get('/api/v1/task-templates', async request => {
+    auth.authenticate(request); return { templates: requireTaskRooms().listTemplates() };
+  });
+  for (const action of ['start', 'block', 'unblock', 'review', 'finish', 'cancel'] as const) {
+    app.post(`/api/v1/tasks/:id/${action}`, async (request, reply) => {
+      auth.authenticate(request, true);
+      const taskId = (request.params as { id: string }).id;
+      const body = (request.body ?? {}) as { reason?: string; template?: string };
+      const input = { actor: { kind: 'local_control' as const, surface: 'web' as const }, taskId };
+      const api = requireTaskRooms();
+      return taskApi(async () => {
+        switch (action) {
+          case 'start': {
+            const task = await api.startTask({ ...input, template: body.template });
+            const provisioning = await api.launchTaskProvisioning(taskId);
+            if (provisioning.kind !== 'ready') reply.code(202);
+            return { task, provisioning };
+          }
+          case 'block':
+            if (typeof body.reason !== 'string' || !body.reason.trim()) throw new FleetError('invalid_request', 'reason is required');
+            return { task: api.blockTask({ ...input, reason: body.reason }) };
+          case 'unblock': return { task: api.unblockTask(input) };
+          case 'review': return { task: api.reviewTask(input) };
+          case 'finish':
+          case 'cancel': {
+            const plan = action === 'finish' ? await api.finishTask(input) : await api.cancelTask(input);
+            const task = plan.settlementRequired ? await api.launchTaskSettlement(taskId) : plan.task;
+            const pending = task.terminal_intent?.status === 'pending';
+            if (pending) reply.code(202);
+            return { task, pending };
+          }
+        }
+      });
+    });
+  }
+
   app.get('/api/v1/configuration', async request => {
     auth.authenticate(request);
     if (!services.configuration)
       throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
-    return services.configuration.read();
+    return services.configuration.read((request.query as { includeDefinitions?: string }).includeDefinitions === 'true');
   });
 
   app.post('/api/v1/configuration/preview', async request => {
@@ -672,7 +715,7 @@ export async function buildWebServer(
       });
     });
 
-  const staticRoot = join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
+  const staticRoot = options.staticRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
   if (existsSync(staticRoot)) {
     await app.register(fastifyStatic, { root: staticRoot, prefix: '/' });
     app.setNotFoundHandler((request, reply) => {
@@ -694,19 +737,19 @@ export async function buildWebServer(
 function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string, secure = false): void {
   const suffix = secure ? '; Secure' : '';
   reply.header('Set-Cookie', [
-    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${suffix}`,
-    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000${suffix}`,
+    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${suffix}`,
+    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${suffix}`,
   ]);
 }
 
 function setSessionCookie(reply: { header(name: string, value: string | string[]): unknown }, session: string, secure = false): void {
-  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${secure ? '; Secure' : ''}`);
+  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure ? '; Secure' : ''}`);
 }
 
 function clearAuthCookies(reply: { header(name: string, value: string | string[]): unknown }): void {
   reply.header('Set-Cookie', [
-    'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
-    'ofs_device=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
+    'ofs_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+    'ofs_device=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
   ]);
 }
 

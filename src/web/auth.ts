@@ -41,6 +41,7 @@ export class WebAuth {
   private readonly sessionDevices = new Map<string, string>();
   private readonly tickets = new Map<string, Ticket>();
   private readonly rates = new Map<string, { count: number; resetAt: number }>();
+  private readonly transports = new Map<string, Set<() => void>>();
   private readonly sockets = new Map<string, Set<WebSocket>>();
 
   constructor(
@@ -71,7 +72,7 @@ export class WebAuth {
     return this._bootstrapSecret;
   }
 
-  validateBoundary(request: FastifyRequest, requireOrigin: boolean): void {
+  validateBoundary(request: FastifyRequest, requireOrigin: boolean, allowPageNavigation = false): void {
     const host = request.headers.host;
     const hosts = this.allowedHosts.size ? this.allowedHosts : new Set([this.host]);
     const origins = this.allowedOrigins.size ? this.allowedOrigins : new Set([this.origin]);
@@ -80,7 +81,9 @@ export class WebAuth {
     if (requireOrigin && (!request.headers.origin || !origins.has(request.headers.origin)))
       throw new FleetError('forbidden', 'request Origin does not match the configured control-panel origin');
     const fetchSite = request.headers['sec-fetch-site'];
-    if (fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
+    const pageNavigation = allowPageNavigation && !requireOrigin && request.method === 'GET'
+      && request.headers['sec-fetch-mode'] === 'navigate' && request.headers['sec-fetch-dest'] === 'document';
+    if (!pageNavigation && fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
       throw new FleetError('forbidden', 'cross-site request rejected');
   }
 
@@ -182,7 +185,17 @@ export class WebAuth {
     socket.once('close', () => sockets?.delete(socket));
   }
 
+  /** Raw service streams share the same logout/revocation boundary as native sockets. */
+  bindTransport(sessionId: string, close: () => void): () => void {
+    let transports = this.transports.get(sessionId);
+    if (!transports) { transports = new Set(); this.transports.set(sessionId, transports); }
+    transports.add(close);
+    return () => { transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
+  }
+
   clearSessions(): void {
+    for (const transports of this.transports.values()) for (const close of transports) close();
+    this.transports.clear();
     for (const sockets of this.sockets.values())
       for (const socket of sockets) socket.close(4401, 'authentication revoked');
     this.sockets.clear();
@@ -211,6 +224,8 @@ export class WebAuth {
   }
 
   private removeSession(id: string): void {
+    for (const close of this.transports.get(id) ?? []) close();
+    this.transports.delete(id);
     this.sessions.delete(id);
     this.sessionDevices.delete(id);
     for (const [ticket, value] of this.tickets)

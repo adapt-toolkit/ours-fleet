@@ -479,7 +479,7 @@ export class TaskRoomApplicationService {
   }): Promise<{ deleted: boolean; pending: boolean; error?: string }> {
     const launch = this.deps.launchDeletionWorker
       ?? ((taskId: string) => launchFleetWorker(
-        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath));
+        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath, this.deps.binPath?.()));
     const errorAtBefore = (() => {
       try { return getDeletingTask(input.taskId).deletion?.error_at; } catch { return undefined; }
     })();
@@ -540,6 +540,28 @@ export class TaskRoomApplicationService {
     if (task.room_id)
       (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return this.acceptTerminal(input.taskId, 'cancelled', task.room_id);
+  }
+
+  /** Continue accepted operations outside the HTTP connection's lifetime. */
+  async launchTaskSettlement(taskId: string): Promise<TaskRecord> {
+    try {
+      await launchFleetWorker(['task', '_settle', taskId], `task-settle-${taskId}`,
+        this.configurationPath, this.deps.binPath?.());
+    } catch (error) {
+      await recordTaskTerminalIntentError(taskId,
+        error instanceof Error ? error.message : String(error),
+        'The settlement worker could not start. Inspect the task before retrying.');
+    }
+    return readTask(taskId);
+  }
+
+  async launchTaskProvisioning(taskId: string): Promise<TaskProvisioningOutcome> {
+    const outcome = this.taskProvisioningOutcome(taskId);
+    if (outcome.kind === 'in_progress' && !outcome.next_action) {
+      await launchFleetWorker(['task', '_provision', taskId], `task-provision-${taskId}`,
+        this.configurationPath, this.deps.binPath?.());
+    }
+    return outcome;
   }
 
   async settleTask(input: {
@@ -631,7 +653,7 @@ export class TaskRoomApplicationService {
         throw new ConfigError('rooms: configuration is required before creating or querying rooms');
       const cowork = this.deps.cowork ? this.deps.cowork(cfg) : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
       await (this.deps.provisionMembers ?? provisionMembers)({
-        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
+        configPath: this.configurationPath, cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief, goal: task.title,
       });
       task = readTask(task.task_id); room = getRoomRecord(room.room_id);
@@ -993,7 +1015,7 @@ export class TaskRoomApplicationService {
         if (!cfg.rooms)
           throw new ConfigError('rooms: configuration is required before creating or querying rooms');
         const cowork = this.deps.cowork ? this.deps.cowork(cfg) : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
-        await (this.deps.provisionMembers ?? provisionMembers)({ cfg, cowork, roomId: room.room_id,
+        await (this.deps.provisionMembers ?? provisionMembers)({ configPath: this.configurationPath, cfg, cowork, roomId: room.room_id,
           taskId: task.task_id, template: snapshot, binPath: (this.deps.binPath ?? getBinPath)(),
           brief: task.brief, goal: task.title });
         task = readTask(task.task_id);
@@ -1145,7 +1167,7 @@ export class TaskRoomApplicationService {
     room = advanceSaga(room.room_id, 'create_members', 3);
     if (launchTemplate && (launchTemplate.members.length > 0 || attachOwner)) try {
       room = await (this.deps.provisionMembers ?? provisionMembers)({
-        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
+        configPath: this.configurationPath, cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
         goal: task.task_id ? task.title : task.goal,
       });

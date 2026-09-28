@@ -308,7 +308,7 @@ describe('simple Cowork room member startup', () => {
     beginFleetAuditCollection();
     const result = await provisionMembers({
       cfg: cfg(), cowork: h.cowork, roomId: 'room-1', taskId: task.task_id,
-      template: template(2), binPath: '/usr/bin/ours-fleet',
+      template: template(2), binPath: '/usr/bin/ours-fleet', configPath: '/custom/fleet.yaml',
       goal: 'Ship the simple flow', brief: 'No ACK gate.',
     });
 
@@ -321,6 +321,7 @@ describe('simple Cowork room member startup', () => {
       expect(call[1]).toEqual({ mode: 'one_time', role: 'Developer', min_accepts: 1 });
     }
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp.mock.calls.every(([options]) => options.configPath === '/custom/fleet.yaml')).toBe(true);
     expect(getTask(task.task_id)).toMatchObject({ state: 'active' });
     expect(getTask(task.task_id).member_roles).toHaveLength(2);
     expect(consumeFleetAuditCollection().presentations ?? []).toEqual([]);

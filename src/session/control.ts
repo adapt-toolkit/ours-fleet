@@ -1,4 +1,5 @@
 import type { LayoutControlRequest } from '../rooms-tasks/layout-control.js';
+import { socketPath as privateSocketPath } from '../socket-path.js';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
@@ -207,7 +208,7 @@ export function oversightTaxonomyLines(name = '<Name>'): string[] {
   return oversightTaxonomy(name).map(r => `- **${r.result}** — ${r.meaning} → ${r.action}`);
 }
 
-export const controlSocketPath = (stateDir: string) => join(stateDir, '.control.sock');
+export const controlSocketPath = (stateDir: string) => privateSocketPath(join(stateDir, '.control.sock'));
 export const controlTokenPath = (stateDir: string) => join(stateDir, '.control-token');
 
 function sameToken(actual: string, supplied: string): boolean {

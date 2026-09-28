@@ -108,7 +108,7 @@ export function makeTempSupervisorLauncher(options: {
   const supervisor = options.supervisor ?? process.env.OURS_FLEET_SUPERVISOR;
   return async (binPath, args, dir) => {
     const inherited = [
-      'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'CODEX_HOME',
+      'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME',
       // Preserve runtime selection across the service-manager boundary, including
       // an explicit empty value which selects the bundle over manager defaults.
       'CODEX_PATH',

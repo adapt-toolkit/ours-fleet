@@ -50,6 +50,7 @@ export function getBinPath(): string {
 }
 
 export interface ProvisionMembersInput {
+  configPath?: string;
   cfg: FleetConfig;
   cowork: CoworkAdapter;
   roomId: string;
@@ -406,6 +407,7 @@ async function launchMember(input: {
   try {
     const launched = await spawnRoomMember({
       name: member.name,
+      configPath: provision.configPath,
       temp: true,
       identity: member.name,
       agentDefinition: settings.definition,

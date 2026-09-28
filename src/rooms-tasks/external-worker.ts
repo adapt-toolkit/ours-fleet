@@ -12,7 +12,7 @@ const LIFECYCLE_RETRY_MS = 250;
 
 export function fleetWorkerEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const inheritedKeys = [
-    'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'OURS_CONFIG',
+    'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'OURS_CONFIG',
   ];
   const env = Object.fromEntries(inheritedKeys.flatMap(key =>
     source[key] === undefined ? [] : [[key, source[key]!] as const]));
@@ -57,9 +57,9 @@ export async function presentFleetWorkerLifecycle(
 
 /** Launch a Fleet CLI operation outside the caller's supervisor/session lifecycle. */
 export function launchFleetWorker(
-  args: string[], operation: string, configPath?: string,
+  args: string[], operation: string, configPath?: string, binPath = process.argv[1],
 ): Promise<void> {
-  const cli = [process.argv[1], ...args, ...(configPath ? ['-c', configPath] : [])];
+  const cli = [binPath, ...args, ...(configPath ? ['-c', configPath] : [])];
   const env = fleetWorkerEnv();
   const inherited = Object.entries(env).map(([key, value]) => `${key}=${value}`);
   const suffix = randomUUID().slice(0, 8);

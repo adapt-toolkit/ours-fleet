@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -20,7 +20,8 @@ async function testServer(overrides: Record<string, unknown> = {}) {
   const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
   const isolatedServices = { ...services(), ...overrides };
   isolatedServices.audit = new AuditSink(join(dir, 'audit'));
-  return buildWebServer(isolatedServices, boundary, { auth });
+  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Fleet</title>');
+  return buildWebServer(isolatedServices, boundary, { auth, staticRoot: dir });
 }
 
 function services() {
@@ -96,6 +97,13 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('serves the login document on an external link without relaxing API fetch metadata', async () => {
+    const { server } = await authenticated();
+    const headers = { host: boundary.host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
+    expect((await server.app.inject({ method: 'GET', url: '/', headers })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/roles', headers })).statusCode).toBe(403);
+    await server.close();
+  });
   it('exposes authenticated task-list and assignment routes through the shared service', async () => {
     const task = { task_id: 'task-id', list_id: 'default', list_name: 'default' };
     const taskRooms = {
@@ -126,6 +134,28 @@ describe('secure local web host', () => {
       headers: readHeaders, payload: { name: 'No CSRF' } });
     expect(rejected.statusCode).toBe(403);
     expect(taskRooms.moveTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task-id', list: 'default' }));
+    await server.close();
+  });
+  it('runs accepted task workers and distinguishes pending settlement from completion', async () => {
+    const task = { task_id: 't', terminal_intent: { status: 'pending' } };
+    const taskRooms = {
+      startTask: vi.fn(async () => task),
+      launchTaskProvisioning: vi.fn(async () => ({ kind: 'in_progress' })),
+      finishTask: vi.fn(async () => ({ task, settlementRequired: true })),
+      cancelTask: vi.fn(async () => ({ task: { task_id: 't', state: 'cancelled' }, settlementRequired: false })),
+      launchTaskSettlement: vi.fn(async () => task),
+    };
+    const { server, cookie, csrf } = await authenticated({ taskRooms });
+    const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
+    const call = (action: string) => server.app.inject({ method: 'POST', url: `/api/v1/tasks/t/${action}`, headers, payload: {} });
+    expect((await call('start')).statusCode).toBe(202);
+    expect(taskRooms.launchTaskProvisioning).toHaveBeenCalledWith('t');
+    const finish = await call('finish');
+    expect(finish.statusCode).toBe(202); expect(finish.json().pending).toBe(true);
+    expect(taskRooms.launchTaskSettlement).toHaveBeenCalledOnce();
+    const cancel = await call('cancel');
+    expect(cancel.statusCode).toBe(200); expect(cancel.json().pending).toBe(false);
+    expect(taskRooms.launchTaskSettlement).toHaveBeenCalledOnce();
     await server.close();
   });
   it('deletes tasks in any state with exact confirmation, bounded settlement, and mutation auth', async () => {
