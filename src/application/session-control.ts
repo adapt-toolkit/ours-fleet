@@ -1,3 +1,4 @@
+import type { AgentHistoryQuery } from '../agent-ours/correspondence.js';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt,
@@ -32,6 +33,8 @@ export interface InterruptReceipt {
 }
 
 export interface RoleSessionControl {
+  agentContacts?():Promise<unknown>;
+  agentHistory?(request:AgentHistoryQuery):Promise<unknown>;
   describe(): Promise<SessionDescriptor>;
   snapshot(): Promise<SessionSnapshot>;
   recentOutput(request?: { since?: number; limit?: number }): Promise<OutputPage>;
@@ -68,6 +71,10 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     private readonly stateDir: string,
     private readonly request: typeof controlRequest = controlRequest,
   ) {}
+
+  async agentContacts():Promise<unknown> {await this.requireCorrespondence();return this.call('agent_contacts');}
+  async agentHistory(request:AgentHistoryQuery):Promise<unknown> {await this.requireCorrespondence();return this.call('agent_history',{agentHistory:request});}
+  private async requireCorrespondence(){if(!(await this.describe()).features.includes('agent_correspondence'))throw new FleetError('capability_unavailable','This session needs an updated supervisor to show contacts and history.');}
 
   async describe(): Promise<SessionDescriptor> {
     const response = await this.call('snapshot');

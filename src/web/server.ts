@@ -1,3 +1,5 @@
+import { readChatIdle } from '../temp-idle.js';
+import { agentDir } from '../paths.js';
 import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -432,6 +434,17 @@ export async function buildWebServer(
   });
 
   const oursTools = services.oursTools ?? new SupervisorOursTools();
+  app.get<{Params:{id:string}}>('/api/v1/roles/:id/contacts',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentContacts)throw new FleetError('capability_unavailable','Supervisor contacts API is unavailable');
+    return control.agentContacts();
+  });
+  app.get<{Params:{id:string};Querystring:{peer_cid:string;limit?:string;before_seq?:string}}>('/api/v1/roles/:id/messages',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentHistory)throw new FleetError('capability_unavailable','Supervisor history API is unavailable');
+    return control.agentHistory({peer_cid:request.query.peer_cid,...(request.query.limit!==undefined?{limit:Number(request.query.limit)}:{}),...(request.query.before_seq!==undefined?{before_seq:Number(request.query.before_seq)}:{})});
+  });
+
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/ours/tools', async request => {
     auth.authenticate(request);
     return oursTools.list(request.params.id);
@@ -446,7 +459,8 @@ export async function buildWebServer(
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
     auth.authenticate(request);
-    return services.query.detail(request.params.id);
+    const detail=await services.query.detail(request.params.id);
+    return {...detail, chatIdle: detail.role.lifetime==='temporary' ? readChatIdle(agentDir(request.params.id,true)) ?? null : null};
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/removal-preview', async request => {

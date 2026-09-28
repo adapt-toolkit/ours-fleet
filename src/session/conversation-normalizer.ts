@@ -288,7 +288,7 @@ function redactSensitiveJson(value: unknown): { value: unknown; redacted: boolea
   return { value: visit(value, 0), redacted };
 }
 
-function boundedJson(value: unknown): BoundedJson {
+export function boundedJson(value: unknown): BoundedJson {
   let serialized: string;
   let safe: unknown;
   let redacted = false;

@@ -53,6 +53,33 @@ async function startArbiterServer() {
 }
 
 describe('role-control conversation v3', () => {
+  it('serves typed read-only correspondence from the selected supervisor',async()=>{
+    const {stateDir,server}=await startServer();const queries:unknown[]=[];
+    server.setCorrespondence({contacts:async()=>({identity:{name:'A'},contacts:[{name:'Peer',container_id:'B'.repeat(64)}]}),history:async query=>{queries.push(query);return {items:[{seq:2,direction:'out',text:'hello'}],next_cursor:2};}});
+    const contacts=await controlRequest(stateDir,{command:'agent_contacts'});
+    expect(contacts.ok).toBe(true);expect(contacts.result).toMatchObject({identity:{name:'A'},contacts:[{name:'Peer'}]});
+    const query={peer_cid:'B'.repeat(64),limit:10,before_seq:4};
+    expect((await controlRequest(stateDir,{command:'agent_history',agentHistory:query})).result).toMatchObject({next_cursor:2});
+    expect(queries).toEqual([query]);
+    expect((await controlRequest(stateDir,{command:'agent_history',agentHistory:{peer_cid:'bad'}})).ok).toBe(false);
+    expect(queries).toHaveLength(1);
+  });
+  it('serializes idle retirement with incoming work and rejects prompts after closing', async()=>{
+    const {session}=await startServer();
+    const arbiter=new RoleTurnArbiter(session);
+    const queued=arbiter.queuePrompt('block 80');
+    const firstRetirement=arbiter.retireIfIdle(()=>true);
+    const admitted=await queued;
+    expect(await firstRetirement).toBe(false);
+    await admitted.completion;
+    const closing=arbiter.retireIfIdle(()=>true);
+    const later=arbiter.queuePrompt('must not be admitted');
+    const rejected=expect(later).rejects.toThrow('Chat is closing');
+    expect(await closing).toBe(true);
+    await rejected;
+    await expect.poll(()=>session.isAlive()).toBe(false);
+  });
+
   it('forwards conversation v3 through the production turn arbiter', async () => {
     const { stateDir } = await startArbiterServer();
     const snapshot = await controlRequest(stateDir, { command: 'snapshot' });

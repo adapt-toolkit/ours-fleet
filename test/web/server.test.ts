@@ -97,6 +97,10 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('routes authenticated correspondence GETs to the selected supervisor without MCP',async()=>{
+    const calls:unknown[]=[];const {server,cookie}=await authenticated({session:async(id:string)=>({agentContacts:async()=>{calls.push({id,operation:'contacts'});return {contacts:[{name:'Peer'}]};},agentHistory:async(query:unknown)=>{calls.push({id,query});return {items:[],next_cursor:null};}}),oursTools:{call:()=>{throw Error('must not call MCP');}}});
+    try{const headers={host:boundary.host,cookie};expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers})).json()).toMatchObject({contacts:[{name:'Peer'}]});const peer='B'.repeat(64);expect((await server.app.inject({method:'GET',url:`/api/v1/roles/Selected/messages?peer_cid=${peer}&limit=10&before_seq=4`,headers})).statusCode).toBe(200);expect(calls).toEqual([{id:'Selected',operation:'contacts'},{id:'Selected',query:{peer_cid:peer,limit:10,before_seq:4}}]);expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers:{host:boundary.host}})).statusCode).toBe(401);}finally{await server.close();}
+  });
   it('serves the login document on an external link without relaxing API fetch metadata', async () => {
     const { server } = await authenticated();
     const headers = { host: boundary.host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };

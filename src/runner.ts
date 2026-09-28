@@ -1,4 +1,5 @@
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
+import { TemporaryChatIdle } from './temp-idle.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
@@ -88,7 +89,7 @@ export interface RunnerDeps {
   createControlServer(
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl'>>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl' | 'setCorrespondence'>>;
   /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
   createLoopManager(
     ...args: ConstructorParameters<typeof ScheduledLoopManager>
@@ -551,7 +552,7 @@ export interface AttemptResult {
   mode: 'fresh' | 'resume';
   modelRecovery?: 'advance' | 'hold';
   /** Present only when a temporary-role lifecycle signal ended the session. */
-  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal';
+  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal' | 'idle-timeout';
 }
 
 /** Continuous authoritative absence required after an identity was observed. */
@@ -801,6 +802,7 @@ export async function runOnce(
         ...(configPath ? { configPath } : {}),
       });
       control = deps.createControlServer(dir, arbiter, deps.log);
+      control.setCorrespondence?.({contacts:()=>managedService.runtime.readContacts(),history:query=>managedService.runtime.readHistory(query)});
       control.setFleetAuditor(ownerChannel ? {
         begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
@@ -1023,6 +1025,9 @@ export async function runOnce(
     },
   });
 
+  let chatIdle: TemporaryChatIdle | undefined;
+  try { if(temp && !role.roomMemberStartup) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
+  catch { deps.log(`[${name}] automatic idle closure disabled: activity state is unreadable`); }
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
   let nextIdentityPollAt = deps.now();
@@ -1046,6 +1051,14 @@ export async function runOnce(
         void recoveryController.recover(observation.generation).catch(error =>
           deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
       }
+    }
+    let idleExpired=false;
+    try { idleExpired=chatIdle?.observe(sessionHandle.snapshot(),sessionHandle.conversationSnapshot?.().queueDepth ?? -1,now) ?? false; }
+    catch { chatIdle=undefined; deps.log(`[${name}] automatic idle closure disabled: activity state could not be saved`); }
+    if (idleExpired && await arbiter!.retireIfIdle((snapshot,queue)=>chatIdle!.observe(snapshot,queue,deps.now()))) {
+      retirementReason = 'idle-timeout';
+      sessionClosed = true;
+      break;
     }
     if (deps.shouldStop?.()) {
       if (temp) {

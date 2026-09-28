@@ -170,6 +170,27 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('persists bounded native MCP arguments/results and command output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-native-details-'));
+    let incoming: CodexAppServerTransportOptions | undefined;
+    const session = await start(dir, 'fresh', 'ask', async options => { incoming=options; return new FakeAppServer(options); });
+    try {
+      session.setControllerAttached(true);
+      await session.queuePrompt('permission');
+      await waitFor(()=>session.snapshot().readiness==='awaiting_permission');
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'mcp-detail',type:'mcpToolCall',server:'ours',tool:'list_contacts',status:'completed',arguments:{limit:5},result:{content:[{type:'text',text:'Fixture contact'}]}}});
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'shell-detail',type:'commandExecution',command:'printf fixture',cwd:dir,status:'completed',aggregatedOutput:'fixture',exitCode:0}});
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'secret-detail',type:'mcpToolCall',tool:'fixture',arguments:{password:'DO_NOT_RETAIN'},result:{token:'DO_NOT_RETAIN'}}});
+      const page = session.conversationPage!({limit:100});
+      const serialized=JSON.stringify(page);
+      expect(serialized).toContain('Fixture contact');
+      expect(serialized).toContain('exitCode');
+      expect(serialized).not.toContain('DO_NOT_RETAIN');
+      expect(serialized).toContain('rawInput');
+      expect(serialized).toContain('rawOutput');
+    } finally { await session.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+
   it.each([
     ['allow_once', 'accept', {}],
     ['deny_once', 'decline', null],

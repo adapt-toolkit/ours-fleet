@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import type { CommonPermissions } from '../config.js';
+import { boundedJson } from './conversation-normalizer.js';
 import { ConversationEventStore } from './conversation-store.js';
 import type {
   ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
@@ -823,6 +824,10 @@ export class CodexAppServerSession implements AgentSession {
         toolCallId: scheduled ? 'scheduled-loop-tool' : id, snapshot,
         title: scheduled ? 'scheduled-loop tool' : tool.title, status: tool.status,
         kind: string(item.type),
+        ...(!scheduled && item.arguments !== undefined ? { rawInput: boundedJson(item.arguments) } : {}),
+        ...(!scheduled && item.type === 'commandExecution' ? { rawInput: boundedJson({command:item.command,cwd:item.cwd}), ...(item.aggregatedOutput !== undefined ? { rawOutput: boundedJson({output:item.aggregatedOutput,exitCode:item.exitCode}) } : {}) } : {}),
+        ...(!scheduled && item.type === 'fileChange' && item.changes !== undefined ? { rawOutput: boundedJson(item.changes) } : {}),
+        ...(!scheduled && (item.result !== undefined || item.error !== undefined) ? { rawOutput: boundedJson({result:item.result,error:item.error}) } : {}),
       },
     });
   }

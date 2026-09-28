@@ -16,6 +16,7 @@ export const TEMP_LAUNCH_GRACE_MS = 60_000;
 
 export type TempSupervisorKind = 'systemd-transient' | 'launchd-transient' | 'detached';
 export type TempTerminationReason =
+  | 'idle-timeout'
   | 'identity-closed'
   | 'session-ended'
   | 'operator-stop'
