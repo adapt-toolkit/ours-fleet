@@ -316,7 +316,9 @@ export class CodexAppServerSession implements AgentSession {
 
   async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     const active = this.activeTurn;
-    if (!active || !this.threadId || !active.nativeTurnId) return { state: 'settled' };
+    if (!active || !this.threadId) return { state: 'settled' };
+    if (!active.nativeTurnId) throw new SessionControlError('backend',
+      'The operation is still pending without a native turn ID. Cancellation is not confirmed; inspect or restart the agent if it does not progress.');
     active.cancellationSource ??= source;
     this.events.emit('state', { turnId: active.promptId, status: 'running', origin: active.origin });
     this.conversation.appendSafe({
