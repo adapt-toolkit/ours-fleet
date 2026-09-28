@@ -147,7 +147,7 @@ const defaultDeps = (): RunnerDeps => ({
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
 
-function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void, session:AgentSession) {
+export function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void, session:AgentSession) {
   const bindings=new Map<string,NonNullable<ReturnType<NonNullable<AgentSession["taskNoticeBinding"]>>>>();
   const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
   return {
