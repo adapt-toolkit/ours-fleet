@@ -72,6 +72,17 @@ function fixture() {
 }
 
 describe('deterministic managed room close', () => {
+  it('retires appended members alongside the original roster',async()=>{
+    const original=getRoomRecord(ROOM_ID)!.member_seats[0];
+    updateMemberSeats(ROOM_ID,[original,{...original,role_name:'added-2',identity_cid:'cd'.repeat(32),slot:'extra'}],
+      {name:'extra',version:1,description:'Added',content_hash:'hash',members:[{slot:'extra',role:'Developer',count:1,agent_template:'worker'}]});
+    const f=fixture();const closed=await closeManagedRoom({roomId:ROOM_ID,cowork:f.cowork,deps:f.deps});
+    expect(closed.state).toBe('closed');
+    expect(f.calls).toContain('stop:member-1');expect(f.calls).toContain('stop:added-2');
+    expect(f.calls.indexOf('identity:added-2')).toBeLessThan(f.calls.indexOf(`cowork:${ROOM_ID}`));
+    expect(closed.member_seats.every(s=>s.retirement?.phase==='identity_absent')).toBe(true);
+  });
+
   it.each([true, false])('does not trust an old retirement cursor for a replacement launch (live state=%s)', async live => {
     updateMemberSeats(ROOM_ID, [{ role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer', seat_state: 'active',
       launch: { state: 'launched', attempt: 2, action_id: 'new-action', launch_id: 'new-launch', updated_at: '2026-08-24T00:00:00.000Z' },
