@@ -271,6 +271,12 @@ describe('simple Cowork room member startup', () => {
     if(results[1].status==='fulfilled')await expect.poll(()=>memberAddition(task.task_id,'second-request-123').state).toBe('failed');
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     await expect(requestMemberAddition({...input,request:{...input.request,slot:'Other'}})).rejects.toThrow('different settings');
+    for(const changed of [{role:''},{slot:'invalid slot'}]) {
+      const error=await requestMemberAddition({...input,request:{...input.request,...changed}}).catch(error=>error);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toHaveProperty('accepted');
+      expect(memberAddition(task.task_id,input.request.requestId).state).toBe('succeeded');
+    }
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     // A receipt left running by a terminated server is observed, never relaunched.
     const path=join(stateRoot(),'member-additions',task.task_id,input.request.requestId+'.json');

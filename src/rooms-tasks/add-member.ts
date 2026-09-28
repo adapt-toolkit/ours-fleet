@@ -32,7 +32,8 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
   const {request:r,taskId}=input;
   if(!r || typeof r.slot!=='string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(r.slot)
       || ![r.role,r.brain,r.agentTemplate].every(v=>typeof v==='string'&&v.length>0&&v.length<=128))
-    throw new MemberAdditionRejected('Slot, Role, Brain and Agent Template are required');
+    // No receipt lookup has happened yet: this request ID may already be accepted.
+    throw new TaskStateError('Slot, Role, Brain and Agent Template are required');
   const path=pathFor(taskId,r.requestId);
   const hash=createHash('sha256').update(canonicalJson(r)).digest('hex');
   mkdirSync(join(stateRoot(),'member-additions',taskId),{recursive:true,mode:0o700});
