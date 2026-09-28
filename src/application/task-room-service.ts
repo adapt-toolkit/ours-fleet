@@ -16,7 +16,7 @@ import {
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
-  updateTaskExecutionPlan,
+  updateTaskExecutionPlan, updateTaskBrief,
 } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
@@ -343,6 +343,10 @@ export class TaskRoomApplicationService {
       deleteTaskListRecordLocked(source.list_id);
       return { deleted: source, moved: assigned.length, destination };
     });
+  }
+
+  editTaskDescription(input: { actor: TaskRoomActor; taskId: string; brief: string; expectedBrief: string }): TaskRecord {
+    return updateTaskBrief(input.taskId, input.brief, input.expectedBrief);
   }
 
   getTask(taskId: string): {

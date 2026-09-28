@@ -1,3 +1,4 @@
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -1948,6 +1949,11 @@ export class AcpSession implements AgentSession {
   }
 
   // ── conversation ledger access (AgentSession) ─────────────────────────────
+
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.sessionId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.sessionId,promptId:this.activeTurn.id}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);

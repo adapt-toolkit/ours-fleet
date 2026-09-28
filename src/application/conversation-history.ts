@@ -26,7 +26,7 @@ export async function resumedConversationPage(stateDir:string, request:{after?:s
         let event:ConversationEventV1;try{event=JSON.parse(line);}catch{continue;}
         const cursor=Number(event.seq);
         if(!Number.isSafeInteger(cursor)||cursor<=after)continue;
-        const historical=['prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'].includes(event.kind);
+        const historical=['fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'].includes(event.kind);
         const visible=event.source!=='agent_replay' && (event.sessionGeneration===live.snapshot.sessionGeneration || (historical&&event.acpSessionId===sessionId));
         if(!visible){next=String(cursor);continue;}
         if(events.length===limit){hasMore=true;break scan;}

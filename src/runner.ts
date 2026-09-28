@@ -147,12 +147,14 @@ const defaultDeps = (): RunnerDeps => ({
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
 
-function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void) {
+function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void, session:AgentSession) {
+  const bindings=new Map<string,NonNullable<ReturnType<NonNullable<AgentSession["taskNoticeBinding"]>>>>();
   const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
   return {
     async begin(requestId: string, argv: string[]) {
       let attempt = store.begin(requestId, caller, argv);
       if (attempt.invocation === 'sending') {
+        const binding=session.taskNoticeBinding?.();if(binding)bindings.set(attempt.correlationId,binding);
         log(`[${caller}] fleet proxy command ${attempt.correlationId} `
           + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
         attempt = store.invocation(attempt.correlationId, caller, 'delivered');
@@ -166,6 +168,14 @@ function localFleetAuditor(stateDir: string, caller: string, log: (line: string)
         ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
         ...(input.presentations ? { presentations: input.presentations } : {}),
       });
+      const binding=bindings.get(attempt.correlationId);
+      if(binding&&attempt.outcome?.class==='success'&&attempt.outcome.effect==='completed'){
+        for(const p of attempt.outcome.presentations??[])if(p.kind==='task'&&p.operation==='create'){
+          try { session.recordTaskCreated?.(binding,{operationId:p.eventId,taskId:p.id,title:p.title??p.id,state:p.newState}); }
+          catch { log(`[${caller}] task-created conversation notice could not be persisted`); }
+        }
+        bindings.delete(attempt.correlationId);
+      }
       if (attempt.outcome?.delivery === 'sending')
         attempt = store.outcome(attempt.correlationId, caller, 'delivered');
       return attempt;
@@ -807,7 +817,7 @@ export async function runOnce(
         begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
         present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
-      } : localFleetAuditor(dir, name, deps.log));
+      } : localFleetAuditor(dir, name, deps.log, agentSession));
       control.setLayoutControl?.(createLayoutControl({
         agent: name, temporary: temp, standalone: !role.roomMemberStartup,
         runtime: managedService.runtime, session: arbiter,

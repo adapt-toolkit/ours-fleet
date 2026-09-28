@@ -313,6 +313,17 @@ export async function buildWebServer(
     return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
   });
 
+  app.patch('/api/v1/tasks/:id/description', async request => {
+    auth.authenticate(request, true);
+    const body = request.body as { brief?: unknown; expectedBrief?: unknown };
+    if (typeof body?.brief !== 'string' || typeof body.expectedBrief !== 'string' || body.brief.length > 100_000)
+      throw new FleetError('invalid_request', 'brief and expectedBrief must be strings; brief maximum is 100000 characters');
+    return { task: await taskApi(() => requireTaskRooms().editTaskDescription({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+      brief: body.brief as string, expectedBrief: body.expectedBrief as string,
+    })) };
+  });
+
   app.get('/api/v1/tasks/:id', async request => {
     auth.authenticate(request);
     return taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id));

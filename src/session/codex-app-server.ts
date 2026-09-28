@@ -1,3 +1,4 @@
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -422,6 +423,11 @@ export class CodexAppServerSession implements AgentSession {
     this.conversation.close();
     await this.transport.close();
   }
+
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.threadId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.threadId,promptId:this.activeTurn.promptId}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);

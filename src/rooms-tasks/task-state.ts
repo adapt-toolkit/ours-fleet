@@ -946,3 +946,18 @@ export function beginTaskArchiveCleanup(id: string): void {
     writeTask(stored);
   });
 }
+
+/** Metadata-only edit; compare under the task lock to prevent lost updates. */
+export function updateTaskBrief(id: string, brief: string, expectedBrief: string): TaskRecord {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if ((task.brief ?? '') !== expectedBrief && task.brief !== brief)
+      throw new TaskStateError('Description changed elsewhere. Reload the task before saving.');
+    task.brief = brief;
+    writeTask(task);
+    return task;
+  });
+}
