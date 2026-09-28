@@ -30,11 +30,12 @@ export interface ControlRequest {
   token: string;
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
-    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
+    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'submit_voice_prompt' | 'interrupt_v2'
     | 'layout_control' | 'agent_contacts' | 'agent_history' | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
   layout?: LayoutControlRequest;
   agentHistory?: AgentHistoryQuery;
   text?: string;
+  expectedSessionGeneration?: string;
   permissionId?: string;
   optionId?: string;
   since?: number;
@@ -70,7 +71,7 @@ export interface ControlRequest {
 
 /** Commands that require protocol version 3. */
 const V3_COMMANDS = new Set<ControlRequest['command']>([
-  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'interrupt_v2',
+  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'submit_voice_prompt', 'interrupt_v2',
   'respond_permission_v2',
 ]);
 
@@ -552,7 +553,10 @@ export class RoleControlServer {
               socket.write(JSON.stringify({ version: 1, conversationEvent: event }) + '\n');
           }) };
         }
+        case 'submit_voice_prompt':
         case 'submit_prompt_v2': {
+          if (request.command === 'submit_voice_prompt' && !request.expectedSessionGeneration?.trim())
+            throw new SessionControlError('rejected', 'expectedSessionGeneration is required');
           this.requireConversation(request);
           if (!request.commandId?.trim() || !request.text?.trim() || !request.actor?.trim()
               || request.source !== 'owner_admin_console')
@@ -564,6 +568,7 @@ export class RoleControlServer {
             const receipt = await this.session.submitPromptBrowser({
               commandId: request.commandId, text: request.text,
               source: 'owner_admin_console', actorBrowserSession: request.actor,
+              expectedSessionGeneration: request.expectedSessionGeneration,
             });
             this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           } catch (error) {

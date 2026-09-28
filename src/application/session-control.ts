@@ -45,7 +45,7 @@ export interface RoleSessionControl {
   // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
   submitPromptV2?(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
   interruptV2?(commandId: string): Promise<InterruptReceipt & { commandId: string }>;
@@ -148,19 +148,21 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
   }
 
   async submitPromptV2(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt> {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
     if (Buffer.byteLength(request.text) > 32 * 1024)
       throw new FleetError('invalid_request', 'text exceeds 32 KiB');
     try {
-      return await this.call('submit_prompt_v2', {
+      return await this.call(request.expectedSessionGeneration ? 'submit_voice_prompt' : 'submit_prompt_v2', {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
-        source: request.source,
+        source: request.source, expectedSessionGeneration: request.expectedSessionGeneration,
       }) as PromptReceipt;
     } catch (error) {
       const fleetError = normalizeError(error);
+      if (fleetError.message.includes('session_changed:'))
+        throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
       if (fleetError.message.includes('idempotency_conflict'))
         throw new FleetError('idempotency_conflict',
           'this command id was already used with a different prompt body');

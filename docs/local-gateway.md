@@ -29,3 +29,20 @@ The transport also supports `auth: 'backend'` for a **separate loopback-only mac
 This local integration does not implement central accounts, permanent tunnel provisioning or the entire future API inventory. Notifications in this frontend show current permission requests and unread messages; they are not a new centralized push service. Quick Tunnels buffer SSE, so the frontend also polls chat/history and role/task state. A normal local origin retains streaming transport support.
 
 Validation: `npm run typecheck`, `npx vitest run test/web test/socket-path.test.ts test/rooms-tasks-provision.test.ts`. The transport tests exercise an unknown encoded route, a large binary body, incremental SSE, WebSockets, logout closure, partial upstream abort, external navigation and private machine-client browser rejection.
+
+### Session-bound voice input
+
+The existing `POST /api/v1/roles/:id/input` accepts optional
+`expectedSessionGeneration` (a nonempty string from the conversation snapshot).
+The browser supplies it for voice recorded in an existing agent chat; a draft
+binds it after its single agent creation finishes. This uses the distinct
+`submit_voice_prompt` supervisor command, so older supervisors reject it rather
+than silently ignoring the guard. Both ACP and Codex adapters reject a changed
+generation before admission. An already admitted exact command ID/body can still
+replay its original receipt after a generation change. Normal text clients that
+omit the field retain their current behavior.
+
+Voice transcription belongs to the selected daemon, exposed by the generic
+`/daemon/voice/transcribe` proxy. No STT provider configuration or credentials are
+added to Fleet. Deploying this feature requires coordinated daemon, Fleet web,
+supervisor and frontend versions; source tests do not upgrade live services.

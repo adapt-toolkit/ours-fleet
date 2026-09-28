@@ -463,6 +463,8 @@ export class CodexAppServerSession implements AgentSession {
     const bodyDigest = ConversationEventStore.bodyDigest(command.text);
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
+    if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
+      throw new Error('session_changed: Agent session changed. Record a new voice message.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },

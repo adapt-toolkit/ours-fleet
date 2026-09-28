@@ -533,7 +533,9 @@ export async function buildWebServer(
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { text?: unknown; commandId?: unknown };
+    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown };
+    if (body?.expectedSessionGeneration !== undefined && (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim()))
+      throw new FleetError('invalid_request', 'expectedSessionGeneration must be a nonempty string');
     const text = String(body?.text ?? '');
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
@@ -545,6 +547,7 @@ export async function buildWebServer(
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
         commandId: admittedCommandId, text, source: 'owner_admin_console',
+        expectedSessionGeneration: body.expectedSessionGeneration as string | undefined,
         actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
       });
       await audit.record({
@@ -556,6 +559,8 @@ export async function buildWebServer(
       reply.code(202);
       return receipt;
     }
+    if (body.expectedSessionGeneration !== undefined)
+      throw new FleetError('capability_unavailable', 'session-bound voice input is unavailable for this role');
     const receipt = await control.sendText(text);
     await audit.record({
       requestId: request.id, browser: session.id, roleId: request.params.id,

@@ -306,6 +306,7 @@ export interface ConversationEventV1 {
 // ── Browser commands and receipt transport contracts ────────────────────────
 
 export interface SubmitPromptCommand {
+  expectedSessionGeneration?: string;
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */
   commandId: string;
   text: string;

@@ -170,6 +170,22 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('rejects stale voice before admission but replays an accepted voice receipt', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'ours-voice-session-'));
+    let server:FakeAppServer;
+    const session=await start(dir,'fresh','allow',async options=>{server=new FakeAppServer(options);return server;});
+    try {
+      const command={commandId:'voice-once',text:'Voice message:\n/compact',actorBrowserSession:'test',source:'owner_admin_console' as const};
+      await expect(session.submitPromptBrowser({...command,expectedSessionGeneration:'old'})).rejects.toThrow('session_changed');
+      expect(server!.requests.some(r=>r.method==='turn/start')).toBe(false);
+      const receipt=await session.submitPromptBrowser({...command,expectedSessionGeneration:session.conversationSnapshot().sessionGeneration});
+      expect(await session.submitPromptBrowser({...command,expectedSessionGeneration:'old'})).toEqual(receipt);
+      await waitFor(()=>server.requests.some(r=>r.method==='turn/start'));
+      expect(server.requests.filter(r=>r.method==='turn/start')).toHaveLength(1);
+      expect(server.requests.some(r=>r.method==='thread/compact/start')).toBe(false);
+    } finally {await session.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
   it('runs compact as a native operation and waits for its terminal event, deduplicating browser retries', async () => {
     const dir=mkdtempSync(join(tmpdir(),'ours-native-compact-'));
     let incoming:CodexAppServerTransportOptions;let server:FakeAppServer;

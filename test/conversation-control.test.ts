@@ -53,6 +53,21 @@ async function startArbiterServer() {
 }
 
 describe('role-control conversation v3', () => {
+  it('binds voice input to its recorded session and replays the exact admitted receipt', async () => {
+    const { stateDir, session } = await startServer();
+    const command = { command: 'submit_voice_prompt' as const, commandId: 'voice-once', text: 'Voice message:\n/restart', actor: 'browser', source: 'owner_admin_console' as const };
+    const missing = await controlRequest(stateDir, command);
+    expect(missing.ok).toBe(false);
+    const stale = await controlRequest(stateDir, { ...command, expectedSessionGeneration: 'old' });
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toContain('session_changed');
+    const accepted = await controlRequest(stateDir, { ...command, expectedSessionGeneration: session.conversationSnapshot().sessionGeneration });
+    expect(accepted.ok).toBe(true);
+    const retry = await controlRequest(stateDir, { ...command, expectedSessionGeneration: 'old' });
+    expect(retry.result).toEqual(accepted.result);
+    expect(session.conversationPage({limit:100}).events.filter(e => e.kind === 'prompt.admitted')).toHaveLength(1);
+  });
+
   it('serves typed read-only correspondence from the selected supervisor',async()=>{
     const {stateDir,server}=await startServer();const queries:unknown[]=[];
     server.setCorrespondence({contacts:async()=>({identity:{name:'A'},contacts:[{name:'Peer',container_id:'B'.repeat(64)}]}),history:async query=>{queries.push(query);return {items:[{seq:2,direction:'out',text:'hello'}],next_cursor:2};}});
