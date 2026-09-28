@@ -170,6 +170,35 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('runs compact as a native operation and waits for its terminal event, deduplicating browser retries', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'ours-native-compact-'));
+    let incoming:CodexAppServerTransportOptions;let server:FakeAppServer;
+    const session=await start(dir,'fresh','allow',async options=>{
+      incoming=options;server=new FakeAppServer(options);
+      const request=server.request.bind(server);
+      server.request=async <T=unknown>(method:string,params:Record<string,unknown>={})=>{
+        if(method==='thread/compact/start'){server.requests.push({method,params});return {} as T;}
+        return request<T>(method,params);
+      };return server;
+    });
+    try {
+      const command={commandId:'compact-once',text:'/compact',actorBrowserSession:'test',source:'owner_admin_console' as const};
+      const receipt=await session.submitPromptBrowser(command);
+      await waitFor(()=>server.requests.some(r=>r.method==='thread/compact/start'));
+      expect(session.snapshot().readiness).toBe('running');
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      expect(server.requests.filter(r=>r.method==='thread/compact/start')).toHaveLength(1);
+      expect(server.requests.some(r=>r.method==='turn/start')).toBe(false);
+      expect(server.requests.find(r=>r.method==='thread/compact/start')?.params).toEqual({threadId:'thread-native-1'});
+      incoming!.onNotification!('turn/started',{threadId:'thread-native-1',turn:{id:'compact-turn',status:'inProgress'}});
+      incoming!.onNotification!('turn/completed',{threadId:'thread-native-1',turn:{id:'compact-turn',status:'completed'}});
+      await waitFor(()=>session.snapshot().readiness==='idle');
+      const events=session.conversationPage!({limit:100}).events;
+      expect(events.some(e=>e.kind==='capabilities.updated'&&JSON.stringify(e.payload).includes('compact'))).toBe(true);
+      expect(events.some(e=>e.kind==='turn.completed'&&e.promptId===receipt.promptId)).toBe(true);
+    }finally{await session.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
   it('persists bounded native MCP arguments/results and command output', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-native-details-'));
     let incoming: CodexAppServerTransportOptions | undefined;

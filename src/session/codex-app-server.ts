@@ -503,6 +503,10 @@ export class CodexAppServerSession implements AgentSession {
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `Codex thread ${this.threadId}` });
     this.conversation.appendSafe({
+      kind: 'capabilities.updated', sessionGeneration: this.sessionGeneration,
+      payload: { commands: [{ name: 'compact', description: textBlock('Compact session context') }] },
+    });
+    this.conversation.appendSafe({
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       payload: { status: 'idle' },
     });
@@ -574,6 +578,12 @@ export class CodexAppServerSession implements AgentSession {
       promptId, turnId: promptId, source: sourceFor(origin).source, payload: {},
     });
     try {
+      if (text.trim() === '/compact') {
+        // The acknowledgement is not completion. Standard turn notifications
+        // settle the same queued prompt and durable browser receipt.
+        await this.transport.request('thread/compact/start', { threadId: this.threadId });
+        return await settled;
+      }
       const response = await this.transport.request<JsonObject>('turn/start', {
         threadId: this.threadId,
         input: [{ type: 'text', text, text_elements: [] }],
