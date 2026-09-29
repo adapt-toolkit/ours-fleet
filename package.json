@@ -19,6 +19,7 @@
     "presets",
     "README.md",
     "docs/task-workspaces.md",
+    "docs/room-layouts.md",
     "LICENSE"
   ],
   "engines": {

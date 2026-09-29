@@ -204,6 +204,42 @@ const writeCfg = (roles: Record<string, object>) =>
   writeV2Fixture(join(dir, 'fleet.yaml'), { roles });
 
 describe('managed fleet child environment', () => {
+  it('retires a layout worker through one terminal runtime close', async () => {
+    const name = 'LayoutWorker', d = agentDir(name, true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, harness: 'fake', session: 'acp', identity: name, sourceFile: '(temp)' }));
+    const { deps } = fakeWorld({ lifeChecks: 100 });
+    const prepare = deps.prepareAgentOurs, start = deps.startAgentSession, sleep = deps.sleep;
+    const closed: boolean[] = [];
+    let handler: any;
+    deps.prepareAgentOurs = async () => {
+      const service = await prepare();
+      Object.assign(service.runtime, { snapshot: { instance: 'launch', cid: 'cid' } });
+      service.close = async terminal => { closed.push(terminal); if (closed.length > 1) throw Error('double close'); };
+      return service;
+    };
+    deps.startAgentSession = async (...args) => {
+      const session = await start(...args), snapshot = session.snapshot;
+      session.snapshot = () => ({ ...snapshot(), sessionId: 'layout-session' });
+      return session;
+    };
+    let retired = false;
+    deps.sleep = async ms => {
+      await sleep(ms);
+      if (handler && !retired) {
+        retired = true;
+        const instance = await handler({ action: 'inspect' });
+        await handler({ action: 'retire', instance });
+      }
+    };
+    const result = await runOnce(name, { temp: true }, { ...deps, createControlServer: () => ({
+      start: async () => {}, close: async () => {}, setFleetSpawner: () => {}, setFleetAuditor: () => {},
+      setOwnerChannel: () => {}, setConfigReloader: () => {}, setLoopManager: () => {},
+      setLayoutControl: value => { handler = value; },
+    }) });
+    expect(retired).toBe(true); expect(closed).toEqual([true]);
+    expect(result.retirementReason).toBe('operator-stop');
+  });
   it('does not register fleet lifecycle spawning for a room member', async () => {
     const name = 'RoomMember';
     const d = agentDir(name, true); mkdirSync(d, { recursive: true });

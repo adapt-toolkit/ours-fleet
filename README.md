@@ -1811,3 +1811,8 @@ recreate identities, redeem invites, or rewrite lifecycle state. Temporary room 
 remain transient across host reboot; retained launch records do not restore them.
 
 See [predefined Brain models and runtime requirements](presets/README.md) for the verified model/effort matrix and regeneration instructions.
+
+### YAML room layouts
+
+Room layouts describe room composition with shared or fresh participant sessions and independent room closure.
+See [Room layouts](docs/room-layouts.md) for YAML examples and CLI commands.

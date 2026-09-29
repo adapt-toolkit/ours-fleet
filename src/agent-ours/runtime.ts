@@ -236,6 +236,16 @@ export class AgentOursRuntime {
       throw error;
     }
   }
+  /** Trusted supervisor-only admission for a later room; keeps the live harness
+   * and original startup assignment. Not exposed as an agent lifecycle tool. */
+  async joinAdditionalRoom(invite: string, expectedRoomCid: string): Promise<void> {
+    const release = await this.admit();
+    try {
+      const contact = await this.deps.client.addContact({ invite });
+      if (contact.cid !== expectedRoomCid) throw Error('ADDITIONAL_ROOM_CID_MISMATCH');
+      await this.verify();
+    } finally { release(); }
+  }
   async startHarness<T>(start: () => Promise<T>): Promise<T> {
     if (!this.accepting || this.state.phase !== 'READY') throw Error('RUNTIME_NOT_READY');
     await this.verify();

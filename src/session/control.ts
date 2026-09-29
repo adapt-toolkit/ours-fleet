@@ -1,3 +1,4 @@
+import type { LayoutControlRequest } from '../rooms-tasks/layout-control.js';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
@@ -28,7 +29,8 @@ export interface ControlRequest {
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
     | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
-    | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
+    | 'layout_control' | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
+  layout?: LayoutControlRequest;
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -225,6 +227,8 @@ export class RoleControlServer {
   private ownerChannel?: OwnerChannelHandle;
   private loopManager?: ScheduledLoopManagerHandle;
   private reloadConfig?: () => Promise<unknown>;
+  private layoutControl?: (request: LayoutControlRequest) => Promise<unknown>;
+  setLayoutControl(handler: (request: LayoutControlRequest) => Promise<unknown>): void { this.layoutControl = handler; }
   private fleetSpawner?: (options: SpawnOpts) => Promise<ManagedFleetSpawnResult>;
   private fleetAuditor?: {
     begin(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
@@ -427,6 +431,13 @@ export class RoleControlServer {
           this.write(socket, {
             version: 1, id: request.id, ok: true, result: await this.reloadConfig(),
           });
+          return;
+        }
+        case 'layout_control': {
+          if (request.version !== 2 || !request.layout || !this.layoutControl)
+            throw new SessionControlError('rejected', 'layout control unavailable');
+          const result = await this.layoutControl(request.layout);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
           return;
         }
         case 'fleet_spawn': {

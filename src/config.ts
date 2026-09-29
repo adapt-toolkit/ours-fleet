@@ -876,6 +876,14 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
   return v;
 }
 
+/** Read only room connection/owner settings for an existing layout. */
+export function loadRoomsConfig(configPath = defaultConfigPath()): ReturnType<typeof validateRoomsConfig> {
+  assertTrustedPath(configPath, 'file');
+  const doc = parseFleetDocument(configPath, readFileSync(configPath, 'utf8')).value;
+  const vars = (doc.vars ?? {}) as Record<string, string>;
+  return validateRoomsConfig(deepSub(doc.rooms, vars), vars, configPath);
+}
+
 /** Load a v2 manifest and bare Agent/Role/Brain documents from its stem directory. */
 export function loadConfig(
   configPath?: string,

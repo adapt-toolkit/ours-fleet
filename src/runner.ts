@@ -1,3 +1,4 @@
+import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
@@ -87,7 +88,7 @@ export interface RunnerDeps {
   createControlServer(
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl'>>;
   /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
   createLoopManager(
     ...args: ConstructorParameters<typeof ScheduledLoopManager>
@@ -665,6 +666,7 @@ export async function runOnce(
   }
 
   const managedService = await deps.prepareAgentOurs(role, dir, opts.identityLifetime ? opts.identityLifetime === 'temporary' : temp);
+  let layoutRetiring = false;
   try {
   const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
     harnessChildEnv(role, launch.env, dir));
@@ -804,6 +806,12 @@ export async function runOnce(
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
         present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
       } : localFleetAuditor(dir, name, deps.log));
+      control.setLayoutControl?.(createLayoutControl({
+        agent: name, temporary: temp, standalone: !role.roomMemberStartup,
+        runtime: managedService.runtime, session: arbiter,
+        stopping: () => Boolean(deps.shouldStop?.()),
+        retire: async () => { layoutRetiring = true; await arbiter!.close(); },
+      }));
       await control.start();
     }
     catch (error) {
@@ -1156,10 +1164,10 @@ export async function runOnce(
   if (supervisorRecycleRequired) throw new SupervisorRecycleRequiredError();
   return {
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
-    ...(retirementReason ? { retirementReason } : {}),
+    ...(layoutRetiring ? { retirementReason: 'operator-stop' as const } : retirementReason ? { retirementReason } : {}),
   };
   } finally {
-    await managedService.close(false);
+    await managedService.close(layoutRetiring);
   }
 }
 
