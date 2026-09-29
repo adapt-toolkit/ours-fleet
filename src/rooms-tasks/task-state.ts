@@ -152,23 +152,18 @@ export interface CreateTaskInput {
   listId?: string;
 }
 
+function creationPlan(plan: TaskRecord['execution_plan'], layout?: { name: string; definition_hash: string }): string {
+  return JSON.stringify([plan?.plan_hash ?? null, storedRoomLaunchPolicy(plan?.room_policy) ?? null,
+    layout ? `${layout.name}@${layout.definition_hash}` : null]);
+}
+
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
   const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
-  if (existing?.room_plan_changed_at) return withTaskLock(existing.task_id, () => {
-    const fresh = readTask(existing.task_id);
-    assertNoPendingDeletion(fresh);
-    return fresh;
-  });
+  const requestedPlan = creationPlan(input.execution_plan, input.layout);
   if (existing) {
-    const existingPlan = existing.execution_plan?.plan_hash;
-    const requestedPlan = input.execution_plan?.plan_hash;
-    const existingPolicy = storedRoomLaunchPolicy(existing.execution_plan?.room_policy);
-    const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
-    const existingLayout = existing.layout && `${existing.layout.name}@${existing.layout.definition_hash}`;
-    const requestedLayout = input.layout && `${input.layout.name}@${input.layout.definition_hash}`;
-    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy)
-        || existingLayout !== requestedLayout)
+    // After a Backlog plan edit the current plan differs from the one created; retries compare the original request.
+    if ((existing.creation_plan ?? creationPlan(existing.execution_plan, existing.layout)) !== requestedPlan)
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
     return withTaskLock(existing.task_id, () => {
       const fresh = readTask(existing.task_id);
@@ -197,6 +192,7 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     member_roles: [],
     origin: input.origin,
     idempotency_key: key,
+    creation_plan: requestedPlan,
     created_at: new Date().toISOString(),
     started_at: state === 'provisioning' ? new Date().toISOString() : undefined,
   };

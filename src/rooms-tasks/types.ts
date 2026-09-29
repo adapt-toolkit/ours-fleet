@@ -155,6 +155,8 @@ export interface TaskRecord {
   layout?: TaskLayoutLink;
   /** Set when the room plan (layout or one-room template) was changed after creation, before start. */
   room_plan_changed_at?: string;
+  /** Fingerprint of the room plan requested at creation; idempotent retries compare against it after later plan edits. */
+  creation_plan?: string;
   room_id?: string;
   room_identity_cid?: string;
   member_roles: TaskMemberRole[];

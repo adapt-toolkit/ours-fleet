@@ -398,5 +398,10 @@ describe('choosing a Backlog task\'s room layout', () => {
     const replay = await a.createTask({ actor, title: 'Once', template: 'solo', backlog: true, idempotencyKey: 'create-1', origin: { type: 'web' } });
     expect(replay.task_id).toBe(task.task_id);
     expect(replay.layout?.name).toBe('work'); // the deliberate change is kept
+    // A different request under the same key still conflicts, whether it matches the edited plan or neither.
+    await expect(a.createTask({ actor, title: 'Once', layout: 'work', backlog: true, idempotencyKey: 'create-1', origin: { type: 'web' } }))
+      .rejects.toThrow(/different execution plan/);
+    await expect(a.createTask({ actor, title: 'Once', layout: 'other', backlog: true, idempotencyKey: 'create-1', origin: { type: 'web' } }))
+      .rejects.toThrow(/different execution plan/);
   });
 });
