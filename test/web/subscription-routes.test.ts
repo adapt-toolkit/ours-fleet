@@ -56,6 +56,8 @@ describe('subscription routes', () => {
     expect((await server.app.inject({ method: 'GET', url: '/api/v1/subscriptions', headers })).statusCode).toBe(401);
     const noCsrf = await server.app.inject({ method: 'POST', url: '/api/v1/subscriptions/claude/logins', headers: { ...headers, cookie } });
     expect(noCsrf.statusCode).toBeGreaterThanOrEqual(400);
+    const probeNoCsrf = await server.app.inject({ method: 'POST', url: '/api/v1/subscriptions/claude/profiles/default/probe', headers: { ...headers, cookie } });
+    expect(probeNoCsrf.statusCode).toBeGreaterThanOrEqual(400);
     await server.close();
   });
 

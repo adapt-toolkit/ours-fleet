@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { FleetError } from '../application/errors.js';
 import {
@@ -7,9 +7,11 @@ import {
 } from './cli.js';
 import { HOME_ENV } from './launch.js';
 import { ClaudeLogin, CodexDeviceLogin, type LoginHandle, type LoginView } from './login.js';
+import { recordClaudeRateLimit } from './observed.js';
+import { probeClaudeRateLimit } from './probe.js';
 import {
   DEFAULT_PROFILE_ID, OBSERVED_USAGE_FILE, SUBSCRIPTION_PROVIDERS, createProfileHome, profileHome,
-  readPin, readSubscriptionState, removeProfileHome, updateSubscriptionState,
+  readPin, readSubscriptionState, removeProfileHome, subscriptionsRoot, updateSubscriptionState,
   type SubscriptionProvider,
 } from './store.js';
 
@@ -27,7 +29,7 @@ export interface ProfileUsage {
   windows: UsageWindow[];
   observedAt?: string;
   /** `pull`: asked the provider. `agent`: last value an agent session reported. */
-  source: 'pull' | 'agent' | 'none';
+  source: 'pull' | 'agent' | 'probe' | 'none';
 }
 
 export interface ProfileView {
@@ -71,6 +73,7 @@ export class SubscriptionService {
   private readonly checks = new Map<string, CheckResult>();
   private readonly running = new Map<string, Promise<CheckResult>>();
   private readonly logins = new Map<string, LoginHandle>();
+  private readonly probes = new Map<string, Promise<ProfileUsage>>();
 
   constructor(private readonly options: SubscriptionServiceOptions) {
     this.bins = options.binaries ?? defaultBinaries();
@@ -88,11 +91,15 @@ export class SubscriptionService {
         if (!cached || this.now() - Date.parse(cached.health.checkedAt ?? '0') > STALE_CHECK_MS)
           void this.check(provider, profile.id).catch(() => {});
         const observed = provider === 'claude' ? this.observedUsage(pins, profile.id) : undefined;
+        const probed = provider === 'claude' ? this.probedUsage(profile.id) : undefined;
+        const usage = observed && probed
+          ? (observed.observedAt ?? '') >= (probed.observedAt ?? '') ? observed : probed
+          : observed ?? probed;
         return {
           id: profile.id, label: profile.label, active: profile.id === p.activeProfileId,
           account: cached?.account,
           health: cached?.health ?? { state: 'unknown' as const },
-          usage: observed ?? cached?.usage ?? { windows: [], source: 'none' as const },
+          usage: usage ?? cached?.usage ?? { windows: [], source: 'none' as const },
           agents: pins.filter(x => x.running && x.provider === provider && x.profileId === profile.id).map(x => x.roleId),
         };
       });
@@ -283,6 +290,7 @@ export class SubscriptionService {
       p.profiles = p.profiles.filter(x => x.id !== profileId);
     });
     removeProfileHome(provider, profileId);
+    if (provider === 'claude') rmSync(this.probeUsageDir(profileId), { recursive: true, force: true });
     this.checks.delete(`${provider}/${profileId}`);
     this.options.onChange?.();
   }
@@ -290,6 +298,39 @@ export class SubscriptionService {
   private profile(provider: SubscriptionProvider, profileId: string): void {
     if (!readSubscriptionState().providers[provider].profiles.some(p => p.id === profileId))
       throw new FleetError('resource_not_found', 'profile not found');
+  }
+
+  /** An explicit, bounded Haiku request can refresh Claude usage for an idle profile. */
+  probeClaudeUsage(profileId: string): Promise<ProfileUsage> {
+    this.profile('claude', profileId);
+    const inFlight = this.probes.get(profileId);
+    if (inFlight) return inFlight;
+    const run = (async (): Promise<ProfileUsage> => {
+      const dir = this.probeUsageDir(profileId);
+      const info = await probeClaudeRateLimit(this.bins.claude, profileId);
+      if (info) {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        if (recordClaudeRateLimit(dir, info, new Date(this.now()))) {
+          const usage = readObservedClaudeUsage(dir, this.now());
+          if (usage) { this.options.onChange?.(); return { ...usage, source: 'probe' }; }
+        }
+      }
+      rmSync(join(dir, OBSERVED_USAGE_FILE), { force: true });
+      this.options.onChange?.();
+      return { windows: [], source: 'none' };
+    })().catch((): ProfileUsage => ({ windows: [], source: 'none' }))
+      .finally(() => this.probes.delete(profileId));
+    this.probes.set(profileId, run);
+    return run;
+  }
+
+  private probeUsageDir(profileId: string): string {
+    return join(subscriptionsRoot(), 'observed', 'claude', profileId);
+  }
+
+  private probedUsage(profileId: string): ProfileUsage | undefined {
+    const usage = readObservedClaudeUsage(this.probeUsageDir(profileId), this.now());
+    return usage?.windows.length ? { ...usage, source: 'probe' } : undefined;
   }
 
   private async pins(): Promise<Array<{ roleId: string; stateDir: string; running: boolean; provider: SubscriptionProvider; profileId: string; unmanaged?: string[] }>> {

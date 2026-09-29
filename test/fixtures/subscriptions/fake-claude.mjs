@@ -7,6 +7,16 @@ import { createInterface } from 'node:readline';
 const dir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
 const marker = join(dir, 'fake-login.json');
 const [cmd, sub] = process.argv.slice(2);
+if (process.argv.includes('-p')) {
+  if (!existsSync(marker) || process.env.FAKE_CLAUDE_PROBE_FAIL === '1') process.exit(1);
+  process.stdout.write(`${JSON.stringify({ type: 'system', message: 'started' })}\n`);
+  if (process.env.FAKE_CLAUDE_NO_LIMIT !== '1')
+    process.stdout.write(`${JSON.stringify({ type: 'rate_limit_event', rate_limit_info: {
+      unifiedWindows: { five_hour: { utilization: 0.42, resetsAt: Math.floor(Date.now() / 1000) + 3600 }, seven_day: { utilization: 0.17, resetsAt: Math.floor(Date.now() / 1000) + 86400 } },
+    } })}\n`);
+  process.stdout.write(`${JSON.stringify({ type: 'result', result: 'OK' })}\n`);
+  process.exit(0);
+}
 if (cmd === 'auth' && sub === 'status') {
   if (!existsSync(marker)) { process.stdout.write(JSON.stringify({ loggedIn: false })); process.exit(1); }
   const who = JSON.parse(readFileSync(marker, 'utf8'));

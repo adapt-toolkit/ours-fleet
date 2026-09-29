@@ -556,6 +556,13 @@ export async function buildWebServer(
     return subscriptions().check(provider(request.params.provider), request.params.profileId);
   });
 
+  app.post<{ Params: { profileId: string } }>('/api/v1/subscriptions/claude/profiles/:profileId/probe', async request => {
+    const session = auth.authenticate(request, true);
+    const usage = await subscriptions().probeClaudeUsage(request.params.profileId);
+    await audit.record({ requestId: request.id, browser: session.id, action: 'subscription.usage.probe.claude', result: usage.source });
+    return { usage };
+  });
+
   app.patch<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId', async request => {
     auth.authenticate(request, true);
     const label = (request.body as { label?: unknown })?.label;

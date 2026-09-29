@@ -11,7 +11,7 @@ import { allowedLoginUrl } from '../src/subscriptions/login.js';
 import { recordClaudeRateLimit } from '../src/subscriptions/observed.js';
 import { SubscriptionService, type AgentRef } from '../src/subscriptions/service.js';
 import {
-  DEFAULT_PROFILE_ID, PIN_FILE, createProfileHome, readPin, readSubscriptionState, updateSubscriptionState,
+  DEFAULT_PROFILE_ID, PIN_FILE, createProfileHome, profileHome, readPin, readSubscriptionState, updateSubscriptionState,
 } from '../src/subscriptions/store.js';
 
 const fixtures = resolve('test/fixtures/subscriptions');
@@ -41,6 +41,8 @@ afterEach(() => {
   delete process.env.FAKE_CLAUDE_URL;
   delete process.env.FAKE_CODEX_URL;
   delete process.env.FAKE_CODEX_EXPIRED;
+  delete process.env.FAKE_CLAUDE_NO_LIMIT;
+  delete process.env.FAKE_CLAUDE_PROBE_FAIL;
 });
 
 async function addProfile(provider: 'claude' | 'codex'): Promise<string> {
@@ -348,5 +350,20 @@ describe('subscription service', () => {
     expect(profile.usage.source).toBe('agent');
     expect(profile.usage.windows.map(w => [w.label, w.usedPercent])).toEqual([['5h', 71], ['weekly', 9]]);
     expect(profile.agents).toEqual(['Obs']);
+  });
+
+  it('checks Claude usage only on demand using the selected profile and hides failed probes', async () => {
+    const svc = service();
+    const id = await addProfile('claude');
+    const other = await addProfile('claude');
+    writeFileSync(join(profileHome('claude', id), 'fake-login.json'), JSON.stringify({ email: 'probe@example.test' }));
+    const usage = await svc.probeClaudeUsage(id);
+    expect(usage).toMatchObject({ source: 'probe', windows: [{ label: '5h', usedPercent: 42 }, { label: 'weekly', usedPercent: 17 }] });
+    const profiles = (await svc.list()).find(p => p.provider === 'claude')!.profiles;
+    expect(profiles.find(p => p.id === id)!.usage.source).toBe('probe');
+    expect(profiles.find(p => p.id === other)!.usage.windows).toEqual([]);
+    process.env.FAKE_CLAUDE_NO_LIMIT = '1';
+    expect(await svc.probeClaudeUsage(id)).toEqual({ source: 'none', windows: [] });
+    expect((await svc.list()).find(p => p.provider === 'claude')!.profiles.find(p => p.id === id)!.usage.windows).toEqual([]);
   });
 });
