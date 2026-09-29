@@ -164,6 +164,7 @@ export class CodexDeviceLogin extends BaseLogin {
     this.completed = (async () => {
       try {
         this.server = await CodexAppServer.start(bins.codex, profileEnv('CODEX_HOME', profileId, home));
+        if (this.state !== 'starting') { this.server.close(); return false; }
         const completion = new Promise<boolean>(resolve => {
           this.server!.onNotification((method, params) => {
             const p = params as { loginId?: string | null; success?: boolean; error?: string | null };
@@ -175,6 +176,7 @@ export class CodexDeviceLogin extends BaseLogin {
         });
         const started = await this.server.call<{ type: string; loginId?: string; verificationUrl?: string; userCode?: string }>(
           'account/login/start', { type: 'chatgptDeviceCode' });
+        if (this.state !== 'starting') { this.server.close(); return false; }
         const url = started.verificationUrl && allowedLoginUrl('codex', started.verificationUrl);
         if (!url || !started.userCode) { this.end('failed', 'the CLI returned an unexpected sign-in address'); return false; }
         this.codexLoginId = started.loginId;

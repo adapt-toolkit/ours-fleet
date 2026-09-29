@@ -186,7 +186,7 @@ export class SubscriptionService {
       const view = login.view();
       if (view.provider !== provider) continue;
       if (view.state === 'starting' || view.state === 'awaiting_user' || view.state === 'verifying')
-        throw new FleetError('conflict', `a ${provider} login is already in progress`);
+        login.cancel();
       this.logins.delete(id);
     }
     const { id: profileId, home } = createProfileHome(provider);

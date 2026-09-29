@@ -292,18 +292,34 @@ describe('subscription service', () => {
     expect(readSubscriptionState().providers.codex.profiles).toHaveLength(1);
   });
 
-  it('allows one login per provider at a time and cancels cleanly', async () => {
+  it('replaces an unfinished login for the same provider after a page refresh', async () => {
     process.env.FAKE_CODEX_DELAY = '60000';
     try {
       const svc = service();
       const started = await svc.startLogin('codex', 'b');
-      await expect(svc.startLogin('codex', 'b')).rejects.toThrow(/already in progress/);
       const login = svc.login(started.loginId, 'b');
-      login.cancel();
+      const replacement = await svc.startLogin('codex', 'b');
       await login.done;
       expect(login.view()).toMatchObject({ state: 'cancelled' });
       expect(login.view().userCode).toBeUndefined();
+      expect(replacement).toMatchObject({ provider: 'codex', state: 'awaiting_user' });
+      expect(replacement.loginId).not.toBe(started.loginId);
+      expect(() => svc.login(started.loginId, 'b')).toThrow(/login not found/);
+      svc.login(replacement.loginId, 'b').cancel();
     } finally { delete process.env.FAKE_CODEX_DELAY; }
+  });
+
+  it('replaces a pending Claude login with a fresh sign-in URL', async () => {
+    const svc = service();
+    const started = await svc.startLogin('claude', 'b');
+    const old = svc.login(started.loginId, 'b');
+    const replacement = await svc.startLogin('claude', 'b');
+    await old.done;
+    expect(old.view().state).toBe('cancelled');
+    expect(replacement).toMatchObject({ provider: 'claude', state: 'awaiting_user', url: expect.stringMatching(/^https:\/\/claude\.com\//) });
+    expect(replacement.loginId).not.toBe(started.loginId);
+    expect(() => svc.login(started.loginId, 'b')).toThrow(/login not found/);
+    svc.login(replacement.loginId, 'b').cancel();
   });
 
   it('lets a cancel during post-login verification win: nothing is registered', async () => {
