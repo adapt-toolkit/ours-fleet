@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { FleetError } from '../application/errors.js';
+import { replaceFileAtomically } from '../atomic-file.js';
 import {
   claudeAuthStatus, claudeLoginExpiry, codexUsageWindows, defaultBinaries, profileEnv, withCodex,
   type SubscriptionBinaries, type UsageWindow,
@@ -30,6 +31,8 @@ export interface ProfileUsage {
   observedAt?: string;
   /** `pull`: asked the provider. `agent`: last value an agent session reported. */
   source: 'pull' | 'agent' | 'probe' | 'none';
+  /** A probe received an explicit limit error, even if no percentages were sent. */
+  exhausted?: boolean;
 }
 
 export interface ProfileView {
@@ -205,23 +208,32 @@ export class SubscriptionService {
 
   private async completeLogin(provider: SubscriptionProvider, profileId: string, login: ClaudeLogin | CodexDeviceLogin): Promise<void> {
     let label: string | undefined;
+    let email: string | undefined;
     let error = 'sign-in did not complete';
     try {
       if (login instanceof ClaudeLogin) {
         const code = await login.exited;
         if (code === 0 && login.view().state === 'verifying') {
           const status = await claudeAuthStatus(this.bins.claude, profileEnv(HOME_ENV.claude, profileId, profileHome('claude', profileId)));
-          if (status.loggedIn) label = status.email ?? 'Claude account';
+          if (status.loggedIn) { email = status.email; label = status.email ?? 'Claude account'; }
         } else if (login.view().state === 'verifying') error = 'the sign-in code was not accepted';
       } else if (await login.completed) {
         const result = await this.checkCodex(profileId);
         // Only a verified ChatGPT subscription login becomes a profile.
         if (result.health.state === 'ok') {
-          label = result.account?.email ?? 'Codex account';
+          email = result.account?.email;
+          label = email ?? 'Codex account';
           this.checks.set(`${provider}/${profileId}`, result);
         }
       }
-    } catch { error = 'sign-in could not be verified'; }
+      if (label !== undefined) {
+        if (!email?.trim()) { label = undefined; error = 'the CLI did not provide an account email'; }
+        else if (await this.accountAlreadyAdded(provider, email)) {
+          label = undefined;
+          error = 'this account is already added';
+        }
+      }
+    } catch { label = undefined; error = 'sign-in could not be verified'; }
     let registered = false;
     if (label !== undefined) {
       try {
@@ -242,6 +254,27 @@ export class SubscriptionService {
       this.checks.delete(`${provider}/${profileId}`);
     }
     this.options.onChange?.();
+  }
+
+  /** Query the official CLI for each existing profile, including the adopted default. */
+  private async accountAlreadyAdded(provider: SubscriptionProvider, email: string): Promise<boolean> {
+    const wanted = email.trim().toLowerCase();
+    for (const profile of readSubscriptionState().providers[provider].profiles) {
+      const home = profileHome(provider, profile.id);
+      let existing: string | undefined;
+      if (provider === 'claude') {
+        const status = await claudeAuthStatus(this.bins.claude, profileEnv(HOME_ENV.claude, profile.id, home));
+        if (status.loggedIn) existing = status.email;
+      } else {
+        existing = await withCodex(this.bins.codex, profileEnv(HOME_ENV.codex, profile.id, home), async server => {
+          const read = await server.call<{ account: null | { type: string; email?: string | null } }>(
+            'account/read', { refreshToken: false });
+          return read.account?.type === 'chatgpt' ? read.account.email ?? undefined : undefined;
+        });
+      }
+      if (existing?.trim().toLowerCase() === wanted) return true;
+    }
+    return false;
   }
 
   login(loginId: string, owner: string): LoginHandle {
@@ -307,12 +340,17 @@ export class SubscriptionService {
     if (inFlight) return inFlight;
     const run = (async (): Promise<ProfileUsage> => {
       const dir = this.probeUsageDir(profileId);
-      const info = await probeClaudeRateLimit(this.bins.claude, profileId);
-      if (info) {
+      const result = await probeClaudeRateLimit(this.bins.claude, profileId);
+      if (result) {
         mkdirSync(dir, { recursive: true, mode: 0o700 });
-        if (recordClaudeRateLimit(dir, info, new Date(this.now()))) {
-          const usage = readObservedClaudeUsage(dir, this.now());
-          if (usage) { this.options.onChange?.(); return { ...usage, source: 'probe' }; }
+        const observedAt = new Date(this.now()).toISOString();
+        const windows = result.rateLimit && recordClaudeRateLimit(dir, result.rateLimit, new Date(this.now()))
+          ? readObservedClaudeUsage(dir, this.now())?.windows ?? [] : [];
+        if (windows.length || result.exhausted) {
+          const usage: ProfileUsage = { windows, observedAt, source: 'probe', ...(result.exhausted ? { exhausted: true } : {}) };
+          replaceFileAtomically(join(dir, OBSERVED_USAGE_FILE), `${JSON.stringify(usage)}\n`, 0o600);
+          this.options.onChange?.();
+          return usage;
         }
       }
       rmSync(join(dir, OBSERVED_USAGE_FILE), { force: true });
@@ -330,7 +368,7 @@ export class SubscriptionService {
 
   private probedUsage(profileId: string): ProfileUsage | undefined {
     const usage = readObservedClaudeUsage(this.probeUsageDir(profileId), this.now());
-    return usage?.windows.length ? { ...usage, source: 'probe' } : undefined;
+    return usage && (usage.windows.length || usage.exhausted) ? { ...usage, source: 'probe' } : undefined;
   }
 
   private async pins(): Promise<Array<{ roleId: string; stateDir: string; running: boolean; provider: SubscriptionProvider; profileId: string; unmanaged?: string[] }>> {
@@ -360,6 +398,6 @@ export function readObservedClaudeUsage(stateDir: string, now = Date.now()): Pro
   try {
     const raw = JSON.parse(readFileSync(join(stateDir, OBSERVED_USAGE_FILE), 'utf8')) as ProfileUsage;
     const windows = (raw.windows ?? []).filter(w => !w.resetsAt || Date.parse(w.resetsAt) > now);
-    return { windows, observedAt: raw.observedAt, source: 'agent' };
+    return { windows, observedAt: raw.observedAt, source: 'agent', ...(raw.exhausted === true ? { exhausted: true } : {}) };
   } catch { return undefined; }
 }

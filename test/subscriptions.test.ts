@@ -43,6 +43,7 @@ afterEach(() => {
   delete process.env.FAKE_CODEX_EXPIRED;
   delete process.env.FAKE_CLAUDE_NO_LIMIT;
   delete process.env.FAKE_CLAUDE_PROBE_FAIL;
+  delete process.env.FAKE_CLAUDE_PROBE_EXHAUSTED;
 });
 
 async function addProfile(provider: 'claude' | 'codex'): Promise<string> {
@@ -233,6 +234,24 @@ describe('subscription service', () => {
     expect(JSON.stringify(check)).not.toMatch(/SECRET/);
   });
 
+  it('rejects a second Claude login for an account already in a profile or default', async () => {
+    const svc = service();
+    const first = await svc.startLogin('claude', 'b');
+    svc.login(first.loginId, 'b').submitCode('good-code#state123');
+    await svc.login(first.loginId, 'b').done;
+    const second = await svc.startLogin('claude', 'b');
+    svc.login(second.loginId, 'b').submitCode('good-code#state123');
+    await svc.login(second.loginId, 'b').done;
+    expect(svc.login(second.loginId, 'b').view()).toMatchObject({ state: 'failed', error: 'this account is already added' });
+    expect(readSubscriptionState().providers.claude.profiles).toHaveLength(2);
+    writeFileSync(join(root, '.claude', 'fake-login.json'), JSON.stringify({ email: 'second@example.test' }));
+    const third = await svc.startLogin('claude', 'b');
+    svc.login(third.loginId, 'b').submitCode('good-code#state123');
+    await svc.login(third.loginId, 'b').done;
+    expect(svc.login(third.loginId, 'b').view().error).toBe('this account is already added');
+    expect(readSubscriptionState().providers.claude.profiles).toHaveLength(2);
+  });
+
   it('fails a Claude login whose URL is not allowlisted, and removes the half-made home', async () => {
     process.env.FAKE_CLAUDE_URL = 'https://evil.example/oauth';
     const svc = service();
@@ -269,6 +288,16 @@ describe('subscription service', () => {
     process.env.FAKE_CODEX_EXPIRED = '1';
     expect((await svc.check('codex', added.id)).health.state).toBe('expired');
     expect((await svc.check('codex', DEFAULT_PROFILE_ID)).health.state).toBe('signed_out');
+  });
+
+  it('rejects a second Codex device login for the same account', async () => {
+    const svc = service();
+    const first = await svc.startLogin('codex', 'b');
+    await svc.login(first.loginId, 'b').done;
+    const second = await svc.startLogin('codex', 'b');
+    await svc.login(second.loginId, 'b').done;
+    expect(svc.login(second.loginId, 'b').view()).toMatchObject({ state: 'failed', error: 'this account is already added' });
+    expect(readSubscriptionState().providers.codex.profiles).toHaveLength(2);
   });
 
   it('reports unmanaged running agents and non-subscription Claude credentials', async () => {
@@ -381,5 +410,9 @@ describe('subscription service', () => {
     process.env.FAKE_CLAUDE_NO_LIMIT = '1';
     expect(await svc.probeClaudeUsage(id)).toEqual({ source: 'none', windows: [] });
     expect((await svc.list()).find(p => p.provider === 'claude')!.profiles.find(p => p.id === id)!.usage.windows).toEqual([]);
+    process.env.FAKE_CLAUDE_PROBE_EXHAUSTED = '1';
+    const exhausted = await svc.probeClaudeUsage(id);
+    expect(exhausted).toMatchObject({ source: 'probe', exhausted: true, windows: [] });
+    expect((await svc.list()).find(p => p.provider === 'claude')!.profiles.find(p => p.id === id)!.usage.exhausted).toBe(true);
   });
 });

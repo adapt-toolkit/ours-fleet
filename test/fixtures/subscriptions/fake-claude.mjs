@@ -9,6 +9,10 @@ const marker = join(dir, 'fake-login.json');
 const [cmd, sub] = process.argv.slice(2);
 if (process.argv.includes('-p')) {
   if (!existsSync(marker) || process.env.FAKE_CLAUDE_PROBE_FAIL === '1') process.exit(1);
+  if (process.env.FAKE_CLAUDE_PROBE_EXHAUSTED === '1') {
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, result: "You've hit your limit" })}\n`);
+    process.exit(1);
+  }
   process.stdout.write(`${JSON.stringify({ type: 'system', message: 'started' })}\n`);
   if (process.env.FAKE_CLAUDE_NO_LIMIT !== '1')
     process.stdout.write(`${JSON.stringify({ type: 'rate_limit_event', rate_limit_info: {
