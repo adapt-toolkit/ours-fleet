@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, chmodSync, statSync, rmSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -11,6 +11,13 @@ describe('agent attachment storage',()=>{
   const dir=temp(),body=input('../../metadata.json'),a=storeAgentAttachment(dir,'gen1',body),b=storeAgentAttachment(dir,'gen1',body);expect(a).toEqual(b);
   const prompt=attachmentPrompt(dir,'gen1',[a.id],'Read this');const files=JSON.parse(prompt.slice(prompt.indexOf('[\n')));expect(readFileSync(files[0].path).toString()).toBe('exact file bytes');expect(files[0].path.startsWith(join(dir,'web-attachments',a.id)+'/')).toBe(true);expect(attachmentPrompt(dir,'gen1',[a.id],'Read this')).toBe(prompt);
   expect(()=>attachmentPrompt(dir,'gen2',[a.id],'')).toThrow(/different agent session/);expect(()=>attachmentPrompt(temp(),'gen1',[a.id],'')).toThrow();
+ });
+ it.each([0o755,0o775])('accepts normal runtime parent mode %i but keeps upload storage private',(parentMode)=>{
+  const dir=temp();chmodSync(dir,parentMode);const a=storeAgentAttachment(dir,'gen1',input());
+  expect(attachmentPrompt(dir,'gen1',[a.id],'')).toContain('hello.txt');expect(statSync(dir).mode&0o777).toBe(parentMode);
+  const root=join(dir,'web-attachments');expect(statSync(root).mode&0o777).toBe(0o700);expect(statSync(join(root,a.id)).mode&0o777).toBe(0o700);
+  chmodSync(root,0o775);expect(()=>attachmentPrompt(dir,'gen1',[a.id],'')).toThrow(/directory/);expect(()=>storeAgentAttachment(dir,'gen1',input())).toThrow(/directory/);
+  chmodSync(root,0o700);chmodSync(dir,0o777);expect(()=>storeAgentAttachment(dir,'gen1',input())).toThrow(/directory/);
  });
  it('rejects malformed/oversize data and invalid IDs without guessing a file',()=>{
   const dir=temp();expect(()=>storeAgentAttachment(dir,'gen1',{...input(),data:'a=='})).toThrow();expect(()=>storeAgentAttachment(dir,'gen1',input('large',Buffer.alloc(MAX_ATTACHMENT_BYTES+1)))).toThrow(/20 MiB/);expect(() => attachmentPrompt(dir, 'gen1', ['../outside'], '')).toThrow();
