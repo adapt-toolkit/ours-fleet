@@ -1,3 +1,4 @@
+import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY } from './agent-attachments.js';
 import { readChatIdle } from '../temp-idle.js';
 import { agentDir } from '../paths.js';
 import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
@@ -531,12 +532,40 @@ export async function buildWebServer(
       });
     });
 
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/attachments', { bodyLimit: MAX_ATTACHMENT_BODY }, async (request) => {
+    auth.authenticate(request, true);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const body = request.body as { expectedSessionGeneration?: unknown };
+    if (typeof body?.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+      throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+    const control = await services.session(request.params.id);
+    if (!control.conversationPage || !control.submitPromptV2)
+      throw new FleetError('capability_unavailable', 'Session-bound attachments are unavailable');
+    const page = await control.conversationPage({ limit: 1 });
+    if (page.snapshot.sessionGeneration !== body.expectedSessionGeneration)
+      throw new FleetError('stale_state', 'Agent session changed. Select the files again.');
+    return storeAgentAttachment(stateDir, body.expectedSessionGeneration, request.body);
+  });
+
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown };
+    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown; attachments?: unknown };
     if (body?.expectedSessionGeneration !== undefined && (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim()))
       throw new FleetError('invalid_request', 'expectedSessionGeneration must be a nonempty string');
-    const text = String(body?.text ?? '');
+    let text = String(body?.text ?? '');
+    if (body?.attachments !== undefined) {
+      if (typeof body.commandId !== 'string' || !body.commandId.trim()) throw new FleetError('invalid_request', 'commandId is required for attachments');
+      if (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+        throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+      const role = await services.repository.get(request.params.id);
+      if (!role) throw new FleetError('role_not_found', 'Agent not found');
+      const stateDir = services.repository.stateDir(role);
+      if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+      text = attachmentPrompt(stateDir, body.expectedSessionGeneration, body.attachments, text);
+    }
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
     const control = await services.session(request.params.id);

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -97,6 +97,25 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('uploads actual files for the selected generation and expands verified IDs on input', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'fleet-upload-route-'));const calls:any[]=[];let generation='g1';
+    const control={conversationPage:async()=>({snapshot:{sessionGeneration:generation}}),submitPromptV2:async(input:any)=>{calls.push(input);return {state:'starting',promptId:'p'};}};
+    const {server,cookie,csrf}=await authenticated({repository:{get:async(id:string)=>id==='Alpha'?{id}:undefined,stateDir:()=>dir},session:async()=>control});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    const payload={name:'photo.png',mimeType:'image/png',data:Buffer.from([137,80,78,71,0,1,255]).toString('base64'),expectedSessionGeneration:'g1'};
+    try {
+      const denied=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers:{host:boundary.host,cookie,origin:boundary.origin},payload});expect(denied.statusCode).toBe(403);
+      const upload=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(upload.statusCode).toBe(200);const id=upload.json().id;
+      const retry=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(retry.json().id).toBe(id);
+      const body={text:'',commandId:'once',expectedSessionGeneration:'g1',attachments:[id]};
+      const sent=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:body});expect(sent.statusCode).toBe(202);
+      const prompt=calls[0].text;const files=JSON.parse(prompt.slice(prompt.indexOf('[\n')));expect(readFileSync(files[0].path)).toEqual(Buffer.from(payload.data,'base64'));expect(calls[0].expectedSessionGeneration).toBe('g1');
+      await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:body});expect(calls[1]).toEqual(calls[0]);
+      const malformed=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:{...body,attachments:['../private']}});expect(malformed.statusCode).toBe(400);expect(calls).toHaveLength(2);
+      generation='g2';const stale=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(stale.statusCode).toBe(409);
+      const wrong=await server.app.inject({method:'POST',url:'/api/v1/roles/Missing/attachments',headers,payload});expect(wrong.statusCode).toBe(404);
+    }finally{await server.close();rmSync(dir,{recursive:true,force:true});}
+  });
   it('authenticates and forwards selected-task member creation and receipt reads', async () => {
     const taskRooms={addMember:vi.fn().mockResolvedValue({state:'running',requestId:'request-1'}),memberAddition:vi.fn().mockResolvedValue({state:'succeeded'})};
     const {server,cookie,csrf}=await authenticated({taskRooms});
