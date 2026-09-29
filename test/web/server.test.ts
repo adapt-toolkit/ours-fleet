@@ -130,9 +130,10 @@ describe('secure local web host', () => {
       retryTaskLayoutCleanup:vi.fn().mockResolvedValue({operation:'close',status:'launching'}),
       setTaskLayout:vi.fn().mockResolvedValue({...task,state:'backlog'}),withLayoutRooms:vi.fn((t:unknown)=>t),
     };
+    const presetProvenance={read:vi.fn().mockReturnValue({role:{Developer:{status:'predefined',preset:'mission: Build\n'}},brain:{},template:{},layout:{}})};
     const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),defaultLayout:vi.fn().mockReturnValue('work'),validate:vi.fn().mockReturnValue({issues:[]}),
       save:vi.fn().mockResolvedValue({name:'work',revision:'r2'}),remove:vi.fn().mockResolvedValue({name:'work',deleted:true})};
-    const {server,cookie,csrf}=await authenticated({taskRooms,roomLayouts});
+    const {server,cookie,csrf}=await authenticated({taskRooms,roomLayouts,presetProvenance});
     const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
     try {
       const created=await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload:{title:'Ship',layout:'work'}});
@@ -158,6 +159,8 @@ describe('secure local web host', () => {
         expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload})).statusCode).toBe(400);
       expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers:{host:boundary.host,cookie},payload:{layout:null,expectedLayout:'work'}})).statusCode).toBe(403);
       expect(taskRooms.setTaskLayout).toHaveBeenCalledTimes(1);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/configuration/provenance',headers})).json().provenance.role.Developer.status).toBe('predefined');
+      expect((await server.app.inject({method:'GET',url:'/api/v1/configuration/provenance',headers:{host:boundary.host}})).statusCode).toBe(401);
       expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}],default_layout:'work'});
       const saved=await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{revision:'r1',definition:{version:1}}});
       expect(saved.json()).toEqual({name:'work',revision:'r2'});expect(roomLayouts.save).toHaveBeenCalledWith('work','r1',{version:1});

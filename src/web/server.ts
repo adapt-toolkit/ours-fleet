@@ -33,6 +33,7 @@ import type { RoleRemovalService } from '../application/role-removal-service.js'
 import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
 import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
+import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
 
@@ -53,6 +54,7 @@ export interface WebServices {
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
   roomLayouts?: RoomLayoutDefinitions;
+  presetProvenance?: PresetProvenance;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
 }
 
@@ -455,6 +457,11 @@ export async function buildWebServer(
     });
   }
 
+  app.get('/api/v1/configuration/provenance', async request => {
+    auth.authenticate(request);
+    if (!services.presetProvenance) throw new FleetError('capability_unavailable', 'preset provenance is unavailable');
+    return { provenance: services.presetProvenance.read() };
+  });
   app.get('/api/v1/configuration', async request => {
     auth.authenticate(request);
     if (!services.configuration)
