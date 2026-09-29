@@ -1,0 +1,19 @@
+version: 1
+description: Same agents retain their sessions across rooms
+participants:
+  architect:
+    agent_template: Architect
+  developer:
+    agent_template: Developer
+  reviewer:
+    agent_template: Reviewer
+rooms:
+  product:
+    goal: Agree on the problem and acceptance criteria
+    members: [architect, reviewer]
+  design:
+    goal: Design the accepted solution
+    members: [architect, developer, reviewer]
+  delivery:
+    goal: Implement and verify the accepted design
+    members: [developer, reviewer]

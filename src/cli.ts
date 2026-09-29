@@ -72,6 +72,7 @@ import {
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import './harness/hermes.js';
+import { registerLayoutCommands } from './rooms-tasks/layout-cli.js';
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 import { RoleCreationService } from './application/role-creation-service.js';
 import { RoleRemovalService } from './application/role-removal-service.js';
@@ -1436,6 +1437,7 @@ function configureWebAccess(opts: {
 }
 
 // ── rooms & tasks ──────────────────────────────────────────────────────────
+registerLayoutCommands(program, cOpt);
 registerTemplateCommands(program, cOpt);
 registerTaskCommands(program, cOpt);
 registerRoomCommands(program, cOpt);

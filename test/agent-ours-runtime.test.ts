@@ -237,3 +237,17 @@ it('malformed release response retains cleanup pending', async () => {
     f.cleanup();
   }
 });
+
+it('later room admission preserves serving instance and does not rewrite startup room', async () => {
+  const f = fixture({ temporary: true });
+  try {
+    f.deps.client.addContact = async () => ({ cid: 'ROOM2' }) as any;
+    await f.runtime.prepare(); await f.runtime.startHarness(async () => {});
+    const before = f.runtime.snapshot;
+    await f.runtime.joinAdditionalRoom('private-invite', 'ROOM2');
+    expect(f.runtime.snapshot).toEqual(before);
+    await expect(f.runtime.joinAdditionalRoom('private-invite', 'WRONG')).rejects.toThrow('CID_MISMATCH');
+    await f.runtime.terminal();
+    await expect(f.runtime.joinAdditionalRoom('private-invite', 'ROOM2')).rejects.toThrow('NOT_READY');
+  } finally { f.cleanup(); }
+});
