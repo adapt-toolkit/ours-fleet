@@ -126,9 +126,9 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 10 },
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 11 },
     { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 5 },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 15 },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 16 },
   ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
     const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
@@ -146,6 +146,7 @@ describe('interactive questionnaire', () => {
     if (selected.includes(0)) {
       expect(selects[1].labels).toEqual(expect.arrayContaining([
         expect.stringContaining('GPT-6 Astra (Codex) — gpt-6-astra;'),
+        expect.stringContaining('GPT-6.1 Sol (Codex) — gpt-6.1-sol;'),
       ]));
       const generated = generateSetup(result!);
       for (const work of ['development', 'review', 'coordination'])
