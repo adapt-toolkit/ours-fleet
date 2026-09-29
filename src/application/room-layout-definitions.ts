@@ -49,6 +49,17 @@ export class RoomLayoutDefinitions {
         ? [`participant ${key}: agent template not found: ${participant.agent_template}`] : []);
   }
 
+  /** The configured default (`rooms.defaults.template`, else `tasks.default_room_template`) when it names a usable layout. */
+  defaultLayout(entries = this.list()): string | undefined {
+    let name: string | undefined;
+    try {
+      const config = (this.deps.loadConfiguration ?? loadConfig)(this.configPath);
+      name = config.rooms?.defaults?.template ?? config.tasks?.default_room_template;
+    } catch { return undefined; }
+    const entry = entries.find(e => e.name === name);
+    return entry && !('error' in entry) && !entry.issues.length ? entry.name : undefined;
+  }
+
   list(): LayoutListEntry[] {
     const root = this.root();
     if (!existsSync(root)) return [];

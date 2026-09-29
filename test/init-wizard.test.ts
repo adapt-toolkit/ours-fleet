@@ -16,6 +16,8 @@ import {
 } from '../src/init-wizard.js';
 import { migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
+import { validateRoomLayout } from '../src/rooms-tasks/layout-config.js';
+import { parse as parseYaml } from 'yaml';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
@@ -428,6 +430,17 @@ describe('deterministic default mapping', () => {
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Critic');
     for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
       expect(generated.files.get('room_templates/team.yaml')).toContain(`agent_template: ${role}`);
+    // The same experiences ship as ordinary, editable room layouts: one room each, sessions per participant.
+    const layout = (name: string) => validateRoomLayout(parseYaml(generated.files.get(`room_layouts/${name}.yaml`)!), name);
+    const members = (name: string) => Object.values(layout(name).rooms).map(room => room.members);
+    expect(members('single')).toEqual([['developer']]);
+    expect(members('pair')).toEqual([['developer', 'critic']]);
+    expect(members('team')).toEqual([['local_coordinator', 'developer', 'critic']]);
+    expect(members('engineering')).toEqual([['developer', 'critic']]);
+    for (const name of ['single', 'pair', 'team', 'engineering'])
+      for (const participant of Object.values(layout(name).participants))
+        expect(generated.files.has(`agent_templates/${participant.agent_template}.yaml`)).toBe(true);
+    expect(layout('pair').rooms.task.contract).toContain('Completion requires Developer evidence and Critic sign-off.');
     for (const obsolete of ['Agent', 'Architect', 'Secretary', 'Tester']) {
       expect(generated.files.has(`roles/${obsolete}.yaml`)).toBe(false);
       expect(generated.files.has(`agent_templates/${obsolete}.yaml`)).toBe(false);

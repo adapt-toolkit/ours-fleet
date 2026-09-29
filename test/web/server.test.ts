@@ -130,7 +130,7 @@ describe('secure local web host', () => {
       retryTaskLayoutCleanup:vi.fn().mockResolvedValue({operation:'close',status:'launching'}),
       setTaskLayout:vi.fn().mockResolvedValue({...task,state:'backlog'}),withLayoutRooms:vi.fn((t:unknown)=>t),
     };
-    const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),validate:vi.fn().mockReturnValue({issues:[]}),
+    const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),defaultLayout:vi.fn().mockReturnValue('work'),validate:vi.fn().mockReturnValue({issues:[]}),
       save:vi.fn().mockResolvedValue({name:'work',revision:'r2'}),remove:vi.fn().mockResolvedValue({name:'work',deleted:true})};
     const {server,cookie,csrf}=await authenticated({taskRooms,roomLayouts});
     const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
@@ -139,6 +139,10 @@ describe('secure local web host', () => {
       expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task});
       expect(taskRooms.createTask).toHaveBeenCalledWith(expect.objectContaining({layout:'work',title:'Ship'}));
       expect(taskRooms.launchTaskProvisioning).not.toHaveBeenCalled();
+      // Every task needs a saved layout; room templates and inline room plans are refused before the service.
+      for (const payload of [{title:'Ship'},{title:'Ship',layout:''},{title:'Ship',layout:'work',template:'pair'},{title:'Ship',layout:'work',noRoom:true}])
+        expect((await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload})).statusCode).toBe(400);
+      expect(taskRooms.createTask).toHaveBeenCalledTimes(1);
       expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/layout',headers})).json()).toEqual({layout:{name:'work',rooms:[{key:'design',state:'declared'}]}});
       const open=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers});
       expect(open.statusCode).toBe(202);
@@ -150,10 +154,11 @@ describe('secure local web host', () => {
       const chosen=await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload:{layout:'work',expectedLayout:null}});
       expect(chosen.statusCode).toBe(200);expect(chosen.json().task.state).toBe('backlog');
       expect(taskRooms.setTaskLayout).toHaveBeenCalledWith(expect.objectContaining({taskId:'selected',layout:'work',expectedLayout:null}));
-      expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload:{layout:''}})).statusCode).toBe(400);
+      for (const payload of [{layout:''},{layout:null,expectedLayout:'work'}])
+        expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload})).statusCode).toBe(400);
       expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers:{host:boundary.host,cookie},payload:{layout:null,expectedLayout:'work'}})).statusCode).toBe(403);
       expect(taskRooms.setTaskLayout).toHaveBeenCalledTimes(1);
-      expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}]});
+      expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}],default_layout:'work'});
       const saved=await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{revision:'r1',definition:{version:1}}});
       expect(saved.json()).toEqual({name:'work',revision:'r2'});expect(roomLayouts.save).toHaveBeenCalledWith('work','r1',{version:1});
       expect((await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{definition:{}}})).statusCode).toBe(400);
@@ -213,7 +218,7 @@ describe('secure local web host', () => {
     expect((await server.app.inject({ method: 'GET', url: '/api/v1/tasks?list=default&groupByList=true',
       headers: readHeaders })).json()).toHaveProperty('groups');
     expect((await server.app.inject({ method: 'POST', url: '/api/v1/tasks', headers: writeHeaders,
-      payload: { title: 'Task', backlog: true, list: 'default' } })).statusCode).toBe(201);
+      payload: { title: 'Task', backlog: true, list: 'default', layout: 'single' } })).statusCode).toBe(201);
     expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/tasks/task-id/list', headers: writeHeaders,
       payload: { list: 'default' } })).statusCode).toBe(200);
     const rejected = await server.app.inject({ method: 'POST', url: '/api/v1/task-lists',
@@ -224,7 +229,9 @@ describe('secure local web host', () => {
   });
   it('runs accepted task workers and distinguishes pending settlement from completion', async () => {
     const task = { task_id: 't', terminal_intent: { status: 'pending' } };
+    let layout: object | undefined;
     const taskRooms = {
+      getTask: vi.fn(() => ({ task: { task_id: 't', layout } })),
       startTask: vi.fn(async () => task),
       launchTaskProvisioning: vi.fn(async () => ({ kind: 'in_progress' })),
       finishTask: vi.fn(async () => ({ task, settlementRequired: true })),
@@ -234,6 +241,11 @@ describe('secure local web host', () => {
     const { server, cookie, csrf } = await authenticated({ taskRooms });
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
     const call = (action: string) => server.app.inject({ method: 'POST', url: `/api/v1/tasks/t/${action}`, headers, payload: {} });
+    // Start is refused until the task has a layout.
+    const unchosen = await call('start');
+    expect(unchosen.statusCode).toBe(409); expect(unchosen.json().error.message).toMatch(/choose a room layout/);
+    expect(taskRooms.startTask).not.toHaveBeenCalled();
+    layout = { name: 'single', run_id: 'task-t', definition_hash: 'h' };
     expect((await call('start')).statusCode).toBe(202);
     expect(taskRooms.launchTaskProvisioning).toHaveBeenCalledWith('t');
     const finish = await call('finish');

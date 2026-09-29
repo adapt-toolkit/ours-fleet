@@ -296,20 +296,22 @@ export async function buildWebServer(
     const body = request.body as Record<string, unknown>;
     if (typeof body?.title !== 'string' || !body.title)
       throw new FleetError('invalid_request', 'title is required');
+    // Every task runs a saved Room Layout; rooms are never defined inline or from room templates here.
+    if (typeof body.layout !== 'string' || !body.layout)
+      throw new FleetError('invalid_request', 'layout is required: choose a room layout from Settings › Room layouts');
+    if (body.template !== undefined || body.noRoom !== undefined)
+      throw new FleetError('invalid_request', 'tasks use room layouts; template and noRoom are not accepted');
     const task = await taskApi(() => requireTaskRooms().createTask({
       actor: { kind: 'local_control', surface: 'web' }, title: body.title as string,
       brief: typeof body.brief === 'string' ? body.brief : undefined,
-      template: typeof body.template === 'string' ? body.template : undefined,
-      backlog: body.backlog === true, noRoom: body.noRoom === true,
+      backlog: body.backlog === true,
       list: typeof body.list === 'string' ? body.list : undefined,
-      layout: typeof body.layout === 'string' && body.layout ? body.layout : undefined,
+      layout: body.layout as string,
       idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
     }));
-    const provisioning = task.room_id && !task.layout
-      ? await taskApi(() => requireTaskRooms().launchTaskProvisioning(task.task_id)) : undefined;
-    reply.code(201); return { task, ...(provisioning ? { provisioning } : {}) };
+    reply.code(201); return { task };
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);
@@ -352,11 +354,11 @@ export async function buildWebServer(
   app.patch('/api/v1/tasks/:id/layout', async request => {
     const session = auth.authenticate(request, true);
     const body = request.body as { layout?: unknown; expectedLayout?: unknown };
-    const valid = (v: unknown) => v === null || (typeof v === 'string' && v.length > 0);
-    if (!valid(body?.layout) || !valid(body?.expectedLayout))
-      throw new FleetError('invalid_request', 'layout and expectedLayout must be a layout name or null');
+    const name = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+    if (!name(body?.layout) || !(body.expectedLayout === null || name(body.expectedLayout)))
+      throw new FleetError('invalid_request', 'layout must be a layout name; expectedLayout a layout name or null');
     const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
-      taskId: (request.params as { id: string }).id, layout: body.layout as string | null, expectedLayout: body.expectedLayout as string | null }));
+      taskId: (request.params as { id: string }).id, layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
     await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
     return { task: requireTaskRooms().withLayoutRooms(task) };
   });
@@ -392,7 +394,8 @@ export async function buildWebServer(
   };
   app.get('/api/v1/room-layouts', async request => {
     auth.authenticate(request);
-    return { layouts: layouts().list() };
+    const list = layouts().list(), defaultLayout = layouts().defaultLayout(list);
+    return { layouts: list, ...(defaultLayout ? { default_layout: defaultLayout } : {}) };
   });
   app.post('/api/v1/room-layouts/validate', async request => {
     auth.authenticate(request, true);
@@ -426,7 +429,10 @@ export async function buildWebServer(
       return taskApi(async () => {
         switch (action) {
           case 'start': {
-            const task = await api.startTask({ ...input, template: body.template });
+            // A task's layout can be chosen or changed but never removed, so this check cannot go stale.
+            if (!api.getTask(taskId).task.layout)
+              throw new FleetError('conflict', 'choose a room layout for this task before starting it');
+            const task = await api.startTask(input);
             const provisioning = await api.launchTaskProvisioning(taskId);
             if (provisioning.kind !== 'ready') reply.code(202);
             return { task, provisioning };

@@ -15,12 +15,16 @@ let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ours-fleet-presets-')); });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+import { RoomLayoutDefinitions } from '../src/application/room-layout-definitions.js';
 describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
     expect(seeded.revision).toBe(7);
-    expect(seeded.created).toHaveLength(92);
+    expect(seeded.created).toHaveLength(96);
+    // The standard experiences are also seeded as editable, web-visible room layouts.
+    expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
+      .toEqual([['engineering', []], ['pair', []], ['single', []], ['team', []]]);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
       .toEqual(['engineering', 'pair', 'single', 'team']);
@@ -62,7 +66,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
-    expect(second.preserved).toHaveLength(91);
+    expect(second.preserved).toHaveLength(95);
   });
 
   it('creates private files and refuses symlink targets', () => {
