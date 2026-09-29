@@ -21,6 +21,7 @@ import { FleetConfigService } from './fleet-config-service.js';
 import { mergeTopology } from './topology-model.js';
 import { TopologyDraftStore } from './topology-draft-store.js';
 import { TopologyPromoteService } from './topology-promote.js';
+import { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import { doctor } from '../doctor.js';
 import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
@@ -184,6 +185,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
     taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
+    roomLayouts: new RoomLayoutDefinitions(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
     async session(roleId) {
       const role = await repository.get(roleId);

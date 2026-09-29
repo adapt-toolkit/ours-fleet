@@ -121,6 +121,14 @@ export interface TaskDeletionIntent {
   first_recovery_hint?: string;
 }
 
+export interface TaskLayoutLink {
+  name: string;
+  /** Deterministic `task-<task_id>` Room Layout run ID. */
+  run_id: string;
+  /** sha256 of the canonical source layout definition the run must snapshot. */
+  definition_hash: string;
+}
+
 export interface TaskRecord {
   workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
@@ -143,6 +151,8 @@ export interface TaskRecord {
     plan_hash: string;
   };
   no_room?: boolean;
+  /** Multi-room task: rooms and participants come from a Room Layout run. */
+  layout?: TaskLayoutLink;
   room_id?: string;
   room_identity_cid?: string;
   member_roles: TaskMemberRole[];

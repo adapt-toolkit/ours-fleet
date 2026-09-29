@@ -147,6 +147,7 @@ export interface CreateTaskInput {
   idempotency_key?: string;
   start?: boolean;
   no_room?: boolean;
+  layout?: { name: string; definition_hash: string };
   room_id?: string;
   listId?: string;
 }
@@ -159,7 +160,10 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     const requestedPlan = input.execution_plan?.plan_hash;
     const existingPolicy = storedRoomLaunchPolicy(existing.execution_plan?.room_policy);
     const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
-    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy))
+    const existingLayout = existing.layout && `${existing.layout.name}@${existing.layout.definition_hash}`;
+    const requestedLayout = input.layout && `${input.layout.name}@${input.layout.definition_hash}`;
+    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy)
+        || existingLayout !== requestedLayout)
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
     return withTaskLock(existing.task_id, () => {
       const fresh = readTask(existing.task_id);
@@ -169,9 +173,12 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     });
   }
 
+  if (input.layout && (input.execution_plan || input.no_room || input.room_id))
+    throw new TaskStateError('a layout task cannot also use a room template, no-room mode or a room');
   const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
+  const taskId = generateTaskId();
   const record: StoredTaskRecord = {
-    task_id: generateTaskId(),
+    task_id: taskId,
     list_id: input.listId ?? DEFAULT_TASK_LIST_ID,
     title: input.title,
     brief: input.brief,
@@ -180,6 +187,7 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     template: input.template,
     execution_plan: input.execution_plan,
     no_room: input.no_room || undefined,
+    ...(input.layout ? { layout: { name: input.layout.name, run_id: `task-${taskId}`, definition_hash: input.layout.definition_hash } } : {}),
     room_id: input.room_id,
     member_roles: [],
     origin: input.origin,

@@ -32,6 +32,7 @@ import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
+import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
 
@@ -51,6 +52,7 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
+  roomLayouts?: RoomLayoutDefinitions;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
 }
 
@@ -299,11 +301,12 @@ export async function buildWebServer(
       template: typeof body.template === 'string' ? body.template : undefined,
       backlog: body.backlog === true, noRoom: body.noRoom === true,
       list: typeof body.list === 'string' ? body.list : undefined,
+      layout: typeof body.layout === 'string' && body.layout ? body.layout : undefined,
       idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
     }));
-    const provisioning = task.room_id
+    const provisioning = task.room_id && !task.layout
       ? await taskApi(() => requireTaskRooms().launchTaskProvisioning(task.task_id)) : undefined;
     reply.code(201); return { task, ...(provisioning ? { provisioning } : {}) };
   });
@@ -345,8 +348,61 @@ export async function buildWebServer(
     const {id,requestId}=request.params as {id:string;requestId:string};
     return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
   });
+  app.get('/api/v1/tasks/:id/layout', async request => {
+    auth.authenticate(request);
+    return { layout: await taskApi(async () => requireTaskRooms().taskLayout((request.params as { id: string }).id)) };
+  });
+  for (const operation of ['open', 'close'] as const) {
+    app.post(`/api/v1/tasks/:id/layout/rooms/:room/${operation}`, async (request, reply) => {
+      const session = auth.authenticate(request, true);
+      const { id, room } = request.params as { id: string; room: string };
+      const accepted = await taskApi(() => requireTaskRooms().launchTaskLayoutOperation({
+        actor: { kind: 'local_control', surface: 'web' }, taskId: id, room,
+        operation: operation === 'open' ? 'open' : 'close-room',
+      }));
+      await audit.record({ requestId: request.id, browser: session.id, action: `task.layout.${operation}`, result: 'succeeded' });
+      reply.code(202); return { operation: accepted };
+    });
+  }
+  app.post('/api/v1/tasks/:id/layout/cleanup', async (request, reply) => {
+    auth.authenticate(request, true);
+    const accepted = await taskApi(() => requireTaskRooms().retryTaskLayoutCleanup({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+    }));
+    reply.code(202); return { operation: accepted };
+  });
   app.get('/api/v1/task-templates', async request => {
     auth.authenticate(request); return { templates: requireTaskRooms().listTemplates() };
+  });
+  const layouts = (): RoomLayoutDefinitions => {
+    if (!services.roomLayouts) throw new FleetError('capability_unavailable', 'room layout editing is unavailable');
+    return services.roomLayouts;
+  };
+  app.get('/api/v1/room-layouts', async request => {
+    auth.authenticate(request);
+    return { layouts: layouts().list() };
+  });
+  app.post('/api/v1/room-layouts/validate', async request => {
+    auth.authenticate(request, true);
+    return layouts().validate((request.body as { definition?: unknown })?.definition);
+  });
+  app.put('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { revision?: unknown; definition?: unknown };
+    if (typeof body?.revision !== 'string') throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().save((request.params as { name: string }).name, body.revision, body.definition);
+    events.publish('room_layouts.changed', { name: result.name, revision: result.revision });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.save', result: 'succeeded' });
+    return result;
+  });
+  app.delete('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const revision = (request.query as { revision?: string }).revision;
+    if (typeof revision !== 'string' || !revision) throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().remove((request.params as { name: string }).name, revision);
+    events.publish('room_layouts.changed', { name: result.name });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.delete', result: 'succeeded' });
+    return result;
   });
   for (const action of ['start', 'block', 'unblock', 'review', 'finish', 'cancel'] as const) {
     app.post(`/api/v1/tasks/:id/${action}`, async (request, reply) => {

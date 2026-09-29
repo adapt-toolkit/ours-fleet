@@ -1153,6 +1153,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
+  cOpt(taskCmd.command('_layout <id> <operation> [room]', { hidden: true }))
+    .description('internal: run an accepted layout room operation (open, close-room, close)')
+    .option('--json', 'JSON output')
+    .action(async (id: string, operation: string, room: string | undefined, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        if (!['open', 'close-room', 'close'].includes(operation)) throw new Error(`unknown layout operation: ${operation}`);
+        const view = await taskRoomService(opts.configuration).runTaskLayoutOperation({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+          operation: operation as 'open' | 'close-room' | 'close', room,
+        });
+        console.log(JSON.stringify({ schema_version: 1, layout: view }, null, 2));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
   cOpt(taskCmd.command('_settle_delete <id>', { hidden: true }))
     .description('internal: settle a previously accepted task deletion')
     .option('--json', 'JSON output')

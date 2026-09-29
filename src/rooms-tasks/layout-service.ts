@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, loadRoomsConfig, splitRootFor, type AgentTemplateDefinition } from '../config.js';
@@ -9,7 +9,7 @@ import { spawnTemp } from '../spawn.js';
 import { tempSupervisorLiveness } from '../temp-lifecycle.js';
 import { layoutSupervisorId, type LayoutControlRequest } from './layout-control.js';
 import { RoomLayout, type LayoutInstance, type LayoutSupervisor, type RoomLayoutState } from './layout.js';
-import { assertLayoutFile, validLayoutKey, readRoomLayouts, type RoomLayoutDefinition } from './layout-config.js';
+import { assertLayoutFile, validLayoutKey, readRoomLayout, readRoomLayouts, type RoomLayoutDefinition } from './layout-config.js';
 import { createCoworkAdapter } from './cowork-adapter.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
@@ -83,8 +83,19 @@ export class RoomLayoutService {
         throw Error(`room layout ${name}: agent template not found: ${participant.agent_template}`);
     return layouts;
   }
+  /** Reads only the named file, so an unrelated broken layout cannot block this one. */
   definition(name: string): RoomLayoutDefinition {
-    const def = this.list()[name]; if (!def) throw Error(`room layout not found: ${name}`); return def;
+    if (!validLayoutKey(name)) throw Error(`room layout not found: ${name}`);
+    const root = join(splitRootFor(this.configPath ?? defaultConfigPath()), 'room_layouts');
+    const files = existsSync(root) ? (assertLayoutFile(root, true), readdirSync(root).filter(f => f === `${name}.yaml` || f === `${name}.yml`)) : [];
+    if (files.length > 1) throw Error(`duplicate room layout: ${name}`);
+    if (!files.length) throw Error(`room layout not found: ${name}`);
+    const def = readRoomLayout(join(root, files[0]));
+    const cfg = loadConfig(this.configPath);
+    for (const participant of Object.values(def.participants))
+      if (participant.agent_template && !cfg.agentTemplates?.[participant.agent_template])
+        throw Error(`room layout ${name}: agent template not found: ${participant.agent_template}`);
+    return def;
   }
   supervisor(id = 'inspect', templates: Record<string, AgentTemplateDefinition> = {}): NativeLayoutSupervisor {
     return new NativeLayoutSupervisor(this.configPath, id, templates);
@@ -104,14 +115,18 @@ export class RoomLayoutService {
     return new RoomLayout(layoutRunPath(id), () => createCoworkAdapter(),
       this.supervisor(id, snapshot.agent_templates ?? {}), cleanup ? undefined : this.owner());
   }
-  async create(name: string, bindings: Record<string, LayoutInstance> = {}, id = `run-${randomUUID()}`): Promise<{ id: string; state: RoomLayoutState }> {
+  /** `scope` lets an owner (e.g. a Task) snapshot an adjusted definition and pin agent working directories. */
+  async create(name: string, bindings: Record<string, LayoutInstance> = {}, id = `run-${randomUUID()}`,
+    scope: { definition?: (source: RoomLayoutDefinition) => RoomLayoutDefinition; cwd?: string } = {}): Promise<{ id: string; state: RoomLayoutState }> {
     const cfg = loadConfig(this.configPath);
-    const definition = this.definition(name), templates: Record<string, AgentTemplateDefinition> = {};
+    const source = this.definition(name);
+    const definition = scope.definition ? scope.definition(structuredClone(source)) : source;
+    const templates: Record<string, AgentTemplateDefinition> = {};
     for (const [key, participant] of Object.entries(definition.participants)) {
       if (bindings[key] || !participant.agent_template) continue;
       const template = cfg.agentTemplates?.[participant.agent_template];
       if (!template) throw Error(`agent template not found: ${participant.agent_template}`);
-      templates[participant.agent_template] = structuredClone(template);
+      templates[participant.agent_template] = { ...structuredClone(template), ...(scope.cwd ? { cwd: scope.cwd } : {}) };
     }
     const engine = this.engine(id);
     await engine.create(definition, layoutSupervisorId(), bindings, templates);

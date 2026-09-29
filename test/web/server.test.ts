@@ -121,6 +121,39 @@ describe('secure local web host', () => {
       const wrong=await server.app.inject({method:'POST',url:'/api/v1/roles/Missing/attachments',headers,payload});expect(wrong.statusCode).toBe(404);
     }finally{await server.close();rmSync(dir,{recursive:true,force:true});}
   });
+  it('creates layout tasks without legacy provisioning and routes layout room operations', async () => {
+    const task={task_id:'selected',state:'active',layout:{name:'work',run_id:'task-selected',definition_hash:'h'}};
+    const taskRooms={
+      createTask:vi.fn().mockResolvedValue(task),launchTaskProvisioning:vi.fn(),
+      taskLayout:vi.fn().mockReturnValue({name:'work',rooms:[{key:'design',state:'declared'}]}),
+      launchTaskLayoutOperation:vi.fn().mockResolvedValue({operation:'open',room:'design',status:'launching'}),
+      retryTaskLayoutCleanup:vi.fn().mockResolvedValue({operation:'close',status:'launching'}),
+    };
+    const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),validate:vi.fn().mockReturnValue({issues:[]}),
+      save:vi.fn().mockResolvedValue({name:'work',revision:'r2'}),remove:vi.fn().mockResolvedValue({name:'work',deleted:true})};
+    const {server,cookie,csrf}=await authenticated({taskRooms,roomLayouts});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    try {
+      const created=await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload:{title:'Ship',layout:'work'}});
+      expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task});
+      expect(taskRooms.createTask).toHaveBeenCalledWith(expect.objectContaining({layout:'work',title:'Ship'}));
+      expect(taskRooms.launchTaskProvisioning).not.toHaveBeenCalled();
+      expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/layout',headers})).json()).toEqual({layout:{name:'work',rooms:[{key:'design',state:'declared'}]}});
+      const open=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers});
+      expect(open.statusCode).toBe(202);
+      expect(taskRooms.launchTaskLayoutOperation).toHaveBeenCalledWith(expect.objectContaining({taskId:'selected',room:'design',operation:'open'}));
+      await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/close',headers});
+      expect(taskRooms.launchTaskLayoutOperation).toHaveBeenLastCalledWith(expect.objectContaining({operation:'close-room'}));
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/cleanup',headers})).statusCode).toBe(202);
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers:{host:boundary.host,cookie}})).statusCode).toBe(403);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}]});
+      const saved=await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{revision:'r1',definition:{version:1}}});
+      expect(saved.json()).toEqual({name:'work',revision:'r2'});expect(roomLayouts.save).toHaveBeenCalledWith('work','r1',{version:1});
+      expect((await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{definition:{}}})).statusCode).toBe(400);
+      expect((await server.app.inject({method:'DELETE',url:'/api/v1/room-layouts/work?revision=r2',headers})).json()).toEqual({name:'work',deleted:true});
+      expect((await server.app.inject({method:'DELETE',url:'/api/v1/room-layouts/work',headers})).statusCode).toBe(400);
+    } finally {await server.close();}
+  });
   it('authenticates and forwards selected-task member creation and receipt reads', async () => {
     const taskRooms={addMember:vi.fn().mockResolvedValue({state:'running',requestId:'request-1'}),memberAddition:vi.fn().mockResolvedValue({state:'succeeded'})};
     const {server,cookie,csrf}=await authenticated({taskRooms});
