@@ -161,7 +161,7 @@ describe('layout tasks', () => {
     const task = await app.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
     const accepted = await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
     expect(accepted).toMatchObject({ operation: 'open', room: 'design', status: 'launching' });
-    expect(launches).toEqual([['task', '_layout', task.task_id, 'open', 'design']]);
+    expect(launches).toEqual([['task', '_layout', task.task_id, 'open', 'design', '--operation-id', accepted.id]]);
     await expect(app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'delivery' }))
       .rejects.toThrow(/already in progress/);
     await expect(app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'close-room', room: 'nope' }))
@@ -182,7 +182,7 @@ describe('layout tasks', () => {
     await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
     const plan = await app.cancelTask({ actor, taskId: task.task_id });
     expect(plan.task.state).toBe('cancelled');
-    expect(launches.at(-1)).toEqual(['task', '_layout', task.task_id, 'close']);
+    expect(launches.at(-1)?.slice(0, 4)).toEqual(['task', '_layout', task.task_id, 'close']);
     await expect(app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/closing/);
     await expect(app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/closing or closed/);
     // The close worker itself: nothing was opened, so the run closes cleanly.
@@ -294,5 +294,38 @@ describe('layout task races and worker boundaries', () => {
     const task = await app().createTask({ actor, title: 'Ship', brief: 'secret plan', layout: 'work', origin: { type: 'web' } });
     expect(taskBriefPath(task).startsWith(task.workspace!.path)).toBe(false);
     expect(existsSync(join(task.workspace!.path, '.ours-task'))).toBe(false);
+  });
+});
+
+describe('operation status ownership', () => {
+  const actor = { kind: 'local_control' as const, surface: 'web' as const };
+  beforeEach(() => writeLayout('work'));
+
+  it('never lets a superseded open worker overwrite the terminal close status', async () => {
+    const launches: string[][] = [];
+    const layouts = new TaskLayouts(config, { launch: async args => { launches.push(args); } });
+    const app = new TaskRoomApplicationService(config, { taskLayouts: layouts });
+    const task = await app.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
+    const open = await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
+    await app.cancelTask({ actor, taskId: task.task_id });
+    const closeId = launches.at(-1)!.at(-1)!;
+    expect(closeId).not.toBe(open.id);
+    // The admitted open worker runs late and fails its preconditions; its status write is discarded.
+    await expect(app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design', operationId: open.id })).rejects.toThrow();
+    expect(layouts.readOperation(task.layout!.run_id)).toMatchObject({ id: closeId, operation: 'close', status: 'launching' });
+    await app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'close', operationId: closeId });
+    expect(layouts.readOperation(task.layout!.run_id)).toMatchObject({ id: closeId, status: 'succeeded' });
+  });
+
+  it('does not resurrect an operation record removed by deletion', async () => {
+    const layouts = new TaskLayouts(config, { launch: async () => {} });
+    const app = new TaskRoomApplicationService(config, { taskLayouts: layouts });
+    const task = await app.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
+    const open = await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
+    await app.requestTaskDeletion({ actor, taskId: task.task_id });
+    await layouts.closeAndForget(task);
+    await expect(layouts.run(getTask(task.task_id), 'open', 'design', open.id)).rejects.toThrow(/being deleted/);
+    expect(layouts.readOperation(task.layout!.run_id)).toBeUndefined();
+    expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(false);
   });
 });

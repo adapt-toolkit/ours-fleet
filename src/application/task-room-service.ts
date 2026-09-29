@@ -245,11 +245,11 @@ export class TaskRoomApplicationService {
   }
 
   /** Worker entry for detached layout operations. */
-  async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room' | 'close'; room?: string }) {
+  async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room' | 'close'; room?: string; operationId?: string }) {
     const task = readTask(input.taskId);
     // Preconditions are enforced inside the worker before side effects; the worker is directly callable.
     if (input.operation === 'open') assertLayoutOpenable(task);
-    await this.layouts().run(task, input.operation, input.room);
+    await this.layouts().run(task, input.operation, input.room, input.operationId);
     return this.layouts().view(task)!;
   }
 

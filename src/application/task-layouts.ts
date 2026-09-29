@@ -4,7 +4,7 @@
  * Room opening and closing reuse the #199 engine in detached workers; each
  * operation's outcome is recorded beside the run so HTTP callers can observe it.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { canonicalJson } from '../canonical-json.js';
@@ -21,7 +21,8 @@ import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
 
 export type TaskLayoutOperation = 'open' | 'close-room' | 'close';
 export interface TaskLayoutOperationRecord {
-  operation: TaskLayoutOperation; room?: string;
+  /** Only the worker holding the current ID may update the record. */
+  id: string; operation: TaskLayoutOperation; room?: string;
   status: 'launching' | 'running' | 'succeeded' | 'failed';
   error?: string; updated_at: string;
 }
@@ -139,6 +140,14 @@ export class TaskLayouts {
     try { return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined; } catch { return undefined; }
   }
 
+  /** Update only the still-current operation; a superseded or forgotten one is never resurrected. */
+  private updateOperation(runId: string, record: Omit<TaskLayoutOperationRecord, 'updated_at'>): Promise<boolean> {
+    return withFileLock(this.operationPath(runId) + '.lock', () => {
+      if (this.readOperation(runId)?.id !== record.id) return false;
+      this.writeOperation(runId, record); return true;
+    });
+  }
+
   private writeOperation(runId: string, record: Omit<TaskLayoutOperationRecord, 'updated_at'>): void {
     layoutRunPath(runId); // validates the ID and creates the private layouts directory
     replaceFileAtomically(this.operationPath(runId), JSON.stringify({ ...record, updated_at: new Date().toISOString() }), 0o600);
@@ -178,7 +187,7 @@ export class TaskLayouts {
       const definition = this.runExists(link) ? this.service().open(link.run_id, true).snapshot().definition : undefined;
       if (definition && !Object.hasOwn(definition.rooms, room)) throw new FleetError('resource_not_found', `unknown layout room: ${room}`);
     }
-    const record = { operation, ...(room ? { room } : {}), status: 'launching' as const };
+    const record = { id: randomUUID(), operation, ...(room ? { room } : {}), status: 'launching' as const };
     await withFileLock(this.operationPath(link.run_id) + '.lock', () => {
       const current = this.readOperation(link.run_id);
       // Full close always proceeds: terminal cleanup must not wait behind an open; the engine lock serializes them.
@@ -186,28 +195,30 @@ export class TaskLayouts {
         throw new FleetError('conflict', `layout operation already in progress: ${current.operation}${current.room ? ' ' + current.room : ''}`);
       this.writeOperation(link.run_id, record);
     });
-    const args = ['task', '_layout', task.task_id, operation, ...(room ? [room] : [])];
+    const args = ['task', '_layout', task.task_id, operation, ...(room ? [room] : []), '--operation-id', record.id];
     const launch = this.deps.launch
       ?? ((cli: string[], name: string) => launchFleetWorker(cli, name, this.configPath, this.deps.binPath?.()));
     try { await launch(args, `task-layout-${task.task_id}`); }
     catch (error) {
-      this.writeOperation(link.run_id, { ...record, status: 'failed', error: `worker failed to start: ${String((error as Error).message ?? error)}` });
+      await this.updateOperation(link.run_id, { ...record, status: 'failed', error: `worker failed to start: ${String((error as Error).message ?? error)}` });
       throw error;
     }
     return this.readOperation(link.run_id)!;
   }
 
   /** Worker body. Errors are recorded and rethrown; unknown engine outcomes stay in run state for inspection. */
-  async run(task: TaskRecord, operation: TaskLayoutOperation, room?: string): Promise<void> {
+  /** Without an ID (direct CLI use) the worker claims a new current operation. */
+  async run(task: TaskRecord, operation: TaskLayoutOperation, room?: string, operationId?: string): Promise<void> {
     const link = task.layout;
     if (!link) throw Error(`task ${task.task_id} has no layout`);
-    const record = { operation, ...(room ? { room } : {}) };
-    this.writeOperation(link.run_id, { ...record, status: 'running' });
+    const record = { id: operationId ?? randomUUID(), operation, ...(room ? { room } : {}) };
+    if (!operationId) await withFileLock(this.operationPath(link.run_id) + '.lock', () => this.writeOperation(link.run_id, { ...record, status: 'running' }));
+    else await this.updateOperation(link.run_id, { ...record, status: 'running' });
     try {
       await this.perform(task, operation, room);
-      this.writeOperation(link.run_id, { ...record, status: 'succeeded' });
+      await this.updateOperation(link.run_id, { ...record, status: 'succeeded' });
     } catch (error) {
-      this.writeOperation(link.run_id, { ...record, status: 'failed', error: (error as Error).message ?? String(error) });
+      await this.updateOperation(link.run_id, { ...record, status: 'failed', error: (error as Error).message ?? String(error) });
       throw error;
     }
   }
@@ -236,8 +247,9 @@ export class TaskLayouts {
     if (!link) return;
     if (this.runExists(link)) await this.service().open(link.run_id, true).close(layoutSupervisorId());
     await this.withTaskLock(link.run_id, async () => {
-      for (const path of [layoutRunPath(link.run_id), this.provenancePath(link.run_id), taskBriefPath(task), this.operationPath(link.run_id)])
+      for (const path of [layoutRunPath(link.run_id), this.provenancePath(link.run_id), taskBriefPath(task)])
         rmSync(path, { force: true });
+      await withFileLock(this.operationPath(link.run_id) + '.lock', () => rmSync(this.operationPath(link.run_id), { force: true }));
     });
   }
 }
