@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -20,7 +20,8 @@ async function testServer(overrides: Record<string, unknown> = {}) {
   const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
   const isolatedServices = { ...services(), ...overrides };
   isolatedServices.audit = new AuditSink(join(dir, 'audit'));
-  return buildWebServer(isolatedServices, boundary, { auth });
+  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Fleet</title>');
+  return buildWebServer(isolatedServices, boundary, { auth, staticRoot: dir });
 }
 
 function services() {
@@ -96,6 +97,107 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('uploads actual files for the selected generation and expands verified IDs on input', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'fleet-upload-route-'));const calls:any[]=[];let generation='g1';
+    const control={conversationPage:async()=>({snapshot:{sessionGeneration:generation}}),submitPromptV2:async(input:any)=>{calls.push(input);return {state:'starting',promptId:'p'};}};
+    const {server,cookie,csrf}=await authenticated({repository:{get:async(id:string)=>id==='Alpha'?{id}:undefined,stateDir:()=>dir},session:async()=>control});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    const payload={name:'photo.png',mimeType:'image/png',data:Buffer.from([137,80,78,71,0,1,255]).toString('base64'),expectedSessionGeneration:'g1'};
+    try {
+      const denied=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers:{host:boundary.host,cookie,origin:boundary.origin},payload});expect(denied.statusCode).toBe(403);
+      const upload=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(upload.statusCode).toBe(200);const id=upload.json().id;
+      const contentUrl='/api/v1/roles/Alpha/attachments/'+id;
+      const anonymous=await server.app.inject({method:'GET',url:contentUrl,headers:{host:boundary.host}});expect(anonymous.statusCode).toBe(401);
+      const content=await server.app.inject({method:'GET',url:contentUrl,headers});expect(content.statusCode).toBe(200);expect(content.rawPayload).toEqual(Buffer.from(payload.data,'base64'));expect(content.headers['x-content-type-options']).toBe('nosniff');expect(content.headers['cache-control']).toBe('private, no-store');expect(content.headers['content-disposition']).toContain('inline');
+      const absent=await server.app.inject({method:'GET',url:contentUrl.replace(id,'0'.repeat(64)),headers});expect(absent.statusCode).toBe(404);
+      const otherRole=await server.app.inject({method:'GET',url:contentUrl.replace('Alpha','Missing'),headers});expect(otherRole.statusCode).toBe(404);
+      const retry=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(retry.json().id).toBe(id);
+      const body={text:'',commandId:'once',expectedSessionGeneration:'g1',attachments:[id]};
+      const sent=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:body});expect(sent.statusCode).toBe(202);
+      const prompt=calls[0].text;const files=JSON.parse(prompt.slice(prompt.indexOf('[\n')));expect(readFileSync(files[0].path)).toEqual(Buffer.from(payload.data,'base64'));expect(calls[0].expectedSessionGeneration).toBe('g1');
+      await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:body});expect(calls[1]).toEqual(calls[0]);
+      const malformed=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:{...body,attachments:['../private']}});expect(malformed.statusCode).toBe(400);expect(calls).toHaveLength(2);
+      generation='g2';const stale=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(stale.statusCode).toBe(409);
+      const wrong=await server.app.inject({method:'POST',url:'/api/v1/roles/Missing/attachments',headers,payload});expect(wrong.statusCode).toBe(404);
+    }finally{await server.close();rmSync(dir,{recursive:true,force:true});}
+  });
+  it('creates layout tasks without legacy provisioning and routes layout room operations', async () => {
+    const task={task_id:'selected',state:'active',layout:{name:'work',run_id:'task-selected',definition_hash:'h'}};
+    const taskRooms={
+      createTask:vi.fn().mockResolvedValue(task),launchTaskProvisioning:vi.fn(),
+      taskLayout:vi.fn().mockReturnValue({name:'work',rooms:[{key:'design',state:'declared'}]}),
+      launchTaskLayoutOperation:vi.fn().mockResolvedValue({operation:'open',room:'design',status:'launching'}),
+      retryTaskLayoutCleanup:vi.fn().mockResolvedValue({operation:'close',status:'launching'}),
+      setTaskLayout:vi.fn().mockResolvedValue({...task,state:'backlog'}),withLayoutRooms:vi.fn((t:unknown)=>t),
+    };
+    const presetProvenance={read:vi.fn().mockReturnValue({role:{Developer:{status:'predefined',preset:'mission: Build\n'}},brain:{},template:{},layout:{}})};
+    const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),defaultLayout:vi.fn().mockReturnValue('work'),validate:vi.fn().mockReturnValue({issues:[]}),
+      save:vi.fn().mockResolvedValue({name:'work',revision:'r2'}),remove:vi.fn().mockResolvedValue({name:'work',deleted:true})};
+    const {server,cookie,csrf}=await authenticated({taskRooms,roomLayouts,presetProvenance});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    try {
+      const created=await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload:{title:'Ship',layout:'work'}});
+      expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task});
+      expect(taskRooms.createTask).toHaveBeenCalledWith(expect.objectContaining({layout:'work',title:'Ship'}));
+      expect(taskRooms.launchTaskProvisioning).not.toHaveBeenCalled();
+      // Every task needs a saved layout; room templates and inline room plans are refused before the service.
+      for (const payload of [{title:'Ship'},{title:'Ship',layout:''},{title:'Ship',layout:'work',template:'pair'},{title:'Ship',layout:'work',noRoom:true}])
+        expect((await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload})).statusCode).toBe(400);
+      expect(taskRooms.createTask).toHaveBeenCalledTimes(1);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/layout',headers})).json()).toEqual({layout:{name:'work',rooms:[{key:'design',state:'declared'}]}});
+      const open=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers});
+      expect(open.statusCode).toBe(202);
+      expect(taskRooms.launchTaskLayoutOperation).toHaveBeenCalledWith(expect.objectContaining({taskId:'selected',room:'design',operation:'open'}));
+      await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/close',headers});
+      expect(taskRooms.launchTaskLayoutOperation).toHaveBeenLastCalledWith(expect.objectContaining({operation:'close-room'}));
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/cleanup',headers})).statusCode).toBe(202);
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers:{host:boundary.host,cookie}})).statusCode).toBe(403);
+      const chosen=await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload:{layout:'work',expectedLayout:null}});
+      expect(chosen.statusCode).toBe(200);expect(chosen.json().task.state).toBe('backlog');
+      expect(taskRooms.setTaskLayout).toHaveBeenCalledWith(expect.objectContaining({taskId:'selected',layout:'work',expectedLayout:null}));
+      for (const payload of [{layout:''},{layout:null,expectedLayout:'work'}])
+        expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload})).statusCode).toBe(400);
+      expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers:{host:boundary.host,cookie},payload:{layout:null,expectedLayout:'work'}})).statusCode).toBe(403);
+      expect(taskRooms.setTaskLayout).toHaveBeenCalledTimes(1);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/configuration/provenance',headers})).json().provenance.role.Developer.status).toBe('predefined');
+      expect((await server.app.inject({method:'GET',url:'/api/v1/configuration/provenance',headers:{host:boundary.host}})).statusCode).toBe(401);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}],default_layout:'work'});
+      const saved=await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{revision:'r1',definition:{version:1}}});
+      expect(saved.json()).toEqual({name:'work',revision:'r2'});expect(roomLayouts.save).toHaveBeenCalledWith('work','r1',{version:1});
+      expect((await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{definition:{}}})).statusCode).toBe(400);
+      expect((await server.app.inject({method:'DELETE',url:'/api/v1/room-layouts/work?revision=r2',headers})).json()).toEqual({name:'work',deleted:true});
+      expect((await server.app.inject({method:'DELETE',url:'/api/v1/room-layouts/work',headers})).statusCode).toBe(400);
+    } finally {await server.close();}
+  });
+  it('authenticates and forwards selected-task member creation and receipt reads', async () => {
+    const taskRooms={addMember:vi.fn().mockResolvedValue({state:'running',requestId:'request-1'}),memberAddition:vi.fn().mockResolvedValue({state:'succeeded'})};
+    const {server,cookie,csrf}=await authenticated({taskRooms});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    const payload={requestId:'request-1',slot:'Reviewer',role:'critic',brain:'codex',agentTemplate:'assistant'};
+    try {
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,payload})).statusCode).toBe(202);
+      expect(taskRooms.addMember).toHaveBeenCalledWith('selected',payload);
+      expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/member-additions/request-1',headers})).json()).toEqual({state:'succeeded'});
+      expect(taskRooms.memberAddition).toHaveBeenCalledWith('selected','request-1');
+      expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers:{host:boundary.host,cookie},payload})).statusCode).toBe(403);
+      expect(taskRooms.addMember).toHaveBeenCalledTimes(1);
+      const {MemberAdditionRejected}=await import('../../src/rooms-tasks/add-member.js');
+      taskRooms.addMember.mockRejectedValueOnce(new MemberAdditionRejected('Slot exists'));
+      const rejected=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,payload});
+      expect(rejected.statusCode).toBe(409);expect(rejected.json()).toMatchObject({accepted:false,error:{code:'member_not_accepted'}});
+    } finally {await server.close();}
+  });
+  it('routes authenticated correspondence GETs to the selected supervisor without MCP',async()=>{
+    const calls:unknown[]=[];const {server,cookie}=await authenticated({session:async(id:string)=>({agentContacts:async()=>{calls.push({id,operation:'contacts'});return {contacts:[{name:'Peer'}]};},agentHistory:async(query:unknown)=>{calls.push({id,query});return {items:[],next_cursor:null};}}),oursTools:{call:()=>{throw Error('must not call MCP');}}});
+    try{const headers={host:boundary.host,cookie};expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers})).json()).toMatchObject({contacts:[{name:'Peer'}]});const peer='B'.repeat(64);expect((await server.app.inject({method:'GET',url:`/api/v1/roles/Selected/messages?peer_cid=${peer}&limit=10&before_seq=4`,headers})).statusCode).toBe(200);expect(calls).toEqual([{id:'Selected',operation:'contacts'},{id:'Selected',query:{peer_cid:peer,limit:10,before_seq:4}}]);expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers:{host:boundary.host}})).statusCode).toBe(401);}finally{await server.close();}
+  });
+  it('serves the login document on an external link without relaxing API fetch metadata', async () => {
+    const { server } = await authenticated();
+    const headers = { host: boundary.host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
+    expect((await server.app.inject({ method: 'GET', url: '/', headers })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/roles', headers })).statusCode).toBe(403);
+    await server.close();
+  });
   it('exposes authenticated task-list and assignment routes through the shared service', async () => {
     const task = { task_id: 'task-id', list_id: 'default', list_name: 'default' };
     const taskRooms = {
@@ -103,7 +205,7 @@ describe('secure local web host', () => {
       createTaskList: vi.fn(async ({ name }) => ({ list_id: 'list-id', name, built_in: false })),
       renameTaskList: vi.fn(async ({ newName }) => ({ list_id: 'list-id', name: newName, built_in: false })),
       deleteTaskList: vi.fn(async () => ({ deleted: { name: 'Work' }, moved: 1 })),
-      listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
+      withLayoutRooms: vi.fn((t: unknown) => t), listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
       createTask: vi.fn(async () => task), moveTask: vi.fn(async () => task),
     };
     const { server, cookie, csrf } = await authenticated({ taskRooms });
@@ -119,7 +221,7 @@ describe('secure local web host', () => {
     expect((await server.app.inject({ method: 'GET', url: '/api/v1/tasks?list=default&groupByList=true',
       headers: readHeaders })).json()).toHaveProperty('groups');
     expect((await server.app.inject({ method: 'POST', url: '/api/v1/tasks', headers: writeHeaders,
-      payload: { title: 'Task', backlog: true, list: 'default' } })).statusCode).toBe(201);
+      payload: { title: 'Task', backlog: true, list: 'default', layout: 'single' } })).statusCode).toBe(201);
     expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/tasks/task-id/list', headers: writeHeaders,
       payload: { list: 'default' } })).statusCode).toBe(200);
     const rejected = await server.app.inject({ method: 'POST', url: '/api/v1/task-lists',
@@ -128,9 +230,38 @@ describe('secure local web host', () => {
     expect(taskRooms.moveTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task-id', list: 'default' }));
     await server.close();
   });
+  it('runs accepted task workers and distinguishes pending settlement from completion', async () => {
+    const task = { task_id: 't', terminal_intent: { status: 'pending' } };
+    let layout: object | undefined;
+    const taskRooms = {
+      getTask: vi.fn(() => ({ task: { task_id: 't', layout } })),
+      startTask: vi.fn(async () => task),
+      launchTaskProvisioning: vi.fn(async () => ({ kind: 'in_progress' })),
+      finishTask: vi.fn(async () => ({ task, settlementRequired: true })),
+      cancelTask: vi.fn(async () => ({ task: { task_id: 't', state: 'cancelled' }, settlementRequired: false })),
+      launchTaskSettlement: vi.fn(async () => task),
+    };
+    const { server, cookie, csrf } = await authenticated({ taskRooms });
+    const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
+    const call = (action: string) => server.app.inject({ method: 'POST', url: `/api/v1/tasks/t/${action}`, headers, payload: {} });
+    // Start is refused until the task has a layout.
+    const unchosen = await call('start');
+    expect(unchosen.statusCode).toBe(409); expect(unchosen.json().error.message).toMatch(/choose a room layout/);
+    expect(taskRooms.startTask).not.toHaveBeenCalled();
+    layout = { name: 'single', run_id: 'task-t', definition_hash: 'h' };
+    expect((await call('start')).statusCode).toBe(202);
+    expect(taskRooms.launchTaskProvisioning).toHaveBeenCalledWith('t');
+    const finish = await call('finish');
+    expect(finish.statusCode).toBe(202); expect(finish.json().pending).toBe(true);
+    expect(taskRooms.launchTaskSettlement).toHaveBeenCalledOnce();
+    const cancel = await call('cancel');
+    expect(cancel.statusCode).toBe(200); expect(cancel.json().pending).toBe(false);
+    expect(taskRooms.launchTaskSettlement).toHaveBeenCalledOnce();
+    await server.close();
+  });
   it('deletes tasks in any state with exact confirmation, bounded settlement, and mutation auth', async () => {
     const taskRooms = {
-      listTasks: vi.fn(() => []),
+      withLayoutRooms: vi.fn((t: unknown) => t), listTasks: vi.fn(() => []),
       requestTaskDeletion: vi.fn(async () => ({ status: 'accepted', task: { task_id: 'task-id' } })),
       launchTaskDeletionWorker: vi.fn(async () => ({ deleted: true, pending: false })),
     };
@@ -208,6 +339,13 @@ describe('secure local web host', () => {
     expect(response.statusCode).toBe(202);
     expect(execute).toHaveBeenCalledWith({ roleId: 'Alpha', action: 'restart_resume',
       actionId: 'restart-action', confirmation: undefined });
+    await server.close();
+  });
+  it.each([false,true])('marks lifecycle rejection not accepted only without prior receipt (%s)', async prior => {
+    const { server,cookie,csrf }=await authenticated({commands:{execute:vi.fn(async()=>{throw Error('validation refused');}),get:vi.fn(()=>prior?{actionId:'same-action',state:'running'}:undefined)}});
+    const response=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/actions',headers:{host:boundary.host,origin:boundary.origin,cookie,'x-csrf-token':csrf},payload:{action:'restart_resume',actionId:'same-action'}});
+    if(prior)expect(response.json().accepted).toBeUndefined();
+    else {expect(response.statusCode).toBe(409);expect(response.json()).toMatchObject({accepted:false,error:{code:'action_not_accepted'}});}
     await server.close();
   });
   it('does not register room or template query routes', async () => {

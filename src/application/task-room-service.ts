@@ -1,3 +1,6 @@
+import type { AddMemberRequest } from '../rooms-tasks/add-member.js';
+import { TaskLayouts, assertLayoutOpenable, writeTaskBrief } from './task-layouts.js';
+import { FleetError } from './errors.js';
 import { readFileSync } from 'node:fs';
 import { taskLiveReadiness, type LiveReadinessDeps, type TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
 
@@ -15,7 +18,7 @@ import {
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
-  updateTaskExecutionPlan,
+  updateTaskExecutionPlan, updateTaskBrief, updateTaskLayout,
 } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
@@ -130,6 +133,8 @@ export interface CreateTaskRequest {
   list?: string;
   members?: MemberOverrides;
   anonymous?: boolean;
+  /** Room Layout name: the task's rooms and participants come from a layout run. */
+  layout?: string;
 }
 export interface CreateRoomRequest {
   actor: TaskRoomActor;
@@ -150,6 +155,7 @@ export function resolveRoomLaunchPolicy(
 }
 
 export interface TaskRoomServiceDeps {
+  taskLayouts?: TaskLayouts;
   liveReadiness?: LiveReadinessDeps;
   loadConfiguration?(path?: string): FleetConfig;
   cowork?(config: FleetConfig, options?: { timeoutMs: number }): CoworkAdapter;
@@ -168,7 +174,113 @@ export class TaskRoomApplicationService {
     private readonly deps: TaskRoomServiceDeps = {},
   ) {}
 
+  async addMember(taskId: string, request: AddMemberRequest) {
+    const {requestMemberAddition}=await import('../rooms-tasks/add-member.js');
+    const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+    return requestMemberAddition({taskId,request,cfg,configPath:this.configurationPath,
+      cowork:(this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers});
+  }
+  async memberAddition(taskId:string,requestId:string) { const {memberAddition}=await import('../rooms-tasks/add-member.js');return memberAddition(taskId,requestId); }
+
+  private layouts(): TaskLayouts {
+    return this.deps.taskLayouts ?? new TaskLayouts(this.configurationPath, { binPath: this.deps.binPath });
+  }
+
+  private async createLayoutTask(request: CreateTaskRequest): Promise<TaskRecord> {
+    if (request.template || request.noRoom || request.members || request.anonymous !== undefined)
+      throw new FleetError('invalid_request', 'a layout task cannot be combined with a room template, no-room mode, member overrides or anonymity');
+    let layout: { name: string; definition_hash: string };
+    try { layout = this.layouts().resolve(request.layout!); }
+    catch (error) { throw new FleetError('invalid_request', (error as Error).message, { details: { layout: request.layout! } }); }
+    const brief = request.briefFile ? readFileSync(request.briefFile, 'utf8') : request.brief;
+    const task = await withTaskListsLock(() => persistTask({
+      title: request.title, brief, brief_file: request.briefFile, layout,
+      origin: request.origin, idempotency_key: request.idempotencyKey,
+      start: !request.backlog, listId: resolveTaskList(request.list ?? 'default').list_id,
+    }));
+    recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
+      title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
+      list: task.list_name ?? 'default', roomId: undefined, template: `layout:${layout.name}`, agents: [] });
+    return task.state === 'provisioning' ? (await this.ensureLayoutWork(task)).task : task;
+  }
+
+  /** Layout tasks never provision the legacy single room; their run is a local snapshot. */
+  private async ensureLayoutWork(task: TaskRecord): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' }> {
+    if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
+      'task_terminal', 'task terminal', { task: task.task_id, state: task.state });
+    if (task.state === 'active' || task.state === 'review') return { task, status: 'already_active' };
+    if (task.state === 'backlog') {
+      // Verify the pinned source before leaving Backlog, so a stale choice stays editable on the task page.
+      if (!this.layouts().runExists(task.layout!) && this.layouts().resolve(task.layout!.name).definition_hash !== task.layout!.definition_hash)
+        throw new FleetError('conflict', `room layout ${task.layout!.name} changed after it was chosen for this task; choose it again on the task page to use the edited version`);
+      task = transitionTask(task.task_id);
+    }
+    try { await this.layouts().ensureRun(task); }
+    catch (error) {
+      const reason = `layout run could not be created: ${(error as Error).message}`;
+      persistBlockTask(task.task_id, reason);
+      throw new FleetError('conflict', reason, { details: { task: task.task_id } });
+    }
+    return { task: activateTask(task.task_id), status: 'ready' };
+  }
+
+  /** Compact room list for task listings; never fails the listing on an unreadable run. */
+  withLayoutRooms<T extends TaskRecord>(task: T): T & { layout_rooms?: Array<{ key: string; state: string; room_id?: string; identity_cid?: string }> } {
+    if (!task.layout) return task;
+    try {
+      const view = this.layouts().view(task);
+      return { ...task, layout_rooms: (view?.rooms ?? []).map(({ key, state, room_id, identity_cid }) =>
+        ({ key, state, ...(room_id ? { room_id } : {}), ...(identity_cid ? { identity_cid } : {}) })) };
+    } catch { return { ...task, layout_rooms: [] }; }
+  }
+
+  /** Backlog only: choose, change or clear the task's Room Layout before it starts. */
+  async setTaskLayout(input: { actor: TaskRoomActor; taskId: string; layout: string | null; expectedLayout: string | null }): Promise<TaskRecord> {
+    let next: { name: string; definition_hash: string } | null = null;
+    if (input.layout !== null) {
+      try { next = this.layouts().resolve(input.layout); }
+      catch (error) { throw new FleetError('invalid_request', (error as Error).message, { details: { layout: input.layout } }); }
+    }
+    const current = readTask(input.taskId);
+    if (current.layout && this.layouts().runExists(current.layout))
+      throw new FleetError('conflict', 'this task already has a layout run; its room layout is fixed');
+    let result: ReturnType<typeof updateTaskLayout>;
+    try { result = updateTaskLayout(input.taskId, input.expectedLayout, next); }
+    catch (error) {
+      if (error instanceof TaskStateError && !/task not found/.test(error.message)) throw new FleetError('conflict', error.message);
+      throw error;
+    }
+    // Only after the task stopped referencing it; release re-checks every retained reference under its lock.
+    if (result.releasedSnapshot) releaseLaunchSnapshot(result.releasedSnapshot);
+    return result.task;
+  }
+
+  taskLayout(taskId: string) {
+    const task = readTask(taskId);
+    if (!task.layout) throw new FleetError('resource_not_found', 'task has no room layout');
+    return this.layouts().view(task)!;
+  }
+
+  async launchTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room'; room: string }) {
+    const task = readTask(input.taskId);
+    if (!task.layout) throw new FleetError('resource_not_found', 'task has no room layout');
+    if (input.operation === 'open') assertLayoutOpenable(task);
+    else if (task.deletion?.status === 'pending' || task.terminal_intent)
+      throw new FleetError('conflict', 'task is closing; its layout rooms are cleaned up by the terminal operation');
+    return this.layouts().launch(task, input.operation, input.room);
+  }
+
+  /** Worker entry for detached layout operations. */
+  async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room' | 'close'; room?: string; operationId?: string }) {
+    const task = readTask(input.taskId);
+    // Preconditions are enforced inside the worker before side effects; the worker is directly callable.
+    if (input.operation === 'open') assertLayoutOpenable(task);
+    await this.layouts().run(task, input.operation, input.room, input.operationId);
+    return this.layouts().view(task)!;
+  }
+
   async createTask(request: CreateTaskRequest): Promise<TaskRecord> {
+    if (request.layout !== undefined) return this.createLayoutTask(request);
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let template = this.createTemplate(cfg, request.template, request.noRoom);
     if (request.noRoom && request.anonymous !== undefined)
@@ -336,19 +448,39 @@ export class TaskRoomApplicationService {
     });
   }
 
+  editTaskDescription(input: { actor: TaskRoomActor; taskId: string; brief: string; expectedBrief: string }): TaskRecord {
+    const task = updateTaskBrief(input.taskId, input.brief, input.expectedBrief);
+    // Layout rooms reference the brief file, so rooms opened later read the edited brief.
+    if (task.layout) writeTaskBrief(task);
+    return task;
+  }
+
   getTask(taskId: string): {
     task: TaskRecord; orchestration: RoomOrchestrationRecord | undefined;
   } {
-    const task = readTask(taskId);
+    const task = this.withLayoutRooms(readTask(taskId));
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
   }
 
   /** Durable provisioning progress only; use active task start/work for a live readiness check. */
   taskProvisioningOutcome(taskId: string): TaskProvisioningOutcome {
     const task = readTask(taskId);
+    if (task.layout) {
+      const failed = task.state === 'failed';
+      const ready = ['active', 'review', 'done'].includes(task.state);
+      const blocker = task.outcome?.summary ?? task.blocked?.reason;
+      return {
+        kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room: undefined,
+        launch: { template: `layout:${task.layout.name}`, anonymous: false, owner_attached: false },
+        members: { expected: 0, active: 0, launched: 0 },
+        ...(blocker ? { blocker } : {}),
+        ...(!ready && !failed ? { next_action: `Correct the blocker, then run ours-fleet task start ${task.task_id}.` } : {}),
+      };
+    }
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-    const expected = room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
-      ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0;
+    const expected = (room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
+      ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0)
+      + (room?.additional_member_templates ?? []).reduce((n,t)=>n+t.members.reduce((m,s)=>m+s.count,0),0);
     const active = room?.member_seats.filter(seat => seat.seat_state === 'active').length ?? 0;
     const launched = room?.member_seats.filter(seat => seat.launch?.state === 'launched').length ?? 0;
     const failed = task.state === 'failed' || room?.saga.phase === 'failed';
@@ -447,6 +579,9 @@ export class TaskRoomApplicationService {
   async settleTaskDeletion(input: {
     actor: { kind: 'internal_worker'; surface: 'cli' }; taskId: string;
   }): Promise<TaskDeletionSettleResult> {
+    // Layout resources close first; a failure stays a retryable pending deletion.
+    const deleting = (() => { try { return getDeletingTask(input.taskId); } catch { return undefined; } })();
+    if (deleting?.layout) await this.layouts().closeAndForget(deleting);
     const result = await settleTaskDeletion({
       taskId: input.taskId,
       cowork: () => {
@@ -479,7 +614,7 @@ export class TaskRoomApplicationService {
   }): Promise<{ deleted: boolean; pending: boolean; error?: string }> {
     const launch = this.deps.launchDeletionWorker
       ?? ((taskId: string) => launchFleetWorker(
-        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath));
+        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath, this.deps.binPath?.()));
     const errorAtBefore = (() => {
       try { return getDeletingTask(input.taskId).deletion?.error_at; } catch { return undefined; }
     })();
@@ -531,6 +666,22 @@ export class TaskRoomApplicationService {
     return this.acceptTerminal(input.taskId, 'done', roomId, input.outcome);
   }
 
+  /** Terminal layout tasks archive their rooms and retire only agents their run created. */
+  private async withLayoutCleanup(plan: TaskSettlementPlan): Promise<TaskSettlementPlan> {
+    // The task is already terminal; a worker launch failure is recorded on the run for retry.
+    if (plan.task.layout && this.layouts().runExists(plan.task.layout))
+      await this.layouts().launch(plan.task, 'close').catch(() => {});
+    return plan;
+  }
+
+  /** Retry terminal layout cleanup for known resources (e.g. after a failed close). */
+  async retryTaskLayoutCleanup(input: { actor: TaskRoomActor; taskId: string }) {
+    const task = readTask(input.taskId);
+    if (!task.layout || !TASK_TERMINAL_STATES.includes(task.state))
+      throw new TaskStateError('layout cleanup applies to finished or cancelled layout tasks');
+    return this.layouts().launch(task, 'close');
+  }
+
   async cancelTask(input: {
     actor: TaskRoomActor; taskId: string;
   }): Promise<TaskSettlementPlan> {
@@ -540,6 +691,28 @@ export class TaskRoomApplicationService {
     if (task.room_id)
       (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return this.acceptTerminal(input.taskId, 'cancelled', task.room_id);
+  }
+
+  /** Continue accepted operations outside the HTTP connection's lifetime. */
+  async launchTaskSettlement(taskId: string): Promise<TaskRecord> {
+    try {
+      await launchFleetWorker(['task', '_settle', taskId], `task-settle-${taskId}`,
+        this.configurationPath, this.deps.binPath?.());
+    } catch (error) {
+      await recordTaskTerminalIntentError(taskId,
+        error instanceof Error ? error.message : String(error),
+        'The settlement worker could not start. Inspect the task before retrying.');
+    }
+    return readTask(taskId);
+  }
+
+  async launchTaskProvisioning(taskId: string): Promise<TaskProvisioningOutcome> {
+    const outcome = this.taskProvisioningOutcome(taskId);
+    if (outcome.kind === 'in_progress' && !outcome.next_action) {
+      await launchFleetWorker(['task', '_provision', taskId], `task-provision-${taskId}`,
+        this.configurationPath, this.deps.binPath?.());
+    }
+    return outcome;
   }
 
   async settleTask(input: {
@@ -631,7 +804,7 @@ export class TaskRoomApplicationService {
         throw new ConfigError('rooms: configuration is required before creating or querying rooms');
       const cowork = this.deps.cowork ? this.deps.cowork(cfg) : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
       await (this.deps.provisionMembers ?? provisionMembers)({
-        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
+        configPath: this.configurationPath, cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief, goal: task.title,
       });
       task = readTask(task.task_id); room = getRoomRecord(room.room_id);
@@ -698,7 +871,8 @@ export class TaskRoomApplicationService {
     taskId: string, kind: 'done' | 'cancelled', roomId?: string, outcome?: TaskOutcome,
   ): Promise<TaskSettlementPlan> {
     const task = await acceptTaskTerminalIntent({ taskId, kind, roomId, outcome });
-    return { task, settlementRequired: task.terminal_intent?.status === 'pending' && !!roomId };
+    // Every terminal path (complete, finish, cancel) closes a layout task's rooms.
+    return this.withLayoutCleanup({ task, settlementRequired: task.terminal_intent?.status === 'pending' && !!roomId });
   }
 
   listTemplates() {
@@ -840,6 +1014,11 @@ export class TaskRoomApplicationService {
   }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' | 'in_progress' }> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
+    if (task.layout) {
+      if (input.template || input.members || input.anonymous !== undefined)
+        throw new FleetError('invalid_request', 'a layout task cannot take a room template or member overrides');
+      return this.ensureLayoutWork(task);
+    }
     const recordedRoom = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const recordedPolicy = storedRoomLaunchPolicy(
       recordedRoom?.room_policy ?? task.execution_plan?.room_policy);
@@ -993,7 +1172,7 @@ export class TaskRoomApplicationService {
         if (!cfg.rooms)
           throw new ConfigError('rooms: configuration is required before creating or querying rooms');
         const cowork = this.deps.cowork ? this.deps.cowork(cfg) : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
-        await (this.deps.provisionMembers ?? provisionMembers)({ cfg, cowork, roomId: room.room_id,
+        await (this.deps.provisionMembers ?? provisionMembers)({ configPath: this.configurationPath, cfg, cowork, roomId: room.room_id,
           taskId: task.task_id, template: snapshot, binPath: (this.deps.binPath ?? getBinPath)(),
           brief: task.brief, goal: task.title });
         task = readTask(task.task_id);
@@ -1145,7 +1324,7 @@ export class TaskRoomApplicationService {
     room = advanceSaga(room.room_id, 'create_members', 3);
     if (launchTemplate && (launchTemplate.members.length > 0 || attachOwner)) try {
       room = await (this.deps.provisionMembers ?? provisionMembers)({
-        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
+        configPath: this.configurationPath, cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
         goal: task.task_id ? task.title : task.goal,
       });

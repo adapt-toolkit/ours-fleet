@@ -1,8 +1,10 @@
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import type { CommonPermissions } from '../config.js';
+import { boundedJson } from './conversation-normalizer.js';
 import { ConversationEventStore } from './conversation-store.js';
 import type {
   ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
@@ -315,7 +317,9 @@ export class CodexAppServerSession implements AgentSession {
 
   async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     const active = this.activeTurn;
-    if (!active || !this.threadId || !active.nativeTurnId) return { state: 'settled' };
+    if (!active || !this.threadId) return { state: 'settled' };
+    if (!active.nativeTurnId) throw new SessionControlError('backend',
+      'The operation is still pending without a native turn ID. Cancellation is not confirmed; inspect or restart the agent if it does not progress.');
     active.cancellationSource ??= source;
     this.events.emit('state', { turnId: active.promptId, status: 'running', origin: active.origin });
     this.conversation.appendSafe({
@@ -420,6 +424,11 @@ export class CodexAppServerSession implements AgentSession {
     await this.transport.close();
   }
 
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.threadId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.threadId,promptId:this.activeTurn.promptId}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
+
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);
     const requested = Number(request.after ?? 0);
@@ -454,6 +463,8 @@ export class CodexAppServerSession implements AgentSession {
     const bodyDigest = ConversationEventStore.bodyDigest(command.text);
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
+    if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
+      throw new Error('session_changed: Agent session changed. Record a new voice message.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },
@@ -501,6 +512,10 @@ export class CodexAppServerSession implements AgentSession {
     if (effort) this.reasoningEffort = { value: effort };
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `Codex thread ${this.threadId}` });
+    this.conversation.appendSafe({
+      kind: 'capabilities.updated', sessionGeneration: this.sessionGeneration,
+      payload: { commands: [{ name: 'compact', description: textBlock('Compact session context') }] },
+    });
     this.conversation.appendSafe({
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       payload: { status: 'idle' },
@@ -573,6 +588,12 @@ export class CodexAppServerSession implements AgentSession {
       promptId, turnId: promptId, source: sourceFor(origin).source, payload: {},
     });
     try {
+      if (text.trim() === '/compact') {
+        // The acknowledgement is not completion. Standard turn notifications
+        // settle the same queued prompt and durable browser receipt.
+        await this.transport.request('thread/compact/start', { threadId: this.threadId });
+        return await settled;
+      }
       const response = await this.transport.request<JsonObject>('turn/start', {
         threadId: this.threadId,
         input: [{ type: 'text', text, text_elements: [] }],
@@ -823,6 +844,10 @@ export class CodexAppServerSession implements AgentSession {
         toolCallId: scheduled ? 'scheduled-loop-tool' : id, snapshot,
         title: scheduled ? 'scheduled-loop tool' : tool.title, status: tool.status,
         kind: string(item.type),
+        ...(!scheduled && item.arguments !== undefined ? { rawInput: boundedJson(item.arguments) } : {}),
+        ...(!scheduled && item.type === 'commandExecution' ? { rawInput: boundedJson({command:item.command,cwd:item.cwd}), ...(item.aggregatedOutput !== undefined ? { rawOutput: boundedJson({output:item.aggregatedOutput,exitCode:item.exitCode}) } : {}) } : {}),
+        ...(!scheduled && item.type === 'fileChange' && item.changes !== undefined ? { rawOutput: boundedJson(item.changes) } : {}),
+        ...(!scheduled && (item.result !== undefined || item.error !== undefined) ? { rawOutput: boundedJson({result:item.result,error:item.error}) } : {}),
       },
     });
   }

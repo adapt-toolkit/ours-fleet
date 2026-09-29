@@ -1,3 +1,4 @@
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -907,6 +908,8 @@ export class AcpSession implements AgentSession {
     const bodyDigest = ConversationEventStore.bodyDigest(command.text);
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
+    if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
+      throw new Error('session_changed: Agent session changed. Record a new voice message.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },
@@ -1948,6 +1951,11 @@ export class AcpSession implements AgentSession {
   }
 
   // ── conversation ledger access (AgentSession) ─────────────────────────────
+
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.sessionId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.sessionId,promptId:this.activeTurn.id}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);

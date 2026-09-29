@@ -1,3 +1,4 @@
+import type {TaskCreatedNotice,TaskNoticeBinding} from './task-notice.js';
 import type { SessionBackendId } from '../config.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
@@ -383,6 +384,8 @@ export interface AgentSession {
   readonly capabilities?: AgentSessionCapabilities;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  taskNoticeBinding?():TaskNoticeBinding|undefined;
+  recordTaskCreated?(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void;
   // ── durable conversation ledger ────────────────────────────────────────────
   conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
   conversationSnapshot?(): ConversationSnapshot;

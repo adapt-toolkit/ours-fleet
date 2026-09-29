@@ -139,7 +139,11 @@ the caller's owner channel with the caller and spawned-role details. This is an
 honest-actor convenience and attribution path, not a security boundary; host
 shells and deliberately bypassed absolute binaries retain direct behavior.
 
-## Local web console
+## Local web API
+
+Frontend source and builds are maintained in the standalone `ours-web` repository. Fleet builds only its backend API. Configure a separately built frontend static root when serving the unified application through the gateway. The former console source is preserved there under `legacy-fleet/`.
+
+### Console API usage
 
 The interactive console is packaged with `@ours.network/fleet` and binds to
 IPv4 loopback by default. Remote or proxy exposure is always explicit:

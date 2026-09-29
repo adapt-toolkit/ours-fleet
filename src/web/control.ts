@@ -1,3 +1,4 @@
+import { socketPath as privateSocketPath } from '../socket-path.js';
 import { chmodSync, mkdirSync, rmSync } from 'node:fs';
 import { createConnection, createServer, type Server } from 'node:net';
 import { join } from 'node:path';
@@ -6,7 +7,7 @@ import { stateRoot } from '../paths.js';
 
 export type WebControlCommand = 'open' | 'revoke-all';
 
-export const webControlPath = (dir = join(stateRoot(), 'web')) => join(dir, 'control.sock');
+export const webControlPath = (dir = join(stateRoot(), 'web')) => privateSocketPath(join(dir, 'control.sock'));
 
 export interface WebControlServer {
   path: string;

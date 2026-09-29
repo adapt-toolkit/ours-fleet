@@ -1,3 +1,4 @@
+import type {TaskCreatedNotice} from './task-notice.js';
 import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
@@ -16,6 +17,7 @@ export type ConversationEventKind =
   | 'plan.replace'
   | 'tool.upsert' | 'tool.content_chunk'
   | 'permission.requested' | 'permission.resolved'
+  | 'fleet.task_created'
   | 'monitor.delivery'
   | 'usage.updated'
   | 'turn.state' | 'turn.completed'
@@ -27,7 +29,7 @@ export type ConversationEventKind =
 /** Where a conversation record came from. Typed provenance, never prompt text. */
 export type ConversationSource =
   | 'owner_admin_console' | 'owner_channel' | 'fleet_monitor' | 'scheduled_loop' | 'startup'
-  | 'local_console' | 'agent' | 'agent_replay';
+  | 'local_console' | 'agent' | 'agent_replay' | 'fleet_lifecycle';
 
 // ── Normalized content ────────────────────────────────────────────────────────
 // Every text payload is capped; oversized or redacted content keeps its byte
@@ -266,7 +268,7 @@ export type ConversationPayload =
   | PromptStartedPayload | PromptInterruptRequestedPayload | PermissionRequestedPayload
   | PermissionResolvedPayload | TurnStatePayload | TurnCompletedPayload
   | MonitorDeliveryPayload
-  | SessionLifecyclePayload | ErrorPayload;
+  | SessionLifecyclePayload | ErrorPayload | TaskCreatedNotice;
 
 // ── The durable event ────────────────────────────────────────────────────────
 
@@ -304,6 +306,7 @@ export interface ConversationEventV1 {
 // ── Browser commands and receipt transport contracts ────────────────────────
 
 export interface SubmitPromptCommand {
+  expectedSessionGeneration?: string;
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */
   commandId: string;
   text: string;

@@ -147,19 +147,23 @@ export interface CreateTaskInput {
   idempotency_key?: string;
   start?: boolean;
   no_room?: boolean;
+  layout?: { name: string; definition_hash: string };
   room_id?: string;
   listId?: string;
+}
+
+function creationPlan(plan: TaskRecord['execution_plan'], layout?: { name: string; definition_hash: string }): string {
+  return JSON.stringify([plan?.plan_hash ?? null, storedRoomLaunchPolicy(plan?.room_policy) ?? null,
+    layout ? `${layout.name}@${layout.definition_hash}` : null]);
 }
 
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
   const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
+  const requestedPlan = creationPlan(input.execution_plan, input.layout);
   if (existing) {
-    const existingPlan = existing.execution_plan?.plan_hash;
-    const requestedPlan = input.execution_plan?.plan_hash;
-    const existingPolicy = storedRoomLaunchPolicy(existing.execution_plan?.room_policy);
-    const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
-    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy))
+    // After a Backlog plan edit the current plan differs from the one created; retries compare the original request.
+    if ((existing.creation_plan ?? creationPlan(existing.execution_plan, existing.layout)) !== requestedPlan)
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
     return withTaskLock(existing.task_id, () => {
       const fresh = readTask(existing.task_id);
@@ -169,9 +173,12 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     });
   }
 
+  if (input.layout && (input.execution_plan || input.no_room || input.room_id))
+    throw new TaskStateError('a layout task cannot also use a room template, no-room mode or a room');
   const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
+  const taskId = generateTaskId();
   const record: StoredTaskRecord = {
-    task_id: generateTaskId(),
+    task_id: taskId,
     list_id: input.listId ?? DEFAULT_TASK_LIST_ID,
     title: input.title,
     brief: input.brief,
@@ -180,10 +187,12 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     template: input.template,
     execution_plan: input.execution_plan,
     no_room: input.no_room || undefined,
+    ...(input.layout ? { layout: { name: input.layout.name, run_id: `task-${taskId}`, definition_hash: input.layout.definition_hash } } : {}),
     room_id: input.room_id,
     member_roles: [],
     origin: input.origin,
     idempotency_key: key,
+    creation_plan: requestedPlan,
     created_at: new Date().toISOString(),
     started_at: state === 'provisioning' ? new Date().toISOString() : undefined,
   };
@@ -944,5 +953,50 @@ export function beginTaskArchiveCleanup(id: string): void {
     if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
     stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
     writeTask(stored);
+  });
+}
+
+/** Metadata-only edit; compare under the task lock to prevent lost updates. */
+/**
+ * Choose, change or clear a Backlog task's Room Layout before it starts.
+ * `expected` is the layout name the caller saw (null = none); a different
+ * current choice is a stale edit. Choosing a layout drops the sealed room
+ * template plan; the caller releases the returned launch snapshot hash.
+ */
+export function updateTaskLayout(
+  id: string, expected: string | null, next: { name: string; definition_hash: string } | null,
+): { task: TaskRecord; releasedSnapshot?: string } {
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if (task.state !== 'backlog' || task.room_id)
+      throw new TaskStateError(`task ${id} has started; its room layout is fixed (state '${task.state}')`);
+    const current = task.layout?.name ?? null;
+    // A replay of the same choice is idempotent (and refreshes the pinned source hash).
+    if (current !== expected && current !== (next?.name ?? null))
+      throw new TaskStateError(`task ${id} room layout changed to '${current ?? 'one room'}'; reload before changing it`);
+    const releasedSnapshot = next ? task.execution_plan?.snapshot.launch_snapshot_hash : undefined;
+    if (next) {
+      task.layout = { name: next.name, run_id: `task-${task.task_id}`, definition_hash: next.definition_hash };
+      delete task.execution_plan; delete task.template; delete task.no_room;
+    } else delete task.layout;
+    task.room_plan_changed_at = new Date().toISOString();
+    writeTask(task);
+    return { task: readTask(id), ...(releasedSnapshot ? { releasedSnapshot } : {}) };
+  });
+}
+
+export function updateTaskBrief(id: string, brief: string, expectedBrief: string): TaskRecord {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if ((task.brief ?? '') !== expectedBrief && task.brief !== brief)
+      throw new TaskStateError('Description changed elsewhere. Reload the task before saving.');
+    task.brief = brief;
+    writeTask(task);
+    return task;
   });
 }

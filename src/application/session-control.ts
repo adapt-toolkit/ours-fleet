@@ -1,3 +1,5 @@
+import {resumedConversationPage} from './conversation-history.js';
+import type { AgentHistoryQuery } from '../agent-ours/correspondence.js';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt,
@@ -32,6 +34,8 @@ export interface InterruptReceipt {
 }
 
 export interface RoleSessionControl {
+  agentContacts?():Promise<unknown>;
+  agentHistory?(request:AgentHistoryQuery):Promise<unknown>;
   describe(): Promise<SessionDescriptor>;
   snapshot(): Promise<SessionSnapshot>;
   recentOutput(request?: { since?: number; limit?: number }): Promise<OutputPage>;
@@ -41,7 +45,7 @@ export interface RoleSessionControl {
   // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
   submitPromptV2?(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
   interruptV2?(commandId: string): Promise<InterruptReceipt & { commandId: string }>;
@@ -68,6 +72,10 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     private readonly stateDir: string,
     private readonly request: typeof controlRequest = controlRequest,
   ) {}
+
+  async agentContacts():Promise<unknown> {await this.requireCorrespondence();return this.call('agent_contacts');}
+  async agentHistory(request:AgentHistoryQuery):Promise<unknown> {await this.requireCorrespondence();return this.call('agent_history',{agentHistory:request});}
+  private async requireCorrespondence(){if(!(await this.describe()).features.includes('agent_correspondence'))throw new FleetError('capability_unavailable','This session needs an updated supervisor to show contacts and history.');}
 
   async describe(): Promise<SessionDescriptor> {
     const response = await this.call('snapshot');
@@ -127,25 +135,34 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
   }
 
   async conversationPage(request: { after?: string; limit?: number } = {}): Promise<ConversationPageView> {
-    return await this.call('conversation_page', {
+    const live = await this.call('conversation_page', {
       after: request.after, limit: request.limit,
     }) as ConversationPageView;
+    const snapshot = await this.snapshot();
+    if(snapshot.backend!=='acp'||!snapshot.sessionId)return live;
+    try{
+      const history=await resumedConversationPage(this.stateDir,request,live,snapshot.sessionId);
+      const check=await this.call('conversation_page',{limit:1}) as ConversationPageView;
+      return check.snapshot.sessionGeneration===live.snapshot.sessionGeneration?history:await this.call('conversation_page',request) as ConversationPageView;
+    }catch{return live;}
   }
 
   async submitPromptV2(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt> {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
     if (Buffer.byteLength(request.text) > 32 * 1024)
       throw new FleetError('invalid_request', 'text exceeds 32 KiB');
     try {
-      return await this.call('submit_prompt_v2', {
+      return await this.call(request.expectedSessionGeneration ? 'submit_voice_prompt' : 'submit_prompt_v2', {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
-        source: request.source,
+        source: request.source, expectedSessionGeneration: request.expectedSessionGeneration,
       }) as PromptReceipt;
     } catch (error) {
       const fleetError = normalizeError(error);
+      if (fleetError.message.includes('session_changed:'))
+        throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
       if (fleetError.message.includes('idempotency_conflict'))
         throw new FleetError('idempotency_conflict',
           'this command id was already used with a different prompt body');

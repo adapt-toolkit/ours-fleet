@@ -170,6 +170,106 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('rejects stale voice before admission but replays an accepted voice receipt', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'ours-voice-session-'));
+    let server:FakeAppServer;
+    const session=await start(dir,'fresh','allow',async options=>{server=new FakeAppServer(options);return server;});
+    try {
+      const command={commandId:'voice-once',text:'Voice message:\n/compact',actorBrowserSession:'test',source:'owner_admin_console' as const};
+      await expect(session.submitPromptBrowser({...command,expectedSessionGeneration:'old'})).rejects.toThrow('session_changed');
+      expect(server!.requests.some(r=>r.method==='turn/start')).toBe(false);
+      const receipt=await session.submitPromptBrowser({...command,expectedSessionGeneration:session.conversationSnapshot().sessionGeneration});
+      expect(await session.submitPromptBrowser({...command,expectedSessionGeneration:'old'})).toEqual(receipt);
+      await waitFor(()=>server.requests.some(r=>r.method==='turn/start'));
+      expect(server.requests.filter(r=>r.method==='turn/start')).toHaveLength(1);
+      expect(server.requests.some(r=>r.method==='thread/compact/start')).toBe(false);
+    } finally {await session.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
+  it('runs compact as a native operation and waits for its terminal event, deduplicating browser retries', async () => {
+    const dir=mkdtempSync(join(tmpdir(),'ours-native-compact-'));
+    let incoming:CodexAppServerTransportOptions;let server:FakeAppServer;
+    const session=await start(dir,'fresh','allow',async options=>{
+      incoming=options;server=new FakeAppServer(options);
+      const request=server.request.bind(server);
+      server.request=async <T=unknown>(method:string,params:Record<string,unknown>={})=>{
+        if(method==='thread/compact/start'){server.requests.push({method,params});return {} as T;}
+        return request<T>(method,params);
+      };return server;
+    });
+    try {
+      const command={commandId:'compact-once',text:'/compact',actorBrowserSession:'test',source:'owner_admin_console' as const};
+      const receipt=await session.submitPromptBrowser(command);
+      await waitFor(()=>server.requests.some(r=>r.method==='thread/compact/start'));
+      expect(session.snapshot().readiness).toBe('running');
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      expect(server.requests.filter(r=>r.method==='thread/compact/start')).toHaveLength(1);
+      expect(server.requests.some(r=>r.method==='turn/start')).toBe(false);
+      expect(server.requests.find(r=>r.method==='thread/compact/start')?.params).toEqual({threadId:'thread-native-1'});
+      incoming!.onNotification!('turn/started',{threadId:'thread-native-1',turn:{id:'compact-turn',status:'inProgress'}});
+      incoming!.onNotification!('turn/completed',{threadId:'thread-native-1',turn:{id:'compact-turn',status:'completed'}});
+      await waitFor(()=>session.snapshot().readiness==='idle');
+      const events=session.conversationPage!({limit:100}).events;
+      expect(events.some(e=>e.kind==='capabilities.updated'&&JSON.stringify(e.payload).includes('compact'))).toBe(true);
+      expect(events.some(e=>e.kind==='turn.completed'&&e.promptId===receipt.promptId)).toBe(true);
+    }finally{await session.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
+  it.each(['rejected','failed','interrupted','exit','missing-events'])('handles compact %s without false completion or replay', async mode => {
+    const dir=mkdtempSync(join(tmpdir(),'ours-compact-failure-'));
+    let incoming:CodexAppServerTransportOptions;let server:FakeAppServer;
+    const session=await start(dir,'fresh','allow',async options=>{
+      incoming=options;server=new FakeAppServer(options);const request=server.request.bind(server);
+      server.request=async <T=unknown>(method:string,params:Record<string,unknown>={})=>{
+        if(method==='thread/compact/start'){server.requests.push({method,params});if(mode==='rejected')throw Error('compact rejected');return {} as T;}
+        return request<T>(method,params);
+      };return server;
+    });
+    try {
+      const command={commandId:'compact-failure',text:'/compact',actorBrowserSession:'test',source:'owner_admin_console' as const};
+      const receipt=await session.submitPromptBrowser(command);
+      await waitFor(()=>server.requests.some(r=>r.method==='thread/compact/start'));
+      if(mode==='missing-events') {
+        await expect(session.interrupt()).rejects.toThrow('Cancellation is not confirmed');
+        expect(session.snapshot().readiness).toBe('running');
+        expect(session.conversationPage!({limit:100}).events.some(e=>e.kind==='turn.completed'&&e.promptId===receipt.promptId)).toBe(false);
+      } else {
+        if(mode==='exit')server.child.kill('SIGTERM');
+        else if(mode!=='rejected'){
+          incoming!.onNotification!('turn/started',{threadId:'thread-native-1',turn:{id:'compact-negative',status:'inProgress'}});
+          incoming!.onNotification!('turn/completed',{threadId:'thread-native-1',turn:{id:'compact-negative',status:mode}});
+        }
+        await waitFor(()=>session.snapshot().readiness!=='running');
+        const terminal=session.conversationPage!({limit:100}).events.find(e=>e.kind==='turn.completed'&&e.promptId===receipt.promptId);
+        expect(terminal?.payload.outcome).toBe(mode==='interrupted'?'cancelled':'failed');
+      }
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      expect(server.requests.filter(r=>r.method==='thread/compact/start')).toHaveLength(1);
+      expect(server.requests.some(r=>r.method==='turn/start')).toBe(false);
+    }finally{await session.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
+  it('persists bounded native MCP arguments/results and command output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-native-details-'));
+    let incoming: CodexAppServerTransportOptions | undefined;
+    const session = await start(dir, 'fresh', 'ask', async options => { incoming=options; return new FakeAppServer(options); });
+    try {
+      session.setControllerAttached(true);
+      await session.queuePrompt('permission');
+      await waitFor(()=>session.snapshot().readiness==='awaiting_permission');
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'mcp-detail',type:'mcpToolCall',server:'ours',tool:'list_contacts',status:'completed',arguments:{limit:5},result:{content:[{type:'text',text:'Fixture contact'}]}}});
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'shell-detail',type:'commandExecution',command:'printf fixture',cwd:dir,status:'completed',aggregatedOutput:'fixture',exitCode:0}});
+      incoming!.onNotification!('item/completed', {threadId:'thread-native-1',turnId:'turn-1',item:{id:'secret-detail',type:'mcpToolCall',tool:'fixture',arguments:{password:'DO_NOT_RETAIN'},result:{token:'DO_NOT_RETAIN'}}});
+      const page = session.conversationPage!({limit:100});
+      const serialized=JSON.stringify(page);
+      expect(serialized).toContain('Fixture contact');
+      expect(serialized).toContain('exitCode');
+      expect(serialized).not.toContain('DO_NOT_RETAIN');
+      expect(serialized).toContain('rawInput');
+      expect(serialized).toContain('rawOutput');
+    } finally { await session.close(); rmSync(dir,{recursive:true,force:true}); }
+  });
+
   it.each([
     ['allow_once', 'accept', {}],
     ['deny_once', 'decline', null],

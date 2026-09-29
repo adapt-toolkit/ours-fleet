@@ -312,8 +312,10 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
     .replace('brain: { ref: claude-default }', 'brain: { ref: coordination }'));
-  for (const name of ['single', 'pair', 'team', 'engineering'])
+  for (const name of ['single', 'pair', 'team', 'engineering']) {
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
+    files.set(`room_layouts/${name}.yaml`, preset(`room_layouts/${name}.yaml`));
+  }
   return { files, answers };
 }
 
@@ -476,7 +478,7 @@ function writeStaged(stageManifest: string, setup: GeneratedSetup): void {
     replaceFileAtomically(target, contents, 0o600);
     fsyncPath(target);
   }
-  for (const kind of ['agents', 'agent_templates', 'roles', 'brains', 'room_templates'])
+  for (const kind of ['agents', 'agent_templates', 'roles', 'brains', 'room_templates', 'room_layouts'])
     fsyncPath(join(stageRoot, kind));
   fsyncPath(stageRoot);
   fsyncPath(dirname(stageManifest));

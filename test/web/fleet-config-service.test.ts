@@ -32,6 +32,20 @@ describe('split-document fleet configuration service', () => {
     expect(opened.model).not.toHaveProperty('roles');
   });
 
+  it('saves reusable definitions transactionally and rejects stale or invalid references', async () => {
+    const service = new FleetConfigService({ configPath: file });
+    const opened = service.read(true);
+    opened.model.roles!.Review = { mission: 'Review the local workspace' };
+    opened.model.brains!.Runtime = { harness: 'codex', session: 'codex-app-server' };
+    opened.model.agent_templates.Review = { role: { ref: 'Review' }, brain: { ref: 'Runtime' } };
+    await service.write(opened.revision, opened.model);
+    expect(service.read(true).model.roles!.Review.mission).toBe('Review the local workspace');
+    await expect(service.write(opened.revision, opened.model)).rejects.toThrow(/changed since opened/);
+    const next = service.read(true); delete next.model.brains!.Runtime;
+    await expect(service.write(next.revision, next.model)).rejects.toThrow();
+    expect(service.read(true).model.brains!.Runtime.harness).toBe('codex');
+  });
+
   it('adds, edits, and deletes inert Agent Template documents independently of Agents', async () => {
     const service = new FleetConfigService({ configPath: file });
     const opened = service.read();

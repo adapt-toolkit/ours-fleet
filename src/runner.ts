@@ -1,4 +1,5 @@
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
+import { TemporaryChatIdle } from './temp-idle.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
@@ -88,7 +89,7 @@ export interface RunnerDeps {
   createControlServer(
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl'>>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl' | 'setCorrespondence'>>;
   /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
   createLoopManager(
     ...args: ConstructorParameters<typeof ScheduledLoopManager>
@@ -146,12 +147,14 @@ const defaultDeps = (): RunnerDeps => ({
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
 
-function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void) {
+export function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void, session:AgentSession) {
+  const bindings=new Map<string,NonNullable<ReturnType<NonNullable<AgentSession["taskNoticeBinding"]>>>>();
   const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
   return {
     async begin(requestId: string, argv: string[]) {
       let attempt = store.begin(requestId, caller, argv);
       if (attempt.invocation === 'sending') {
+        const binding=session.taskNoticeBinding?.();if(binding)bindings.set(attempt.correlationId,binding);
         log(`[${caller}] fleet proxy command ${attempt.correlationId} `
           + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
         attempt = store.invocation(attempt.correlationId, caller, 'delivered');
@@ -165,6 +168,14 @@ function localFleetAuditor(stateDir: string, caller: string, log: (line: string)
         ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
         ...(input.presentations ? { presentations: input.presentations } : {}),
       });
+      const binding=bindings.get(attempt.correlationId);
+      if(binding&&attempt.outcome?.class==='success'&&attempt.outcome.effect==='completed'){
+        for(const p of attempt.outcome.presentations??[])if(p.kind==='task'&&p.operation==='create'){
+          try { session.recordTaskCreated?.(binding,{operationId:p.eventId,taskId:p.id,title:p.title??p.id,state:p.newState}); }
+          catch { log(`[${caller}] task-created conversation notice could not be persisted`); }
+        }
+        bindings.delete(attempt.correlationId);
+      }
       if (attempt.outcome?.delivery === 'sending')
         attempt = store.outcome(attempt.correlationId, caller, 'delivered');
       return attempt;
@@ -551,7 +562,7 @@ export interface AttemptResult {
   mode: 'fresh' | 'resume';
   modelRecovery?: 'advance' | 'hold';
   /** Present only when a temporary-role lifecycle signal ended the session. */
-  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal';
+  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal' | 'idle-timeout';
 }
 
 /** Continuous authoritative absence required after an identity was observed. */
@@ -801,11 +812,12 @@ export async function runOnce(
         ...(configPath ? { configPath } : {}),
       });
       control = deps.createControlServer(dir, arbiter, deps.log);
+      control.setCorrespondence?.({contacts:()=>managedService.runtime.readContacts(),history:query=>managedService.runtime.readHistory(query)});
       control.setFleetAuditor(ownerChannel ? {
         begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
         present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
-      } : localFleetAuditor(dir, name, deps.log));
+      } : localFleetAuditor(dir, name, deps.log, agentSession));
       control.setLayoutControl?.(createLayoutControl({
         agent: name, temporary: temp, standalone: !role.roomMemberStartup,
         runtime: managedService.runtime, session: arbiter,
@@ -1023,6 +1035,9 @@ export async function runOnce(
     },
   });
 
+  let chatIdle: TemporaryChatIdle | undefined;
+  try { if(temp && !role.roomMemberStartup) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
+  catch { deps.log(`[${name}] automatic idle closure disabled: activity state is unreadable`); }
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
   let nextIdentityPollAt = deps.now();
@@ -1046,6 +1061,14 @@ export async function runOnce(
         void recoveryController.recover(observation.generation).catch(error =>
           deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
       }
+    }
+    let idleExpired=false;
+    try { idleExpired=chatIdle?.observe(sessionHandle.snapshot(),sessionHandle.conversationSnapshot?.().queueDepth ?? -1,now) ?? false; }
+    catch { chatIdle=undefined; deps.log(`[${name}] automatic idle closure disabled: activity state could not be saved`); }
+    if (idleExpired && await arbiter!.retireIfIdle((snapshot,queue)=>chatIdle!.observe(snapshot,queue,deps.now()))) {
+      retirementReason = 'idle-timeout';
+      sessionClosed = true;
+      break;
     }
     if (deps.shouldStop?.()) {
       if (temp) {

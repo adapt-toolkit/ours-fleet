@@ -1,3 +1,6 @@
+import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
+import { readChatIdle } from '../temp-idle.js';
+import { agentDir } from '../paths.js';
 import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -29,6 +32,8 @@ import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
+import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
+import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
 
@@ -48,6 +53,8 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
+  roomLayouts?: RoomLayoutDefinitions;
+  presetProvenance?: PresetProvenance;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
 }
 
@@ -68,7 +75,7 @@ const statusFor = (code: string): number => ({
 export async function buildWebServer(
   services: WebServices,
   boundary: { origin: string; host: string },
-  options: { auth?: WebAuth } = {},
+  options: { auth?: WebAuth; staticRoot?: string } = {},
 ): Promise<WebServer> {
   const app = Fastify({
     trustProxy: false, bodyLimit: 512 * 1024, logger: false,
@@ -86,14 +93,14 @@ export async function buildWebServer(
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
-    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    reply.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
     reply.header('X-Frame-Options', 'DENY');
     reply.header('Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ` +
+      `default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; ` +
       `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
       `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
-    try { auth.validateBoundary(request, false); }
+    try { auth.validateBoundary(request, false, !request.url.startsWith('/api/')); }
     catch (error) {
       if (request.url.startsWith('/api/')) throw error;
       const message = normalizeError(error).message;
@@ -196,7 +203,8 @@ export async function buildWebServer(
 
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
-    return { roles: await services.query.list() };
+    const query = request.query as { includeTemporary?: string };
+    return { roles: await services.query.list(query.includeTemporary === 'true') };
   });
 
   const taskApi = async <T>(fn: () => T | Promise<T>): Promise<T> => {
@@ -208,6 +216,7 @@ export async function buildWebServer(
             ? 'conflict' : 'invalid_request';
         throw new FleetError(code, error.message);
       }
+      if (error instanceof TaskStateError && 'accepted' in error && error.accepted === false) return Promise.reject(Object.assign(new FleetError('invalid_request',error.message),{memberNotAccepted:true}));
       if (error instanceof TaskStateError) {
         throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'conflict', error.message);
       }
@@ -256,9 +265,10 @@ export async function buildWebServer(
     const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
     const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
       ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
+    const api = requireTaskRooms();
     return taskApi(() => query.groupByList === 'true'
-      ? { groups: requireTaskRooms().groupedTasks(filter) }
-      : { tasks: requireTaskRooms().listTasks(filter) });
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => api.withLayoutRooms(task)) })) }
+      : { tasks: api.listTasks(filter).map(task => api.withLayoutRooms(task)) });
   });
   app.delete('/api/v1/tasks/:id', async (request, reply) => {
     auth.authenticate(request, true);
@@ -288,12 +298,17 @@ export async function buildWebServer(
     const body = request.body as Record<string, unknown>;
     if (typeof body?.title !== 'string' || !body.title)
       throw new FleetError('invalid_request', 'title is required');
+    // Every task runs a saved Room Layout; rooms are never defined inline or from room templates here.
+    if (typeof body.layout !== 'string' || !body.layout)
+      throw new FleetError('invalid_request', 'layout is required: choose a room layout from Settings › Room layouts');
+    if (body.template !== undefined || body.noRoom !== undefined)
+      throw new FleetError('invalid_request', 'tasks use room layouts; template and noRoom are not accepted');
     const task = await taskApi(() => requireTaskRooms().createTask({
       actor: { kind: 'local_control', surface: 'web' }, title: body.title as string,
       brief: typeof body.brief === 'string' ? body.brief : undefined,
-      template: typeof body.template === 'string' ? body.template : undefined,
-      backlog: body.backlog === true, noRoom: body.noRoom === true,
+      backlog: body.backlog === true,
       list: typeof body.list === 'string' ? body.list : undefined,
+      layout: body.layout as string,
       idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
@@ -307,11 +322,151 @@ export async function buildWebServer(
     return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
   });
 
+  app.patch('/api/v1/tasks/:id/description', async request => {
+    auth.authenticate(request, true);
+    const body = request.body as { brief?: unknown; expectedBrief?: unknown };
+    if (typeof body?.brief !== 'string' || typeof body.expectedBrief !== 'string' || body.brief.length > 100_000)
+      throw new FleetError('invalid_request', 'brief and expectedBrief must be strings; brief maximum is 100000 characters');
+    return { task: await taskApi(() => requireTaskRooms().editTaskDescription({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+      brief: body.brief as string, expectedBrief: body.expectedBrief as string,
+    })) };
+  });
+
+  app.get('/api/v1/tasks/:id', async request => {
+    auth.authenticate(request);
+    return taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id));
+  });
+  app.post('/api/v1/tasks/:id/members', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
+    try {
+      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+      reply.code(result.state==='running'?202:200);return result;
+    } catch(error) {
+      if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});
+      throw error;
+    }
+  });
+  app.get('/api/v1/tasks/:id/member-additions/:requestId', async request => {
+    auth.authenticate(request);
+    const {id,requestId}=request.params as {id:string;requestId:string};
+    return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
+  });
+  app.patch('/api/v1/tasks/:id/layout', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { layout?: unknown; expectedLayout?: unknown };
+    const name = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+    if (!name(body?.layout) || !(body.expectedLayout === null || name(body.expectedLayout)))
+      throw new FleetError('invalid_request', 'layout must be a layout name; expectedLayout a layout name or null');
+    const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
+      taskId: (request.params as { id: string }).id, layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
+    await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
+    return { task: requireTaskRooms().withLayoutRooms(task) };
+  });
+  app.get('/api/v1/tasks/:id/layout', async request => {
+    auth.authenticate(request);
+    return { layout: await taskApi(async () => requireTaskRooms().taskLayout((request.params as { id: string }).id)) };
+  });
+  for (const operation of ['open', 'close'] as const) {
+    app.post(`/api/v1/tasks/:id/layout/rooms/:room/${operation}`, async (request, reply) => {
+      const session = auth.authenticate(request, true);
+      const { id, room } = request.params as { id: string; room: string };
+      const accepted = await taskApi(() => requireTaskRooms().launchTaskLayoutOperation({
+        actor: { kind: 'local_control', surface: 'web' }, taskId: id, room,
+        operation: operation === 'open' ? 'open' : 'close-room',
+      }));
+      await audit.record({ requestId: request.id, browser: session.id, action: `task.layout.${operation}`, result: 'succeeded' });
+      reply.code(202); return { operation: accepted };
+    });
+  }
+  app.post('/api/v1/tasks/:id/layout/cleanup', async (request, reply) => {
+    auth.authenticate(request, true);
+    const accepted = await taskApi(() => requireTaskRooms().retryTaskLayoutCleanup({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+    }));
+    reply.code(202); return { operation: accepted };
+  });
+  app.get('/api/v1/task-templates', async request => {
+    auth.authenticate(request); return { templates: requireTaskRooms().listTemplates() };
+  });
+  const layouts = (): RoomLayoutDefinitions => {
+    if (!services.roomLayouts) throw new FleetError('capability_unavailable', 'room layout editing is unavailable');
+    return services.roomLayouts;
+  };
+  app.get('/api/v1/room-layouts', async request => {
+    auth.authenticate(request);
+    const list = layouts().list(), defaultLayout = layouts().defaultLayout(list);
+    return { layouts: list, ...(defaultLayout ? { default_layout: defaultLayout } : {}) };
+  });
+  app.post('/api/v1/room-layouts/validate', async request => {
+    auth.authenticate(request, true);
+    return layouts().validate((request.body as { definition?: unknown })?.definition);
+  });
+  app.put('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { revision?: unknown; definition?: unknown };
+    if (typeof body?.revision !== 'string') throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().save((request.params as { name: string }).name, body.revision, body.definition);
+    events.publish('room_layouts.changed', { name: result.name, revision: result.revision });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.save', result: 'succeeded' });
+    return result;
+  });
+  app.delete('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const revision = (request.query as { revision?: string }).revision;
+    if (typeof revision !== 'string' || !revision) throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().remove((request.params as { name: string }).name, revision);
+    events.publish('room_layouts.changed', { name: result.name });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.delete', result: 'succeeded' });
+    return result;
+  });
+  for (const action of ['start', 'block', 'unblock', 'review', 'finish', 'cancel'] as const) {
+    app.post(`/api/v1/tasks/:id/${action}`, async (request, reply) => {
+      auth.authenticate(request, true);
+      const taskId = (request.params as { id: string }).id;
+      const body = (request.body ?? {}) as { reason?: string; template?: string };
+      const input = { actor: { kind: 'local_control' as const, surface: 'web' as const }, taskId };
+      const api = requireTaskRooms();
+      return taskApi(async () => {
+        switch (action) {
+          case 'start': {
+            // A task's layout can be chosen or changed but never removed, so this check cannot go stale.
+            if (!api.getTask(taskId).task.layout)
+              throw new FleetError('conflict', 'choose a room layout for this task before starting it');
+            const task = await api.startTask(input);
+            const provisioning = await api.launchTaskProvisioning(taskId);
+            if (provisioning.kind !== 'ready') reply.code(202);
+            return { task, provisioning };
+          }
+          case 'block':
+            if (typeof body.reason !== 'string' || !body.reason.trim()) throw new FleetError('invalid_request', 'reason is required');
+            return { task: api.blockTask({ ...input, reason: body.reason }) };
+          case 'unblock': return { task: api.unblockTask(input) };
+          case 'review': return { task: api.reviewTask(input) };
+          case 'finish':
+          case 'cancel': {
+            const plan = action === 'finish' ? await api.finishTask(input) : await api.cancelTask(input);
+            const task = plan.settlementRequired ? await api.launchTaskSettlement(taskId) : plan.task;
+            const pending = task.terminal_intent?.status === 'pending';
+            if (pending) reply.code(202);
+            return { task, pending };
+          }
+        }
+      });
+    });
+  }
+
+  app.get('/api/v1/configuration/provenance', async request => {
+    auth.authenticate(request);
+    if (!services.presetProvenance) throw new FleetError('capability_unavailable', 'preset provenance is unavailable');
+    return { provenance: services.presetProvenance.read() };
+  });
   app.get('/api/v1/configuration', async request => {
     auth.authenticate(request);
     if (!services.configuration)
       throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
-    return services.configuration.read();
+    return services.configuration.read((request.query as { includeDefinitions?: string }).includeDefinitions === 'true');
   });
 
   app.post('/api/v1/configuration/preview', async request => {
@@ -389,6 +544,17 @@ export async function buildWebServer(
   });
 
   const oursTools = services.oursTools ?? new SupervisorOursTools();
+  app.get<{Params:{id:string}}>('/api/v1/roles/:id/contacts',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentContacts)throw new FleetError('capability_unavailable','Supervisor contacts API is unavailable');
+    return control.agentContacts();
+  });
+  app.get<{Params:{id:string};Querystring:{peer_cid:string;limit?:string;before_seq?:string}}>('/api/v1/roles/:id/messages',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentHistory)throw new FleetError('capability_unavailable','Supervisor history API is unavailable');
+    return control.agentHistory({peer_cid:request.query.peer_cid,...(request.query.limit!==undefined?{limit:Number(request.query.limit)}:{}),...(request.query.before_seq!==undefined?{before_seq:Number(request.query.before_seq)}:{})});
+  });
+
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/ours/tools', async request => {
     auth.authenticate(request);
     return oursTools.list(request.params.id);
@@ -403,7 +569,8 @@ export async function buildWebServer(
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
     auth.authenticate(request);
-    return services.query.detail(request.params.id);
+    const detail=await services.query.detail(request.params.id);
+    return {...detail, chatIdle: detail.role.lifetime==='temporary' ? readChatIdle(agentDir(request.params.id,true)) ?? null : null};
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/removal-preview', async request => {
@@ -440,16 +607,66 @@ export async function buildWebServer(
       const control = await services.session(request.params.id);
       if (!control.conversationPage)
         throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
-      return control.conversationPage({
+      const page = await control.conversationPage({
         after: request.query.after,
         limit: request.query.limit ? Number(request.query.limit) : undefined,
       });
+      const role = await services.repository.get(request.params.id);
+      const stateDir = role ? services.repository.stateDir(role) : undefined;
+      return { ...page, events: page.events.map(event => presentAttachmentEvent(stateDir, request.params.id, event)) };
     });
+
+  app.get<{ Params: { id: string; attachmentId: string } }>('/api/v1/roles/:id/attachments/:attachmentId', async (request, reply) => {
+    auth.authenticate(request);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const { record, bytes } = readAgentAttachment(stateDir, request.params.attachmentId);
+    const image = /^image\/(png|jpeg|gif|webp|avif)$/.test(record.mimeType);
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    reply.header('Content-Disposition', `${image ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(record.name).replace(/'/g, '%27')}`);
+    return reply.type(image ? record.mimeType : 'application/octet-stream').send(bytes);
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/attachments', { bodyLimit: MAX_ATTACHMENT_BODY }, async (request) => {
+    auth.authenticate(request, true);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const body = request.body as { expectedSessionGeneration?: unknown };
+    if (typeof body?.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+      throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+    const control = await services.session(request.params.id);
+    if (!control.conversationPage || !control.submitPromptV2)
+      throw new FleetError('capability_unavailable', 'Session-bound attachments are unavailable');
+    const page = await control.conversationPage({ limit: 1 });
+    if (page.snapshot.sessionGeneration !== body.expectedSessionGeneration)
+      throw new FleetError('stale_state', 'Agent session changed. Select the files again.');
+    return storeAgentAttachment(stateDir, body.expectedSessionGeneration, request.body);
+  });
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { text?: unknown; commandId?: unknown };
-    const text = String(body?.text ?? '');
+    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown; attachments?: unknown };
+    if (body?.expectedSessionGeneration !== undefined && (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim()))
+      throw new FleetError('invalid_request', 'expectedSessionGeneration must be a nonempty string');
+    let text = String(body?.text ?? '');
+    if (body?.attachments !== undefined) {
+      if (typeof body.commandId !== 'string' || !body.commandId.trim()) throw new FleetError('invalid_request', 'commandId is required for attachments');
+      if (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+        throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+      const role = await services.repository.get(request.params.id);
+      if (!role) throw new FleetError('role_not_found', 'Agent not found');
+      const stateDir = services.repository.stateDir(role);
+      if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+      const originalText = text;
+      text = attachmentPrompt(stateDir, body.expectedSessionGeneration, body.attachments, text);
+      prepareAttachmentPresentation(stateDir, body.expectedSessionGeneration, body.commandId, body.attachments as string[], originalText, text);
+    }
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
     const control = await services.session(request.params.id);
@@ -460,6 +677,7 @@ export async function buildWebServer(
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
         commandId: admittedCommandId, text, source: 'owner_admin_console',
+        expectedSessionGeneration: body.expectedSessionGeneration as string | undefined,
         actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
       });
       await audit.record({
@@ -471,6 +689,8 @@ export async function buildWebServer(
       reply.code(202);
       return receipt;
     }
+    if (body.expectedSessionGeneration !== undefined)
+      throw new FleetError('capability_unavailable', 'session-bound voice input is unavailable for this role');
     const receipt = await control.sendText(text);
     await audit.record({
       requestId: request.id, browser: session.id, roleId: request.params.id,
@@ -544,10 +764,21 @@ export async function buildWebServer(
     const body = request.body as { action?: LifecycleAction; actionId?: string; confirmation?: string };
     if (!body.action || !['start', 'stop', 'restart_resume', 'restart_fresh'].includes(body.action))
       throw new FleetError('invalid_request', 'invalid lifecycle action');
-    const receipt = await services.commands.execute({
-      roleId: request.params.id, action: body.action!,
-      actionId: body.actionId, confirmation: body.confirmation,
-    });
+    let receipt;
+    try {
+      receipt = await services.commands.execute({
+        roleId: request.params.id, action: body.action!,
+        actionId: body.actionId, confirmation: body.confirmation,
+      });
+    } catch (error) {
+      // An existing receipt always wins: a conflicting/repeated action is not a
+      // proof that the original operation was never admitted.
+      if (typeof body.actionId === 'string' && !services.commands.get(body.actionId)) {
+        const normalized = normalizeError(error);
+        return reply.code(409).send({error:{code:'action_not_accepted',message:normalized.message},accepted:false});
+      }
+      throw error;
+    }
     events.publish('action.changed', receipt, request.params.id);
     reply.code(202);
     return receipt;
@@ -647,6 +878,9 @@ export async function buildWebServer(
           socket.send(JSON.stringify(payload));
         };
 
+        const role = await services.repository.get(request.params.id);
+        const stateDir = role ? services.repository.stateDir(role) : undefined;
+        const present = (event: any) => presentAttachmentEvent(stateDir, request.params.id, event);
         const follow = await control.followConversation({
           after,
           onPage: page => {
@@ -656,10 +890,10 @@ export async function buildWebServer(
               firstAvailableCursor: page.firstAvailableCursor,
               lastCursor: page.nextCursor ?? after,
             });
-            if (page.events.length) guardedSend({ type: 'events', events: page.events });
+            if (page.events.length) guardedSend({ type: 'events', events: page.events.map(present) });
             if (page.hasMore) guardedSend({ type: 'resync.required' });
           },
-          onEvent: event => guardedSend({ type: 'events', events: [event] }),
+          onEvent: event => guardedSend({ type: 'events', events: [present(event)] }),
           onClose: reason => {
             if (socket.readyState === socket.OPEN)
               socket.close(4409, (reason ?? 'conversation stream ended').slice(0, 120));
@@ -672,7 +906,7 @@ export async function buildWebServer(
       });
     });
 
-  const staticRoot = join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
+  const staticRoot = options.staticRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
   if (existsSync(staticRoot)) {
     await app.register(fastifyStatic, { root: staticRoot, prefix: '/' });
     app.setNotFoundHandler((request, reply) => {
@@ -694,19 +928,19 @@ export async function buildWebServer(
 function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string, secure = false): void {
   const suffix = secure ? '; Secure' : '';
   reply.header('Set-Cookie', [
-    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${suffix}`,
-    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000${suffix}`,
+    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${suffix}`,
+    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${suffix}`,
   ]);
 }
 
 function setSessionCookie(reply: { header(name: string, value: string | string[]): unknown }, session: string, secure = false): void {
-  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${secure ? '; Secure' : ''}`);
+  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure ? '; Secure' : ''}`);
 }
 
 function clearAuthCookies(reply: { header(name: string, value: string | string[]): unknown }): void {
   reply.header('Set-Cookie', [
-    'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
-    'ofs_device=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
+    'ofs_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+    'ofs_device=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
   ]);
 }
 

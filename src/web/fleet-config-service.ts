@@ -24,6 +24,9 @@ export interface EditableFleetModel {
   manifest: Record<string, unknown>;
   agents: Record<string, Record<string, unknown>>;
   agent_templates: Record<string, Record<string, unknown>>;
+  roles?: Record<string, Record<string, unknown>>;
+  brains?: Record<string, Record<string, unknown>>;
+  room_templates?: Record<string, Record<string, unknown>>;
 }
 
 interface SourceSet {
@@ -71,11 +74,11 @@ export class FleetConfigService {
     this.beforeMutation = options.beforeMutation;
   }
 
-  read(): ConfigReadResult {
+  read(includeDefinitions = false): ConfigReadResult {
     const sources = readSources(this.path);
     try { loadConfig(this.path, { yamlMode: 'strict' }); }
     catch (error) { throw safeError(error, sourceSensitiveValues(sources)); }
-    const raw = modelFrom(sources);
+    const raw = modelFrom(sources, includeDefinitions);
     const redacted = redactModel(raw);
     return {
       path: basename(this.path), exists: true, firstRun: false,
@@ -86,7 +89,7 @@ export class FleetConfigService {
   async preview(baseRevision: string, input: unknown): Promise<ConfigPreviewResult> {
     const current = readSources(this.path);
     assertRevision(baseRevision, current);
-    const currentModel = modelFrom(current);
+    const currentModel = modelFrom(current, !!input && typeof input === 'object' && 'roles' in input);
     const next = restoreRedactions(assertModel(input), currentModel,
       new Set(redactModel(currentModel).paths));
     const proposal = renderProposal(current, next);
@@ -106,7 +109,7 @@ export class FleetConfigService {
     return withFileLock(`${splitRootFor(this.path)}.web-edit.lock`, async () => {
       const current = readSources(this.path);
       assertRevision(baseRevision, current);
-      const currentModel = modelFrom(current);
+      const currentModel = modelFrom(current, !!input && typeof input === 'object' && 'roles' in input);
       const next = restoreRedactions(assertModel(input), currentModel,
         new Set(redactModel(currentModel).paths));
       const proposal = renderProposal(current, next);
@@ -143,6 +146,8 @@ export class FleetConfigService {
           if (contents === undefined) rmSync(target, { force: true });
           else {
             assertWritableTarget(target, current.documents.has(rel));
+            mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+            trustedDirectory(dirname(target));
             replaceFileAtomically(target, contents, 0o600);
             chmodSync(target, 0o600);
           }
@@ -208,7 +213,7 @@ function readSources(manifest: string): SourceSet {
   return { manifest, root, documents };
 }
 
-function modelFrom(sources: SourceSet): EditableFleetModel {
+function modelFrom(sources: SourceSet, includeDefinitions = false): EditableFleetModel {
   const manifestKey = basename(sources.manifest);
   const manifest = parseFleetDocument(sources.manifest, sources.documents.get(manifestKey)!, 'strict').value;
   const agents: Record<string, Record<string, unknown>> = {};
@@ -221,14 +226,21 @@ function modelFrom(sources: SourceSet): EditableFleetModel {
     const id = basename(rel, extname(rel));
     agent_templates[id] = parseFleetDocument(absoluteFor(sources.manifest, rel), source, 'strict').value;
   }
-  return { manifest, agents, agent_templates };
+  const model: EditableFleetModel = { manifest, agents, agent_templates };
+  if (includeDefinitions) for (const kind of ['roles', 'brains', 'room_templates'] as const) {
+    model[kind] = {};
+    for (const [rel, source] of sources.documents) if (rel.startsWith(kind + '/') && ['.yaml', '.yml'].includes(extname(rel))) {
+      model[kind]![basename(rel, extname(rel))] = parseFleetDocument(absoluteFor(sources.manifest, rel), source, 'strict').value;
+    }
+  }
+  return model;
 }
 
 function assertModel(value: unknown): EditableFleetModel {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new FleetError('invalid_request', 'model must be an object');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).sort().join(',') !== 'agent_templates,agents,manifest') throw new FleetError('invalid_request', 'model allows exactly manifest, agents, and agent_templates');
-  for (const key of ['manifest', 'agents', 'agent_templates']) if (!input[key] || typeof input[key] !== 'object' || Array.isArray(input[key]))
+  if (!['agent_templates,agents,manifest', 'agent_templates,agents,brains,manifest,roles,room_templates'].includes(Object.keys(input).sort().join(','))) throw new FleetError('invalid_request', 'model requires manifest, agents, agent_templates and optionally all definition collections');
+  for (const key of Object.keys(input)) if (!input[key] || typeof input[key] !== 'object' || Array.isArray(input[key]))
     throw new FleetError('invalid_request', `${key} must be an object`);
   for (const [id, doc] of Object.entries(input.agents as Record<string, unknown>)) {
     if (!ROLE_NAME_RE.test(id)) throw new FleetError('invalid_request', `invalid Agent ID '${id}'`);
@@ -237,6 +249,12 @@ function assertModel(value: unknown): EditableFleetModel {
   for (const [id, doc] of Object.entries(input.agent_templates as Record<string, unknown>)) {
     if (!ROLE_NAME_RE.test(id)) throw new FleetError('invalid_request', `invalid Agent Template ID '${id}'`);
     if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new FleetError('invalid_request', `Agent Template '${id}' must be an object`);
+  }
+  for (const kind of ['roles', 'brains', 'room_templates']) {
+    for (const [id, doc] of Object.entries((input[kind] ?? {}) as Record<string, unknown>)) {
+      if (!ROLE_NAME_RE.test(id)) throw new FleetError('invalid_request', `invalid definition ID '${id}'`);
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new FleetError('invalid_request', `definition '${id}' must be an object`);
+    }
   }
   return structuredClone(input) as unknown as EditableFleetModel;
 }
@@ -257,9 +275,17 @@ function renderProposal(current: SourceSet, model: EditableFleetModel): Map<stri
     next.set(oldRel ?? join('agent_templates', `${id}.yaml`), oldRel
       ? render(current.documents.get(oldRel)!, doc) : stringify(doc));
   }
-  for (const [rel, source] of current.documents) if (
-    rel.startsWith('roles/') || rel.startsWith('brains/') || rel.startsWith('room_templates/')
-  ) next.set(rel, source);
+  for (const kind of ['roles', 'brains', 'room_templates'] as const) {
+    if (model[kind] === undefined) {
+      for (const [rel, source] of current.documents) if (rel.startsWith(kind + '/')) next.set(rel, source);
+      continue;
+    }
+    for (const [rel, source] of current.documents) if (rel.startsWith(kind + '/') && !['.yaml', '.yml'].includes(extname(rel))) next.set(rel, source);
+    for (const [id, doc] of Object.entries(model[kind]!)) {
+      const oldRel = [...current.documents.keys()].find(rel => rel.startsWith(kind + '/') && ['.yaml', '.yml'].includes(extname(rel)) && basename(rel, extname(rel)) === id);
+      next.set(oldRel ?? join(kind, `${id}.yaml`), oldRel ? render(current.documents.get(oldRel)!, doc) : stringify(doc));
+    }
+  }
   return next;
 }
 
@@ -396,8 +422,8 @@ function sourceDiff(before: string, after: string, label: string, secrets: strin
 }
 
 function proposalDiff(current: SourceSet, proposal: Map<string, string>): string {
-  const secrets = sensitiveValues(modelFrom(current));
-  try { secrets.push(...sensitiveValues(modelFrom({ ...current, documents: proposal }))); } catch { /* validation reports later */ }
+  const secrets = sensitiveValues(modelFrom(current, true));
+  try { secrets.push(...sensitiveValues(modelFrom({ ...current, documents: proposal }, true))); } catch { /* validation reports later */ }
   return [...new Set([...current.documents.keys(), ...proposal.keys()])].sort().map(rel =>
     sourceDiff(current.documents.get(rel) ?? '', proposal.get(rel) ?? '', rel, secrets)).filter(Boolean).join('\n');
 }
@@ -406,7 +432,7 @@ function splitLines(source: string): string[] { return source.replace(/\n$/, '')
 
 function restartImpact(before: EditableFleetModel, after: EditableFleetModel): RestartImpact {
   const roles = [...new Set([...Object.keys(before.agents), ...Object.keys(after.agents)])]
-    .filter(id => JSON.stringify(before.agents[id]) !== JSON.stringify(after.agents[id])).sort();
+    .filter(id => JSON.stringify(before.agents[id]) !== JSON.stringify(after.agents[id]) || JSON.stringify(before.roles) !== JSON.stringify(after.roles) || JSON.stringify(before.brains) !== JSON.stringify(after.brains)).sort();
   const watchdogScheduler = JSON.stringify(before.manifest.watchdogs) !== JSON.stringify(after.manifest.watchdogs);
   const scheduledLoops = JSON.stringify(before.manifest.loops) !== JSON.stringify(after.manifest.loops);
   const required = roles.length > 0 || watchdogScheduler || scheduledLoops;

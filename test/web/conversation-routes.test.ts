@@ -80,7 +80,7 @@ async function authenticated(control: unknown = conversationControl()) {
       async list() { return []; },
       async detail() { return { role, status: {}, capabilities: {} }; },
     },
-    repository: { async get() { return role; } },
+    repository: { async get() { return role; }, stateDir: () => dir },
     async session() { return control; },
     logs: { source: () => ({ tail: async () => ({ records: [], truncated: false }) }) },
     commands: { async execute() { return {}; }, get() { return undefined; } },
@@ -136,6 +136,18 @@ describe('conversation web routes', () => {
     await server.close();
   });
 
+
+  it('validates and forwards the optional voice session binding', async () => {
+    const submitted:any[]=[];
+    const {server,cookie,csrf}=await authenticated(conversationControl(request=>submitted.push(request)));
+    try {
+      const send=(generation:unknown)=>server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers:headers(cookie,csrf),payload:{text:'Voice message: fixture',commandId:'voice',expectedSessionGeneration:generation}});
+      for(const bad of ['',null,23])expect((await send(bad)).statusCode).toBe(400);
+      expect(submitted).toHaveLength(0);
+      expect((await send('recorded-generation')).statusCode).toBe(202);
+      expect(submitted[0].expectedSessionGeneration).toBe('recorded-generation');
+    } finally {await server.close();}
+  });
   it('admits prompts idempotently with 202 receipts and CSRF protection', async () => {
     const submitted: any[] = [];
     const { server, cookie, csrf } = await authenticated(conversationControl(request => submitted.push(request)));

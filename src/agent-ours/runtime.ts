@@ -1,3 +1,4 @@
+import type { AgentHistoryQuery } from './correspondence.js';
 import type { OursClient } from '@ours.network/sdk/client';
 import { RuntimeJournal, type RuntimeState, type Phase } from './state.js';
 
@@ -245,6 +246,16 @@ export class AgentOursRuntime {
       if (contact.cid !== expectedRoomCid) throw Error('ADDITIONAL_ROOM_CID_MISMATCH');
       await this.verify();
     } finally { release(); }
+  }
+  async readContacts():Promise<unknown> {
+    const release=await this.admit();
+    try { const data=await this.deps.client.listContacts(); await this.verify(); return {identity:{name:this.state.name,cid:this.state.cid,generation:this.state.generation},...data}; }
+    finally {release();}
+  }
+  async readHistory(request: AgentHistoryQuery):Promise<unknown> {
+    const release=await this.admit();
+    try { const data=await this.deps.client.listHistory(request); await this.verify(); return {identity:{name:this.state.name,cid:this.state.cid,generation:this.state.generation},...data}; }
+    finally {release();}
   }
   async startHarness<T>(start: () => Promise<T>): Promise<T> {
     if (!this.accepting || this.state.phase !== 'READY') throw Error('RUNTIME_NOT_READY');

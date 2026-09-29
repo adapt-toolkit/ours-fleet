@@ -74,6 +74,14 @@ function fixture(options: { temporary?: boolean; releaseFails?: boolean } = {}) 
   };
 }
 describe('supervisor identity runtime', () => {
+  it('reads correspondence under the owning identity fence without consuming unread',async()=>{
+    const f=fixture();let contacts=0,history=0,consume=0;
+    Object.assign(f.deps.client,{listContacts:async()=>{contacts++;return {contacts:[{name:'Peer',container_id:'P'}]};},listHistory:async(q:unknown)=>{history++;return {items:[],next_cursor:null,query:q};},getMessages:async()=>{consume++;}});
+    try{await f.runtime.prepare();expect(await f.runtime.readContacts()).toMatchObject({identity:{name:'Agent',cid:'CID'},contacts:[{name:'Peer'}]});expect(await f.runtime.readHistory({peer_cid:'P'})).toMatchObject({items:[],query:{peer_cid:'P'}});expect([contacts,history,consume]).toEqual([1,1,0]);
+    Object.assign(f.deps.client,{currentIdentity:async()=>({name:'Wrong',cid:'WRONG',temporary:false})});
+    await expect(f.runtime.readContacts()).rejects.toThrow();expect(contacts).toBe(1);
+    }finally{f.cleanup();}
+  });
   it('does not start harness before room established; pending retries only observation', async () => {
     const f = fixture({ temporary: true });
     let established = false,

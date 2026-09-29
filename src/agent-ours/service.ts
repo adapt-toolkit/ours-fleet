@@ -1,3 +1,4 @@
+import { socketPath as privateSocketPath } from '../socket-path.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -240,7 +241,7 @@ export async function prepareManagedAgent(
     const bridgeDir = join(stateDir, '.ours-bridge');
     mkdirSync(bridgeDir, { recursive: true, mode: 0o700 });
     const capability = randomBytes(32).toString('hex'),
-      socket = join(bridgeDir, `g${generation}.sock`);
+      socket = privateSocketPath(join(bridgeDir, `g${generation}.sock`));
     const endpoint = await startMcpEndpoint({
       socket,
       capability,
