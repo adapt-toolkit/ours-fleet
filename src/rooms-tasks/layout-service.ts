@@ -117,9 +117,10 @@ export class RoomLayoutService {
   }
   /** `scope` lets an owner (e.g. a Task) snapshot an adjusted definition and pin agent working directories. */
   async create(name: string, bindings: Record<string, LayoutInstance> = {}, id = `run-${randomUUID()}`,
-    scope: { definition?: (source: RoomLayoutDefinition) => RoomLayoutDefinition; cwd?: string } = {}): Promise<{ id: string; state: RoomLayoutState }> {
+    scope: { source?: RoomLayoutDefinition; definition?: (source: RoomLayoutDefinition) => RoomLayoutDefinition; cwd?: string } = {}): Promise<{ id: string; state: RoomLayoutState }> {
     const cfg = loadConfig(this.configPath);
-    const source = this.definition(name);
+    // A caller that already verified the source passes it, so no second read can race an edit.
+    const source = scope.source ?? this.definition(name);
     const definition = scope.definition ? scope.definition(structuredClone(source)) : source;
     const templates: Record<string, AgentTemplateDefinition> = {};
     for (const [key, participant] of Object.entries(definition.participants)) {

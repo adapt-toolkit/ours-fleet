@@ -5,15 +5,16 @@
  * operation's outcome is recorded beside the run so HTTP callers can observe it.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { canonicalJson } from '../canonical-json.js';
-import { replaceFileAtomically } from '../atomic-file.js';
+import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
+import { assertLayoutFile, type RoomLayoutDefinition } from '../rooms-tasks/layout-config.js';
+import { getTask as readTask } from '../rooms-tasks/task-state.js';
 import { stateRoot } from '../paths.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import { layoutSupervisorId } from '../rooms-tasks/layout-control.js';
 import { layoutRunPath, RoomLayoutService } from '../rooms-tasks/layout-service.js';
-import type { RoomLayoutDefinition } from '../rooms-tasks/layout-config.js';
 import type { RoomLayoutState } from '../rooms-tasks/layout.js';
 import { FleetError } from './errors.js';
 import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
@@ -43,26 +44,24 @@ export function layoutDefinitionHash(definition: RoomLayoutDefinition): string {
   return createHash('sha256').update(canonicalJson({ version, description: description ?? null, participants, rooms })).digest('hex');
 }
 
-/** Private, always-current brief for layout participants; rooms may open long after the run snapshot. */
-export function taskBriefPath(task: Pick<TaskRecord, 'workspace'>): string | undefined {
-  return task.workspace ? join(task.workspace.path, '.ours-task', 'brief.md') : undefined;
+/** Always-current brief for layout participants; rooms may open long after the run snapshot.
+ * It lives in Fleet's private layout state, never in the agent-writable task workspace. */
+export function taskBriefPath(task: Pick<TaskRecord, 'task_id'>): string {
+  return layoutRunPath(`task-${task.task_id}`).replace(/\.json$/, '.brief.md');
 }
-export function writeTaskBrief(task: Pick<TaskRecord, 'task_id' | 'title' | 'brief' | 'workspace'>): void {
-  const path = taskBriefPath(task);
-  if (!path) return;
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+export function writeTaskBrief(task: Pick<TaskRecord, 'task_id' | 'title' | 'brief'>): void {
+  const path = taskBriefPath(task); // layoutRunPath verified the private directory
+  if (existsSync(path)) assertLayoutFile(path);
   replaceFileAtomically(path, `# ${task.title}\n\nTask ${task.task_id}\n\n${task.brief?.trim() ?? ''}\n`, 0o600);
 }
 
 /** Task context reaches every participant through the room contract (briefing text).
  * The contract references the brief file instead of copying the brief, so later edits reach later rooms. */
 export function taskScopedDefinition(definition: RoomLayoutDefinition, task: Pick<TaskRecord, 'task_id' | 'title' | 'brief' | 'workspace'>): RoomLayoutDefinition {
-  const brief = taskBriefPath(task);
   const preamble = [
     `Task ${task.task_id}: ${task.title}`,
     ...(task.workspace ? [`Task workspace: ${task.workspace.path}`] : []),
-    ...(brief ? [`Current task brief: ${brief} (kept up to date by Fleet; read it before starting work)`]
-      : task.brief?.trim() ? ['', 'Task brief:', task.brief.trim()] : []),
+    `Current task brief: ${taskBriefPath(task)} (kept up to date by Fleet; read it before starting work)`,
   ].join('\n');
   for (const room of Object.values(definition.rooms))
     room.contract = room.contract ? `${preamble}\n\nRoom contract:\n${room.contract}` : preamble;
@@ -70,6 +69,16 @@ export function taskScopedDefinition(definition: RoomLayoutDefinition, task: Pic
 }
 
 const ROOM_KEY = /^[A-Za-z][A-Za-z0-9_-]*$/;
+interface RunProvenance { task_id: string; source_hash: string; scoped_hash: string }
+
+/** Opening rooms requires a started, live task; checked again by the worker before any side effect. */
+export function assertLayoutOpenable(task: TaskRecord): void {
+  if (task.deletion?.status === 'pending') throw new FleetError('conflict', 'task is being deleted; its layout rooms cannot be opened');
+  if (task.terminal_intent || ['done', 'cancelled', 'failed'].includes(task.state))
+    throw new FleetError('conflict', 'task is closing or closed; its layout rooms cannot be opened');
+  if (task.state !== 'active' && task.state !== 'review')
+    throw new FleetError('conflict', `start the task before opening rooms (state '${task.state}')`);
+}
 
 export class TaskLayouts {
   constructor(private configPath?: string, private deps: {
@@ -81,6 +90,11 @@ export class TaskLayouts {
   private service(): RoomLayoutService { return this.deps.service ?? new RoomLayoutService(this.configPath); }
 
   private operationPath(runId: string): string { return join(stateRoot(), 'layouts', `${runId}.op.json`); }
+  private provenancePath(runId: string): string { return layoutRunPath(runId).replace(/\.json$/, '.provenance.json'); }
+  /** Serializes run creation, worker preconditions and deletion's removal of the run. */
+  private withTaskLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    return withFileLock(layoutRunPath(runId).replace(/\.json$/, '.task.lock'), fn);
+  }
 
   /** Resolve a layout for task creation: it must exist, parse and reference known Agent Templates. */
   resolve(name: string): { name: string; definition_hash: string } {
@@ -89,25 +103,35 @@ export class TaskLayouts {
 
   runExists(link: TaskLayoutLink): boolean { return existsSync(layoutRunPath(link.run_id)); }
 
-  /** Idempotent: reuse the run, or snapshot it only from the unchanged source definition. */
-  async ensureRun(task: TaskRecord): Promise<void> {
+  /** Idempotent: reuse a run whose provenance matches this task, or snapshot one from the pinned source. */
+  async ensureRun(task: TaskRecord, precondition?: (current: TaskRecord) => void): Promise<void> {
     const link = task.layout;
     if (!link) throw Error(`task ${task.task_id} has no layout`);
-    writeTaskBrief(task);
-    if (this.runExists(link)) return;
-    const service = this.service();
-    const source = service.definition(link.name);
-    if (layoutDefinitionHash(source) !== link.definition_hash)
-      throw Error(`room layout ${link.name} changed before this task's layout run was created; create a new task to use the edited layout`);
-    try {
-      await service.create(link.name, {}, link.run_id, {
-        definition: definition => taskScopedDefinition(definition, task),
-        cwd: task.workspace?.path,
-      });
-    } catch (error) {
-      // A concurrent creator won the lock; its snapshot came from the same verified source.
-      if (!(this.runExists(link) && /already exists/.test(String(error)))) throw error;
-    }
+    await this.withTaskLock(link.run_id, async () => {
+      const current = readTask(task.task_id);
+      precondition?.(current);
+      writeTaskBrief(current);
+      if (this.runExists(link)) { this.verifyProvenance(current); return; }
+      const service = this.service();
+      const source = service.definition(link.name);
+      if (layoutDefinitionHash(source) !== link.definition_hash)
+        throw Error(`room layout ${link.name} changed before this task's layout run was created; create a new task to use the edited layout`);
+      const scoped = taskScopedDefinition(structuredClone(source), current);
+      const provenance: RunProvenance = { task_id: current.task_id, source_hash: link.definition_hash, scoped_hash: layoutDefinitionHash(scoped) };
+      // Provenance precedes the run: a crash in between is re-derived from the same pinned source.
+      replaceFileAtomically(this.provenancePath(link.run_id), JSON.stringify(provenance), 0o600);
+      await service.create(link.name, {}, link.run_id, { source: scoped, cwd: current.workspace?.path });
+    });
+  }
+
+  private verifyProvenance(task: TaskRecord): void {
+    const link = task.layout!, path = this.provenancePath(link.run_id);
+    let provenance: RunProvenance | undefined;
+    try { assertLayoutFile(path); provenance = JSON.parse(readFileSync(path, 'utf8')); } catch { /* missing or untrusted */ }
+    const snapshot = this.service().open(link.run_id, true).snapshot();
+    if (!provenance || provenance.task_id !== task.task_id || provenance.source_hash !== link.definition_hash
+        || provenance.scoped_hash !== layoutDefinitionHash({ version: 1, ...snapshot.definition } as RoomLayoutDefinition))
+      throw Error(`layout run ${link.run_id} does not match this task's pinned layout; inspect it before continuing`);
   }
 
   readOperation(runId: string): TaskLayoutOperationRecord | undefined {
@@ -154,12 +178,14 @@ export class TaskLayouts {
       const definition = this.runExists(link) ? this.service().open(link.run_id, true).snapshot().definition : undefined;
       if (definition && !Object.hasOwn(definition.rooms, room)) throw new FleetError('resource_not_found', `unknown layout room: ${room}`);
     }
-    const current = this.readOperation(link.run_id);
-    // Full close always proceeds: terminal cleanup must not wait behind an open; the engine lock serializes them.
-    if (operation !== 'close' && current && ['launching', 'running'].includes(current.status) && Date.now() - Date.parse(current.updated_at) < 10 * 60_000)
-      throw new FleetError('conflict', `layout operation already in progress: ${current.operation}${current.room ? ' ' + current.room : ''}`);
     const record = { operation, ...(room ? { room } : {}), status: 'launching' as const };
-    this.writeOperation(link.run_id, record);
+    await withFileLock(this.operationPath(link.run_id) + '.lock', () => {
+      const current = this.readOperation(link.run_id);
+      // Full close always proceeds: terminal cleanup must not wait behind an open; the engine lock serializes them.
+      if (operation !== 'close' && current && ['launching', 'running'].includes(current.status) && Date.now() - Date.parse(current.updated_at) < 10 * 60_000)
+        throw new FleetError('conflict', `layout operation already in progress: ${current.operation}${current.room ? ' ' + current.room : ''}`);
+      this.writeOperation(link.run_id, record);
+    });
     const args = ['task', '_layout', task.task_id, operation, ...(room ? [room] : [])];
     const launch = this.deps.launch
       ?? ((cli: string[], name: string) => launchFleetWorker(cli, name, this.configPath, this.deps.binPath?.()));
@@ -189,7 +215,10 @@ export class TaskLayouts {
   private async perform(task: TaskRecord, operation: TaskLayoutOperation, room?: string): Promise<void> {
     const link = task.layout!;
     if (operation === 'open') {
-      await this.ensureRun(task);
+      // Re-read under the task-layout lock: a deletion or terminal action accepted after HTTP admission wins.
+      await this.ensureRun(task, assertLayoutOpenable);
+      // If deletion removed the run since, fail rather than recreate it.
+      if (!this.runExists(link)) throw new FleetError('conflict', 'task layout run was removed');
       await this.service().open(link.run_id).activate(layoutSupervisorId(), room!);
       return;
     }
@@ -205,11 +234,10 @@ export class TaskLayouts {
   async closeAndForget(task: Pick<TaskRecord, 'task_id' | 'layout'>): Promise<void> {
     const link = task.layout;
     if (!link) return;
-    if (this.runExists(link)) {
-      await this.service().open(link.run_id, true).close(layoutSupervisorId());
-      rmSync(layoutRunPath(link.run_id), { force: true });
-      rmSync(layoutRunPath(link.run_id) + '.lock', { force: true });
-    }
-    rmSync(this.operationPath(link.run_id), { force: true });
+    if (this.runExists(link)) await this.service().open(link.run_id, true).close(layoutSupervisorId());
+    await this.withTaskLock(link.run_id, async () => {
+      for (const path of [layoutRunPath(link.run_id), this.provenancePath(link.run_id), taskBriefPath(task), this.operationPath(link.run_id)])
+        rmSync(path, { force: true });
+    });
   }
 }

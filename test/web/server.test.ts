@@ -190,7 +190,7 @@ describe('secure local web host', () => {
       createTaskList: vi.fn(async ({ name }) => ({ list_id: 'list-id', name, built_in: false })),
       renameTaskList: vi.fn(async ({ newName }) => ({ list_id: 'list-id', name: newName, built_in: false })),
       deleteTaskList: vi.fn(async () => ({ deleted: { name: 'Work' }, moved: 1 })),
-      listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
+      withLayoutRooms: vi.fn((t: unknown) => t), listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
       createTask: vi.fn(async () => task), moveTask: vi.fn(async () => task),
     };
     const { server, cookie, csrf } = await authenticated({ taskRooms });
@@ -239,7 +239,7 @@ describe('secure local web host', () => {
   });
   it('deletes tasks in any state with exact confirmation, bounded settlement, and mutation auth', async () => {
     const taskRooms = {
-      listTasks: vi.fn(() => []),
+      withLayoutRooms: vi.fn((t: unknown) => t), listTasks: vi.fn(() => []),
       requestTaskDeletion: vi.fn(async () => ({ status: 'accepted', task: { task_id: 'task-id' } })),
       launchTaskDeletionWorker: vi.fn(async () => ({ deleted: true, pending: false })),
     };

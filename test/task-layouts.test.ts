@@ -88,7 +88,8 @@ describe('task-scoped layout snapshots', () => {
     const task = { task_id: '000000000aaaaaaaa', title: 'Ship', brief: 'Original brief',
       workspace: { version: 1 as const, owner: 'task' as const, id: 'x', path: '/work/space', token: 't' } };
     const scoped = taskScopedDefinition(structuredClone(source), task);
-    expect(scoped.rooms.design.contract).toContain('Current task brief: /work/space/.ours-task/brief.md');
+    expect(scoped.rooms.design.contract).toContain(`Current task brief: ${taskBriefPath(task)}`);
+    expect(taskBriefPath(task)).toMatch(/\/layouts\/task-000000000aaaaaaaa\.brief\.md$/);
     expect(scoped.rooms.design.contract).toContain('Room contract:\nAgree first');
     expect(scoped.rooms.design.contract).not.toContain('Original brief');
     expect(layoutDefinitionHash(scoped)).not.toBe(hash);
@@ -183,7 +184,7 @@ describe('layout tasks', () => {
     expect(plan.task.state).toBe('cancelled');
     expect(launches.at(-1)).toEqual(['task', '_layout', task.task_id, 'close']);
     await expect(app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/closing/);
-    await expect(app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/terminal/);
+    await expect(app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/closing or closed/);
     // The close worker itself: nothing was opened, so the run closes cleanly.
     const view = await app.runTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'close' });
     expect(view).toMatchObject({ closed: true, operation: { operation: 'close', status: 'succeeded' } });
@@ -214,5 +215,84 @@ describe('layout tasks', () => {
     vi.spyOn(TaskLayouts.prototype, 'closeAndForget').mockRejectedValueOnce(Error('cleanup incomplete'));
     await expect(app.settleTaskDeletion({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id })).rejects.toThrow(/cleanup incomplete/);
     expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(true);
+  });
+});
+
+it('summarizes layout rooms for task listings without exposing run internals', async () => {
+  writeLayout('work');
+  const app = new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+  const task = await app.createTask({ actor: { kind: 'local_control', surface: 'web' }, title: 'Ship', layout: 'work', origin: { type: 'web' } });
+  expect(app.withLayoutRooms(task).layout_rooms).toEqual([{ key: 'design', state: 'declared' }, { key: 'delivery', state: 'declared' }]);
+  expect(app.getTask(task.task_id).task.layout_rooms).toHaveLength(2);
+  rmSync(layoutRunPath(task.layout!.run_id));
+  writeFileSync(layoutRunPath(task.layout!.run_id), 'not json', { mode: 0o600 });
+  expect(app.withLayoutRooms(task).layout_rooms).toEqual([]);
+});
+
+describe('layout task races and worker boundaries', () => {
+  const actor = { kind: 'local_control' as const, surface: 'web' as const };
+  const worker = { kind: 'internal_worker' as const, surface: 'cli' as const };
+  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+  beforeEach(() => writeLayout('work'));
+
+  it('refuses a run file that does not carry this task\'s provenance', async () => {
+    const a = app();
+    const first = await a.createTask({ actor, title: 'One', layout: 'work', origin: { type: 'web' } });
+    const second = await a.createTask({ actor, title: 'Two', layout: 'work', backlog: true, origin: { type: 'web' } });
+    // Plant the first task's run under the second task's run ID.
+    writeFileSync(layoutRunPath(second.layout!.run_id), readFileSync(layoutRunPath(first.layout!.run_id)), { mode: 0o600 });
+    await expect(a.startTask({ actor, taskId: second.task_id })).rejects.toThrow(/does not match this task's pinned layout/);
+  });
+
+  it('snapshots the verified source even if the file changes during creation', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
+    const definition = RoomLayoutService.prototype.definition;
+    const spy = vi.spyOn(RoomLayoutService.prototype, 'definition').mockImplementationOnce(function (this: RoomLayoutService, name: string) {
+      const verified = definition.call(this, name);
+      writeLayout('work', { ...LAYOUT, description: 'Edited during creation' });
+      return verified;
+    });
+    await a.startTask({ actor, taskId: task.task_id });
+    spy.mockRestore();
+    const run = JSON.parse(readFileSync(layoutRunPath(task.layout!.run_id), 'utf8'));
+    expect(run.definition.description).toBe('Two rooms');
+  });
+
+  it('serializes concurrent launches so only one open is accepted', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
+    const results = await Promise.allSettled(['design', 'delivery'].map(room =>
+      a.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room })));
+    expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter(r => r.status === 'rejected').map(r => String((r as PromiseRejectedResult).reason))).toEqual([expect.stringMatching(/already in progress/)]);
+  });
+
+  it('enforces open preconditions inside the directly callable worker', async () => {
+    const a = app();
+    const backlog = await a.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
+    await expect(a.runTaskLayoutOperation({ actor: worker, taskId: backlog.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/start the task/);
+    expect(existsSync(layoutRunPath(backlog.layout!.run_id))).toBe(false);
+    const deleting = await a.createTask({ actor, title: 'Gone', layout: 'work', origin: { type: 'web' } });
+    await a.requestTaskDeletion({ actor, taskId: deleting.task_id });
+    await expect(a.runTaskLayoutOperation({ actor: worker, taskId: deleting.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/being deleted/);
+  });
+
+  it('does not recreate a run removed by deletion when a stale open worker proceeds', async () => {
+    const layouts = new TaskLayouts(config, { launch: async () => {} });
+    const a = new TaskRoomApplicationService(config, { taskLayouts: layouts });
+    const task = await a.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
+    await layouts.closeAndForget(task);           // deletion cleanup wins the race
+    expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(false);
+    await a.requestTaskDeletion({ actor, taskId: task.task_id });
+    // The worker admitted earlier now runs: it re-reads the task under the lock and refuses.
+    await expect(layouts.run(getTask(task.task_id), 'open', 'design')).rejects.toThrow(/being deleted/);
+    expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(false);
+  });
+
+  it('keeps the brief outside the agent-writable workspace', async () => {
+    const task = await app().createTask({ actor, title: 'Ship', brief: 'secret plan', layout: 'work', origin: { type: 'web' } });
+    expect(taskBriefPath(task).startsWith(task.workspace!.path)).toBe(false);
+    expect(existsSync(join(task.workspace!.path, '.ours-task'))).toBe(false);
   });
 });

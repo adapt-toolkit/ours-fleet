@@ -1,5 +1,5 @@
 import type { AddMemberRequest } from '../rooms-tasks/add-member.js';
-import { TaskLayouts, writeTaskBrief } from './task-layouts.js';
+import { TaskLayouts, assertLayoutOpenable, writeTaskBrief } from './task-layouts.js';
 import { FleetError } from './errors.js';
 import { readFileSync } from 'node:fs';
 import { taskLiveReadiness, type LiveReadinessDeps, type TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
@@ -219,6 +219,16 @@ export class TaskRoomApplicationService {
     return { task: activateTask(task.task_id), status: 'ready' };
   }
 
+  /** Compact room list for task listings; never fails the listing on an unreadable run. */
+  withLayoutRooms<T extends TaskRecord>(task: T): T & { layout_rooms?: Array<{ key: string; state: string; room_id?: string; identity_cid?: string }> } {
+    if (!task.layout) return task;
+    try {
+      const view = this.layouts().view(task);
+      return { ...task, layout_rooms: (view?.rooms ?? []).map(({ key, state, room_id, identity_cid }) =>
+        ({ key, state, ...(room_id ? { room_id } : {}), ...(identity_cid ? { identity_cid } : {}) })) };
+    } catch { return { ...task, layout_rooms: [] }; }
+  }
+
   taskLayout(taskId: string) {
     const task = readTask(taskId);
     if (!task.layout) throw new FleetError('resource_not_found', 'task has no room layout');
@@ -228,18 +238,17 @@ export class TaskRoomApplicationService {
   async launchTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room'; room: string }) {
     const task = readTask(input.taskId);
     if (!task.layout) throw new FleetError('resource_not_found', 'task has no room layout');
-    if (task.deletion?.status === 'pending' || task.terminal_intent)
-      throw new TaskStateError('task is closing; its layout rooms are cleaned up by the terminal operation');
-    if (input.operation === 'open' && task.state !== 'active' && task.state !== 'review')
-      throw new TaskStateError(`start the task before opening rooms (state '${task.state}')`);
+    if (input.operation === 'open') assertLayoutOpenable(task);
+    else if (task.deletion?.status === 'pending' || task.terminal_intent)
+      throw new FleetError('conflict', 'task is closing; its layout rooms are cleaned up by the terminal operation');
     return this.layouts().launch(task, input.operation, input.room);
   }
 
   /** Worker entry for detached layout operations. */
   async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room' | 'close'; room?: string }) {
     const task = readTask(input.taskId);
-    if (input.operation === 'open' && (task.terminal_intent || TASK_TERMINAL_STATES.includes(task.state)))
-      throw new TaskStateError('task is terminal; rooms can no longer be opened');
+    // Preconditions are enforced inside the worker before side effects; the worker is directly callable.
+    if (input.operation === 'open') assertLayoutOpenable(task);
     await this.layouts().run(task, input.operation, input.room);
     return this.layouts().view(task)!;
   }
@@ -423,7 +432,7 @@ export class TaskRoomApplicationService {
   getTask(taskId: string): {
     task: TaskRecord; orchestration: RoomOrchestrationRecord | undefined;
   } {
-    const task = readTask(taskId);
+    const task = this.withLayoutRooms(readTask(taskId));
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
   }
 

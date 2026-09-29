@@ -263,9 +263,10 @@ export async function buildWebServer(
     const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
     const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
       ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
+    const api = requireTaskRooms();
     return taskApi(() => query.groupByList === 'true'
-      ? { groups: requireTaskRooms().groupedTasks(filter) }
-      : { tasks: requireTaskRooms().listTasks(filter) });
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => api.withLayoutRooms(task)) })) }
+      : { tasks: api.listTasks(filter).map(task => api.withLayoutRooms(task)) });
   });
   app.delete('/api/v1/tasks/:id', async (request, reply) => {
     auth.authenticate(request, true);
