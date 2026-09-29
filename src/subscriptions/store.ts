@@ -109,7 +109,6 @@ export function readSubscriptionState(): SubscriptionState {
   if (!providers || typeof providers !== 'object') throw unreadable();
   for (const provider of SUBSCRIPTION_PROVIDERS) {
     const p = providers[provider];
-    if (p === undefined) continue;
     if (!p || !Array.isArray(p.profiles) || typeof p.activeProfileId !== 'string') throw unreadable();
     const profiles = p.profiles;
     if (profiles.some(x => !x || typeof x.id !== 'string' || (x.id !== DEFAULT_PROFILE_ID && !PROFILE_ID_RE.test(x.id))))

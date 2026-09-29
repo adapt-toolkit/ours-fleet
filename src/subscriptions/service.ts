@@ -208,7 +208,8 @@ export class SubscriptionService {
         } else if (login.view().state === 'verifying') error = 'the sign-in code was not accepted';
       } else if (await login.completed) {
         const result = await this.checkCodex(profileId);
-        if (result.health.state !== 'signed_out') {
+        // Only a verified ChatGPT subscription login becomes a profile.
+        if (result.health.state === 'ok') {
           label = result.account?.email ?? 'Codex account';
           this.checks.set(`${provider}/${profileId}`, result);
         }

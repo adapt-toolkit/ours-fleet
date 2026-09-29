@@ -134,6 +134,8 @@ describe('subscription profiles: fail-closed auth sources', () => {
     expect(() => pinSubscriptionForLaunch(claudeRole, agentDir('X'), {})).toThrow(/unreadable or invalid/);
     writeFileSync(file, JSON.stringify({ version: 1, providers: { claude: { activeProfileId: 'p-gone', profiles: [] } } }));
     expect(() => readSubscriptionState()).toThrow(/unreadable or invalid/);
+    writeFileSync(file, JSON.stringify({ version: 1, providers: { claude: { activeProfileId: 'default', profiles: [] } } }));
+    expect(() => readSubscriptionState()).toThrow(/unreadable or invalid/);
     rmSync(file);
     expect(readSubscriptionState().providers.claude.activeProfileId).toBe(DEFAULT_PROFILE_ID);
   });
@@ -276,6 +278,16 @@ describe('subscription service', () => {
     const claude = (await svc.list()).find(p => p.provider === 'claude')!;
     expect(claude.unmanagedAgents).toEqual([{ roleId: 'Env', via: ['ANTHROPIC_API_KEY'] }]);
     expect((await svc.check('claude', DEFAULT_PROFILE_ID)).health).toMatchObject({ state: 'error', detail: expect.stringMatching(/not using a Claude subscription/) });
+  });
+
+  it('does not register a Codex login that is not a working ChatGPT subscription', async () => {
+    process.env.FAKE_CODEX_EXPIRED = '1';
+    const svc = service();
+    const started = await svc.startLogin('codex', 'b');
+    const login = svc.login(started.loginId, 'b');
+    await login.done;
+    expect(login.view().state).toBe('failed');
+    expect(readSubscriptionState().providers.codex.profiles).toHaveLength(1);
   });
 
   it('allows one login per provider at a time and cancels cleanly', async () => {
