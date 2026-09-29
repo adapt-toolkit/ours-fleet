@@ -182,6 +182,7 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
     addRw(join(home, '.claude.json'));
   }
   for (const dir of ctx.additionalWriteDirs ?? []) addRw(dir);
+  if (ctx.subscriptionHome) addRw(ctx.subscriptionHome);
 
   // The selected harness/session command may live outside the system allowlist
   // (for example Node and a bundled ACP adapter under ~/.local). The runner

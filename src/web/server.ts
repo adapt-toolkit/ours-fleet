@@ -36,6 +36,8 @@ import type { RoomLayoutDefinitions } from '../application/room-layout-definitio
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
+import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
+import type { SubscriptionService } from '../subscriptions/service.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -56,6 +58,7 @@ export interface WebServices {
   roomLayouts?: RoomLayoutDefinitions;
   presetProvenance?: PresetProvenance;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
+  subscriptions?: SubscriptionService;
 }
 
 export interface WebServer {
@@ -488,6 +491,86 @@ export async function buildWebServer(
       requestId: request.id, browser: session.id, action: 'configuration.save', result: 'succeeded',
     });
     return result;
+  });
+
+  // Claude Code / Codex subscription profiles. Responses carry account metadata
+  // only; token values never leave the CLI-owned credential files.
+  const subscriptions = () => {
+    if (!services.subscriptions)
+      throw new FleetError('capability_unavailable', 'subscription management is unavailable');
+    return services.subscriptions;
+  };
+  const provider = (raw: string): SubscriptionProvider => {
+    if (!isProvider(raw)) throw new FleetError('invalid_request', 'unknown subscription provider');
+    return raw;
+  };
+  const subscriptionsChanged = () => events.publish('subscription.changed', {});
+
+  app.get('/api/v1/subscriptions', async request => {
+    auth.authenticate(request);
+    return { providers: await subscriptions().list() };
+  });
+
+  app.post<{ Params: { provider: string } }>('/api/v1/subscriptions/:provider/logins', async (request, reply) => {
+    const session = auth.authenticate(request, true);
+    const login = await subscriptions().startLogin(provider(request.params.provider), session.id);
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.login.${request.params.provider}`, result: login.state });
+    reply.code(201);
+    return login;
+  });
+
+  app.get<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId', async request => {
+    const session = auth.authenticate(request);
+    return subscriptions().login(request.params.loginId, session.id).view();
+  });
+
+  app.post<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId/code', async request => {
+    const session = auth.authenticate(request, true);
+    const code = (request.body as { code?: unknown })?.code;
+    if (typeof code !== 'string') throw new FleetError('invalid_request', 'code is required');
+    const login = subscriptions().login(request.params.loginId, session.id);
+    login.submitCode(code.trim());
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.login.code.${request.params.provider}`, result: 'submitted' });
+    return login.view();
+  });
+
+  app.delete<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId', async request => {
+    const session = auth.authenticate(request, true);
+    const login = subscriptions().login(request.params.loginId, session.id);
+    login.cancel();
+    return login.view();
+  });
+
+  app.post<{ Params: { provider: string } }>('/api/v1/subscriptions/:provider/active', async request => {
+    const session = auth.authenticate(request, true);
+    const profileId = (request.body as { profileId?: unknown })?.profileId;
+    if (typeof profileId !== 'string') throw new FleetError('invalid_request', 'profileId is required');
+    const view = await subscriptions().setActive(provider(request.params.provider), profileId);
+    subscriptionsChanged();
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.activate.${request.params.provider}`, result: 'succeeded' });
+    return view;
+  });
+
+  app.post<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId/check', async request => {
+    auth.authenticate(request, true);
+    return subscriptions().check(provider(request.params.provider), request.params.profileId);
+  });
+
+  app.patch<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId', async request => {
+    auth.authenticate(request, true);
+    const label = (request.body as { label?: unknown })?.label;
+    if (typeof label !== 'string') throw new FleetError('invalid_request', 'label is required');
+    await subscriptions().rename(provider(request.params.provider), request.params.profileId, label);
+    subscriptionsChanged();
+    return { ok: true };
+  });
+
+  app.delete<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId', async request => {
+    const session = auth.authenticate(request, true);
+    await subscriptions().remove(provider(request.params.provider), request.params.profileId);
+    subscriptionsChanged();
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.remove.${request.params.provider}`, result: 'succeeded' });
+    return { ok: true };
   });
 
   app.get('/api/v1/topology', async request => {
