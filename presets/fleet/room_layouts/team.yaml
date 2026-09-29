@@ -26,3 +26,5 @@ rooms:
       LocalCoordinator instructions, member replies, routine state, evidence, and ordinary errors stay in this room.
       LocalCoordinator is not a separate reporting channel. Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration problem requiring Fleet-level action.
       LocalCoordinator has no Fleet lifecycle or agent-management authority.
+    quiet_membership: false
+    anonymous: false

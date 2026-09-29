@@ -21,3 +21,5 @@ rooms:
       Both keep routine state, findings, verdicts, completion, handoffs, and ordinary errors in this room.
       Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration problem that prevents safe progress or room communication and requires Fleet-level action.
       Completion requires Engineer evidence and Critic sign-off.
+    quiet_membership: false
+    anonymous: false

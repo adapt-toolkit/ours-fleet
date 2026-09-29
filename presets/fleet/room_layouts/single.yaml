@@ -13,3 +13,5 @@ rooms:
     contract: |-
       Developer owns task execution and reports routine state, evidence, and ordinary errors only in this room.
       Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration problem that prevents safe progress or room communication and requires Fleet-level action.
+    quiet_membership: false
+    anonymous: false
