@@ -6,6 +6,18 @@ command with `--check` to verify generated files. An empty `efforts` array gener
 one `-default` preset with no `effort` field. Bootstrap adds missing presets and
 preserves existing user files. Existing model presets remain available.
 
+## GPT-6.1 Sol (added 2026-09-29)
+
+The Codex presets `codex-gpt-6-1-sol-{low,medium,high,xhigh,max,ultra}`
+use the exact model ID `gpt-6.1-sol` with ACP sessions. The init wizard offers
+GPT-6.1 Sol for development, review, and coordination.
+
+[Official OpenAI documentation](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+supports low, medium, high, xhigh, and max API reasoning efforts. The local
+Codex `models_cache.json` inspected on 2026-09-29 additionally advertises
+`ultra`, a Codex harness mode. These presets reflect that six-effort Codex
+catalog; no inference or ACP launch was performed for this addition.
+
 ## Current model additions (verified 2026-09-24)
 
 | Harness | Exact model ID | Preset efforts |
