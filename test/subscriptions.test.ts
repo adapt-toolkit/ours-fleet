@@ -19,12 +19,15 @@ const bins = { claude: join(fixtures, 'fake-claude.mjs'), codex: join(fixtures, 
 
 let root: string;
 let previousHome: string | undefined;
+let previousUserHome: string | undefined;
 const claudeRole = { name: 'Alpha', harness: 'claude-code' };
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'ours-fleet-subs-'));
   previousHome = process.env.OURS_FLEET_HOME;
   process.env.OURS_FLEET_HOME = root;
+  previousUserHome = process.env.HOME;
+  process.env.HOME = root;
   mkdirSync(join(root, '.claude'));
   mkdirSync(join(root, '.codex'));
   writeFileSync(join(root, '.claude', 'settings.json'), '{}');
@@ -33,6 +36,7 @@ beforeEach(() => {
 afterEach(() => {
   if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
   else process.env.OURS_FLEET_HOME = previousHome;
+  process.env.HOME = previousUserHome;
   rmSync(root, { recursive: true, force: true });
   delete process.env.FAKE_CLAUDE_URL;
   delete process.env.FAKE_CODEX_URL;

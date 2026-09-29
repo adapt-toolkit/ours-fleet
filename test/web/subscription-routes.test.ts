@@ -14,17 +14,21 @@ const headers = { host: '127.0.0.1:49271', origin: 'http://127.0.0.1:49271' };
 
 let root: string;
 let previousHome: string | undefined;
+let previousUserHome: string | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'ours-fleet-sub-routes-'));
   previousHome = process.env.OURS_FLEET_HOME;
   process.env.OURS_FLEET_HOME = root;
+  previousUserHome = process.env.HOME;
+  process.env.HOME = root;
   mkdirSync(join(root, '.claude'));
   mkdirSync(join(root, '.codex'));
 });
 afterEach(() => {
   if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
   else process.env.OURS_FLEET_HOME = previousHome;
+  process.env.HOME = previousUserHome;
   rmSync(root, { recursive: true, force: true });
 });
 

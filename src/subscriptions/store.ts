@@ -3,7 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { FleetError } from '../application/errors.js';
-import { home, stateRoot } from '../paths.js';
+import { homedir } from 'node:os';
+import { stateRoot } from '../paths.js';
 
 /**
  * Fleet-wide Claude Code / Codex subscription profiles.
@@ -64,9 +65,12 @@ export const subscriptionsRoot = () => join(stateRoot(), 'subscriptions');
 const stateFile = () => join(subscriptionsRoot(), 'state.json');
 const lockPath = () => join(subscriptionsRoot(), '.lock');
 
-/** The CLI's own default home, adopted as the `default` profile. */
+/**
+ * The CLI's own default home, adopted as the `default` profile. This follows
+ * `$HOME` like the CLIs do, not OURS_FLEET_HOME (which may relocate Fleet state).
+ */
 export const baseHome = (provider: SubscriptionProvider) =>
-  join(home(), provider === 'claude' ? '.claude' : '.codex');
+  join(homedir(), provider === 'claude' ? '.claude' : '.codex');
 
 export function isProvider(value: unknown): value is SubscriptionProvider {
   return value === 'claude' || value === 'codex';

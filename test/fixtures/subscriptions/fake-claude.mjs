@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
-const dir = process.env.CLAUDE_CONFIG_DIR ?? join(process.env.OURS_FLEET_HOME ?? homedir(), '.claude');
+const dir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
 const marker = join(dir, 'fake-login.json');
 const [cmd, sub] = process.argv.slice(2);
 if (cmd === 'auth' && sub === 'status') {

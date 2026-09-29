@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 if (process.argv[2] !== 'app-server') process.exit(2);
-const dir = process.env.CODEX_HOME ?? join(process.env.OURS_FLEET_HOME ?? homedir(), '.codex');
+const dir = process.env.CODEX_HOME ?? join(homedir(), '.codex');
 const marker = join(dir, 'fake-login.json');
 const send = m => process.stdout.write(JSON.stringify(m) + '\n');
 createInterface({ input: process.stdin }).on('line', line => {
