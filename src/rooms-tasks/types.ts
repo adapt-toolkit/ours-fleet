@@ -153,6 +153,8 @@ export interface TaskRecord {
   no_room?: boolean;
   /** Multi-room task: rooms and participants come from a Room Layout run. */
   layout?: TaskLayoutLink;
+  /** Set when the room plan (layout or one-room template) was changed after creation, before start. */
+  room_plan_changed_at?: string;
   room_id?: string;
   room_identity_cid?: string;
   member_roles: TaskMemberRole[];

@@ -18,7 +18,7 @@ import {
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
-  updateTaskExecutionPlan, updateTaskBrief,
+  updateTaskExecutionPlan, updateTaskBrief, updateTaskLayout,
 } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
@@ -209,7 +209,12 @@ export class TaskRoomApplicationService {
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: task.task_id, state: task.state });
     if (task.state === 'active' || task.state === 'review') return { task, status: 'already_active' };
-    if (task.state === 'backlog') task = transitionTask(task.task_id);
+    if (task.state === 'backlog') {
+      // Verify the pinned source before leaving Backlog, so a stale choice stays editable on the task page.
+      if (!this.layouts().runExists(task.layout!) && this.layouts().resolve(task.layout!.name).definition_hash !== task.layout!.definition_hash)
+        throw new FleetError('conflict', `room layout ${task.layout!.name} changed after it was chosen for this task; choose it again on the task page to use the edited version`);
+      task = transitionTask(task.task_id);
+    }
     try { await this.layouts().ensureRun(task); }
     catch (error) {
       const reason = `layout run could not be created: ${(error as Error).message}`;
@@ -227,6 +232,27 @@ export class TaskRoomApplicationService {
       return { ...task, layout_rooms: (view?.rooms ?? []).map(({ key, state, room_id, identity_cid }) =>
         ({ key, state, ...(room_id ? { room_id } : {}), ...(identity_cid ? { identity_cid } : {}) })) };
     } catch { return { ...task, layout_rooms: [] }; }
+  }
+
+  /** Backlog only: choose, change or clear the task's Room Layout before it starts. */
+  async setTaskLayout(input: { actor: TaskRoomActor; taskId: string; layout: string | null; expectedLayout: string | null }): Promise<TaskRecord> {
+    let next: { name: string; definition_hash: string } | null = null;
+    if (input.layout !== null) {
+      try { next = this.layouts().resolve(input.layout); }
+      catch (error) { throw new FleetError('invalid_request', (error as Error).message, { details: { layout: input.layout } }); }
+    }
+    const current = readTask(input.taskId);
+    if (current.layout && this.layouts().runExists(current.layout))
+      throw new FleetError('conflict', 'this task already has a layout run; its room layout is fixed');
+    let result: ReturnType<typeof updateTaskLayout>;
+    try { result = updateTaskLayout(input.taskId, input.expectedLayout, next); }
+    catch (error) {
+      if (error instanceof TaskStateError && !/task not found/.test(error.message)) throw new FleetError('conflict', error.message);
+      throw error;
+    }
+    // Only after the task stopped referencing it; release re-checks every retained reference under its lock.
+    if (result.releasedSnapshot) releaseLaunchSnapshot(result.releasedSnapshot);
+    return result.task;
   }
 
   taskLayout(taskId: string) {

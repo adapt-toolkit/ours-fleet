@@ -13,11 +13,12 @@ import { defaultConfigPath } from '../paths.js';
 import { loadConfig, splitRootFor } from '../config.js';
 import { assertLayoutFile, validLayoutKey, validateRoomLayout, type RoomLayoutDefinition } from '../rooms-tasks/layout-config.js';
 import { FleetError } from './errors.js';
+import { layoutDefinitionHash } from './task-layouts.js';
 
 export const ABSENT_REVISION = 'absent';
 export type LayoutDefinitionBody = Omit<RoomLayoutDefinition, 'sourceFile'>;
 export type LayoutListEntry =
-  | { name: string; revision: string; file: string; definition: LayoutDefinitionBody; issues: string[] }
+  | { name: string; revision: string; file: string; definition: LayoutDefinitionBody; issues: string[]; definition_hash: string }
   | { name: string; revision: string; file: string; error: string };
 
 const revisionOf = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex');
@@ -59,7 +60,7 @@ export class RoomLayoutDefinitions {
         assertLayoutFile(path);
         const bytes = readFileSync(path);
         const definition = validateRoomLayout(parseFleetDocument(path, bytes.toString('utf8'), 'strict').value, file);
-        return { name, file, revision: revisionOf(bytes), definition, issues: this.templateIssues(definition) };
+        return { name, file, revision: revisionOf(bytes), definition, issues: this.templateIssues(definition), definition_hash: layoutDefinitionHash(definition) };
       } catch (error) {
         // Only a trusted regular file may be read to offer an overwrite revision.
         let revision = ABSENT_REVISION;

@@ -155,6 +155,11 @@ export interface CreateTaskInput {
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
   const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
+  if (existing?.room_plan_changed_at) return withTaskLock(existing.task_id, () => {
+    const fresh = readTask(existing.task_id);
+    assertNoPendingDeletion(fresh);
+    return fresh;
+  });
   if (existing) {
     const existingPlan = existing.execution_plan?.plan_hash;
     const requestedPlan = input.execution_plan?.plan_hash;
@@ -956,6 +961,36 @@ export function beginTaskArchiveCleanup(id: string): void {
 }
 
 /** Metadata-only edit; compare under the task lock to prevent lost updates. */
+/**
+ * Choose, change or clear a Backlog task's Room Layout before it starts.
+ * `expected` is the layout name the caller saw (null = none); a different
+ * current choice is a stale edit. Choosing a layout drops the sealed room
+ * template plan; the caller releases the returned launch snapshot hash.
+ */
+export function updateTaskLayout(
+  id: string, expected: string | null, next: { name: string; definition_hash: string } | null,
+): { task: TaskRecord; releasedSnapshot?: string } {
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if (task.state !== 'backlog' || task.room_id)
+      throw new TaskStateError(`task ${id} has started; its room layout is fixed (state '${task.state}')`);
+    const current = task.layout?.name ?? null;
+    // A replay of the same choice is idempotent (and refreshes the pinned source hash).
+    if (current !== expected && current !== (next?.name ?? null))
+      throw new TaskStateError(`task ${id} room layout changed to '${current ?? 'one room'}'; reload before changing it`);
+    const releasedSnapshot = next ? task.execution_plan?.snapshot.launch_snapshot_hash : undefined;
+    if (next) {
+      task.layout = { name: next.name, run_id: `task-${task.task_id}`, definition_hash: next.definition_hash };
+      delete task.execution_plan; delete task.template; delete task.no_room;
+    } else delete task.layout;
+    task.room_plan_changed_at = new Date().toISOString();
+    writeTask(task);
+    return { task: readTask(id), ...(releasedSnapshot ? { releasedSnapshot } : {}) };
+  });
+}
+
 export function updateTaskBrief(id: string, brief: string, expectedBrief: string): TaskRecord {
   assertCanonicalTaskId(id);
   return withTaskLock(id, () => {

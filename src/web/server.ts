@@ -349,6 +349,17 @@ export async function buildWebServer(
     const {id,requestId}=request.params as {id:string;requestId:string};
     return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
   });
+  app.patch('/api/v1/tasks/:id/layout', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { layout?: unknown; expectedLayout?: unknown };
+    const valid = (v: unknown) => v === null || (typeof v === 'string' && v.length > 0);
+    if (!valid(body?.layout) || !valid(body?.expectedLayout))
+      throw new FleetError('invalid_request', 'layout and expectedLayout must be a layout name or null');
+    const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
+      taskId: (request.params as { id: string }).id, layout: body.layout as string | null, expectedLayout: body.expectedLayout as string | null }));
+    await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
+    return { task: requireTaskRooms().withLayoutRooms(task) };
+  });
   app.get('/api/v1/tasks/:id/layout', async request => {
     auth.authenticate(request);
     return { layout: await taskApi(async () => requireTaskRooms().taskLayout((request.params as { id: string }).id)) };

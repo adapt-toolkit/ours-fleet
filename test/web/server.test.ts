@@ -128,6 +128,7 @@ describe('secure local web host', () => {
       taskLayout:vi.fn().mockReturnValue({name:'work',rooms:[{key:'design',state:'declared'}]}),
       launchTaskLayoutOperation:vi.fn().mockResolvedValue({operation:'open',room:'design',status:'launching'}),
       retryTaskLayoutCleanup:vi.fn().mockResolvedValue({operation:'close',status:'launching'}),
+      setTaskLayout:vi.fn().mockResolvedValue({...task,state:'backlog'}),withLayoutRooms:vi.fn((t:unknown)=>t),
     };
     const roomLayouts={list:vi.fn().mockReturnValue([{name:'work'}]),validate:vi.fn().mockReturnValue({issues:[]}),
       save:vi.fn().mockResolvedValue({name:'work',revision:'r2'}),remove:vi.fn().mockResolvedValue({name:'work',deleted:true})};
@@ -146,6 +147,12 @@ describe('secure local web host', () => {
       expect(taskRooms.launchTaskLayoutOperation).toHaveBeenLastCalledWith(expect.objectContaining({operation:'close-room'}));
       expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/cleanup',headers})).statusCode).toBe(202);
       expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers:{host:boundary.host,cookie}})).statusCode).toBe(403);
+      const chosen=await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload:{layout:'work',expectedLayout:null}});
+      expect(chosen.statusCode).toBe(200);expect(chosen.json().task.state).toBe('backlog');
+      expect(taskRooms.setTaskLayout).toHaveBeenCalledWith(expect.objectContaining({taskId:'selected',layout:'work',expectedLayout:null}));
+      expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers,payload:{layout:''}})).statusCode).toBe(400);
+      expect((await server.app.inject({method:'PATCH',url:'/api/v1/tasks/selected/layout',headers:{host:boundary.host,cookie},payload:{layout:null,expectedLayout:'work'}})).statusCode).toBe(403);
+      expect(taskRooms.setTaskLayout).toHaveBeenCalledTimes(1);
       expect((await server.app.inject({method:'GET',url:'/api/v1/room-layouts',headers})).json()).toEqual({layouts:[{name:'work'}]});
       const saved=await server.app.inject({method:'PUT',url:'/api/v1/room-layouts/work',headers,payload:{revision:'r1',definition:{version:1}}});
       expect(saved.json()).toEqual({name:'work',revision:'r2'});expect(roomLayouts.save).toHaveBeenCalledWith('work','r1',{version:1});

@@ -136,10 +136,9 @@ describe('layout tasks', () => {
     const app = service();
     const task = await app.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
     writeLayout('work', { ...LAYOUT, description: 'Edited' });
-    await expect(app.startTask({ actor, taskId: task.task_id })).rejects.toThrow(/changed before this task's layout run was created/);
+    await expect(app.startTask({ actor, taskId: task.task_id })).rejects.toThrow(/changed after it was chosen/);
     const current = getTask(task.task_id);
-    expect(current.state).toBe('provisioning');
-    expect(current.blocked?.reason).toMatch(/layout run could not be created/);
+    expect(current.state).toBe('backlog');
     expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(false);
   });
 
@@ -248,9 +247,10 @@ describe('layout task races and worker boundaries', () => {
     const a = app();
     const task = await a.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
     const definition = RoomLayoutService.prototype.definition;
-    const spy = vi.spyOn(RoomLayoutService.prototype, 'definition').mockImplementationOnce(function (this: RoomLayoutService, name: string) {
+    let reads = 0; // 1: start's pre-check, 2: the verified read inside run creation — edit right after it
+    const spy = vi.spyOn(RoomLayoutService.prototype, 'definition').mockImplementation(function (this: RoomLayoutService, name: string) {
       const verified = definition.call(this, name);
-      writeLayout('work', { ...LAYOUT, description: 'Edited during creation' });
+      if (++reads === 2) writeLayout('work', { ...LAYOUT, description: 'Edited during creation' });
       return verified;
     });
     await a.startTask({ actor, taskId: task.task_id });
@@ -327,5 +327,76 @@ describe('operation status ownership', () => {
     await expect(layouts.run(getTask(task.task_id), 'open', 'design', open.id)).rejects.toThrow(/being deleted/);
     expect(layouts.readOperation(task.layout!.run_id)).toBeUndefined();
     expect(existsSync(layoutRunPath(task.layout!.run_id))).toBe(false);
+  });
+});
+
+describe('choosing a Backlog task\'s room layout', () => {
+  const actor = { kind: 'local_control' as const, surface: 'web' as const };
+  const snapshotDir = () => join(root, '.ours-fleet', 'launch-snapshots');
+  beforeEach(() => {
+    writeV2Fixture(config, { roles: {}, rooms: { owner: { expected_cid: '0'.repeat(64) }, defaults: { attach_owner: false } },
+      room_templates: { solo: { version: 1, description: 'one agent', members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] } } } as any);
+    writeLayout('work'); writeLayout('other', { ...LAYOUT, description: 'Other' });
+  });
+  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+
+  it('replaces a sealed one-room plan with a layout, releases its snapshot, and starts with the chosen layout', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Later', template: 'solo', backlog: true, origin: { type: 'web' } });
+    const sealed = task.execution_plan!.snapshot.launch_snapshot_hash!;
+    expect(sealed).toBeTruthy();
+    const snapshot = join(snapshotDir(), `${sealed}.json`);
+    expect(existsSync(snapshot)).toBe(true);
+    const changed = await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'work', expectedLayout: null });
+    expect(changed.layout).toMatchObject({ name: 'work', run_id: `task-${task.task_id}` });
+    expect(changed.execution_plan).toBeUndefined(); expect(changed.template).toBeUndefined();
+    expect(existsSync(snapshot)).toBe(false); // no task references it any more
+    await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'other', expectedLayout: 'work' });
+    const started = await a.startTask({ actor, taskId: task.task_id });
+    expect(started).toMatchObject({ state: 'active', layout: { name: 'other' } });
+    expect(JSON.parse(readFileSync(layoutRunPath(`task-${task.task_id}`), 'utf8')).definition.description).toBe('Other');
+    await expect(a.setTaskLayout({ actor, taskId: task.task_id, layout: 'work', expectedLayout: 'other' })).rejects.toThrow(/fixed/);
+  });
+
+  it('keeps a snapshot another task still references', async () => {
+    const a = app();
+    const one = await a.createTask({ actor, title: 'One', template: 'solo', backlog: true, origin: { type: 'web' } });
+    const two = await a.createTask({ actor, title: 'Two', template: 'solo', backlog: true, origin: { type: 'web' } });
+    const hash = one.execution_plan!.snapshot.launch_snapshot_hash!;
+    expect(two.execution_plan!.snapshot.launch_snapshot_hash).toBe(hash);
+    await a.setTaskLayout({ actor, taskId: one.task_id, layout: 'work', expectedLayout: null });
+    expect(existsSync(join(snapshotDir(), `${hash}.json`))).toBe(true);
+  });
+
+  it('rejects stale choices, accepts an idempotent replay, and can clear back to one room', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
+    await expect(a.setTaskLayout({ actor, taskId: task.task_id, layout: 'other', expectedLayout: null })).rejects.toThrow(/changed to 'work'/);
+    await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'other', expectedLayout: 'work' });
+    const replay = await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'other', expectedLayout: 'work' });
+    expect(replay.layout?.name).toBe('other');
+    const cleared = await a.setTaskLayout({ actor, taskId: task.task_id, layout: null, expectedLayout: 'other' });
+    expect(cleared.layout).toBeUndefined(); expect(cleared.state).toBe('backlog');
+    await expect(a.setTaskLayout({ actor, taskId: task.task_id, layout: 'missing', expectedLayout: null })).rejects.toThrow(/not found/);
+  });
+
+  it('refreshes the pinned source when the same layout is chosen again after an edit', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Later', layout: 'work', backlog: true, origin: { type: 'web' } });
+    writeLayout('work', { ...LAYOUT, description: 'Edited' });
+    await expect(a.startTask({ actor, taskId: task.task_id })).rejects.toThrow(/choose it again on the task page/);
+    expect(getTask(task.task_id).state).toBe('backlog'); // a stale choice does not strand the task
+    const refreshed = await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'work', expectedLayout: 'work' });
+    expect(refreshed.layout!.definition_hash).not.toBe(task.layout!.definition_hash);
+    expect((await a.startTask({ actor, taskId: task.task_id })).state).toBe('active');
+  });
+
+  it('returns the created task when its original create request is replayed after a layout change', async () => {
+    const a = app();
+    const task = await a.createTask({ actor, title: 'Once', template: 'solo', backlog: true, idempotencyKey: 'create-1', origin: { type: 'web' } });
+    await a.setTaskLayout({ actor, taskId: task.task_id, layout: 'work', expectedLayout: null });
+    const replay = await a.createTask({ actor, title: 'Once', template: 'solo', backlog: true, idempotencyKey: 'create-1', origin: { type: 'web' } });
+    expect(replay.task_id).toBe(task.task_id);
+    expect(replay.layout?.name).toBe('work'); // the deliberate change is kept
   });
 });
