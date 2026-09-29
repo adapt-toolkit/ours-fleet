@@ -17,7 +17,7 @@ export function probeClaudeRateLimit(bin: string, profileId: string, timeoutMs =
   mkdirSync(cwd, { recursive: true, mode: 0o700 });
   return new Promise(resolve => {
     const child = spawn(bin, [
-      '-p', 'Reply OK.', '--model', 'haiku', '--output-format', 'stream-json',
+      '-p', 'Reply OK.', '--model', 'haiku', '--output-format', 'stream-json', '--verbose',
       '--no-session-persistence', '--strict-mcp-config', '--tools', '',
       '--system-prompt', 'Reply OK.', '--max-budget-usd', '0.05',
     ], {

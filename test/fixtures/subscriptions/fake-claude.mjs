@@ -8,6 +8,7 @@ const dir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
 const marker = join(dir, 'fake-login.json');
 const [cmd, sub] = process.argv.slice(2);
 if (process.argv.includes('-p')) {
+  if (!process.argv.includes('--verbose')) process.exit(2);
   if (!existsSync(marker) || process.env.FAKE_CLAUDE_PROBE_FAIL === '1') process.exit(1);
   if (process.env.FAKE_CLAUDE_PROBE_EXHAUSTED === '1') {
     process.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, result: "You've hit your limit" })}\n`);
