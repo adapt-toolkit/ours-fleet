@@ -2,7 +2,7 @@ import { mkdtempSync, chmodSync, statSync, rmSync, readFileSync, symlinkSync, un
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { attachmentPrompt, storeAgentAttachment, MAX_ATTACHMENT_BYTES } from '../../src/web/agent-attachments.js';
+import { attachmentPrompt, storeAgentAttachment, MAX_ATTACHMENT_BYTES, prepareAttachmentPresentation, presentAttachmentEvent, readAgentAttachment } from '../../src/web/agent-attachments.js';
 const dirs:string[]=[];const temp=()=>{const dir=mkdtempSync(join(tmpdir(),'fleet-attachments-'));dirs.push(dir);return dir;};
 afterEach(()=>{for(const dir of dirs.splice(0))rmSync(dir,{recursive:true,force:true});});
 const input=(name='hello.txt',data=Buffer.from('exact file bytes'))=>({name,mimeType:'application/octet-stream',data:data.toString('base64')});
@@ -27,5 +27,22 @@ describe('agent attachment storage',()=>{
  });
  it('allows empty files and refuses symlink storage roots',()=>{
   const dir=temp(),a=storeAgentAttachment(dir,'gen1',input('empty',Buffer.alloc(0)));expect(a.size).toBe(0);expect(attachmentPrompt(dir,'gen1',[a.id],'')).toContain('empty');const other=temp();symlinkSync(dir,join(other,'web-attachments'));expect(()=>storeAgentAttachment(other,'gen1',input())).toThrow(/directory/);
+ });
+});
+
+describe('attachment presentation',()=>{
+ it('binds persisted display to exact admitted command and transport; never guesses markers',()=>{
+  const dir=temp(),a=storeAgentAttachment(dir,'gen1',input());
+  const text='Attached files is ordinary user text',transport=attachmentPrompt(dir,'gen1',[a.id],text);
+  const event={kind:'prompt.admitted',source:'owner_admin_console',commandId:'cmd',sessionGeneration:'gen1',payload:{text:{type:'text',text:transport}}};
+  expect(presentAttachmentEvent(dir,'agent',event)).toEqual(event);
+  prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],text,transport);
+  const visible:any=presentAttachmentEvent(dir,'agent',event);
+  expect(visible.payload.text.text).toBe(text);expect(visible.payload.attachments[0].url).toBe('/api/v1/roles/agent/attachments/'+a.id);
+  expect(JSON.stringify(visible)).not.toContain(dir);expect(readAgentAttachment(dir,a.id).bytes.toString()).toBe('exact file bytes');
+  expect(presentAttachmentEvent(dir,'agent',{...event,commandId:'other'})).toEqual({...event,commandId:'other'});
+  expect(presentAttachmentEvent(dir,'agent',{...event,payload:{text:{type:'text',text:'different'}}})).toEqual({...event,payload:{text:{type:'text',text:'different'}}});
+  expect(()=>prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],'conflict',transport)).toThrow();
+  prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],text,transport);
  });
 });

@@ -80,7 +80,7 @@ async function authenticated(control: unknown = conversationControl()) {
       async list() { return []; },
       async detail() { return { role, status: {}, capabilities: {} }; },
     },
-    repository: { async get() { return role; } },
+    repository: { async get() { return role; }, stateDir: () => dir },
     async session() { return control; },
     logs: { source: () => ({ tail: async () => ({ records: [], truncated: false }) }) },
     commands: { async execute() { return {}; }, get() { return undefined; } },

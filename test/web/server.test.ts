@@ -106,6 +106,11 @@ describe('secure local web host', () => {
     try {
       const denied=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers:{host:boundary.host,cookie,origin:boundary.origin},payload});expect(denied.statusCode).toBe(403);
       const upload=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(upload.statusCode).toBe(200);const id=upload.json().id;
+      const contentUrl='/api/v1/roles/Alpha/attachments/'+id;
+      const anonymous=await server.app.inject({method:'GET',url:contentUrl,headers:{host:boundary.host}});expect(anonymous.statusCode).toBe(401);
+      const content=await server.app.inject({method:'GET',url:contentUrl,headers});expect(content.statusCode).toBe(200);expect(content.rawPayload).toEqual(Buffer.from(payload.data,'base64'));expect(content.headers['x-content-type-options']).toBe('nosniff');expect(content.headers['cache-control']).toBe('private, no-store');expect(content.headers['content-disposition']).toContain('inline');
+      const absent=await server.app.inject({method:'GET',url:contentUrl.replace(id,'0'.repeat(64)),headers});expect(absent.statusCode).toBe(404);
+      const otherRole=await server.app.inject({method:'GET',url:contentUrl.replace('Alpha','Missing'),headers});expect(otherRole.statusCode).toBe(404);
       const retry=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/attachments',headers,payload});expect(retry.json().id).toBe(id);
       const body={text:'',commandId:'once',expectedSessionGeneration:'g1',attachments:[id]};
       const sent=await server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers,payload:body});expect(sent.statusCode).toBe(202);

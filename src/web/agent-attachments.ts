@@ -68,3 +68,57 @@ export function attachmentPrompt(stateDir: string, generation: string, ids: unkn
   });
   return `${text}${text ? '\n\n' : ''}Attached files (available on this host; open the files to inspect their contents, and use the image viewer for images):\n${JSON.stringify(files, null, 2)}`;
 }
+
+/** Authenticated content access reuses the same ownership and integrity checks as admission. */
+function attachmentMetadata(stateDir: string, id: string): AgentAttachment {
+  if (!/^[a-f0-9]{64}$/.test(id)) fail('Invalid attachment ID');
+  directory(stateDir, false, false);
+  const root = join(stateDir, 'web-attachments'); directory(root);
+  const dir = join(root, id); directory(dir);
+  const record = JSON.parse(read(join(dir, 'metadata.json'), 4096).toString()) as AgentAttachment;
+  if (record.id !== id || typeof record.name !== 'string' || typeof record.mimeType !== 'string') fail('Invalid attachment metadata');
+  if (digest(JSON.stringify({ generation: record.generation, name: record.name, mimeType: record.mimeType, sha256: record.sha256 })) !== id) fail('Attachment metadata changed');
+  return record;
+}
+export function readAgentAttachment(stateDir: string, id: string): { record: AgentAttachment; bytes: Buffer } {
+  let record: AgentAttachment;
+  try { record = attachmentMetadata(stateDir, id); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new FleetError('resource_not_found', 'Attachment not found');
+    throw error;
+  }
+  const bytes = read(join(stateDir, 'web-attachments', id, 'content-' + filename(record.name)), MAX_ATTACHMENT_BYTES);
+  if (bytes.length !== record.size || digest(bytes) !== record.sha256) fail('Attachment content changed');
+  return { record, bytes };
+}
+
+interface AttachmentPresentation { generation: string; commandId: string; text: string; transportDigest: string; ids: string[] }
+/** Written before admission so a lost HTTP response cannot lose the visible message. */
+export function storeAttachmentPresentation(stateDir: string, value: AttachmentPresentation): void {
+  directory(stateDir, false, false);
+  const root = join(stateDir, 'web-attachment-messages'); directory(root, true);
+  immutable(join(root, digest(JSON.stringify([value.generation, value.commandId])) + '.json'), Buffer.from(JSON.stringify(value)));
+}
+export function prepareAttachmentPresentation(stateDir: string, generation: string, commandId: string, ids: string[], text: string, transport: string): void {
+  storeAttachmentPresentation(stateDir, { generation, commandId, ids, text, transportDigest: digest(transport) });
+}
+/** Never infer attachments by stripping user text or interpreting a marker. */
+export function presentAttachmentEvent<T>(stateDir: string | undefined, roleId: string, event: T): T {
+  const e = event as any;
+  if (!stateDir || e.kind !== 'prompt.admitted' || e.source !== 'owner_admin_console' || !e.commandId || e.payload?.text?.redacted) return event;
+  const root = join(stateDir, 'web-attachment-messages');
+  if (!existsSync(root)) return event;
+  const path = join(root, digest(JSON.stringify([e.sessionGeneration, e.commandId])) + '.json');
+  if (!existsSync(path)) return event;
+  try {
+    directory(stateDir, false, false); directory(root);
+    const value = JSON.parse(read(path, 1024 * 1024).toString()) as AttachmentPresentation;
+    if (value.generation !== e.sessionGeneration || value.commandId !== e.commandId || value.transportDigest !== digest(e.payload.text.text)) return event;
+    const attachments = value.ids.map(id => {
+      const record = attachmentMetadata(stateDir, id);
+      if (record.generation !== value.generation) fail('Attachment session changed');
+      return { id, name: record.name, mimeType: record.mimeType, size: record.size, url: `/api/v1/roles/${encodeURIComponent(roleId)}/attachments/${id}` };
+    });
+    return { ...e, payload: { ...e.payload, text: { type: 'text', text: value.text, bytes: Buffer.byteLength(value.text) }, displayText: { type: 'text', text: value.text, bytes: Buffer.byteLength(value.text) }, attachments } };
+  } catch { return event; }
+}

@@ -1,4 +1,4 @@
-import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY } from './agent-attachments.js';
+import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
 import { readChatIdle } from '../temp-idle.js';
 import { agentDir } from '../paths.js';
 import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
@@ -526,11 +526,29 @@ export async function buildWebServer(
       const control = await services.session(request.params.id);
       if (!control.conversationPage)
         throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
-      return control.conversationPage({
+      const page = await control.conversationPage({
         after: request.query.after,
         limit: request.query.limit ? Number(request.query.limit) : undefined,
       });
+      const role = await services.repository.get(request.params.id);
+      const stateDir = role ? services.repository.stateDir(role) : undefined;
+      return { ...page, events: page.events.map(event => presentAttachmentEvent(stateDir, request.params.id, event)) };
     });
+
+  app.get<{ Params: { id: string; attachmentId: string } }>('/api/v1/roles/:id/attachments/:attachmentId', async (request, reply) => {
+    auth.authenticate(request);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const { record, bytes } = readAgentAttachment(stateDir, request.params.attachmentId);
+    const image = /^image\/(png|jpeg|gif|webp|avif)$/.test(record.mimeType);
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    reply.header('Content-Disposition', `${image ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(record.name).replace(/'/g, '%27')}`);
+    return reply.type(image ? record.mimeType : 'application/octet-stream').send(bytes);
+  });
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/attachments', { bodyLimit: MAX_ATTACHMENT_BODY }, async (request) => {
     auth.authenticate(request, true);
@@ -564,7 +582,9 @@ export async function buildWebServer(
       if (!role) throw new FleetError('role_not_found', 'Agent not found');
       const stateDir = services.repository.stateDir(role);
       if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+      const originalText = text;
       text = attachmentPrompt(stateDir, body.expectedSessionGeneration, body.attachments, text);
+      prepareAttachmentPresentation(stateDir, body.expectedSessionGeneration, body.commandId, body.attachments as string[], originalText, text);
     }
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
@@ -777,6 +797,9 @@ export async function buildWebServer(
           socket.send(JSON.stringify(payload));
         };
 
+        const role = await services.repository.get(request.params.id);
+        const stateDir = role ? services.repository.stateDir(role) : undefined;
+        const present = (event: any) => presentAttachmentEvent(stateDir, request.params.id, event);
         const follow = await control.followConversation({
           after,
           onPage: page => {
@@ -786,10 +809,10 @@ export async function buildWebServer(
               firstAvailableCursor: page.firstAvailableCursor,
               lastCursor: page.nextCursor ?? after,
             });
-            if (page.events.length) guardedSend({ type: 'events', events: page.events });
+            if (page.events.length) guardedSend({ type: 'events', events: page.events.map(present) });
             if (page.hasMore) guardedSend({ type: 'resync.required' });
           },
-          onEvent: event => guardedSend({ type: 'events', events: [event] }),
+          onEvent: event => guardedSend({ type: 'events', events: [present(event)] }),
           onClose: reason => {
             if (socket.readyState === socket.OPEN)
               socket.close(4409, (reason ?? 'conversation stream ended').slice(0, 120));

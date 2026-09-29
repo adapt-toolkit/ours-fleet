@@ -52,7 +52,7 @@ async function startStack() {
       async list() { return []; },
       async detail() { return { role, status: {}, capabilities: {} }; },
     },
-    repository: { async get() { return role; } },
+    repository: { async get() { return role; }, stateDir: () => stateDir },
     async session() { return new AcpRoleSessionAdapter(stateDir); },
     logs: { source: () => ({ tail: async () => ({ records: [], truncated: false }) }) },
     commands: { async execute() { return {}; }, get() { return undefined; } },
