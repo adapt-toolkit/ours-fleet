@@ -637,7 +637,7 @@ export class TaskRoomApplicationService {
         ?? cfg.rooms?.defaults?.close_when_task_done ?? false;
       if (shouldClose) roomId = task.room_id;
     }
-    return this.withLayoutCleanup(await this.acceptTerminal(input.taskId, 'done', roomId, input.outcome));
+    return this.acceptTerminal(input.taskId, 'done', roomId, input.outcome);
   }
 
   /** Terminal layout tasks archive their rooms and retire only agents their run created. */
@@ -664,7 +664,7 @@ export class TaskRoomApplicationService {
       throw new TaskStateError(`cannot cancel a '${task.state}' task`);
     if (task.room_id)
       (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
-    return this.withLayoutCleanup(await this.acceptTerminal(input.taskId, 'cancelled', task.room_id));
+    return this.acceptTerminal(input.taskId, 'cancelled', task.room_id);
   }
 
   /** Continue accepted operations outside the HTTP connection's lifetime. */
@@ -845,7 +845,8 @@ export class TaskRoomApplicationService {
     taskId: string, kind: 'done' | 'cancelled', roomId?: string, outcome?: TaskOutcome,
   ): Promise<TaskSettlementPlan> {
     const task = await acceptTaskTerminalIntent({ taskId, kind, roomId, outcome });
-    return { task, settlementRequired: task.terminal_intent?.status === 'pending' && !!roomId };
+    // Every terminal path (complete, finish, cancel) closes a layout task's rooms.
+    return this.withLayoutCleanup({ task, settlementRequired: task.terminal_intent?.status === 'pending' && !!roomId });
   }
 
   listTemplates() {
