@@ -454,7 +454,7 @@ describe('secure local web host', () => {
       method: 'GET', url: '/api/v1/meta',
       headers: { host: '127.0.0.1:49271', cookie },
     });
-    expect(response.headers['content-security-policy']).toContain("frame-ancestors 'none'");
+    expect(response.headers['content-security-policy']).toContain("frame-ancestors 'self' https://app.ours.network");
     expect(response.headers['referrer-policy']).toBe('no-referrer');
     expect(response.headers['access-control-allow-origin']).toBeUndefined();
     expect(response.headers['cache-control']).toBe('no-store');

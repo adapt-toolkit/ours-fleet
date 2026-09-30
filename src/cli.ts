@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import QRCode from 'qrcode';
+import { readWorkspacePayload,enrollWorkspace } from './workspace-enrollment.js';
 import { waitForRoleDaemon } from './startup-readiness.js';
 import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
 import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
@@ -58,7 +60,7 @@ import type {
   OwnerChannelManagementRequest, OwnerChannelManagementResult,
 } from './owner-channel/channel.js';
 import { startWebConsole } from './web/runtime.js';
-import { requestWebControl } from './web/control.js';
+import { requestWebControl, webControlPath } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/access.js';
 import {
@@ -1389,6 +1391,29 @@ webCommand.command('open').description('securely open or re-pair a browser with 
       await requestWebControl('open');
       process.stdout.write('Control-panel authentication opened in the browser.\n');
     } catch (e) { die(e); }
+  });
+
+cOpt(program.command('workspace-enroll').description('enroll this host using a private account setup file'))
+  .requiredOption('--file <path>','owned private payload file')
+  .action(async opts=>{try {
+    const result=await enrollWorkspace(readWorkspacePayload(opts.file),opts.configuration);
+    const manager=new WebServiceManager();await manager.install(binPath,49271,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
+    const controlDeadline=Date.now()+20000;
+    while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Workspace console is still starting; run ours-fleet link-device when ready');await new Promise(resolve=>setTimeout(resolve,200));}
+    const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
+    process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
+    process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write(code+'\n');
+  }catch(error){die(error);}});
+
+program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
+  .action(async () => {
+    try {
+      const link=await requestWebControl('link-device');
+      process.stdout.write('Private connection code; share only with the intended device.\n');
+      const code=Buffer.from(JSON.stringify(link)).toString('base64url');
+      process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));
+      process.stdout.write(code+'\n');
+    } catch(e) { die(e); }
   });
 
 webCommand.command('revoke-all').description('revoke all trusted browsers and active web sessions')

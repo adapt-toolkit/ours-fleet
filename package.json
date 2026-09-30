@@ -23,7 +23,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -46,6 +46,7 @@
     "@ours.network/sdk": "3.8.1-nightly.15",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
+    "qrcode": "1.5.4",
     "secure-json-parse": "^4.1.0",
     "ws": "^8.18.3",
     "yaml": "^2.5.0"
@@ -56,7 +57,8 @@
   },
   "devDependencies": {
     "@ours.network/daemon": "3.8.1-nightly.7",
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.20.4",
+    "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.18.1",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"

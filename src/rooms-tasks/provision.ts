@@ -776,7 +776,7 @@ export async function reconcileExistingTaskMembers(input: {
         || remote.state !== 'active') throw new Error('Cowork room is not the exact active room');
       assertCoworkRoomPolicy(remote, storedRoomLaunchPolicy(current.room_policy).anonymous);
       if (current.owner_seat_cid && !remote.seats.some(seat =>
-        seat.identity_cid === current.owner_seat_cid && seat.seat_state === 'active'))
+        seat.identity_cid.toLowerCase() === current.owner_seat_cid!.toLowerCase() && seat.seat_state === 'active'))
         throw new Error('expected Owner seat is not active');
       const seats: RoomMemberSeat[] = [];
       for (const seat of current.member_seats) {

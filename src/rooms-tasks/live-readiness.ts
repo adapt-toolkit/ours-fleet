@@ -41,7 +41,7 @@ export async function taskLiveReadiness(
   if (!remote || remote.room_id !== room.room_id || remote.identity_cid !== room.room_identity_cid
       || remote.state !== 'active') return degraded('room_identity_or_state_mismatch');
   if (room.owner_seat_cid && remote.seats.filter(seat =>
-    seat.identity_cid === room.owner_seat_cid && seat.seat_state === 'active').length !== 1)
+    seat.identity_cid.toLowerCase() === room.owner_seat_cid!.toLowerCase() && seat.seat_state === 'active').length !== 1)
     return degraded('owner_seat_missing');
   for (const seat of room.member_seats) {
     const member = seat.role_name;
@@ -82,6 +82,6 @@ export async function taskLiveReadiness(
   const memberCids = new Set(room.member_seats.map(seat => seat.identity_cid));
   const memberRoles = new Set(room.member_seats.map(seat => seat.cowork_role));
   if (remote.seats.some(seat => seat.seat_state === 'active' && memberRoles.has(seat.role)
-      && !memberCids.has(seat.identity_cid) && seat.identity_cid !== room.owner_seat_cid))
+      && !memberCids.has(seat.identity_cid) && seat.identity_cid.toLowerCase() !== room.owner_seat_cid?.toLowerCase()))
     return degraded('untracked_member_seats');
 }

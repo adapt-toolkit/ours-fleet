@@ -8,6 +8,7 @@ import type { WebAuth } from './auth.js';
 export interface ServiceTarget {
   prefix: string;
   origin: string;
+  upstreamPrefix?: string;
   /** Server-side service credentials; never taken from browser headers. */
   headers?: Record<string, string>;
   /** Dedicated credential-authenticated services reject direct browser context. */
@@ -31,6 +32,7 @@ export function createPrefixGateway(options: GatewayOptions) {
   const services = options.services.map(target => {
     if (!/^\/[a-z][a-z0-9-]*$/.test(target.prefix) || target.prefix === '/fleet') throw new Error('invalid service prefix');
     const origin = new URL(target.origin);
+    if(target.upstreamPrefix && !/^\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]*$/.test(target.upstreamPrefix))throw new Error('invalid upstream service prefix');
     if (!['http:', 'https:'].includes(origin.protocol) || origin.pathname !== '/' || origin.search || origin.hash || origin.username || origin.password) throw new Error('service target must be an HTTP origin');
     return { ...target, origin: origin.origin };
   });
@@ -42,11 +44,11 @@ export function createPrefixGateway(options: GatewayOptions) {
     const service = services.find(x => path === x.prefix || path.startsWith(x.prefix + '/'));
     const fleet = path === '/fleet/api' || path.startsWith('/fleet/api/');
     return { service, page: !service && !fleet && !path.startsWith('/api/'), origin: service?.origin ?? options.fleetOrigin,
-      path: service ? (raw.slice(service.prefix.length) || '/').replace(/^\?/, '/?') : fleet ? raw.slice('/fleet'.length) : raw };
+      path: service ? (service.upstreamPrefix || '')+(raw.slice(service.prefix.length) || '/').replace(/^\?/, '/?') : fleet ? raw.slice('/fleet'.length) : raw };
   };
   const prepare = (req: IncomingMessage, upgrade = false) => {
     const route = select(req);
-    const request = { headers: req.headers, method: req.method } as FastifyRequest;
+    const request = { headers: req.headers, method: req.method, url: route.path } as FastifyRequest;
     if (!auth && (req.headers.origin || req.headers['sec-fetch-site'] || !route.service)) throw new Error('machine-client listener rejects browser requests');
     auth?.validateBoundary(request, upgrade, route.page);
     const session = route.service && auth ? auth.authenticate(request, !upgrade && !['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) : undefined;
@@ -55,10 +57,10 @@ export function createPrefixGateway(options: GatewayOptions) {
     for (const key of Object.keys(headers)) if (key.startsWith('x-forwarded-') || key === 'forwarded') delete headers[key];
     if (route.service) {
       if (auth) for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-ours-api-token']) delete headers[name];
-      Object.assign(headers, route.service.headers);
       if (route.service.stripBrowserContext) {
         for (const name of ['origin', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user']) delete headers[name];
       }
+      Object.assign(headers, route.service.headers);
       headers.host = new URL(route.origin).host;
     }
     if (upgrade) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }

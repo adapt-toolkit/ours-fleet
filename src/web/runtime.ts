@@ -1,3 +1,7 @@
+import { startWorkspaceTunnel } from './workspace-tunnel.js';
+import {createPrefixGateway,type ServiceTarget} from './prefix-gateway.js';
+import {readClientProfile} from '../client-profile.js';
+import {readPrivateFile} from '@ours.network/sdk/connector';
 import { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
 import { RoomLayoutService } from '../rooms-tasks/layout-service.js';
 import { spawn } from 'node:child_process';
@@ -30,6 +34,7 @@ import { RoomLayoutDefinitions } from '../application/room-layout-definitions.js
 import { PresetProvenance } from '../application/preset-provenance.js';
 import { doctor } from '../doctor.js';
 import { acquireWebServerLock } from './lock.js';
+import { WorkspaceDeviceStore } from './workspace-devices.js';
 import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
 import { startWebControlServer, type WebControlServer } from './control.js';
@@ -83,6 +88,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const lock = acquireWebServerLock(webDir);
   const bind = options.bind ?? '127.0.0.1';
   const publicOrigin = options.publicOrigin ? validatePublicOrigin(options.publicOrigin) : undefined;
+  const workspaceGateway=Boolean(publicOrigin && existsSync(resolve(stateRoot(),'workspace','binding.json')));
   if (!isLoopback(bind) && !publicOrigin) {
     lock.release();
     throw new FleetError('forbidden', 'a non-loopback bind requires an explicit --public-origin');
@@ -92,7 +98,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
     publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,
     Date.now, new TrustedDeviceStore(webDir),
-    access,
+    access, new WorkspaceDeviceStore(webDir),
   );
   const backend = pickBackend();
   const repository = new RoleRepository({
@@ -219,17 +225,25 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw error;
   }
   let address: string;
-  try { address = await server.app.listen({ host: bind, port: requestedPort }); }
+  try { address = await server.app.listen({ host: workspaceGateway?'127.0.0.1':bind, port: workspaceGateway?0:requestedPort }); }
   catch (error) { await server.close(); lock.release(); throw error; }
   const actual = new URL(address);
   const localHost = `127.0.0.1:${actual.port}`;
   const browserOrigin = publicOrigin?.origin ?? `http://${localHost}`;
   const browserHost = publicOrigin?.host ?? localHost;
+  let gateway:ReturnType<typeof createPrefixGateway>|undefined;
+  if(workspaceGateway)try{
+    const profile=readClientProfile(),provider=new URL(profile.serverUrl),credential=readPrivateFile(profile.credentialPath,4096).toString('utf8').trim();
+    const basePath=provider.pathname.replace(/\/$/,'');
+    const services:ServiceTarget[]=['daemon','cowork','messenger'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})}}));
+    gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services});
+    await new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(requestedPort,bind,()=>{gateway!.server.off('error',reject);resolve();});});
+  }catch(error){await gateway?.close().catch(()=>{});await server.close();lock.release();throw error;}
   server.auth.setBoundary(browserOrigin, browserHost, publicOrigin ? {
     // nginx's safe default uses the loopback upstream as Host. The declared
     // browser Origin remains mandatory for auth/mutations and WebSocket hello,
     // so operators do not need a fragile Host-rewrite incantation.
-    hosts: [localHost, `localhost:${actual.port}`],
+    hosts: [localHost, `localhost:${actual.port}`,...(workspaceGateway?[`127.0.0.1:${requestedPort}`,`localhost:${requestedPort}`]:[])],
   } : {
     hosts: [`localhost:${actual.port}`], origins: [`http://localhost:${actual.port}`],
   });
@@ -242,21 +256,30 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
           ? `${browserOrigin}/#bootstrap=${server.auth.mintBootstrap()}` : `${browserOrigin}/`;
         openBrowser(url);
       },
+      onLinkDevice() { return {version:1,origin:browserOrigin,...server.auth.workspaceEnrollment()}; },
       onRevokeAll() { server.auth.revokeAllTrustedDevices(); },
     });
   } catch (error) {
+    await gateway?.close();
     await server.close();
     lock.release();
     throw error;
   }
   if (options.open !== false) openBrowser(access.mode === 'pairing'
     ? `${browserOrigin}/#bootstrap=${server.auth.bootstrapSecret}` : `${browserOrigin}/`);
+  let stopTunnel:()=>Promise<void>;
+  try { stopTunnel=startWorkspaceTunnel(browserOrigin); }
+  catch(error) {
+    try { await control?.close(); await gateway?.close(); await server.close(); }
+    finally { lock.release(); }
+    throw error;
+  }
   const notifications = notificationConfig ? new FleetNotificationProducer(
     [agentsRoot(), tmpRoot()], resolve(webDir, 'notification-outboxes'), notificationConfig, options.log) : undefined;
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await notifications?.close(); await control?.close(); await server.close(); }
+      try { await stopTunnel(); await notifications?.close(); await control?.close(); await gateway?.close(); await server.close(); }
       finally { lock.release(); }
     },
   };

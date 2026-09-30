@@ -59,7 +59,7 @@ describe('generic service prefix transport', () => {
     });
     const bytes = Buffer.alloc(2 * 1024 * 1024, 171);
     const response = await fetch(s.publicOrigin + '/messenger/future/a%2Fb?q=a%2Bb', { method: 'POST', body: bytes,
-      headers: { ...s.headers, authorization: 'Bearer attacker', 'x-ours-api-token': 'attacker', 'x-forwarded-host': 'attacker' } });
+      headers: { ...s.headers, 'x-ours-api-token': 'attacker', 'x-forwarded-host': 'attacker' } });
     expect(response.status).toBe(418); expect(response.headers.get('x-backend')).toBe('yes');
     expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes); expect(url).toBe('/future/a%2Fb?q=a%2Bb');
     expect(requestHeaders.cookie).toBeUndefined(); expect(requestHeaders.authorization).toBeUndefined();
@@ -67,6 +67,8 @@ describe('generic service prefix transport', () => {
   });
   it('rejects missing sessions and cross-origin mutations before dispatch', async () => {
     let calls = 0; const s = await setup((_req, res) => { calls++; res.end('ok'); });
+    expect((await fetch(s.publicOrigin+'/messenger/api/status',{headers:{...s.headers,authorization:'Bearer invalid-device'}})).status).toBe(401);
+    expect(calls).toBe(0);
     expect((await fetch(s.publicOrigin + '/messenger/new')).status).toBe(401);
     expect((await fetch(s.publicOrigin + '/messenger/new', { method: 'POST', headers: { ...s.headers, origin: 'https://evil.example' } })).status).toBe(403);
     expect((await fetch(s.publicOrigin + '/messenger/new', { method: 'POST', headers: { cookie: s.headers.cookie, origin: s.publicOrigin } })).status).toBe(403);
