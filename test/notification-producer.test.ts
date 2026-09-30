@@ -26,13 +26,13 @@ it('produces only user-correlated completions, retries, and recovers delivery af
   const store = new ConversationEventStore(join(root, 'agent-one', '.conversation'), { roleId: 'agent-one' }); cleanup.push(async () => store.close());
   const admit = (promptId: string, source: 'owner_admin_console' | 'fleet_monitor') => store.append({ kind: 'prompt.admitted', promptId, source, sessionGeneration: 'g', payload: { queuedBehind: 0 } });
   const complete = (promptId: string) => store.append({ kind: 'turn.completed', promptId, sessionGeneration: 'g', payload: { outcome: 'completed' } });
-  admit('human', 'owner_admin_console'); const done = complete('human'); admit('wake', 'fleet_monitor'); complete('wake');
+  admit('human', 'owner_admin_console'); store.append({kind:'message.replace',promptId:'human',messageId:'reply-human',sessionGeneration:'g',payload:{role:'assistant',content:{type:'text',text:'Answer'}}}); const done = complete('human'); admit('wake', 'fleet_monitor'); complete('wake');
   producer.poll(); await producer.drain(); expect(accepted).toHaveLength(0);
   await producer.close(); store.close();
   const restarted = new FleetNotificationProducer([root], join(dir, 'outboxes'), config);
   cleanup.push(() => restarted.close()); fail = false; await restarted.drain();
   expect(accepted).toHaveLength(1); expect(accepted[0].eventId).toBe(`agent-one:g:${done.seq}`);
-  expect(accepted[0].url).toBe('/fleet/chats?chat=agent-one&detail=1');
+  expect(accepted[0].url).toBe('/fleet/chats?chat=agent-one&detail=1#fleet-message-reply-human');
 
 });
 

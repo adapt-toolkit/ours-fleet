@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { NotificationOutbox, type ProducerConfig } from './outbox.js';
 import type { ConversationEventV1 } from '../session/conversation-types.js';
 
-interface Checkpoint { segment: string; offset: number; prompts: string[]; discarding?: boolean; }
+interface Checkpoint { segment: string; offset: number; prompts: string[]; discarding?: boolean; messages?: Record<string, string>; }
 /** Read durable supervisor ledgers without restarting agents or attaching a
  * conversation controller. Each tick reads at most 256 KiB per role, from its
  * checkpoint; it never loads a complete transcript or requests model history. */
@@ -42,7 +42,7 @@ export class FleetNotificationProducer {
           this.queues.set(roleDir, outbox);
         }
         const saved = outbox.checkpoint as Checkpoint;
-        const current = { ...saved, prompts: [...saved.prompts] };
+        const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages } };
         let index = segments.indexOf(current.segment);
         if (index < 0) { this.warn('Notification ledger segment unavailable; checkpoint retained'); continue; }
         const file = join(dir, current.segment), size = statSync(file).size;
@@ -74,9 +74,10 @@ export class FleetNotificationProducer {
           if (event.kind === 'prompt.admitted' && event.promptId && ['browser', 'owner_admin_console', 'owner_channel'].includes(event.source ?? '')) {
             if (!current.prompts.includes(prompt)) current.prompts.push(prompt);
           }
+          if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, {})) break;
-            current.prompts = current.prompts.filter(p => p !== prompt);
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { url: `/fleet/chats?chat=${encodeURIComponent(roleId)}&detail=1#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
+            current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
         }

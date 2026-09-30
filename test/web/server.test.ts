@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -681,4 +681,27 @@ describe('watchdog read endpoints', () => {
     expect(res.statusCode).toBe(409);
     await server.close();
   });
+});
+
+
+it('serves Fleet installation metadata in initial HTML and preserves standalone entry', async () => {
+  mkdirSync('.test-artifacts', { recursive: true });
+  const dir = mkdtempSync('.test-artifacts/fleet-entry-');
+  writeFileSync(join(dir, 'index.html'), '<link rel="manifest" href="/manifest.webmanifest">');
+  writeFileSync(join(dir, 'fleet-index.html'), '<link rel="manifest" href="/fleet.webmanifest">');
+  const server = await buildWebServer({}, boundary, { staticRoot: join(process.cwd(), dir) });
+  try {
+    for (const url of ['/fleet', '/fleet/chats?chat=A', '/fleet/settings/notifications']) {
+      const response = await server.app.inject({ url, headers: {host:boundary.host} });
+      expect(response.statusCode).toBe(200); expect(response.body).toContain('href="/fleet.webmanifest"');
+    }
+    const standalone = await server.app.inject({ url: '/chats', headers:{host:boundary.host} });
+    expect(standalone.statusCode).toBe(302); expect(standalone.headers.location).toBe('/fleet');
+    const oldTarget = await server.app.inject({url:'/chats?chat=A&detail=1',headers:{host:boundary.host}});
+    expect(oldTarget.headers.location).toBe('/fleet/chats?chat=A&detail=1');
+    const standaloneIndex = await server.app.inject({ url:'/index.html', headers:{host:boundary.host} });
+    expect(standaloneIndex.body).toContain('href="/manifest.webmanifest"');
+    const missingApi = await server.app.inject({ url: '/api/not-a-route', headers:{host:boundary.host} });
+    expect(missingApi.statusCode).not.toBe(200);
+  } finally { await server.close(); rmSync(dir, { recursive: true }); }
 });
