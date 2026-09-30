@@ -5,6 +5,7 @@ import { stateRoot,defaultConfigPath } from './paths.js';
 import { replaceFileAtomically } from './atomic-file.js';
 import { loadConfig, splitRootFor } from './config.js';
 import { stringify } from 'yaml';
+import { WebAccessStore } from './web/access.js';
 import { WorkspaceDeviceStore } from './web/workspace-devices.js';
 export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;rootName:string;name:string;surname:string;connectorToken:string;invitation:string;serverCid:string;challenge:{nonce:string;workspaceId:string;accountId:string;expiresAt:number}}
 export function readWorkspacePayload(file:string):WorkspacePayload {
@@ -20,6 +21,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   if(!base.pathname.endsWith('/messenger/'))throw Error('Workspace setup requires the supported gateway client profile');
   const secret=readFileSync(profile.credentialPath,'utf8').trim();
   const request=async(path:string,value?:unknown)=>{const response=await fetch(new URL('api/'+path,base),{method:value===undefined?'GET':'POST',headers:{'X-Ours-Api-Token':secret,...(value===undefined?{}:{'Content-Type':'application/json','Origin':base.origin,'X-Ours-Messenger-CSRF':'1'})},...(value===undefined?{}:{body:JSON.stringify(value)}),signal:AbortSignal.timeout(15000),redirect:'error'});if(!response.ok){await response.body?.cancel();throw Error('Workspace Messenger enrollment failed (HTTP '+response.status+'); request a fresh setup payload before retrying');}return response.json();};
+  if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
   const dir=join(stateRoot(),'workspace');mkdirSync(dir,{recursive:true,mode:0o700});
   const previousFile=join(dir,'binding.json');
   if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId)throw Error('This host is already associated with another workspace');}

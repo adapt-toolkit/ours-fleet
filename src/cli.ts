@@ -1397,12 +1397,13 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
   .requiredOption('--file <path>','owned private payload file')
   .action(async opts=>{try {
     const result=await enrollWorkspace(readWorkspacePayload(opts.file),opts.configuration);
+    if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
     const manager=new WebServiceManager();await manager.install(binPath,49271,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
     const controlDeadline=Date.now()+20000;
     while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Workspace console is still starting; run ours-fleet link-device when ready');await new Promise(resolve=>setTimeout(resolve,200));}
     const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
     process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
-    process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write(code+'\n');
+    process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
   }catch(error){die(error);}});
 
 program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
@@ -1412,7 +1413,7 @@ program.command('link-device').description('create a single-use workspace device
       process.stdout.write('Private connection code; share only with the intended device.\n');
       const code=Buffer.from(JSON.stringify(link)).toString('base64url');
       process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));
-      process.stdout.write(code+'\n');
+      process.stdout.write('\n'+code+'\n');
     } catch(e) { die(e); }
   });
 

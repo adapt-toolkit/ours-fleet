@@ -6,6 +6,8 @@ import {join} from 'node:path';
 import {once} from 'node:events';
 import {startWebConsole} from '../../src/web/runtime.js';
 import {writeV2Fixture} from '../v2-fixture.js';
+import {WebAccessStore} from '../../src/web/access.js';
+import {enrollWorkspace} from '../../src/workspace-enrollment.js';
 import {WorkspaceDeviceStore} from '../../src/web/workspace-devices.js';
 async function browserRequest(url:string,options:{method?:string;headers?:Record<string,string>;body?:string}={}) {
  return new Promise<Response>((resolve,reject)=>{const req=request(url,{method:options.method,headers:options.headers},res=>{const chunks:Buffer[]=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve(new Response(Buffer.concat(chunks),{status:res.statusCode,headers:res.headers as Record<string,string>})));res.on('error',reject);});req.on('error',reject);req.end(options.body);});
@@ -21,6 +23,9 @@ it('runs the native public workspace gateway with protected services and a publi
   process.env.OURS_FLEET_HOME=dir;const profile=join(dir,'profile.json'),credential=join(dir,'server-credential');writeFileSync(credential,'fixture-server-credential-32-characters\n',{mode:0o600});writeFileSync(profile,JSON.stringify({serverUrl:providerOrigin,endpoint:providerOrigin+'/daemon',expectedInstanceId:'12345678-1234-1234-1234-123456789abc',credentialPath:credential}),{mode:0o600});process.env.OURS_CONFIG=profile;
   mkdirSync(join(dir,'.ours-fleet','workspace'),{recursive:true,mode:0o700});writeFileSync(join(dir,'.ours-fleet','workspace','binding.json'),'{}',{mode:0o600});
   const config=join(dir,'fleet.yaml');writeV2Fixture(config,{roles:{}});const staticRoot=join(dir,'static');mkdirSync(staticRoot);writeFileSync(join(staticRoot,'fleet-index.html'),'<html>workspace fixture shell</html>');writeFileSync(join(staticRoot,'index.html'),'<html>workspace fixture shell</html>');
+  const access=new WebAccessStore();access.write({version:1,mode:'none'});
+  await expect(enrollWorkspace({} as Parameters<typeof enrollWorkspace>[0],config)).rejects.toThrow('requires protected web access');
+  expect(observed.length).toBe(0);access.write({version:1,mode:'pairing'});
   running=await startWebConsole({configPath:config,binPath:process.execPath,port,publicOrigin:'https://fixture.ours-tunnel.com',open:false,control:false,staticRoot});
   const origin='http://127.0.0.1:'+port,host='fixture.ours-tunnel.com',appOrigin='https://app.ours.network';
   const devices=new WorkspaceDeviceStore(join(dir,'.ours-fleet','web'));const link=devices.mint();devices.close();
