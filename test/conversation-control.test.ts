@@ -99,7 +99,7 @@ describe('role-control conversation v3', () => {
     const { stateDir } = await startArbiterServer();
     const snapshot = await controlRequest(stateDir, { command: 'snapshot' });
     expect(snapshot.result).toMatchObject({
-      protocolVersion: 3, features: expect.arrayContaining(['conversation_v3']),
+      protocolVersion: 3, features: expect.arrayContaining(['conversation_v3', 'generation_bound_prompts']),
     });
     const submitted = await controlRequest(stateDir, {
       command: 'submit_prompt_v2', commandId: 'arbiter-cmd',
@@ -117,6 +117,7 @@ describe('role-control conversation v3', () => {
     const result = response.result as { protocolVersion: number; features: string[] };
     expect(result.protocolVersion).toBe(3);
     expect(result.features).toContain('conversation_v3');
+    expect(result.features).toContain('generation_bound_prompts');
     // v1/v2 features remain, so old callers keep working.
     expect(result.features).toEqual(expect.arrayContaining(
       ['events_since', 'observer_follow', 'retained_range']));
