@@ -154,8 +154,20 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
     if (Buffer.byteLength(request.text) > 32 * 1024)
       throw new FleetError('invalid_request', 'text exceeds 32 KiB');
+    // A prompt bound to a session generation (voice or attachments) is checked atomically by supervisors that
+    // support it. Older supervisors do not know that command and never answer, so check the generation here
+    // and submit an ordinary prompt; its command id keeps retries idempotent either way.
+    let command: 'submit_voice_prompt' | 'submit_prompt_v2' = 'submit_prompt_v2';
+    if (request.expectedSessionGeneration) {
+      if ((await this.describe()).features.includes('generation_bound_prompts')) command = 'submit_voice_prompt';
+      else {
+        const live = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+        if (live.snapshot?.sessionGeneration !== request.expectedSessionGeneration)
+          throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
+      }
+    }
     try {
-      return await this.call(request.expectedSessionGeneration ? 'submit_voice_prompt' : 'submit_prompt_v2', {
+      return await this.call(command, {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
         source: request.source, expectedSessionGeneration: request.expectedSessionGeneration,
       }) as PromptReceipt;
