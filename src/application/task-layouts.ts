@@ -35,7 +35,7 @@ export interface TaskLayoutView {
   name: string; run_id: string; created: boolean;
   closed: boolean; closing: boolean; uncertain?: string;
   rooms: TaskLayoutRoomView[];
-  participants: Array<{ key: string; agent_template?: string; owned: boolean; retired: boolean; agent?: string; cid?: string }>;
+  participants: Array<{ key: string; participant?: string; room?: string; agent_template?: string; owned: boolean; retired: boolean; agent?: string; cid?: string }>;
   operation?: TaskLayoutOperationRecord;
 }
 
@@ -172,7 +172,8 @@ export class TaskLayouts {
         };
       }),
       participants: Object.entries(state.participants).map(([key, p]) => ({
-        key, agent_template: state.definition.participants[key]?.agent_template, owned: p.owned, retired: Boolean(p.retired),
+        key, ...(p.participant ? { participant: p.participant, room: p.room } : {}),
+        agent_template: state.definition.participants[p.participant ?? key]?.agent_template, owned: p.owned, retired: Boolean(p.retired),
         ...(p.instance?.agent ? { agent: p.instance.agent } : {}), ...(p.instance?.cid ? { cid: p.instance.cid } : {}),
       })),
     };

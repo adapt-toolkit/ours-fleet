@@ -12,8 +12,9 @@ export interface LayoutOwner { cid: string; role: string; invite: string }
 const ownerReference = (owner: LayoutOwner) => ({ cid: owner.cid, role: owner.role, fingerprint: createHash('sha256').update(owner.invite).digest('hex') });
 export interface LayoutInstance {
   supervisor: string; launch: string; cid: string; session: string; agent?: string; temporary?: boolean;
+  remote?: { url: string; grant_id: string; credential_file: string; daemon_instance_id: string };
 }
-export interface LayoutParticipant { agent_template?: string }
+export interface LayoutParticipant { agent_template?: string; instance_scope?: 'layout' | 'room' }
 export interface LayoutRoom {
   goal: string; members: string[]; contract?: string; quiet_membership?: boolean; anonymous?: boolean; roles?: Record<string, string>;
 }
@@ -30,12 +31,12 @@ export interface LayoutSupervisor {
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
   spawn(key: string, template: string): Promise<LayoutInstance>;
-  join(instance: LayoutInstance, invite: string, roomCid: string): Promise<void>;
+  join(instance: LayoutInstance, invite: string, roomCid: string, membership?: { roomId: string; role: string }): Promise<void>;
   assign(instance: LayoutInstance, assignment: LayoutAssignment): Promise<void>;
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
   retire(instance: LayoutInstance): Promise<void>;
 }
-type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean };
+type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean; participant?: string; room?: string };
 type RoomState = {
   spec: LayoutRoom; native?: CoworkRoomCreateResult; ready: string[];
   state: 'provisioning' | 'active' | 'closed'; owner_ready?: boolean;
@@ -47,8 +48,17 @@ export interface RoomLayoutState {
 }
 const own = (o: object, key: string) => Object.hasOwn(o, key);
 function need(ok: unknown, message: string): asserts ok { if (!ok) throw Error(message); }
+/** Room/participant keys cannot contain ':', so scoped instance keys cannot collide. */
+function instanceKey(definition: LayoutDefinition, participant: string, room: string): string {
+  return definition.participants[participant].instance_scope === 'room' ? `${room}:${participant}` : participant;
+}
 export function validateLayout(def: LayoutDefinition): void {
   need(Object.keys(def.rooms).length && Object.keys(def.participants).length, 'rooms and participants required');
+  for (const [key, participant] of Object.entries(def.participants)) {
+    need(participant.instance_scope === undefined || ['layout', 'room'].includes(participant.instance_scope), `invalid instance_scope for ${key}`);
+    if (participant.instance_scope === 'room')
+      need(typeof participant.agent_template === 'string' && participant.agent_template.trim(), `room-scoped participant ${key} requires agent_template`);
+  }
   for (const [key, room] of Object.entries(def.rooms)) {
     need(key.length && room.goal.trim() && room.members.length, 'room goal and members required');
     need(new Set(room.members).size === room.members.length, 'duplicate participant in room');
@@ -68,7 +78,7 @@ export class RoomLayout {
   snapshot(): RoomLayoutState { return JSON.parse(readFileSync(this.file, 'utf8')); }
   private save(s: RoomLayoutState): void { replaceFileAtomically(this.file, JSON.stringify(s, null, 2)); }
   private async verify(i: LayoutInstance): Promise<void> {
-    need(i.supervisor === this.supervisor.id, 'remote binding unsupported');
+    need(i.supervisor === this.supervisor.id || i.remote, 'remote binding unsupported');
     need(i.launch && i.cid && i.session, 'incomplete instance reference');
     await this.supervisor.verify(i);
   }
@@ -77,7 +87,10 @@ export class RoomLayout {
     this.checkOwnerRoles(definition);
     await withFileLock(this.file + '.lock', async () => {
       need(!existsSync(this.file), 'layout instance already exists');
-      for (const key of Object.keys(bindings)) need(own(definition.participants, key), 'unknown binding');
+      for (const key of Object.keys(bindings)) {
+        need(own(definition.participants, key), 'unknown binding');
+        need(definition.participants[key].instance_scope !== 'room', `binding unsupported for room-scoped participant ${key}`);
+      }
       // Validate every supplied binding before any external mutation.
       for (const [key, p] of Object.entries(definition.participants)) {
         need(bindings[key] || p.agent_template, `binding required for ${key}`);
@@ -87,9 +100,15 @@ export class RoomLayout {
         const cids = room.members.flatMap(key => bindings[key] ? [bindings[key].cid] : []);
         need(new Set(cids).size === cids.length, 'same instance cannot occupy two seats in one room');
       }
-      this.save({ version: 1, definition, controller, ...(this.owner ? { owner: ownerReference(this.owner) } : {}), agent_templates: agentTemplates, participants: Object.fromEntries(
-        Object.keys(definition.participants).map(key => [key, { owned: !bindings[key], ...(bindings[key] ? { instance: bindings[key] } : {}) }])
-      ), rooms: {}, order: [], closed: false });
+      const participants: RoomLayoutState['participants'] = {};
+      for (const [key, participant] of Object.entries(definition.participants)) {
+        if (participant.instance_scope === 'room') {
+          for (const [room, spec] of Object.entries(definition.rooms)) if (spec.members.includes(key))
+            participants[instanceKey(definition, key, room)] = { owned: true, participant: key, room };
+        } else participants[key] = { owned: !bindings[key], ...(bindings[key] ? { instance: bindings[key] } : {}) };
+      }
+      this.save({ version: 1, definition, controller, ...(this.owner ? { owner: ownerReference(this.owner) } : {}),
+        agent_templates: agentTemplates, participants, rooms: {}, order: [], closed: false });
     });
   }
   private checkOwnerRoles(definition: LayoutDefinition): void {
@@ -117,18 +136,19 @@ export class RoomLayout {
     this.checkOwnerRoles(s.definition);
     need(s.rooms[key]?.state !== 'closed', 'room closed');
     for (const member of spec.members) {
-      const i = s.participants[member]?.instance; if (i) await this.verify(i);
-      need(!s.participants[member]?.retired, 'participant retired');
+      const p = s.participants[instanceKey(s.definition, member, key)];
+      const i = p?.instance; if (i) await this.verify(i);
+      need(!p?.retired, 'participant retired');
     }
     if (s.rooms[key]?.state === 'active') { await this.assertRoomActive(s, key); return; }
     const room = s.rooms[key] ??= { spec, state: 'provisioning', ready: [] };
     this.save(s);
     for (const member of spec.members) {
-      const p = s.participants[member];
+      const resolvedKey = instanceKey(s.definition, member, key), p = s.participants[resolvedKey];
       if (!p.instance) {
         const template = s.definition.participants[member]?.agent_template;
         need(template, `no factory for ${member}`);
-        await this.mutation(s, `spawn:${member}`, () => this.supervisor.spawn(member, template), i => { p.instance = i; });
+        await this.mutation(s, `spawn:${resolvedKey}`, () => this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
         await this.verify(p.instance!);
       }
     }
@@ -145,13 +165,13 @@ export class RoomLayout {
     }, () => { room.owner_ready = true; });
     for (const member of spec.members) {
       if (room.ready.includes(member)) continue;
-      const i = s.participants[member].instance!;
+      const i = s.participants[instanceKey(s.definition, member, key)].instance!;
       await this.verify(i);
       const seats = await this.cowork.getSeats(room.native!.room_id);
       if (!seats.some(seat => seat.identity_cid === i.cid && seat.role === roleFor(member) && seat.seat_state !== 'removed')) {
         await this.mutation(s, `admit:${key}:${member}`, async () => {
-          const invitation = await this.cowork.issueInvite(room.native!.room_id, { mode: 'one_time', role: roleFor(member), min_accepts: 1 });
-          await this.supervisor.join(i, invitation.invite, room.native!.identity_cid);
+          const invite = i.remote ? '' : (await this.cowork.issueInvite(room.native!.room_id, { mode: 'one_time', role: roleFor(member), min_accepts: 1 })).invite;
+          await this.supervisor.join(i, invite, room.native!.identity_cid, { roomId: room.native!.room_id, role: roleFor(member) });
         }, () => {});
       }
     }
@@ -159,7 +179,7 @@ export class RoomLayout {
     // Admission of all required seats precedes any participant work.
     for (const member of spec.members) {
       if (room.ready.includes(member)) continue;
-      const i = s.participants[member].instance!;
+      const i = s.participants[instanceKey(s.definition, member, key)].instance!;
       await this.verify(i);
       await this.mutation(s, `assignment:${key}:${member}`, () => this.supervisor.assign(i, {
         id: `${key}:${member}`, room_id: room.native!.room_id, room_cid: room.native!.identity_cid,
@@ -177,9 +197,9 @@ export class RoomLayout {
   private async assertRoomActive(s: RoomLayoutState, key: string): Promise<void> {
     const room = s.rooms[key], native = await this.cowork.getRoom(room.native!.room_id);
     need(native?.identity_cid === room.native!.identity_cid && native.state === 'active', 'native room missing, changed or inactive');
-    if (s.owner) need(native.seats.some(seat => seat.identity_cid === s.owner!.cid
+    if (s.owner) need(native.seats.some(seat => seat.identity_cid.toLowerCase() === s.owner!.cid.toLowerCase()
       && seat.role === s.owner!.role && seat.seat_state === 'active'), 'owner membership not active');
-    need(room.spec.members.every(member => native.seats.some(seat => seat.identity_cid === s.participants[member].instance!.cid
+    need(room.spec.members.every(member => native.seats.some(seat => seat.identity_cid === s.participants[instanceKey(s.definition, member, key)].instance!.cid
       && seat.role === (room.spec.roles?.[member] ?? member) && seat.seat_state === 'active')), 'membership not active');
   }
   private async archiveRoom(s: RoomLayoutState, key: string): Promise<void> {

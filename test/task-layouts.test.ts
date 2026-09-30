@@ -105,6 +105,32 @@ describe('layout tasks', () => {
   const actor = { kind: 'local_control' as const, surface: 'web' as const };
   beforeEach(() => { launches.length = 0; writeLayout('work'); });
 
+  it('preserves scoped source provenance and exposes each room instance with its template', async () => {
+    const definition = structuredClone(LAYOUT);
+    Object.assign(definition.participants.qa, { instance_scope: 'room' });
+    definition.rooms.delivery.members.push('qa');
+    writeLayout('work', definition);
+    const app = service();
+    const task = await app.createTask({ actor, title: 'Scoped', layout: 'work', origin: { type: 'web' } });
+    const run = JSON.parse(readFileSync(layoutRunPath(task.layout!.run_id), 'utf8'));
+    expect(run.definition.participants).toEqual(definition.participants);
+    expect(run.definition.rooms.design.members).toEqual(['dev', 'qa']);
+    expect(Object.keys(run.participants)).toEqual(['dev', 'design:qa', 'delivery:qa']);
+    const view = app.taskLayout(task.task_id);
+    expect(view.participants).toEqual([
+      { key: 'dev', agent_template: 'Agent', owned: true, retired: false },
+      { key: 'design:qa', participant: 'qa', room: 'design', agent_template: 'Agent', owned: true, retired: false },
+      { key: 'delivery:qa', participant: 'qa', room: 'delivery', agent_template: 'Agent', owned: true, retired: false },
+    ]);
+    // Rechecking the original task/run provenance must not require an expanded definition.
+    await new TaskLayouts(config).ensureRun(task);
+    const source = new RoomLayoutService(config).definition('work');
+    expect(task.layout!.definition_hash).toBe(layoutDefinitionHash(source));
+    const changed = structuredClone(source); changed.participants.qa.instance_scope = 'layout';
+    expect(layoutDefinitionHash(changed)).not.toBe(task.layout!.definition_hash);
+    expect(JSON.stringify(view)).not.toMatch(/agent_templates|fingerprint|session|launch/);
+  });
+
   it('creates an active task with a task-scoped run and a sanitized read model', async () => {
     const app = service();
     const task = await app.createTask({ actor, title: 'Ship', brief: 'Do it', layout: 'work', origin: { type: 'web' } });

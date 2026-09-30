@@ -44,6 +44,97 @@ function fixture() {
   const layout = new RoomLayout(file, cowork, supervisor);
   return { file, layout, supervisor, cowork, running, rooms, reload: () => new RoomLayout(file, cowork, supervisor) };
 }
+function scopedDefinition(): LayoutDefinition {
+  return { participants: {
+    doctor: { agent_template: 'Doctor', instance_scope: 'layout' },
+    critic: { agent_template: 'Critic', instance_scope: 'room' },
+  }, rooms: {
+    discovery: { goal: 'Scope', members: ['doctor', 'critic'], roles: { critic: 'Critic' } },
+    design: { goal: 'Design', members: ['doctor', 'critic'], roles: { critic: 'Critic' } },
+    unused: { goal: 'Later', members: ['critic'] },
+  } };
+}
+describe('participant instance scope', () => {
+  it('keeps one shared session and distinct room sessions across reloads and repeated opens', async () => {
+    const f = fixture(), def = scopedDefinition();
+    await f.layout.create(def, 'operator');
+    expect(f.supervisor.spawn).not.toHaveBeenCalled();
+    await Promise.all([f.layout.activate('operator', 'design'), f.reload().activate('operator', 'discovery')]);
+    await f.reload().activate('operator', 'design');
+    const state = f.layout.snapshot();
+    expect(state.definition).toEqual(def);
+    expect(f.supervisor.spawn.mock.calls.map(([key]) => key).sort()).toEqual(['design:critic', 'discovery:critic', 'doctor']);
+    expect(state.participants['design:critic'].instance!.cid).not.toBe(state.participants['discovery:critic'].instance!.cid);
+    expect(state.participants['design:critic'].instance!.session).not.toBe(state.participants['discovery:critic'].instance!.session);
+    expect(state.participants['unused:critic'].instance).toBeUndefined();
+    for (const room of ['discovery', 'design']) {
+      const seats = f.rooms.get(state.rooms[room].native!.room_id).seats;
+      expect(seats.map((seat: any) => seat.identity_cid).sort()).toEqual([`cid-${room}:critic`, 'cid-doctor']);
+      expect(state.rooms[room].ready).toEqual(['doctor', 'critic']);
+      expect(f.supervisor.assign).toHaveBeenCalledWith(instance(`${room}:critic`), expect.objectContaining({
+        id: `${room}:critic`, participant: 'critic', room_role: 'Critic',
+        room_id: state.rooms[room].native!.room_id,
+      }));
+    }
+    expect(f.supervisor.assign).toHaveBeenCalledTimes(4);
+    expect(f.cowork.createRoom).toHaveBeenCalledTimes(2);
+  });
+  it('keeps scoped agents until run closure, cleans them once and never spawns unopened rooms', async () => {
+    const f = fixture(); await f.layout.create(scopedDefinition(), 'operator');
+    await f.layout.activate('operator', 'discovery'); await f.layout.activate('operator', 'design');
+    await f.layout.closeRoom('operator', 'discovery');
+    expect(f.running.has('discovery:critic')).toBe(true);
+    await expect(f.reload().activate('operator', 'discovery')).rejects.toThrow('room closed');
+    await f.reload().activate('operator', 'design');
+    expect(f.supervisor.spawn).toHaveBeenCalledTimes(3);
+    await f.layout.close('operator'); await f.reload().close('operator');
+    expect(f.supervisor.retire).toHaveBeenCalledTimes(3); expect(f.running.size).toBe(0);
+    expect(f.layout.snapshot().participants['unused:critic'].instance).toBeUndefined();
+  });
+  it('retains borrowed shared instances alongside room-scoped agents', async () => {
+    const f = fixture(), borrowed = instance('existing'); f.running.set(borrowed.launch, borrowed);
+    await f.layout.create(scopedDefinition(), 'operator', { doctor: borrowed });
+    await f.layout.activate('operator', 'design'); await f.layout.activate('operator', 'discovery');
+    await f.layout.close('operator');
+    expect([...f.running.values()]).toEqual([borrowed]); expect(f.supervisor.retire).toHaveBeenCalledTimes(2);
+  });
+  it('rejects a binding for a room-scoped participant before verifying or creating anything', async () => {
+    const f = fixture();
+    await expect(f.layout.create(scopedDefinition(), 'operator', { critic: instance('existing') }))
+      .rejects.toThrow('binding unsupported for room-scoped participant critic');
+    expect(f.supervisor.verify).not.toHaveBeenCalled(); expect(f.supervisor.spawn).not.toHaveBeenCalled();
+    expect(f.cowork.createRoom).not.toHaveBeenCalled();
+  });
+  it('does not reuse another room instance when a scoped spawn outcome is unknown', async () => {
+    const f = fixture(); await f.layout.create(scopedDefinition(), 'operator');
+    await f.layout.activate('operator', 'discovery');
+    f.supervisor.spawn.mockRejectedValueOnce(Error('response lost'));
+    await expect(f.layout.activate('operator', 'design')).rejects.toThrow('response lost');
+    await expect(f.reload().activate('operator', 'design')).rejects.toThrow('reconciliation required');
+    expect(f.layout.snapshot().uncertain).toBe('spawn:design:critic');
+    expect(f.supervisor.spawn).toHaveBeenCalledTimes(3);
+    await expect(f.layout.close('operator')).rejects.toThrow('inspection still required');
+    expect(f.supervisor.retire).toHaveBeenCalledTimes(2);
+  });
+  it('rejects replacement of one room session without retiring or replacing the new session', async () => {
+    const f = fixture(); await f.layout.create(scopedDefinition(), 'operator');
+    await f.layout.activate('operator', 'design');
+    const replacement = { ...instance('design:critic'), session: 'replacement' };
+    f.running.set('design:critic', replacement);
+    await expect(f.reload().activate('operator', 'design')).rejects.toThrow('stale instance');
+    await expect(f.layout.close('operator')).rejects.toThrow('participant design:critic');
+    expect(f.running.get('design:critic')).toEqual(replacement);
+    expect(f.supervisor.spawn).toHaveBeenCalledTimes(2);
+  });
+  it('keeps legacy instance keys and snapshots when scope is omitted', async () => {
+    const f = fixture(); await f.layout.create(definition(), 'operator');
+    const before = f.layout.snapshot();
+    expect(Object.keys(before.participants)).toEqual(Object.keys(before.definition.participants));
+    expect(Object.values(before.participants).every(p => p.participant === undefined && p.room === undefined)).toBe(true);
+    await f.reload().activate('operator', 'product'); await f.reload().activate('operator', 'design');
+    expect(f.supervisor.spawn).toHaveBeenCalledTimes(3);
+  });
+});
 it('uses distinct bounded native room names across layout instances and room keys', async () => {
   const a = fixture(), b = fixture();
   const other = new RoomLayout(join(root, 'other.json'), b.cowork, b.supervisor);
@@ -143,6 +234,53 @@ it('pins room owner attachment and preserves the invite only in memory', async (
   const changed = new RoomLayout(f.file, f.cowork, f.supervisor, { ...owner, cid: 'other-owner' });
   await expect(changed.activate('operator', 'design')).rejects.toThrow('owner configuration changed');
   expect(f.cowork.createRoom).toHaveBeenCalledTimes(1);
+});
+
+describe('Owner hexadecimal CID equality', () => {
+  const cid = 'abcdef01'.repeat(8);
+  function ownerFixture(configured: string, native: string, role = 'Owner', seatState = 'active') {
+    const f = fixture();
+    f.cowork.acceptInvite = vi.fn(async (id) => {
+      f.rooms.get(id).seats.push({ identity_cid: native, role, seat_state: seatState });
+      return {} as any;
+    });
+    f.cowork.setRoleCommands = vi.fn(async () => {});
+    const owner = { cid: configured, role: 'Owner', invite: 'fixture-owner-invite' };
+    const engine = () => new RoomLayout(f.file, f.cowork, f.supervisor, owner);
+    return { ...f, engine };
+  }
+  it.each([[cid, cid.toUpperCase()], [cid.toUpperCase(), cid], [cid, 'AbCdEf01'.repeat(8)]])
+    ('admits equivalent CID casing and reopens without admission or assignment replay', async (configured, native) => {
+      const f = ownerFixture(configured, native);
+      await f.engine().create(scopedDefinition(), 'operator');
+      await f.engine().activate('operator', 'discovery');
+      expect(f.supervisor.assign).toHaveBeenCalledTimes(2);
+      await f.engine().activate('operator', 'discovery');
+      expect(f.cowork.acceptInvite).toHaveBeenCalledTimes(1);
+      expect(f.supervisor.assign).toHaveBeenCalledTimes(2);
+    });
+  it.each([
+    ['different identity', '12345678'.repeat(8), 'Owner', 'active'],
+    ['different role', cid.toUpperCase(), 'owner', 'active'],
+    ['removed seat', cid.toUpperCase(), 'Owner', 'removed'],
+  ])('rejects %s before assignment', async (_label, native, role, state) => {
+    const f = ownerFixture(cid, native, role, state);
+    await f.engine().create(scopedDefinition(), 'operator');
+    await expect(f.engine().activate('operator', 'discovery')).rejects.toThrow('owner membership not active');
+    expect(f.supervisor.assign).not.toHaveBeenCalled();
+  });
+  it.each(['identity', 'role', 'removed'])('rechecks Owner %s on reopen', async change => {
+    const f = ownerFixture(cid, cid);
+    await f.engine().create(scopedDefinition(), 'operator');
+    await f.engine().activate('operator', 'discovery');
+    const seat = f.rooms.get('room-1').seats.find((s: any) => s.role === 'Owner');
+    if (change === 'identity') seat.identity_cid = '12345678'.repeat(8);
+    if (change === 'role') seat.role = 'owner';
+    if (change === 'removed') seat.seat_state = 'removed';
+    await expect(f.engine().activate('operator', 'discovery')).rejects.toThrow('owner membership not active');
+    expect(f.cowork.acceptInvite).toHaveBeenCalledTimes(1);
+    expect(f.supervisor.assign).toHaveBeenCalledTimes(2);
+  });
 });
 
 it('keeps participants alive when one or all of their rooms close', async () => {

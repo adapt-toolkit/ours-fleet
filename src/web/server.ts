@@ -39,7 +39,10 @@ import { TaskStateError } from '../rooms-tasks/task-state.js';
 import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
 import type { SubscriptionService } from '../subscriptions/service.js';
 
+import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
+
 export interface WebServices {
+  layoutBindings?: Pick<LayoutBindingGrants, 'control'>;
   query: FleetQueryService;
   repository: RoleRepository;
   session(roleId: string): Promise<RoleSessionControl>;
@@ -111,8 +114,20 @@ export async function buildWebServer(
     }
   });
 
+  app.post<{ Params: { id: string } }>('/api/v1/layout-bindings/:id/control', async request => {
+    // Initial support is direct same-host Fleet-to-Fleet transport.
+    const forwarded = Object.keys(request.headers).some(name =>
+      name === 'forwarded' || name.startsWith('x-forwarded-') || name === 'x-real-ip' || name === 'via');
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.ip) || forwarded)
+      throw new FleetError('forbidden', 'layout bindings require direct loopback access');
+    // Machine credentials cannot authenticate browser or lifecycle routes.
+    if (request.headers.origin) auth.validateBoundary(request, true);
+    if (!services.layoutBindings) throw new FleetError('capability_unavailable', 'layout bindings unavailable');
+    return services.layoutBindings.control(request.params.id, request.headers.authorization, request.body);
+  });
+
   app.setErrorHandler(async (error, request, reply) => {
-    const privateToolParseError = request.routeOptions.url === '/api/v1/roles/:id/ours/call'
+    const privateToolParseError = ['/api/v1/roles/:id/ours/call', '/api/v1/layout-bindings/:id/control'].includes(request.routeOptions.url ?? '')
       && error instanceof Error && 'code' in error
       && typeof error.code === 'string' && error.code.startsWith('FST_ERR_CTP_');
     const fleetError = normalizeError(privateToolParseError
