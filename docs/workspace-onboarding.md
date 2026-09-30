@@ -12,12 +12,12 @@ attachment is refused. Repeats preserve the root, manifest and Owner invitation
 file while submitting a new expiring challenge. Do not replay consumed invitations.
 
 Enrollment configures a named tunnel connector and protects the workspace gateway
-at port49271. `/fleet/api`, `/daemon`, `/cowork` and `/messenger` require per-device
+at port 49271. `/fleet/api`, `/daemon`, `/cowork` and `/messenger` require per-device
 credentials; private machine credentials remain on the host. Cloudflare management
 credentials belong only to the account server. A usable tunnel requires actual
 provider configuration and an active connector, not merely an enrollment receipt.
 
-Run `ours-fleet link-device --label "My phone"` on the enrolled host, or use Devices
+Run `ours-fleet link-device` on the enrolled host, or use Devices
 on a connected browser. The terminal prints a QR/copyable five-minute single-use
 code; consuming it creates a distinct device credential. Treat codes as private.
 Devices lists metadata, never raw bearers. Revoking a device invalidates its requests
