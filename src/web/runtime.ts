@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { SubscriptionService } from '../subscriptions/service.js';
 import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
@@ -189,6 +190,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     roomLayouts: new RoomLayoutDefinitions(options.configPath),
     presetProvenance: new PresetProvenance(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
+    subscriptions: new SubscriptionService({
+      agents: async () => (await query.list(true)).map(({ role, status }) => ({
+        roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',
+      })),
+      onChange: () => events.publish('subscription.changed', {}),
+    }),
     async session(roleId) {
       const role = await repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);

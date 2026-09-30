@@ -23,6 +23,7 @@ import {
 } from './daemon-recovery.js';
 import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
+import { pinSubscriptionForLaunch } from './subscriptions/launch.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
@@ -644,6 +645,10 @@ export async function runOnce(
   const sessionBackend = role.session ?? 'acp';
   const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);
+  // Resolve the fleet-wide active subscription profile once, now: a later switch
+  // never changes this session (the operator restarts agents to move them).
+  const subscription = pinSubscriptionForLaunch(role, dir);
+  if (subscription?.pin.home) deps.log(`[${name}] subscription: ${subscription.pin.provider} profile ${subscription.pin.profileId}`);
 
   // Preserve the role's existing isolation policy.
   let wrappedArgv = launch.argv;
@@ -655,6 +660,7 @@ export async function runOnce(
     launch = { ...launch, argv: runtime.argv };
     const ctx: WrapContext = {
       ...isolationContextFor(role), stateDir: dir, runCwd,
+      subscriptionHome: subscription?.writablePath,
       runtimeReadPaths: [...runtime.readPaths, ...resolveLaunchRuntime([process.execPath, fileURLToPath(new URL('./agent-ours/bridge.js', import.meta.url))]).readPaths],
     };
     const policy = resolveIsolation(role.isolation, ctx);
@@ -680,7 +686,7 @@ export async function runOnce(
   let layoutRetiring = false;
   try {
   const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
-    harnessChildEnv(role, launch.env, dir));
+    { ...harnessChildEnv(role, launch.env, dir), ...subscription?.env });
   // Start-stagger: space this launch at least start_stagger_ms after the previous
   // agent launch across the whole host, so a burst of boots (systemd starts every
   // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not

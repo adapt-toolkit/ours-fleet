@@ -18,6 +18,7 @@ import type {
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import { recordClaudeRateLimit } from '../subscriptions/observed.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
   type StallObservation, type StallStatus } from './stall-watchdog.js';
 import {
@@ -1856,6 +1857,11 @@ export class AcpSession implements AgentSession {
     this.recordConversationUpdate(update, scheduled, messagePhase === 'commentary');
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
+    if (update.sessionUpdate === 'usage_update') {
+      // Claude subscription rate-limit snapshot (claude-agent-acp forwards the SDK rate_limit_event).
+      const rateLimit = (update._meta as Record<string, unknown> | null | undefined)?.['_claude/rateLimit'];
+      if (rateLimit) recordClaudeRateLimit(this.options.stateDir, rateLimit);
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         const phase = messagePhase;
