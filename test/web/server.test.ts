@@ -705,3 +705,47 @@ it('serves Fleet installation metadata in initial HTML and preserves standalone 
     expect(missingApi.statusCode).not.toBe(200);
   } finally { await server.close(); rmSync(dir, { recursive: true }); }
 });
+
+it('layout machine grant uses its own authorization and cannot authenticate browser control', async () => {
+  const control = vi.fn(async (_id: string, authorization?: string) => {
+    if (authorization !== 'Bearer scoped-grant') throw new (await import('../../src/application/errors.js')).FleetError('unauthorized', 'binding unavailable');
+    return { instance: { cid: 'granted-agent' } };
+  });
+  const server = await testServer({ layoutBindings: { control } });
+  try {
+    const url = '/api/v1/layout-bindings/grant-id/control';
+    const headers = { host: boundary.host, authorization: 'Bearer scoped-grant' };
+    expect((await server.app.inject({ method: 'POST', url, headers, payload: { action: 'verify' } })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'POST', url, headers: { host: boundary.host }, payload: {} })).statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/roles', headers })).statusCode).toBe(401);
+    const before = control.mock.calls.length;
+    for (const unsafe of [{ origin: 'https://foreign.example' }, { host: 'foreign.example' }, { 'sec-fetch-site': 'cross-site' }]) {
+      expect((await server.app.inject({ method: 'POST', url, headers: { ...headers, ...unsafe }, payload: { action: 'verify' } })).statusCode).toBe(403);
+    }
+    expect(control.mock.calls.length).toBe(before);
+  } finally { await server.close(); }
+});
+
+// Presence is enough: even empty forwarding metadata violates direct transport.
+it('refuses forwarded and non-loopback machine grants before capability control', async () => {
+  const control = vi.fn(async () => ({ instance: { cid: 'fixture-agent' } }));
+  const server = await testServer({ layoutBindings: { control } });
+  const url = '/api/v1/layout-bindings/grant-id/control';
+  const headers = { host: boundary.host, authorization: 'Bearer fixture-grant' };
+  try {
+    for (const metadata of [
+      { forwarded: 'for=192.0.2.1;proto=https' }, { forwarded: '' },
+      { 'x-forwarded-for': '192.0.2.1' }, { 'x-forwarded-for': '' },
+      { 'x-forwarded-host': 'foreign.example' }, { 'x-forwarded-proto': 'https' },
+      { 'x-forwarded-port': '443' }, { 'x-forwarded-prefix': '/fleet' },
+      { 'x-real-ip': '192.0.2.1' }, { via: '1.1 proxy' },
+    ]) {
+      const response = await server.app.inject({ method: 'POST', url, headers: { ...headers, ...metadata }, payload: { action: 'verify' } });
+      expect(response.statusCode).toBe(403);
+    }
+    expect((await server.app.inject({ method: 'POST', url, remoteAddress: '192.0.2.1', headers, payload: { action: 'verify' } })).statusCode).toBe(403);
+    expect(control).not.toHaveBeenCalled();
+    expect((await server.app.inject({ method: 'POST', url, remoteAddress: '127.0.0.1', headers, payload: { action: 'verify' } })).statusCode).toBe(200);
+    expect(control).toHaveBeenCalledTimes(1);
+  } finally { await server.close(); }
+});

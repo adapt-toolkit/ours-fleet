@@ -1,3 +1,5 @@
+import { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
+import { RoomLayoutService } from '../rooms-tasks/layout-service.js';
 import { spawn } from 'node:child_process';
 import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
 import { producerConfig } from '../notifications/outbox.js';
@@ -191,6 +193,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
     taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
     roomLayouts: new RoomLayoutDefinitions(options.configPath),
+    layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),
     presetProvenance: new PresetProvenance(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
     subscriptions: new SubscriptionService({

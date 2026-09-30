@@ -15,9 +15,26 @@ const definition = () => ({ version: 1, participants: { worker: { agent_template
     design: { goal: 'Design', members: ['worker'] } } });
 function file(text = stringify(definition())) { const path = join(root, 'layout.yaml'); writeFileSync(path, text, { mode: 0o600 }); return path; }
 describe('room layout YAML authoring', () => {
+  it.each(['layout', 'room'])('accepts instance_scope %s without expanding the authorable definition', scope => {
+    const def = definition();
+    Object.assign(def.participants.worker, { instance_scope: scope });
+    const result = readRoomLayout(file(stringify(def)));
+    expect(result.participants).toEqual(def.participants);
+    expect(result.rooms.design.members).toEqual(['worker']);
+  });
+  it.each(['shared', 'fresh', '', null, true, 42])('rejects unsupported instance_scope %s', scope => {
+    const def = definition(); Object.assign(def.participants.worker, { instance_scope: scope });
+    expect(() => validateRoomLayout(def)).toThrow('invalid instance_scope');
+  });
+  it('requires an agent template for room-scoped participants', () => {
+    const def: any = definition(); def.participants.worker = { instance_scope: 'room' };
+    expect(() => validateRoomLayout(def)).toThrow('requires agent_template');
+    def.participants.worker = {};
+    expect(() => validateRoomLayout(def)).not.toThrow();
+  });
   it('loads split YAML beside legacy templates and records the source', () => {
     const config = join(root, 'fleet.yaml'); writeV2Fixture(config, { roles: {} });
-    const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts);
+    const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts, { mode: 0o700 });
     writeFileSync(join(layouts, 'delivery.yaml'), stringify(definition()), { mode: 0o600 });
     const cfg = loadConfig(config);
     expect(new RoomLayoutService(config).definition('delivery').rooms.design.members).toEqual(['worker']);
@@ -25,9 +42,9 @@ describe('room layout YAML authoring', () => {
   });
   it('validates layout references only for layout authoring, keeping ordinary Fleet config independent', () => {
     const config = join(root, 'fleet.yaml'); writeV2Fixture(config, { roles: {} });
-    const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts);
+    const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts, { mode: 0o700 });
     const def = definition(); def.participants.worker.agent_template = 'missing';
-    writeFileSync(join(layouts, 'bad.yaml'), stringify(def));
+    writeFileSync(join(layouts, 'bad.yaml'), stringify(def), { mode: 0o600 });
     expect(() => new RoomLayoutService(config).list()).toThrow('agent template not found');
     expect(() => loadConfig(config)).not.toThrow();
   });

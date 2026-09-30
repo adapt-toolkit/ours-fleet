@@ -11,6 +11,8 @@ import { layoutSupervisorId, type LayoutControlRequest } from './layout-control.
 import { RoomLayout, type LayoutInstance, type LayoutSupervisor, type RoomLayoutState } from './layout.js';
 import { assertLayoutFile, validLayoutKey, readRoomLayout, readRoomLayouts, type RoomLayoutDefinition } from './layout-config.js';
 import { createCoworkAdapter } from './cowork-adapter.js';
+import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-binding-client.js';
+import { readClientProfile } from '../client-profile.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
   readonly id: string;
@@ -26,7 +28,8 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
   async inspect(agent: string, temporary: boolean): Promise<LayoutInstance> {
     return await this.request(agent, temporary, { action: 'inspect' }) as LayoutInstance;
   }
-  private call(i: LayoutInstance, request: Omit<LayoutControlRequest, 'instance'>): Promise<unknown> {
+  private call(i: LayoutInstance, request: LayoutBindingRequest): Promise<unknown> {
+    if (i.remote) return callRemoteLayoutBinding(i, request, readClientProfile().expectedInstanceId);
     if (i.supervisor !== this.id || !i.agent || typeof i.temporary !== 'boolean') throw Error('invalid local layout binding');
     return this.request(i.agent, i.temporary, { ...request, instance: i });
   }
@@ -44,7 +47,12 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     }
     throw Error(`layout agent startup not confirmed: ${name}: ${String(last)}`);
   }
-  async join(i: LayoutInstance, invite: string, roomCid: string): Promise<void> {
+  async join(i: LayoutInstance, invite: string, roomCid: string, membership?: { roomId: string; role: string }): Promise<void> {
+    if (i.remote) {
+      if (!membership) throw Error('cross-Fleet join requires room ID and role');
+      await this.call(i, { action: 'join', roomCid, roomId: membership.roomId, roomRole: membership.role });
+      return;
+    }
     await this.call(i, { action: 'join', invite, roomCid });
     const cowork = createCoworkAdapter();
     const deadline = Date.now() + 30_000;
@@ -59,6 +67,7 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     await this.call(i, { action: 'assign', assignment });
   }
   async retire(i: LayoutInstance): Promise<void> {
+    if (i.remote) throw Error('cannot retire a borrowed cross-Fleet instance');
     if (i.supervisor !== this.id || !i.agent || !/^[A-Za-z0-9_-]+$/.test(i.agent) || i.temporary !== true)
       throw Error('invalid local temporary layout instance');
     const dir = agentDir(i.agent, true);
