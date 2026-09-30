@@ -10,6 +10,8 @@ export interface ServiceTarget {
   origin: string;
   /** Server-side service credentials; never taken from browser headers. */
   headers?: Record<string, string>;
+  /** Dedicated credential-authenticated services reject direct browser context. */
+  stripBrowserContext?: boolean;
 }
 export interface GatewayOptions {
   /** Backend mode is for a separate loopback machine-client listener; browsers are rejected. */
@@ -54,6 +56,9 @@ export function createPrefixGateway(options: GatewayOptions) {
     if (route.service) {
       if (auth) for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-ours-api-token']) delete headers[name];
       Object.assign(headers, route.service.headers);
+      if (route.service.stripBrowserContext) {
+        for (const name of ['origin', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user']) delete headers[name];
+      }
       headers.host = new URL(route.origin).host;
     }
     if (upgrade) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }

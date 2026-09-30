@@ -1820,3 +1820,8 @@ See [predefined Brain models and runtime requirements](presets/README.md) for th
 
 Room layouts describe room composition with shared or fresh participant sessions and independent room closure.
 See [Room layouts](docs/room-layouts.md) for YAML examples and CLI commands.
+
+
+### Dedicated notification service
+
+Configure the web backend with `OURS_NOTIFICATIONS_ORIGIN` and a Fleet-scoped `OURS_NOTIFICATIONS_PRODUCER_TOKEN`. It reads each local supervisor ledger incrementally with persistent checkpoints under web state, correlating owner browser/channel prompts with terminal completion. Monitor/startup turns do not notify. First installation skips existing history; no agent restart or conversation controller is needed. Persist web state across deployment/restarts. Reads are bounded to 256 KiB per role per tick, and oversized model/media records are skipped across chunks. Expose `/notifications` through the generic authenticated prefix gateway with a server-side user token and `stripBrowserContext: true`; producer tokens stay server-side. All browser sessions of this single-owner console map to one stable notification account. See [ours-notifications](https://github.com/adapt-toolkit/ours-notifications) for configuration/API/release details.

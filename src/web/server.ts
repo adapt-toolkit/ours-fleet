@@ -1025,7 +1025,10 @@ export async function buildWebServer(
     await app.register(fastifyStatic, { root: staticRoot, prefix: '/' });
     app.setNotFoundHandler((request, reply) => {
       if (request.url.startsWith('/api/')) return reply.code(404).send({ error: 'not found' });
-      return reply.sendFile('index.html');
+      const path = request.url.split('?')[0];
+      if ((path === '/chats' || path.startsWith('/chats/')) && existsSync(join(staticRoot, 'fleet-index.html'))) return reply.redirect((request.url.includes('?') ? '/fleet/chats' : '/fleet') + (request.url.includes('?') ? request.url.slice(request.url.indexOf('?')) : ''));
+      const fleetEntry = (path === '/fleet' || path.startsWith('/fleet/')) && existsSync(join(staticRoot, 'fleet-index.html'));
+      return reply.sendFile(fleetEntry ? 'fleet-index.html' : 'index.html');
     });
   }
 
