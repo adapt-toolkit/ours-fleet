@@ -691,19 +691,28 @@ export async function buildWebServer(
       });
     });
 
-  app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>(
+  app.get<{ Params: { id: string }; Querystring: { after?: string; before?: string; latest?: string; limit?: string } }>(
     '/api/v1/roles/:id/conversation', async request => {
       auth.authenticate(request);
       const control = await services.session(request.params.id);
       if (!control.conversationPage)
         throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
-      const page = await control.conversationPage({
-        after: request.query.after,
-        limit: request.query.limit ? Number(request.query.limit) : undefined,
-      });
+      const limit = request.query.limit ? Number(request.query.limit) : undefined;
+      // `latest` / `before` page backwards from the newest event; `after` pages forward for live updates.
+      const backward = request.query.latest === '1' || request.query.before !== undefined;
+      if (backward && request.query.after !== undefined)
+        throw new FleetError('invalid_request', 'after cannot be combined with latest or before');
+      if (backward && !control.conversationTail)
+        throw new FleetError('capability_unavailable', 'this role cannot page its conversation backwards');
       const role = await services.repository.get(request.params.id);
       const stateDir = role ? services.repository.stateDir(role) : undefined;
-      return { ...page, events: page.events.map(event => presentAttachmentEvent(stateDir, request.params.id, event)) };
+      const present = (event: Parameters<typeof presentAttachmentEvent>[2]) => presentAttachmentEvent(stateDir, request.params.id, event);
+      if (backward) {
+        const page = await control.conversationTail!({ before: request.query.before, limit });
+        return { ...page, events: page.events.map(present), context: page.context.map(present) };
+      }
+      const page = await control.conversationPage({ after: request.query.after, limit });
+      return { ...page, events: page.events.map(present) };
     });
 
   app.get<{ Params: { id: string; attachmentId: string } }>('/api/v1/roles/:id/attachments/:attachmentId', async (request, reply) => {
