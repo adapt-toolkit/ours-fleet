@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { LayoutBindingGrants } from './layout-binding-grants.js';
 import { Command } from 'commander';
 import { stringify } from 'yaml';
 import { RoomLayoutService } from './layout-service.js';
@@ -7,7 +9,7 @@ import { assertLayoutFile, readRoomLayout } from './layout-config.js';
 import { parseFleetDocument } from '../config-yaml.js';
 import type { LayoutInstance } from './layout.js';
 
-type Options = { configuration?: string; json?: boolean; bindings?: string; id?: string; file?: string; temporary?: boolean };
+type Options = { configuration?: string; json?: boolean; bindings?: string; id?: string; file?: string; temporary?: boolean; serverUrl?: string; output?: string; participant?: string };
 const emit = (value: Record<string, unknown>): void => {
   const output = { ...value };
   if (output.state) {
@@ -18,6 +20,14 @@ const emit = (value: Record<string, unknown>): void => {
 };
 function document(file: string): Record<string, unknown> {
   assertLayoutFile(file); return parseFleetDocument(file, readFileSync(file, 'utf8'), 'strict').value;
+}
+export function readLayoutBindings(file: string): Record<string, LayoutInstance> {
+  const absolute = resolve(file);
+  const bindings = document(absolute) as unknown as Record<string, LayoutInstance>;
+  for (const instance of Object.values(bindings)) {
+    if (instance.remote) instance.remote.credential_file = resolve(dirname(absolute), instance.remote.credential_file);
+  }
+  return bindings;
 }
 export function registerLayoutCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
   const layout = parent.command('layout').description('YAML room composition and membership');
@@ -41,11 +51,26 @@ export function registerLayoutCommands(parent: Command, cOpt: (cmd: Command) => 
   command('instance <agent>', 'inspect an exact live instance for a bindings YAML file')
     .option('--temporary', 'select a temporary agent')
     .action(action(async (agent: string, opts: Options) => emit({ instance: await new RoomLayoutService(opts.configuration).supervisor().inspect(agent, Boolean(opts.temporary)) })));
-  command('create <name>', 'snapshot a layout without creating rooms or agents')
+  command('share <agent>', 'grant room membership access to one exact local standalone instance')
+    .option('--temporary', 'select a temporary agent')
+    .requiredOption('--server-url <origin>', 'existing owner Fleet loopback HTTP origin')
+    .requiredOption('--output <file>', 'create binding YAML and adjacent private credential file')
+    .option('--participant <key>', 'logical layout participant key (default: agent name)')
+    .action(action(async (agent: string, opts: Options) => {
+      const supervisor = new RoomLayoutService(opts.configuration).supervisor();
+      const instance = await supervisor.inspect(agent, Boolean(opts.temporary));
+      emit(await new LayoutBindingGrants(supervisor).share(instance, opts.serverUrl!, resolve(opts.output!), opts.participant ?? agent));
+    }));
+  command('revoke-binding <grant-id>', 'revoke a room membership grant without stopping the agent')
+    .action(action(async (id: string, opts: Options) => {
+      await new LayoutBindingGrants(new RoomLayoutService(opts.configuration).supervisor()).revoke(id);
+      emit({ grant_id: id, revoked: true });
+    }));
+  command('create <name>' , 'snapshot a layout without creating rooms or agents')
     .option('--id <id>', 'unique layout instance ID').option('--bindings <file>', 'YAML mapping participant keys to exact instance references')
     .action(action(async (name: string, opts: Options) => {
       const service = new RoomLayoutService(opts.configuration);
-      const created = await service.create(name, opts.bindings ? document(opts.bindings) as unknown as Record<string, LayoutInstance> : {}, opts.id);
+      const created = await service.create(name, opts.bindings ? readLayoutBindings(opts.bindings) : {}, opts.id);
       emit({ id: created.id, state: created.state });
     }));
   command('status <id>', 'inspect room membership and agent instances').action(action((id: string, opts: Options) => emit({ id, state: new RoomLayoutService(opts.configuration).open(id, true).snapshot() })));
