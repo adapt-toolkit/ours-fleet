@@ -1,4 +1,6 @@
-import {resumedConversationPage} from './conversation-history.js';
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {conversationTailPage,resumedConversationPage,type ConversationTailPage} from './conversation-history.js';
 import type { AgentHistoryQuery } from '../agent-ours/correspondence.js';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
@@ -44,6 +46,8 @@ export interface RoleSessionControl {
   respondPermission?(request: { permissionId: string; optionId: string }): Promise<{ accepted: true }>;
   // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
+  /** The newest visible events (or those before `before`), read backwards from the ledger. */
+  conversationTail?(request: { before?: string; limit?: number }): Promise<ConversationTailPage>;
   submitPromptV2?(request: {
     commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
     source: 'owner_admin_console';
@@ -145,6 +149,22 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
       const check=await this.call('conversation_page',{limit:1}) as ConversationPageView;
       return check.snapshot.sessionGeneration===live.snapshot.sessionGeneration?history:await this.call('conversation_page',request) as ConversationPageView;
     }catch{return live;}
+  }
+
+  async conversationTail(request: { before?: string; limit?: number } = {}): Promise<ConversationTailPage> {
+    const live = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+    const snapshot = await this.snapshot();
+    let resumed: string | undefined;
+    if (snapshot.backend === 'acp' && snapshot.sessionId) {
+      try {
+        if ((await readFile(join(this.stateDir, '.acp-session-id'), 'utf8')).trim() === snapshot.sessionId) resumed = snapshot.sessionId;
+      } catch { /* no resumed history: live generation only */ }
+    }
+    try {
+      return await conversationTailPage(this.stateDir, request, live.snapshot, resumed);
+    } catch (error) {
+      throw new FleetError('invalid_request', (error as Error).message);
+    }
   }
 
   async submitPromptV2(request: {

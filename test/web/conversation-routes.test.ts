@@ -123,6 +123,35 @@ describe('conversation web routes', () => {
     await server.close();
   });
 
+  it('pages backwards with latest/before and keeps after for forward paging', async () => {
+    const calls: unknown[] = [];
+    const control = conversationControl() as Record<string, unknown>;
+    control.conversationTail = async (request: unknown) => {
+      calls.push(request);
+      return {
+        events: [{ schemaVersion: 1, roleId: 'Alpha', eventId: 'e9', seq: 9, at: new Date().toISOString(), sessionGeneration: 'gen', kind: 'prompt.admitted', payload: {} }],
+        context: [], hasOlder: true, olderCursor: '9', nextCursor: '12', hasMore: false,
+        snapshot: { sessionGeneration: 'gen', readiness: 'idle', queueDepth: 0, pendingPermissionIds: [] },
+      };
+    };
+    const { server, cookie } = await authenticated(control);
+    const latest = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1&limit=100', headers: headers(cookie) });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.json()).toMatchObject({ hasOlder: true, olderCursor: '9', nextCursor: '12', context: [] });
+    const older = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?before=9&limit=100', headers: headers(cookie) });
+    expect(older.statusCode).toBe(200);
+    expect(calls).toEqual([{ before: undefined, limit: 100 }, { before: '9', limit: 100 }]);
+    const mixed = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1&after=3', headers: headers(cookie) });
+    expect(mixed.statusCode).toBe(400);
+    const forward = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?after=3', headers: headers(cookie) });
+    expect(forward.statusCode).toBe(200);
+    expect(calls).toHaveLength(2);
+    delete control.conversationTail;
+    const unsupported = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1', headers: headers(cookie) });
+    expect(unsupported.json().error.code).toBe('capability_unavailable');
+    await server.close();
+  });
+
   it('reports capability_unavailable when the role has no ledger', async () => {
     const control = conversationControl() as Record<string, unknown>;
     delete control.conversationPage;
