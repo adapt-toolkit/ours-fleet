@@ -2,10 +2,13 @@ import { it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ expectedInstanceId: 'shared-daemon' }) }));
 vi.mock('../src/session/control.js', async importOriginal => ({ ...await importOriginal<typeof import('../src/session/control.js')>(), controlRequest: vi.fn() }));
 vi.mock('../src/temp-lifecycle.js', async importOriginal => ({ ...await importOriginal<typeof import('../src/temp-lifecycle.js')>(), tempSupervisorLiveness: vi.fn() }));
+vi.mock('../src/spawn.js', () => ({ spawnTemp: vi.fn() }));
 import { controlRequest } from '../src/session/control.js';
 import { tempSupervisorLiveness } from '../src/temp-lifecycle.js';
+import { spawnTemp } from '../src/spawn.js';
 import { NativeLayoutSupervisor, RoomLayoutService } from '../src/rooms-tasks/layout-service.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import { stringify } from 'yaml';
@@ -17,6 +20,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   if (previous === undefined) delete process.env.OURS_FLEET_HOME; else process.env.OURS_FLEET_HOME = previous;
+  vi.unstubAllGlobals();
   rmSync(root, { recursive: true, force: true });
 });
 function fixture() {
@@ -25,10 +29,30 @@ function fixture() {
   mkdirSync(agentDir('worker', true), { recursive: true });
   return { supervisor, instance };
 }
+it('gives scoped keys safe distinct native agent names across rooms and runs', async () => {
+  const config = join(root, 'fleet.yaml');
+  writeV2Fixture(config, { roles: {} });
+  const { loadConfig } = await import('../src/config.js');
+  const templates = loadConfig(config).agentTemplates!;
+  const first = new NativeLayoutSupervisor(config, 'first', templates);
+  const second = new NativeLayoutSupervisor(config, 'second', templates);
+  vi.mocked(controlRequest).mockImplementation(async (_dir, request: any) => ({
+    ok: true, result: { supervisor: first.id, agent: request.layout.agent, launch: 'launch', cid: 'cid', session: 'session' },
+  } as any));
+  await first.spawn('discovery:critic', 'Agent'); await first.spawn('design:critic', 'Agent');
+  await second.spawn('discovery:critic', 'Agent');
+  const calls = vi.mocked(spawnTemp).mock.calls;
+  const names = calls.map(([options]) => options.name);
+  expect(new Set(names).size).toBe(3);
+  expect(names.every(name => /^layout-[a-f0-9]{16}$/.test(name))).toBe(true);
+  expect(calls.map(([options]) => options.creationActionId)).toEqual([
+    'first:discovery:critic', 'first:design:critic', 'second:discovery:critic',
+  ]);
+});
 it('keeps retained snapshots and cleanup independent of source layout/template edits', async () => {
   const config = join(root, 'fleet.yaml');
   writeV2Fixture(config, { roles: {}, rooms: { owner: { expected_cid: '0'.repeat(64) }, defaults: { attach_owner: false } } });
-  const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts);
+  const layouts = join(root, 'fleet', 'room_layouts'); mkdirSync(layouts, { mode: 0o700 });
   const source = join(layouts, 'work.yaml');
   writeFileSync(source, stringify({ version: 1, participants: { worker: { agent_template: 'Agent' } },
     rooms: { design: { goal: 'Original goal', members: ['worker'] } } }), { mode: 0o600 });
@@ -74,4 +98,20 @@ it('rejects non-local, persistent and invalid-name references before observing o
   for (const change of [{ supervisor: 'remote' }, { temporary: false }, { agent: '../other' }])
     await expect(f.supervisor.retire({ ...f.instance, ...change })).rejects.toThrow('invalid local temporary');
   expect(tempSupervisorLiveness).not.toHaveBeenCalled(); expect(controlRequest).not.toHaveBeenCalled();
+});
+
+it('routes a borrowed instance through the owner HTTP port without opening foreign control sockets', async () => {
+  const f = fixture();
+  const credential = join(root, 'grant.token'); writeFileSync(credential, 'x'.repeat(43), { mode: 0o600 });
+  const local = { ...f.instance, supervisor: '/different-owner-root' };
+  const instance = { ...local, remote: { url: 'http://127.0.0.1:49271', grant_id: '11111111-1111-4111-8111-111111111111', credential_file: credential, daemon_instance_id: 'shared-daemon' } };
+  const fetcher = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({ instance: local })));
+  vi.stubGlobal('fetch', fetcher);
+  await f.supervisor.verify(instance);
+  expect(fetcher).toHaveBeenCalledTimes(1); expect(controlRequest).not.toHaveBeenCalled();
+  await f.supervisor.join(instance, '', 'room-cid', { roomId: 'room-id', role: 'Architect' });
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).toMatchObject({ action: 'join', roomCid: 'room-cid', roomId: 'room-id', roomRole: 'Architect', instance: local });
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).not.toHaveProperty('invite');
+  await expect(f.supervisor.retire(instance)).rejects.toThrow('cannot retire a borrowed');
+  expect(fetcher).toHaveBeenCalledTimes(2); expect(tempSupervisorLiveness).not.toHaveBeenCalled();
 });

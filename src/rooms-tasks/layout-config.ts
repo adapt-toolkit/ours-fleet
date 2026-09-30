@@ -27,7 +27,7 @@ export function validateRoomLayout(raw: unknown, label = 'room layout'): RoomLay
     for (const key of Object.keys(value)) if (!validLayoutKey(key)) throw Error(`${label}: invalid key ${key}`);
   }
   for (const [key, rawParticipant] of Object.entries(doc.participants as object)) {
-    const participant = mapping(rawParticipant, ['agent_template'], `${label}.participants.${key}`);
+    const participant = mapping(rawParticipant, ['agent_template', 'instance_scope'], `${label}.participants.${key}`);
     if (participant.agent_template !== undefined) text(participant.agent_template, 'agent_template');
   }
   for (const [key, rawRoom] of Object.entries(doc.rooms as object)) {
