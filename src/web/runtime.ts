@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
+import { producerConfig } from '../notifications/outbox.js';
 import { SubscriptionService } from '../subscriptions/service.js';
 import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -14,7 +16,7 @@ import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
-import { home, stateRoot } from '../paths.js';
+import { home, stateRoot, agentsRoot, tmpRoot } from '../paths.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
@@ -71,6 +73,7 @@ export interface RunningWebConsole extends WebServer {
 }
 
 export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
+  const notificationConfig = producerConfig();
   const requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
@@ -245,10 +248,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   }
   if (options.open !== false) openBrowser(access.mode === 'pairing'
     ? `${browserOrigin}/#bootstrap=${server.auth.bootstrapSecret}` : `${browserOrigin}/`);
+  const notifications = notificationConfig ? new FleetNotificationProducer(
+    [agentsRoot(), tmpRoot()], resolve(webDir, 'notification-outboxes'), notificationConfig, options.log) : undefined;
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await control?.close(); await server.close(); }
+      try { await notifications?.close(); await control?.close(); await server.close(); }
       finally { lock.release(); }
     },
   };
