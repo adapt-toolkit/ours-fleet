@@ -2,6 +2,7 @@ import { it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ expectedInstanceId: 'shared-daemon' }) }));
 vi.mock('../src/session/control.js', async importOriginal => ({ ...await importOriginal<typeof import('../src/session/control.js')>(), controlRequest: vi.fn() }));
 vi.mock('../src/temp-lifecycle.js', async importOriginal => ({ ...await importOriginal<typeof import('../src/temp-lifecycle.js')>(), tempSupervisorLiveness: vi.fn() }));
 import { controlRequest } from '../src/session/control.js';
@@ -17,6 +18,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   if (previous === undefined) delete process.env.OURS_FLEET_HOME; else process.env.OURS_FLEET_HOME = previous;
+  vi.unstubAllGlobals();
   rmSync(root, { recursive: true, force: true });
 });
 function fixture() {
@@ -74,4 +76,20 @@ it('rejects non-local, persistent and invalid-name references before observing o
   for (const change of [{ supervisor: 'remote' }, { temporary: false }, { agent: '../other' }])
     await expect(f.supervisor.retire({ ...f.instance, ...change })).rejects.toThrow('invalid local temporary');
   expect(tempSupervisorLiveness).not.toHaveBeenCalled(); expect(controlRequest).not.toHaveBeenCalled();
+});
+
+it('routes a borrowed instance through the owner HTTP port without opening foreign control sockets', async () => {
+  const f = fixture();
+  const credential = join(root, 'grant.token'); writeFileSync(credential, 'x'.repeat(43), { mode: 0o600 });
+  const local = { ...f.instance, supervisor: '/different-owner-root' };
+  const instance = { ...local, remote: { url: 'http://127.0.0.1:49271', grant_id: '11111111-1111-4111-8111-111111111111', credential_file: credential, daemon_instance_id: 'shared-daemon' } };
+  const fetcher = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({ instance: local })));
+  vi.stubGlobal('fetch', fetcher);
+  await f.supervisor.verify(instance);
+  expect(fetcher).toHaveBeenCalledTimes(1); expect(controlRequest).not.toHaveBeenCalled();
+  await f.supervisor.join(instance, '', 'room-cid', { roomId: 'room-id', role: 'Architect' });
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).toMatchObject({ action: 'join', roomCid: 'room-cid', roomId: 'room-id', roomRole: 'Architect', instance: local });
+  expect(JSON.parse(fetcher.mock.calls[1][1].body)).not.toHaveProperty('invite');
+  await expect(f.supervisor.retire(instance)).rejects.toThrow('cannot retire a borrowed');
+  expect(fetcher).toHaveBeenCalledTimes(2); expect(tempSupervisorLiveness).not.toHaveBeenCalled();
 });

@@ -682,3 +682,23 @@ describe('watchdog read endpoints', () => {
     await server.close();
   });
 });
+
+it('layout machine grant uses its own authorization and cannot authenticate browser control', async () => {
+  const control = vi.fn(async (_id: string, authorization?: string) => {
+    if (authorization !== 'Bearer scoped-grant') throw new (await import('../../src/application/errors.js')).FleetError('unauthorized', 'binding unavailable');
+    return { instance: { cid: 'granted-agent' } };
+  });
+  const server = await testServer({ layoutBindings: { control } });
+  try {
+    const url = '/api/v1/layout-bindings/grant-id/control';
+    const headers = { host: boundary.host, authorization: 'Bearer scoped-grant' };
+    expect((await server.app.inject({ method: 'POST', url, headers, payload: { action: 'verify' } })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'POST', url, headers: { host: boundary.host }, payload: {} })).statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/roles', headers })).statusCode).toBe(401);
+    const before = control.mock.calls.length;
+    for (const unsafe of [{ origin: 'https://foreign.example' }, { host: 'foreign.example' }, { 'sec-fetch-site': 'cross-site' }]) {
+      expect((await server.app.inject({ method: 'POST', url, headers: { ...headers, ...unsafe }, payload: { action: 'verify' } })).statusCode).toBe(403);
+    }
+    expect(control.mock.calls.length).toBe(before);
+  } finally { await server.close(); }
+});

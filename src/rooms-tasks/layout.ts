@@ -12,6 +12,7 @@ export interface LayoutOwner { cid: string; role: string; invite: string }
 const ownerReference = (owner: LayoutOwner) => ({ cid: owner.cid, role: owner.role, fingerprint: createHash('sha256').update(owner.invite).digest('hex') });
 export interface LayoutInstance {
   supervisor: string; launch: string; cid: string; session: string; agent?: string; temporary?: boolean;
+  remote?: { url: string; grant_id: string; credential_file: string; daemon_instance_id: string };
 }
 export interface LayoutParticipant { agent_template?: string }
 export interface LayoutRoom {
@@ -30,7 +31,7 @@ export interface LayoutSupervisor {
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
   spawn(key: string, template: string): Promise<LayoutInstance>;
-  join(instance: LayoutInstance, invite: string, roomCid: string): Promise<void>;
+  join(instance: LayoutInstance, invite: string, roomCid: string, membership?: { roomId: string; role: string }): Promise<void>;
   assign(instance: LayoutInstance, assignment: LayoutAssignment): Promise<void>;
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
   retire(instance: LayoutInstance): Promise<void>;
@@ -68,7 +69,7 @@ export class RoomLayout {
   snapshot(): RoomLayoutState { return JSON.parse(readFileSync(this.file, 'utf8')); }
   private save(s: RoomLayoutState): void { replaceFileAtomically(this.file, JSON.stringify(s, null, 2)); }
   private async verify(i: LayoutInstance): Promise<void> {
-    need(i.supervisor === this.supervisor.id, 'remote binding unsupported');
+    need(i.supervisor === this.supervisor.id || i.remote, 'remote binding unsupported');
     need(i.launch && i.cid && i.session, 'incomplete instance reference');
     await this.supervisor.verify(i);
   }
@@ -150,8 +151,8 @@ export class RoomLayout {
       const seats = await this.cowork.getSeats(room.native!.room_id);
       if (!seats.some(seat => seat.identity_cid === i.cid && seat.role === roleFor(member) && seat.seat_state !== 'removed')) {
         await this.mutation(s, `admit:${key}:${member}`, async () => {
-          const invitation = await this.cowork.issueInvite(room.native!.room_id, { mode: 'one_time', role: roleFor(member), min_accepts: 1 });
-          await this.supervisor.join(i, invitation.invite, room.native!.identity_cid);
+          const invite = i.remote ? '' : (await this.cowork.issueInvite(room.native!.room_id, { mode: 'one_time', role: roleFor(member), min_accepts: 1 })).invite;
+          await this.supervisor.join(i, invite, room.native!.identity_cid, { roomId: room.native!.room_id, role: roleFor(member) });
         }, () => {});
       }
     }
