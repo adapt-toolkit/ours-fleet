@@ -59,4 +59,4 @@ try{
  assert.equal(await child.evaluate(async()=>(await fetch('/fleet/api/v1/meta')).status),401);
  await page.waitForFunction(()=>window.expired===true);
  process.stdout.write('Installed packaged Fleet rendered, completed frame authorization/service-worker setup, authenticated its real API and rejected the revoked device.\n');
-}finally{await browser?.close();tls.closeAllConnections();await new Promise(resolve=>tls.close(resolve));await server.close();store.close();rmSync(dir,{recursive:true,force:true});}
+}finally{await browser?.close();tls.closeAllConnections();await new Promise(resolve=>tls.close(resolve));await server.close();rmSync(dir,{recursive:true,force:true});}
