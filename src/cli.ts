@@ -1395,8 +1395,9 @@ webCommand.command('open').description('securely open or re-pair a browser with 
 
 cOpt(program.command('workspace-enroll').description('enroll this host using a private account setup file'))
   .requiredOption('--file <path>','owned private payload file')
+  .option('--migrate-app-origin','explicitly migrate the same workspace to its new account origin after verified signed proof')
   .action(async opts=>{try {
-    const result=await enrollWorkspace(readWorkspacePayload(opts.file),opts.configuration);
+    const result=await enrollWorkspace(readWorkspacePayload(opts.file),opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin});
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
     const manager=new WebServiceManager();await manager.install(binPath,49271,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
     const controlDeadline=Date.now()+20000;

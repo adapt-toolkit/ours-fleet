@@ -81,6 +81,7 @@ export class WebAuth {
     const origins = this.allowedOrigins.size ? this.allowedOrigins : new Set([this.origin]);
     if (!host || !hosts.has(host)) throw new FleetError('forbidden',
       `This address is not configured for the fleet console. Open ${this.origin} or set --public-origin.`);
+    if(this.workspaceDevices && String(request.headers.authorization ?? '').startsWith('Bearer ') && request.headers.origin && request.headers.origin!==this.appOrigin && !origins.has(request.headers.origin))throw new FleetError('forbidden','workspace request Origin does not match configured account origin');
     const workspaceRequest = Boolean(this.workspaceDevices) && request.headers.origin === this.appOrigin
       && (String(request.headers.authorization ?? '').startsWith('Bearer ') || (request.url ?? '').split('?')[0] === '/api/v1/devices/enroll' || request.method === 'OPTIONS');
     if (requireOrigin && !workspaceRequest && (!request.headers.origin || !origins.has(request.headers.origin)))

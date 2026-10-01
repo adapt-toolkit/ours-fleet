@@ -1,3 +1,4 @@
+import {validateAccountOrigin} from './account-origin.js';
 import { lstatSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readClientProfile } from './client-profile.js';
@@ -12,19 +13,21 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
   const path=resolve(file),stat=lstatSync(path);
   if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>32768)throw Error('Setup payload requires an owned private regular file (chmod 600)');
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(readFileSync(path,'utf8').trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
-  if(p.version!==1 || p.appOrigin!=='https://app.ours.network' || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || p.challenge.expiresAt<=Date.now() || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
+  if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || p.challenge.expiresAt<=Date.now() || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
   for(const k of ['connectorToken','invitation','name','surname'] as const)if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');
   return p;
 }
-export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath()) {
+export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean}={}) {
   const profile=readClientProfile();const base=new URL(profile.endpoint);base.pathname=base.pathname.replace(/\/daemon\/?$/,'/messenger/');
   if(!base.pathname.endsWith('/messenger/'))throw Error('Workspace setup requires the supported gateway client profile');
   const secret=readFileSync(profile.credentialPath,'utf8').trim();
   const request=async(path:string,value?:unknown)=>{const response=await fetch(new URL('api/'+path,base),{method:value===undefined?'GET':'POST',headers:{'X-Ours-Api-Token':secret,...(value===undefined?{}:{'Content-Type':'application/json','Origin':base.origin,'X-Ours-Messenger-CSRF':'1'})},...(value===undefined?{}:{body:JSON.stringify(value)}),signal:AbortSignal.timeout(15000),redirect:'error'});if(!response.ok){await response.body?.cancel();throw Error('Workspace Messenger enrollment failed (HTTP '+response.status+'); request a fresh setup payload before retrying');}return response.json();};
   if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
   const dir=join(stateRoot(),'workspace');mkdirSync(dir,{recursive:true,mode:0o700});
+  const appOrigin=validateAccountOrigin(payload.appOrigin);
   const previousFile=join(dir,'binding.json');
-  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId)throw Error('This host is already associated with another workspace');}
+  let migrating=false;
+  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin ?? 'https://app.ours.network');migrating=priorOrigin!==appOrigin;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
   const loaded=loadConfig(configuration);if(loaded.rooms?.defaults?.attach_owner===false)throw Error('Existing rooms.defaults.attach_owner is disabled; enable automatic Human Owner admission before workspace setup');if(loaded.rooms && !loaded.rooms.owner.public_invite_file)throw Error('Existing room owner configuration must be reviewed before workspace enrollment');
   const identity=await request('workspace/enrollment-identity');
   if(!/^[a-f0-9]{64}$/i.test(identity.cid))throw Error('Bound Messenger identity unavailable');
@@ -35,12 +38,22 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const result=await request('workspace/enroll',{...payload,hostWorkspaceId});
   if(!result.submitted || !/^[a-f0-9]{64}$/i.test(result.rootCid) || typeof result.ownerInvite!=='string')throw Error('Malformed workspace enrollment response');
   if(loaded.rooms && loaded.rooms.owner.expected_cid.toLowerCase()!==result.rootCid.toLowerCase())throw Error('Retained room owner CID conflicts with the Human root');
+  if(migrating){
+    const deadline=Date.now()+15000;
+    while(true){
+      const response=await fetch(appOrigin+'/account-api/workspace-proof',{method:'POST',headers:{Origin:appOrigin,'Content-Type':'application/json'},credentials:'omit',redirect:'error',signal:AbortSignal.timeout(5000),body:JSON.stringify({...payload.challenge,hostWorkspaceId,rootCid:result.rootCid})});
+      if(!response.ok){await response.body?.cancel();throw Error('Account origin migration proof was rejected; local trust unchanged');}
+      const receipt=await response.json() as {verified?:boolean};if(receipt.verified===true)break;
+      if(Date.now()>=deadline)throw Error('Account origin migration proof is not confirmed; local trust unchanged');
+      await new Promise(resolve=>setTimeout(resolve,500));
+    }
+  }
   replaceFileAtomically(inviteFile,result.ownerInvite+'\n',0o600);
   const split=splitRootFor(configuration);mkdirSync(split,{recursive:true,mode:0o700});
   if(!loaded.rooms)replaceFileAtomically(configuration,readFileSync(configuration,'utf8')+'\n'+stringify({rooms:{owner:{provider:'messenger-server',expected_cid:result.rootCid,public_invite_file:inviteFile,role:'Owner'},defaults:{attach_owner:true,close_when_task_done:true}}}),0o600);
   replaceFileAtomically(join(dir,'connector'),payload.connectorToken+'\n',0o600);
   const origin=`https://${payload.hostname}`;
   replaceFileAtomically(join(dir,'tunnel.json'),JSON.stringify({origin,tokenFile:join(dir,'connector')})+'\n',0o600);
-  replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId})+'\n',0o600);
+  replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase()})+'\n',0o600);
   loadConfig(configuration);return {origin,hostWorkspaceId};
 }

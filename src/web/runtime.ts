@@ -1,3 +1,4 @@
+import {validateAccountOrigin} from '../account-origin.js';
 import { startWorkspaceTunnel } from './workspace-tunnel.js';
 import {createPrefixGateway,type ServiceTarget} from './prefix-gateway.js';
 import {readClientProfile} from '../client-profile.js';
@@ -8,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
 import { producerConfig } from '../notifications/outbox.js';
 import { SubscriptionService } from '../subscriptions/service.js';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync,readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
@@ -94,11 +95,14 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw new FleetError('forbidden', 'a non-loopback bind requires an explicit --public-origin');
   }
   const access = options.access ?? new WebAccessStore(webDir).read();
+  const bindingFile=resolve(stateRoot(),'workspace','binding.json');
+  let appOrigin='https://app.ours.network';
+  try {if(existsSync(bindingFile))appOrigin=validateAccountOrigin(JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin ?? appOrigin);}catch(error){lock.release();throw error;}
   const auth = new WebAuth(
     publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
     publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,
     Date.now, new TrustedDeviceStore(webDir),
-    access, new WorkspaceDeviceStore(webDir),
+    access, new WorkspaceDeviceStore(webDir),appOrigin,
   );
   const backend = pickBackend();
   const repository = new RoleRepository({

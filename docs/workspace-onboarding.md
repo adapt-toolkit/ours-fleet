@@ -30,3 +30,14 @@ revision guard and starts FleetCoordinator through the ordinary lifecycle. An
 accepted start does not establish provider authentication or actual model access.
 Owner invitations attach the same active native Human seat to new task rooms;
 CID comparisons tolerate hexadecimal casing. Existing room defaults remain intact.
+
+The account launcher supports the exact production origin https://app.ours.network
+and controlled test origin https://app.ours-tunnel.com. Enrollment persists one
+trusted origin; CORS/CSP/bearer checks use it without granting access to the other.
+To switch the same account/workspace after moving the account server, obtain a
+fresh private setup file and run `ours-fleet workspace-enroll --file /private/new.payload
+--migrate-app-origin`. The server identity and Human Owner are retained, and local
+trust changes only after the fresh challenge has a confirmed signed root receipt.
+Default enrollment refuses an origin change. The runtime restarts, device records
+remain local, and each browser signs in and links a new device on the new account
+origin. Follow ours-app/server/DEPLOYMENT.md; do not edit private binding files.
