@@ -58,7 +58,7 @@ try{
  await frame.getByRole('dialog',{name:'Workspaces',exact:true}).getByRole('button',{name:'Packed workspace',exact:true}).waitFor();
  let child=page.frames().find(frame=>frame.url().startsWith(workspaceOrigin));assert.ok(child);
  // This seed selects the already-completed wizard state; provider/task data remain fixtures.
- await child.evaluate(()=>{localStorage.setItem('ours-workspace-onboarding-complete','1');location.reload();});
+ await Promise.all([child.waitForNavigation({waitUntil:'load'}),child.evaluate(()=>{localStorage.setItem('ours-workspace-onboarding-complete','1');setTimeout(()=>location.reload(),0);})]);
  await frame.locator('.fleet-nav').waitFor();
  await frame.locator('.fleet-nav').getByRole('button',{name:'Switch workspace',exact:true}).waitFor();
  child=page.frames().find(frame=>frame.url().startsWith(workspaceOrigin));assert.ok(child);
