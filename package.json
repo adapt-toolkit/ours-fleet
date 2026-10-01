@@ -42,7 +42,7 @@
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@ours.network/cli": "2.8.1-nightly.13",
-    "@ours.network/mcp": "1.2.0-nightly.9",
+    "@ours.network/mcp": "1.2.0-nightly.10",
     "@ours.network/sdk": "3.8.1-nightly.15",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
@@ -62,13 +62,5 @@
     "@types/ws": "^8.18.1",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
-  },
-  "overrides": {
-    "@ours.network/mcp": {
-      "@ours.network/sdk": "$@ours.network/sdk"
-    },
-    "@ours.network/cli": {
-      "@ours.network/sdk": "$@ours.network/sdk"
-    }
   }
 }
