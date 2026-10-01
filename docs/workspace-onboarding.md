@@ -55,3 +55,9 @@ normal restarts do not silently relocate a retained tunnel. Cloudflare target
 configuration uses a bounded receipt of the previously SDK-verified signed root
 binding, never a client assertion of root identity. The app must expose the
 matching workspace-tunnel-configure endpoint before this Fleet release is used.
+
+Private repository access is not a release prerequisite: `assets/web-source.pack`
+contains only the immutable pinned commit and its complete source tree, without
+ancestor history. `prepare-web.mjs` verifies SHA256, restores that exact Git
+commit in an isolated directory, then builds it with its lockfile. Only compiled
+web files are included in the Fleet npm package, not the source pack.
