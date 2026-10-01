@@ -57,7 +57,7 @@ describe('packed root package', () => {
         try {
           const shell=await server.app.inject({url:'/fleet?workspace-frame=1&account-origin=https%3A%2F%2Fapp.ours-tunnel.com',headers:{host:boundary.host}});
           if(shell.statusCode!==200 || !shell.body.includes('/fleet.webmanifest'))throw Error('Packed Fleet iframe entry missing');
-          const assets=[...shell.body.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map(row=>row[1]);
+          const assets=[...shell.body.matchAll(new RegExp('(?:src|href)="(/assets/[^"]+)"','g'))].map(row=>row[1]);
           if(!assets.length)throw Error('Packed Fleet entry has no assets');
           for(const url of [...assets,'/sw.js','/fleet.webmanifest']){
             const response=await server.app.inject({url,headers:{host:boundary.host}});

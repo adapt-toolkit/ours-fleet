@@ -1,6 +1,6 @@
 import {it,expect} from 'vitest';
 import {createServer,request} from 'node:http';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {once} from 'node:events';
@@ -12,12 +12,12 @@ import {WorkspaceDeviceStore} from '../../src/web/workspace-devices.js';
 async function browserRequest(url:string,options:{method?:string;headers?:Record<string,string>;body?:string}={}) {
  return new Promise<Response>((resolve,reject)=>{const req=request(url,{method:options.method,headers:options.headers},res=>{const chunks:Buffer[]=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve(new Response(Buffer.concat(chunks),{status:res.statusCode,headers:res.headers as Record<string,string>})));res.on('error',reject);});req.on('error',reject);req.end(options.body);});
 }
-it.each(['https://app.ours.network','https://app.ours-tunnel.com'])('runs %s native public workspace gateway with protected services and a public static iframe shell',async(appOrigin)=>{
+it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOrigin=>[false,true].map(occupied=>({appOrigin,occupied}))))('runs $appOrigin native workspace gateway (occupied preferred port: $occupied)',async({appOrigin,occupied})=>{
  const dir=mkdtempSync(join(tmpdir(),'workspace-runtime-')),previous={...process.env};let running:Awaited<ReturnType<typeof startWebConsole>>|undefined;
  const observed:Array<Record<string,unknown>>=[];
  const provider=createServer((req,res)=>{observed.push({url:req.url,authorization:req.headers.authorization,token:req.headers['x-ours-api-token'],origin:req.headers.origin,csrf:req.headers['x-ours-messenger-csrf']});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({workspace:'fixture'}));});
  provider.listen(0,'127.0.0.1');await once(provider,'listening');const providerOrigin='http://127.0.0.1:'+(provider.address() as {port:number}).port;
- const reservation=createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');const port=(reservation.address() as {port:number}).port;await new Promise<void>(r=>reservation.close(()=>r()));
+ const reservation=createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');const port=(reservation.address() as {port:number}).port;if(!occupied)await new Promise<void>(r=>reservation.close(()=>r()));
  try{
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];
   process.env.OURS_FLEET_HOME=dir;const profile=join(dir,'profile.json'),credential=join(dir,'server-credential');writeFileSync(credential,'fixture-server-credential-32-characters\n',{mode:0o600});writeFileSync(profile,JSON.stringify({serverUrl:providerOrigin,endpoint:providerOrigin+'/daemon',expectedInstanceId:'12345678-1234-1234-1234-123456789abc',credentialPath:credential}),{mode:0o600});process.env.OURS_CONFIG=profile;
@@ -26,8 +26,21 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'])('runs %s nat
   const access=new WebAccessStore();access.write({version:1,mode:'none'});
   await expect(enrollWorkspace({} as Parameters<typeof enrollWorkspace>[0],config)).rejects.toThrow('requires protected web access');
   expect(observed.length).toBe(0);access.write({version:1,mode:'pairing'});
-  running=await startWebConsole({configPath:config,binPath:process.execPath,port,publicOrigin:'https://fixture.ours-tunnel.com',open:false,control:false,staticRoot});
-  const origin='http://127.0.0.1:'+port,host='fixture.ours-tunnel.com';
+  const webDir=join(dir,'.ours-fleet','web'),selection=join(webDir,'port-selection.json');
+  if(occupied)writeFileSync(selection,JSON.stringify({expiresAt:Date.now()+60000}),{mode:0o600});
+  const options={configPath:config,binPath:process.execPath,port,publicOrigin:'https://fixture.ours-tunnel.com',open:false,control:false,staticRoot};
+  running=await startWebConsole(options);
+  const bound=JSON.parse(readFileSync(join(webDir,'workspace-port.json'),'utf8')) as {port:number};
+  expect(bound.port).toBeGreaterThan(0);
+  if(occupied){
+   expect(bound.port).not.toBe(port);expect(reservation.listening).toBe(true);
+   // A normal restart uses the persisted listener without enrollment's fallback authority.
+   await running.close();running=undefined;rmSync(selection);
+   running=await startWebConsole({...options,port:bound.port});
+   expect(JSON.parse(readFileSync(join(webDir,'workspace-port.json'),'utf8')).port).toBe(bound.port);
+   expect(reservation.listening).toBe(true);
+  }else expect(bound.port).toBe(port);
+  const origin='http://127.0.0.1:'+bound.port,host='fixture.ours-tunnel.com';
   const devices=new WorkspaceDeviceStore(join(dir,'.ours-fleet','web'));const link=devices.mint();devices.close();
   const enrolled=await browserRequest(origin+'/fleet/api/v1/devices/enroll',{method:'POST',headers:{Host:host,Origin:appOrigin,'Content-Type':'application/json','Sec-Fetch-Site':'cross-site'},body:JSON.stringify({...link,label:'Browser fixture'})});expect(enrolled.status, enrolled.status===200?undefined:await enrolled.clone().text()).toBe(200);const first=await enrolled.json() as {token:string;device:{id:string}};
   const opposite=appOrigin==='https://app.ours.network'?'https://app.ours-tunnel.com':'https://app.ours.network';
@@ -45,5 +58,5 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'])('runs %s nat
   expect((await browserRequest(origin+'/fleet/api/v1/devices/'+first.device.id,{method:'DELETE',headers})).status).toBe(200);
   expect((await browserRequest(origin+'/messenger/api/identity',{headers})).status).toBe(401);
   expect((await browserRequest(origin+'/messenger/api/identity',{headers:{...headers,Authorization:'Bearer '+second.token}})).status).toBe(200);
- }finally{await running?.close();provider.closeAllConnections();await new Promise<void>(r=>provider.close(()=>r()));for(const key of Object.keys(process.env))if(!(key in previous))delete process.env[key];Object.assign(process.env,previous);rmSync(dir,{recursive:true,force:true});}
+ }finally{await running?.close();if(reservation.listening)await new Promise<void>(r=>reservation.close(()=>r()));provider.closeAllConnections();await new Promise<void>(r=>provider.close(()=>r()));for(const key of Object.keys(process.env))if(!(key in previous))delete process.env[key];Object.assign(process.env,previous);rmSync(dir,{recursive:true,force:true});}
 },30000);

@@ -1409,14 +1409,17 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
     mkdirSync(joinPath(stateRoot(),'web'),{recursive:true,mode:0o700});
     writeFileSync(joinPath(stateRoot(),'web','port-selection.json'),JSON.stringify({expiresAt:Date.now()+60000})+'\n',{mode:0o600});
     await manager.install(binPath,selectedPort,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
-    const controlDeadline=Date.now()+20000;
-    while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
+    const waitForControl=async()=>{
+      const controlDeadline=Date.now()+20000;
+      while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
+    };
+    await waitForControl();
     const bound=JSON.parse(readFileSync(joinPath(stateRoot(),'web','workspace-port.json'),'utf8')) as {port:number};
     if(!Number.isInteger(bound.port) || bound.port<1 || bound.port>65535)throw Error('Invalid workspace listener port');
     if(bound.port!==selectedPort){
       await manager.install(binPath,bound.port,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});
       // launchd caches a loaded plist; reload it so restarts retain the actual port.
-      if(process.platform==='darwin'){await manager.stop();await manager.start();}
+      if(process.platform==='darwin'){await manager.stop();await manager.start();await waitForControl();}
     }
     await configureWorkspacePort(payload,result.hostWorkspaceId,result.rootCid,bound.port);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
