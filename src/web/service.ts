@@ -100,6 +100,13 @@ export class WebServiceManager {
     return [`installed ${this.definitionPath}`, 'launchd service starts at login'];
   }
 
+  /** Persist an enrollment bind fallback, reloading launchd's cached definition. */
+  async retainBoundPort(script: string, port: number, configuration?: string,
+    web: { bind?: string; publicOrigin?: string } = {}): Promise<void> {
+    await this.install(script, port, configuration, web);
+    if (this.platform === 'darwin') { await this.stop(); await this.start(); }
+  }
+
   async start(): Promise<void> {
     this.requireInstalled();
     if (this.platform === 'linux') {

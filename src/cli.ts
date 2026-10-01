@@ -1417,9 +1417,8 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
     const bound=JSON.parse(readFileSync(joinPath(stateRoot(),'web','workspace-port.json'),'utf8')) as {port:number};
     if(!Number.isInteger(bound.port) || bound.port<1 || bound.port>65535)throw Error('Invalid workspace listener port');
     if(bound.port!==selectedPort){
-      await manager.install(binPath,bound.port,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});
-      // launchd caches a loaded plist; reload it so restarts retain the actual port.
-      if(process.platform==='darwin'){await manager.stop();await manager.start();await waitForControl();}
+      await manager.retainBoundPort(binPath,bound.port,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});
+      await waitForControl();
     }
     await configureWorkspacePort(payload,result.hostWorkspaceId,result.rootCid,bound.port);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
