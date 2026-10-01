@@ -68,6 +68,7 @@ describe('packed root package', () => {
         }finally{await server.close();}
       `;
       execFileSync(process.execPath,['--input-type=module','--eval',webProbe],{cwd:consumerDir,encoding:'utf8'});
+      execFileSync(process.execPath,[resolve('scripts/packed-web-browser.mjs'),consumerDir,resolve('.web-source/node_modules/@playwright/test/index.mjs')],{cwd:process.cwd(),encoding:'utf8',timeout:60000});
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
         import { join, resolve } from 'node:path';

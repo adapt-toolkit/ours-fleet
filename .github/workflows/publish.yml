@@ -46,7 +46,15 @@ jobs:
       # The root package is the only one whose bin target and build stamp come
       # from a build step, so packing it is a gate in its own right. Sequential
       # and separate: it runs tsc and Vite, which would starve the suite above.
+      - name: Install hosted packaged-browser fixture
+        run: cd .web-source && npx playwright install --with-deps chromium
       - run: npm run test:pack
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: packed-workspace-browser
+          path: test-artifacts/packed-web
+          if-no-files-found: ignore
       - name: Verify real daemon recovery through the shared gateway profile
         run: npm run test:v1-recovery
       - run: npm pack --dry-run
