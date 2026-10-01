@@ -6,6 +6,7 @@ import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import https from 'node:https';
+import http from 'node:http';
 const consumer=resolve(process.argv[2]),playwrightModule=resolve(process.argv[3]);
 const {chromium}=await import(pathToFileURL(playwrightModule));
 const packaged=join(consumer,'node_modules/@ours.network/fleet/dist');
@@ -22,6 +23,8 @@ const services={
  query:{list:async()=>[]},taskRooms:{listTaskLists:()=>[],listTasks:()=>[],withLayoutRooms:task=>task},
 };
 const server=await buildWebServer(services,{origin:workspaceOrigin,host:auth.host},{auth});
+await server.app.listen({port:0,host:'127.0.0.1'});
+const upstreamPort=server.app.server.address().port;
 execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',join(dir,'key.pem'),'-out',join(dir,'cert.pem'),'-days','1','-subj','/CN=packed-fixture.ours-tunnel.com'],{stdio:'ignore'});
 let browser;const observed=[];
 const tls=https.createServer({key:readFileSync(join(dir,'key.pem')),cert:readFileSync(join(dir,'cert.pem'))},async(req,res)=>{
@@ -36,8 +39,12 @@ const tls=https.createServer({key:readFileSync(join(dir,'key.pem')),cert:readFil
  const chunks=[];for await(const chunk of req)chunks.push(chunk);
  const url=req.url.replace(/^\/fleet\/api\//,'/api/');
  if(url.startsWith('/api/'))observed.push({url,authorized:req.headers.authorization==='Bearer '+enrolled.token});
- const result=await server.app.inject({method:req.method,url,headers:req.headers,payload:chunks.length?Buffer.concat(chunks):undefined});
- res.writeHead(result.statusCode,result.headers);res.end(result.rawPayload);
+ const upstream=http.request({hostname:'127.0.0.1',port:upstreamPort,method:req.method,path:url,headers:req.headers},reply=>{
+  res.writeHead(reply.statusCode,reply.headers);reply.pipe(res);
+ });
+ res.once('close',()=>upstream.destroy());
+ upstream.once('error',()=>{if(!res.headersSent)res.writeHead(502);res.end();});
+ upstream.end(chunks.length?Buffer.concat(chunks):undefined);
 });
 try{
  await new Promise((resolve,reject)=>{tls.once('error',reject);tls.listen(0,'127.0.0.1',resolve);});
