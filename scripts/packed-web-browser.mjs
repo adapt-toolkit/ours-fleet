@@ -18,8 +18,12 @@ const appOrigin='https://app.ours-tunnel.com',workspaceOrigin='https://packed-fi
 const store=new WorkspaceDeviceStore(join(dir,'devices')),code=store.mint();
 const enrolled=store.enroll(code.enrollment,code.workspaceId,'Hosted Chromium');
 const auth=new WebAuth(workspaceOrigin,new URL(workspaceOrigin).host,Date.now,undefined,{version:1,mode:'pairing'},store,appOrigin);
+const configurationSnapshot={
+ revision:'fixture',
+ model:{roles:{},brains:{},agents:{},agent_templates:{},room_templates:{}},
+};
 const services={
- configuration:{read:()=>({revision:'fixture',model:{roles:{},brains:{},agents:{},agent_templates:{},room_templates:{}})},
+ configuration:{read:()=>configurationSnapshot},
  query:{list:async()=>[]},taskRooms:{listTaskLists:()=>[],listTasks:()=>[],withLayoutRooms:task=>task},
 };
 const server=await buildWebServer(services,{origin:workspaceOrigin,host:auth.host},{auth});
