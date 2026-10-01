@@ -8,7 +8,7 @@ import {
   launchdPlist, systemdUnit, WebServiceManager, WEB_LAUNCHD_LABEL, WEB_SYSTEMD_UNIT,
 } from '../../src/web/service.js';
 
-function fixture(platform: 'linux' | 'darwin') {
+function fixture(platform: 'linux' | 'darwin', environment: NodeJS.ProcessEnv = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ours-fleet-web-service-'));
   const executable = join(root, 'ours fleet & safe');
   writeFileSync(executable, 'console.log("fixture")\n', { mode: 0o644 });
@@ -22,7 +22,7 @@ function fixture(platform: 'linux' | 'darwin') {
   };
   const manager = new WebServiceManager({
     platform, exec, homeDir: root, stateDir: join(root, 'state'), uid: 123,
-    runtimeExecutable: process.execPath,
+    runtimeExecutable: process.execPath, environment,
   });
   return { root, executable, calls, manager };
 }
@@ -93,6 +93,31 @@ describe('native supervised web service', () => {
       version: 3, bind: '127.0.0.1', publicOrigin: 'https://fleet.example.com',
     });
     expect(metadata).not.toMatch(/password|secret|credential/i);
+  });
+
+  it.each(['linux', 'darwin'] as const)('retains selected profile and tool paths on %s without inherited secrets', async platform => {
+    const environment = {
+      OURS_CONFIG: '/tmp/selected profile&%n.json', OURS_FLEET_HOME: '/tmp/fleet home',
+      PATH: '/private/tools/bin:/usr/bin', OURS_API_TOKEN: 'unrelated-private-value',
+    };
+    const { executable, manager } = fixture(platform, environment);
+    await manager.install(executable);
+    const definition = readFileSync(manager.definitionPath, 'utf8');
+    const metadata = JSON.parse(readFileSync(manager.metadataPath, 'utf8'));
+    expect(metadata.environment).toEqual({
+      OURS_CONFIG: environment.OURS_CONFIG, OURS_FLEET_HOME: environment.OURS_FLEET_HOME,
+      PATH: environment.PATH,
+    });
+    expect(definition).toContain(platform === 'linux'
+      ? 'Environment="OURS_CONFIG=/tmp/selected profile&%%n.json"'
+      : '<key>OURS_CONFIG</key><string>/tmp/selected profile&amp;%n.json</string>');
+    expect(definition).toContain('/private/tools/bin:/usr/bin');
+    expect(definition).not.toContain('unrelated-private-value');
+    expect(JSON.stringify(metadata)).not.toContain('OURS_API_TOKEN');
+  });
+
+  it('rejects newline injection in service path settings', () => {
+    expect(() => fixture('linux', { PATH: '/bin\nExecStart=/malicious' })).toThrow('invalid service path setting');
   });
 
   it('accepts version-2 local metadata as the safe pairing migration', async () => {

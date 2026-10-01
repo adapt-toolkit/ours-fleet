@@ -10,6 +10,8 @@ const VERSION = 3;
 export const WEB_SYSTEMD_UNIT = 'ours-fleet-web.service';
 export const WEB_LAUNCHD_LABEL = 'network.ours.fleet.web';
 
+type ServiceEnvironment = Partial<Record<'OURS_CONFIG' | 'OURS_FLEET_HOME' | 'PATH', string>>;
+
 interface ServiceMetadata {
   version: 3;
   platform: 'linux' | 'darwin';
@@ -19,6 +21,7 @@ interface ServiceMetadata {
   configuration?: string;
   bind?: string;
   publicOrigin?: string;
+  environment?: ServiceEnvironment;
 }
 
 export interface WebServiceOptions {
@@ -28,6 +31,7 @@ export interface WebServiceOptions {
   stateDir?: string;
   uid?: number;
   runtimeExecutable?: string;
+  environment?: NodeJS.ProcessEnv;
 }
 
 export class WebServiceManager {
@@ -37,6 +41,7 @@ export class WebServiceManager {
   private readonly stateDir: string;
   private readonly uid: number;
   private readonly runtimeExecutable: string;
+  private readonly environment: ServiceEnvironment;
 
   constructor(options: WebServiceOptions = {}) {
     const platform = options.platform ?? process.platform;
@@ -48,6 +53,7 @@ export class WebServiceManager {
     this.stateDir = options.stateDir ?? join(stateRoot(), 'web');
     this.uid = options.uid ?? process.getuid?.() ?? 501;
     this.runtimeExecutable = options.runtimeExecutable ?? process.execPath;
+    this.environment = serviceEnvironment(options.environment ?? process.env);
   }
 
   get metadataPath(): string { return join(this.stateDir, 'service.json'); }
@@ -70,14 +76,15 @@ export class WebServiceManager {
     const config = configuration ? resolve(configuration) : undefined;
     const metadata: ServiceMetadata = {
       version: VERSION, platform: this.platform, runtime, script: resolvedScript, port,
+      environment: this.environment,
       ...(config ? { configuration: config } : {}),
       ...(web.bind ? { bind: web.bind } : {}),
       ...(web.publicOrigin ? { publicOrigin: web.publicOrigin } : {}),
     };
     replaceFileAtomically(this.definitionPath,
       this.platform === 'linux'
-        ? systemdUnit(runtime, resolvedScript, port, config, web)
-        : launchdPlist(runtime, resolvedScript, port, config, web), 0o600);
+        ? systemdUnit(runtime, resolvedScript, port, config, web, this.environment)
+        : launchdPlist(runtime, resolvedScript, port, config, web, this.environment), 0o600);
     replaceFileAtomically(this.metadataPath, JSON.stringify(metadata, null, 2) + '\n', 0o600);
     if (this.platform === 'linux') {
       await this.must('systemctl', ['--user', 'daemon-reload']);
@@ -190,12 +197,14 @@ function systemdQuote(value: string): string {
 export function systemdUnit(
   runtime: string, script: string, port: number, configuration?: string,
   web: { bind?: string; publicOrigin?: string } = {},
+  environment: ServiceEnvironment = {},
 ): string {
   const config = configuration ? ` --configuration ${systemdQuote(configuration)}` : '';
   const access = `${web.bind ? ` --bind ${systemdQuote(web.bind)}` : ''}`
     + `${web.publicOrigin ? ` --public-origin ${systemdQuote(web.publicOrigin)}` : ''}`;
   return `[Unit]\nDescription=ours-fleet localhost web console\nAfter=default.target\n\n`
     + `[Service]\nType=simple\nExecStart=${systemdQuote(runtime)} ${systemdQuote(script)} web serve --port ${port} --no-open${config}${access}\n`
+    + Object.entries(serviceEnvironment(environment)).map(([key, value]) => `Environment=${systemdQuote(`${key}=${value}`)}\n`).join('')
     + `Restart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n\n`
     + `[Install]\nWantedBy=default.target\n`;
 }
@@ -207,6 +216,7 @@ const xml = (value: string) => value.replace(/[&<>"']/g, char => ({
 export function launchdPlist(
   runtime: string, script: string, port: number, configuration?: string,
   web: { bind?: string; publicOrigin?: string } = {},
+  environment: ServiceEnvironment = {},
 ): string {
   const config = configuration
     ? `<string>--configuration</string><string>${xml(configuration)}</string>` : '';
@@ -217,6 +227,20 @@ export function launchdPlist(
     + `<plist version="1.0"><dict>\n<key>Label</key><string>${WEB_LAUNCHD_LABEL}</string>\n`
     + `<key>ProgramArguments</key><array><string>${xml(runtime)}</string><string>${xml(script)}</string><string>web</string>`
     + `<string>serve</string><string>--port</string><string>${port}</string><string>--no-open</string>${config}${access}</array>\n`
+    + `<key>EnvironmentVariables</key><dict>${Object.entries(serviceEnvironment(environment)).map(([key, value]) => `<key>${key}</key><string>${xml(value)}</string>`).join('')}</dict>\n`
     + `<key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n`
     + `<key>ProcessType</key><string>Background</string>\n</dict></plist>\n`;
+}
+
+// Retain only profile/tool paths, never inherited credentials or arbitrary environment.
+function serviceEnvironment(source: NodeJS.ProcessEnv): ServiceEnvironment {
+  const result: ServiceEnvironment = {};
+  for (const key of ['OURS_CONFIG', 'OURS_FLEET_HOME', 'PATH'] as const) {
+    const value = source[key];
+    if (!value) continue;
+    if (/[\r\n\0]/.test(value))
+      throw new FleetError('invalid_request', `invalid service path setting: ${key}`);
+    result[key] = key === 'PATH' ? value : resolve(value);
+  }
+  return result;
 }

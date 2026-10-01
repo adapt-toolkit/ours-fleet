@@ -1402,7 +1402,7 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
     const manager=new WebServiceManager();await manager.install(binPath,49271,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
     const controlDeadline=Date.now()+20000;
-    while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Workspace console is still starting; run ours-fleet link-device when ready');await new Promise(resolve=>setTimeout(resolve,200));}
+    while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
     const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
     process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
     process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
