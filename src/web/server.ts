@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { packagedPresetRoot } from '../preset-bootstrap.js';
+import { validateCatalog } from '../init-wizard.js';
+import { getAdapter } from '../harness/registry.js';
 import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
 import { readChatIdle } from '../temp-idle.js';
 import { agentDir } from '../paths.js';
@@ -100,12 +104,18 @@ export async function buildWebServer(
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
     reply.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
-    reply.header('X-Frame-Options', 'DENY');
+    // Only the configured account launcher may embed workspace pages.
     reply.header('Content-Security-Policy',
       `default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; ` +
       `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
-      `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
+      `frame-ancestors 'self' ${auth.appOrigin}; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
+    if (request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
+      reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
+      reply.header('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key');
+      if (request.method === 'OPTIONS') {auth.validateBoundary(request,false);return reply.code(204).send();}
+    }
     try { auth.validateBoundary(request, false, !request.url.startsWith('/api/')); }
     catch (error) {
       if (request.url.startsWith('/api/')) throw error;
@@ -184,6 +194,20 @@ export async function buildWebServer(
     return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
   });
 
+  app.get('/api/v1/workspace/identity',async () => auth.workspaceIdentity());
+  app.post('/api/v1/devices/enroll',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    const input=request.body as { enrollment: string; workspaceId: string; label: string };
+    if (!input) throw new FleetError('invalid_request','device enrollment body required');
+    return auth.enrollWorkspace(request,input);
+  });
+  app.post('/api/v1/devices/link',async request => {
+    const session=auth.authenticate(request,true);
+    return {version:1,origin:auth.origin,...auth.workspaceEnrollment(session.id)};
+  });
+  app.get('/api/v1/devices',async request => {auth.authenticate(request);return {devices:auth.listWorkspaceDevices()};});
+  app.delete<{Params:{id:string}}>('/api/v1/devices/:id',async request => {auth.authenticate(request,true);auth.revokeWorkspaceDevice(request.params.id);return {revoked:true};});
+
   app.get('/api/v1/meta', async request => {
     auth.authenticate(request);
     return {
@@ -193,6 +217,15 @@ export async function buildWebServer(
       ],
       auditDegraded: audit.degraded,
     };
+  });
+
+  app.get('/api/v1/onboarding',async request=>{
+    auth.authenticate(request);
+    const harnesses=await Promise.all((['codex','claude-code'] as const).map(async harness=>{
+      try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
+    }));
+    const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
+    return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator'};
   });
 
   app.get('/api/v1/creation-capabilities', async request => {

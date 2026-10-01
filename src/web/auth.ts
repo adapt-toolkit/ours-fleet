@@ -1,3 +1,4 @@
+import { WorkspaceDeviceStore } from './workspace-devices.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
@@ -50,6 +51,8 @@ export class WebAuth {
     private readonly now: () => number = Date.now,
     private readonly devices = new TrustedDeviceStore(),
     private readonly access: WebAccessConfig = { version: 1, mode: 'pairing' },
+    private readonly workspaceDevices?: WorkspaceDeviceStore,
+    readonly appOrigin = 'https://app.ours.network',
   ) {}
   get bootstrapSecret(): string { return this._bootstrapSecret; }
   get origin(): string { return this._origin; }
@@ -78,12 +81,16 @@ export class WebAuth {
     const origins = this.allowedOrigins.size ? this.allowedOrigins : new Set([this.origin]);
     if (!host || !hosts.has(host)) throw new FleetError('forbidden',
       `This address is not configured for the fleet console. Open ${this.origin} or set --public-origin.`);
-    if (requireOrigin && (!request.headers.origin || !origins.has(request.headers.origin)))
+    if(this.workspaceDevices && String(request.headers.authorization ?? '').startsWith('Bearer ') && request.headers.origin && request.headers.origin!==this.appOrigin && !origins.has(request.headers.origin))throw new FleetError('forbidden','workspace request Origin does not match configured account origin');
+    const workspaceRequest = Boolean(this.workspaceDevices) && request.headers.origin === this.appOrigin
+      && (String(request.headers.authorization ?? '').startsWith('Bearer ') || (request.url ?? '').split('?')[0] === '/api/v1/devices/enroll' || request.method === 'OPTIONS');
+    if (requireOrigin && !workspaceRequest && (!request.headers.origin || !origins.has(request.headers.origin)))
       throw new FleetError('forbidden', 'request Origin does not match the configured control-panel origin');
     const fetchSite = request.headers['sec-fetch-site'];
     const pageNavigation = allowPageNavigation && !requireOrigin && request.method === 'GET'
-      && request.headers['sec-fetch-mode'] === 'navigate' && request.headers['sec-fetch-dest'] === 'document';
-    if (!pageNavigation && fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
+      && request.headers['sec-fetch-mode'] === 'navigate'
+      && (request.headers['sec-fetch-dest'] === 'document' || (Boolean(this.workspaceDevices) && request.headers['sec-fetch-dest'] === 'iframe' && new URL(request.url || '/',this.origin).searchParams.get('workspace-frame')==='1'));
+    if (!workspaceRequest && !pageNavigation && fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
       throw new FleetError('forbidden', 'cross-site request rejected');
   }
 
@@ -127,7 +134,19 @@ export class WebAuth {
   }
 
   authenticate(request: FastifyRequest, mutation = false): BrowserSession {
+    const authorization = String(request.headers.authorization ?? '');
+    if (authorization.startsWith('Bearer ')) {
+      this.validateBoundary(request, mutation);
+      if(!this.workspaceDevices)throw new FleetError('unauthorized','workspace bearer credential is invalid');
+      const device = this.requireWorkspaceDevices().authenticate(authorization.slice(7));
+      const id = `workspace:${device.id}`;
+      const session = { id, csrf: '', createdAt: device.createdAt, lastSeenAt: this.now(), absoluteExpiresAt: device.expiresAt };
+      this.sessions.set(id,session); this.sessionDevices.set(id,id);
+      if (mutation) this.consumeRate(`mutation:${id}`,120,60000);
+      return session;
+    }
     this.validateBoundary(request, mutation);
+    if (request.headers.origin === this.appOrigin && !this.allowedOrigins.has(this.appOrigin)) throw new FleetError('unauthorized','workspace bearer credential required');
     const id = parseCookies(request.headers.cookie ?? '').ofs_session;
     const session = id ? this.sessions.get(id) : undefined;
     const now = this.now();
@@ -147,7 +166,8 @@ export class WebAuth {
   logout(request: FastifyRequest): void {
     const session = this.authenticate(request, true);
     const deviceId = this.sessionDevices.get(session.id);
-    if (deviceId && deviceId !== 'unprotected') this.devices.revokeId(deviceId);
+    if (session.id.startsWith('workspace:')) this.workspaceDevices?.revoke(session.id.slice(10));
+    else if (deviceId && deviceId !== 'unprotected') this.devices.revokeId(deviceId);
     this.removeSession(session.id);
   }
 
@@ -174,7 +194,7 @@ export class WebAuth {
         || ticket.roleId !== roleId)
       throw new FleetError('unauthorized', 'WebSocket ticket is invalid, expired, or already used');
     const session = this.sessions.get(ticket.sessionId);
-    if (!session) throw new FleetError('unauthorized', 'browser session expired');
+    if (!session || (session.id.startsWith('workspace:') && !this.workspaceDevices?.valid(session.id.slice(10)))) throw new FleetError('unauthorized', 'browser session expired');
     return session;
   }
 
@@ -182,7 +202,9 @@ export class WebAuth {
     let sockets = this.sockets.get(sessionId);
     if (!sockets) { sockets = new Set(); this.sockets.set(sessionId, sockets); }
     sockets.add(socket);
-    socket.once('close', () => sockets?.delete(socket));
+    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || session.absoluteExpiresAt<=this.now() || (sessionId.startsWith('workspace:') && !this.workspaceDevices?.valid(sessionId.slice(10)))) this.removeSession(sessionId); },1000);
+    expiry.unref();
+    socket.once('close', () => { clearInterval(expiry); sockets?.delete(socket); });
   }
 
   /** Raw service streams share the same logout/revocation boundary as native sockets. */
@@ -190,7 +212,9 @@ export class WebAuth {
     let transports = this.transports.get(sessionId);
     if (!transports) { transports = new Set(); this.transports.set(sessionId, transports); }
     transports.add(close);
-    return () => { transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
+    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || session.absoluteExpiresAt<=this.now() || (sessionId.startsWith('workspace:') && !this.workspaceDevices?.valid(sessionId.slice(10)))) this.removeSession(sessionId); },1000);
+    expiry.unref();
+    return () => { clearInterval(expiry); transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
   }
 
   clearSessions(): void {
@@ -206,11 +230,27 @@ export class WebAuth {
 
   revokeAllTrustedDevices(): number {
     const count = this.devices.revokeAll();
+    for (const device of this.workspaceDevices?.list() ?? []) this.workspaceDevices?.revoke(device.id);
     this.clearSessions();
     return count;
   }
 
-  shutdown(): void { this.clearSessions(); }
+  workspaceIdentity() { return {workspaceId:this.requireWorkspaceDevices().workspaceId}; }
+  workspaceEnrollment(issuer: string | null = null) { return this.requireWorkspaceDevices().mint(issuer?.startsWith('workspace:') ? issuer.slice(10) : null); }
+  enrollWorkspace(request: FastifyRequest, input: { enrollment: string; workspaceId: string; label: string }) {
+    this.validateBoundary(request,true); this.consumeRate('workspace-enrollment',30,60000);
+    return this.requireWorkspaceDevices().enroll(input.enrollment,input.workspaceId,input.label);
+  }
+  listWorkspaceDevices() { return this.requireWorkspaceDevices().list(); }
+  revokeWorkspaceDevice(id: string): void {
+    this.requireWorkspaceDevices().revoke(id);
+    this.removeSession(`workspace:${id}`);
+  }
+  private requireWorkspaceDevices(): WorkspaceDeviceStore {
+    if (!this.workspaceDevices) throw new FleetError('capability_unavailable','workspace device access is not configured');
+    return this.workspaceDevices;
+  }
+  shutdown(): void { this.clearSessions(); this.workspaceDevices?.close(); }
 
   private createSession(deviceId: string): BrowserSession {
     const now = this.now();
