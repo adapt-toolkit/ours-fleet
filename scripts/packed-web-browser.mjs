@@ -79,6 +79,9 @@ try{
   for(const theme of ['light','dark']){
    await child.evaluate(theme=>document.documentElement.classList.toggle('theme-dark',theme==='dark'),theme);
    assert.ok(await child.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'packed Fleet has no horizontal overflow');
+   for(const selector of ['.fleet-nav .workspace-switch-trigger','.workspace-switch-menu']){
+    assert.ok(await child.evaluate(selector=>{const box=document.querySelector(selector).getBoundingClientRect();return box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight;},selector),selector+' is fully inside the viewport');
+   }
    await page.screenshot({path:join(artifacts,name+'-'+theme+'.png'),fullPage:true});
   }
  }
