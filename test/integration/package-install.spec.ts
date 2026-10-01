@@ -45,6 +45,29 @@ describe('packed root package', () => {
       });
 
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
+      const webProbe = `
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        const root = join(process.cwd(),'node_modules/@ours.network/fleet/dist');
+        const {buildWebServer}=await import(pathToFileURL(join(root,'web/server.js')));
+        const {WebAuth}=await import(pathToFileURL(join(root,'web/auth.js')));
+        const boundary={origin:'http://127.0.0.1:49271',host:'127.0.0.1:49271'};
+        const auth=new WebAuth(boundary.origin,boundary.host,Date.now,undefined,{version:1,mode:'none'});
+        const server=await buildWebServer({},boundary,{auth});
+        try {
+          const shell=await server.app.inject({url:'/fleet?workspace-frame=1&account-origin=https%3A%2F%2Fapp.ours-tunnel.com',headers:{host:boundary.host}});
+          if(shell.statusCode!==200 || !shell.body.includes('/fleet.webmanifest'))throw Error('Packed Fleet iframe entry missing');
+          const assets=[...shell.body.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map(row=>row[1]);
+          if(!assets.length)throw Error('Packed Fleet entry has no assets');
+          for(const url of [...assets,'/sw.js','/fleet.webmanifest']){
+            const response=await server.app.inject({url,headers:{host:boundary.host}});
+            if(response.statusCode!==200)throw Error('Packed Fleet asset unavailable');
+          }
+          const api=await server.app.inject({url:'/api/v1/auth/mode',headers:{host:boundary.host}});
+          if(api.statusCode!==200)throw Error('Packed Fleet auth API unavailable');
+        }finally{await server.close();}
+      `;
+      execFileSync(process.execPath,['--input-type=module','--eval',webProbe],{cwd:consumerDir,encoding:'utf8'});
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
         import { join, resolve } from 'node:path';

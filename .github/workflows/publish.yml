@@ -24,6 +24,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  OURS_FLEET_WEB_SOURCE: ${{ github.workspace }}/.web-source/dist/web
+
 jobs:
   gates:
     runs-on: ubuntu-latest
@@ -35,6 +38,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Checkout pinned workspace frontend
+        uses: actions/checkout@v4
+        with:
+          repository: adapt-toolkit/ours-app
+          ref: 99d496d9573e0a1045c11ad04e379746bae64da4
+          path: .web-source
+      - name: Build workspace frontend
+        working-directory: .web-source
+        run: npm ci && npm run build
       - run: npm ci
       - run: npm run build
       - run: npm test
@@ -103,6 +115,15 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Checkout pinned workspace frontend
+        uses: actions/checkout@v4
+        with:
+          repository: adapt-toolkit/ours-app
+          ref: 99d496d9573e0a1045c11ad04e379746bae64da4
+          path: .web-source
+      - name: Build workspace frontend
+        working-directory: .web-source
+        run: npm ci && npm run build
       - run: npm ci
       # Gates already ran the full suite against the shipping source. The release
       # commit changes versions only, so build its artifacts here without letting
@@ -147,6 +168,15 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Checkout pinned workspace frontend
+        uses: actions/checkout@v4
+        with:
+          repository: adapt-toolkit/ours-app
+          ref: 99d496d9573e0a1045c11ad04e379746bae64da4
+          path: .web-source
+      - name: Build workspace frontend
+        working-directory: .web-source
+        run: npm ci && npm run build
       - run: npm ci
       # Gate the COMMITTED version, before the ephemeral rewrite below. The CLI
       # reports whatever version its package.json carries, and the suite asserts
