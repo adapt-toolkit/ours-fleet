@@ -38,10 +38,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Read pinned frontend source
+        id: frontend-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+          owner: adapt-toolkit
+          repositories: ours-app
+          permission-contents: read
       - name: Checkout pinned workspace frontend
         uses: actions/checkout@v4
         with:
           repository: adapt-toolkit/ours-app
+          token: ${{ steps.frontend-token.outputs.token }}
           ref: 99d496d9573e0a1045c11ad04e379746bae64da4
           path: .web-source
       - name: Build workspace frontend
@@ -115,10 +125,20 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Read pinned frontend source
+        id: frontend-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+          owner: adapt-toolkit
+          repositories: ours-app
+          permission-contents: read
       - name: Checkout pinned workspace frontend
         uses: actions/checkout@v4
         with:
           repository: adapt-toolkit/ours-app
+          token: ${{ steps.frontend-token.outputs.token }}
           ref: 99d496d9573e0a1045c11ad04e379746bae64da4
           path: .web-source
       - name: Build workspace frontend
@@ -168,10 +188,20 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Read pinned frontend source
+        id: frontend-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+          owner: adapt-toolkit
+          repositories: ours-app
+          permission-contents: read
       - name: Checkout pinned workspace frontend
         uses: actions/checkout@v4
         with:
           repository: adapt-toolkit/ours-app
+          token: ${{ steps.frontend-token.outputs.token }}
           ref: 99d496d9573e0a1045c11ad04e379746bae64da4
           path: .web-source
       - name: Build workspace frontend
