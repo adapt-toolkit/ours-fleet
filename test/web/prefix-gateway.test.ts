@@ -50,7 +50,8 @@ describe('generic service prefix transport', () => {
     expect(foreignPreflight.status).toBeGreaterThanOrEqual(400);
     expect(foreignPreflight.headers['access-control-allow-origin']).toBeUndefined();
     const anonymous = await call('GET', { origin: appOrigin });
-    expect(anonymous.status).toBe(401);
+    // A cross-site request without the device credential is not a workspace request at all.
+    expect(anonymous.status).toBe(403);
     expect(anonymous.headers['access-control-allow-origin']).toBe(appOrigin);
     const foreign = await call('GET', { origin: 'https://attacker.invalid', authorization: `Bearer ${token}` });
     expect(foreign.status).toBe(403);
