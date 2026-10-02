@@ -21,7 +21,7 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
  try{
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];
   process.env.OURS_FLEET_HOME=dir;const profile=join(dir,'profile.json'),credential=join(dir,'server-credential');writeFileSync(credential,'fixture-server-credential-32-characters\n',{mode:0o600});writeFileSync(profile,JSON.stringify({serverUrl:providerOrigin,endpoint:providerOrigin+'/daemon',expectedInstanceId:'12345678-1234-1234-1234-123456789abc',credentialPath:credential}),{mode:0o600});process.env.OURS_CONFIG=profile;
-  const config=join(dir,'fleet.yaml');await ensureMinimalSetup(config);const staticRoot=join(dir,'static');mkdirSync(staticRoot);writeFileSync(join(staticRoot,'fleet-index.html'),'<html>workspace fixture shell</html>');writeFileSync(join(staticRoot,'index.html'),'<html>workspace fixture shell</html>');
+  const config=join(dir,'fleet.yaml');await ensureMinimalSetup(config);
   const access=new WebAccessStore();access.write({version:1,mode:'none'});
   await expect(enrollWorkspace({} as Parameters<typeof enrollWorkspace>[0],config)).rejects.toThrow('requires protected web access');
   expect(observed.length).toBe(0);access.write({version:1,mode:'pairing'});
@@ -29,7 +29,7 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
   await enrollWorkspace(payload,config,{preserveProfile:true});
   const webDir=join(dir,'.ours-fleet','web'),selection=join(webDir,'port-selection.json');
   if(occupied)writeFileSync(selection,JSON.stringify({expiresAt:Date.now()+60000}),{mode:0o600});
-  const options={configPath:config,binPath:process.execPath,port,publicOrigin:'https://fixture.ours-tunnel.com',open:false,control:true,staticRoot};
+  const options={configPath:config,binPath:process.execPath,port,publicOrigin:'https://fixture.ours-tunnel.com',control:true};
   running=await startWebConsole(options);
   const bound=JSON.parse(readFileSync(join(webDir,'workspace-port.json'),'utf8')) as {port:number};
   expect(bound.port).toBeGreaterThan(0);
@@ -47,8 +47,9 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
   const opposite=appOrigin==='https://app.ours.network'?'https://app.ours-tunnel.com':'https://app.ours.network';
   expect((await browserRequest(origin+'/fleet/api/v1/devices',{headers:{Host:host,Origin:opposite,Authorization:'Bearer '+first.token}})).status).toBe(403);
   const headers={Host:host,Origin:'https://fixture.ours-tunnel.com',Authorization:'Bearer '+first.token};
-  const shell=await browserRequest(origin+'/fleet?workspace-frame=1',{headers:{Host:host,'Sec-Fetch-Site':'cross-site','Sec-Fetch-Mode':'navigate','Sec-Fetch-Dest':'iframe'}});expect(shell.status,shell.status===200?undefined:await shell.clone().text()).toBe(200);expect(await shell.text()).toContain('fixture shell');expect(shell.headers.get('content-security-policy')).toContain("frame-ancestors 'self' "+appOrigin);
-  expect((await browserRequest(origin+'/fleet',{headers:{Host:host,'Sec-Fetch-Site':'cross-site','Sec-Fetch-Mode':'navigate','Sec-Fetch-Dest':'iframe'}})).status).toBe(403);
+  // The host serves no page: a framed or linked entry is refused, a direct one is not found, and nothing redirects.
+  for(const dest of ['iframe','document'])for(const path of ['/fleet?workspace-frame=1','/fleet','/'])expect((await browserRequest(origin+path,{headers:{Host:host,'Sec-Fetch-Site':'cross-site','Sec-Fetch-Mode':'navigate','Sec-Fetch-Dest':dest}})).status,dest+' '+path).toBe(403);
+  for(const path of ['/','/fleet','/fleet/chats','/sw.js']){const page=await browserRequest(origin+path,{headers:{Host:host}});expect(page.status,path).toBe(404);expect(page.headers.get('location'),path).toBeNull();expect(page.headers.get('content-type'),path).toContain('application/json');}
   expect((await browserRequest(origin+'/messenger/api/identity',{headers:{Host:host}})).status).toBe(401);
   expect((await browserRequest(origin+'/fleet/api/v1/devices',{headers})).status).toBe(200);
   const upstream=await browserRequest(origin+'/messenger/api/workspace/enroll',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:'{}'});expect(upstream.status).toBe(200);

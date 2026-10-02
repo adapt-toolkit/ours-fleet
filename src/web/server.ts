@@ -6,11 +6,8 @@ import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentA
 import { readChatIdle } from '../temp-idle.js';
 import { agentDir } from '../paths.js';
 import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
-import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
-import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import type { WebSocket } from 'ws';
 import { createHmac, randomBytes } from 'node:crypto';
@@ -92,7 +89,7 @@ const statusFor = (code: string): number => ({
 export async function buildWebServer(
   services: WebServices,
   boundary: { origin: string; host: string },
-  options: { auth?: WebAuth; staticRoot?: string } = {},
+  options: { auth?: WebAuth } = {},
 ): Promise<WebServer> {
   const app = Fastify({
     trustProxy: false, bodyLimit: 512 * 1024, logger: false,
@@ -111,11 +108,8 @@ export async function buildWebServer(
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
     reply.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
-    // Only the configured account launcher may embed workspace pages.
-    reply.header('Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self' blob:; ` +
-      `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
-      `frame-ancestors 'self' ${auth.appOrigin}; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
+    // Fleet serves an API only: nothing it returns may run, load or be framed as a page.
+    reply.header('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
     if (request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
       reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
@@ -123,12 +117,7 @@ export async function buildWebServer(
       reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key');
       if (request.method === 'OPTIONS') {auth.validateBoundary(request,false);return reply.code(204).send();}
     }
-    try { auth.validateBoundary(request, false, !request.url.startsWith('/api/')); }
-    catch (error) {
-      if (request.url.startsWith('/api/')) throw error;
-      const message = normalizeError(error).message;
-      return reply.code(421).type('text/html').send(`<!doctype html><html><head><title>Fleet console address</title></head><body><main><h1>This fleet-console address is not configured</h1><p>${escapeHtml(message)}</p><p>For nginx or VPS access, configure an explicit public origin. The console does not guess proxy hosts.</p></main></body></html>`);
-    }
+    auth.validateBoundary(request, false);
   });
 
   app.post<{ Params: { id: string } }>('/api/v1/layout-bindings/:id/control', async request => {
@@ -1104,17 +1093,8 @@ export async function buildWebServer(
       });
     });
 
-  const staticRoot = options.staticRoot ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
-  if (existsSync(staticRoot)) {
-    await app.register(fastifyStatic, { root: staticRoot, prefix: '/' });
-    app.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith('/api/')) return reply.code(404).send({ error: 'not found' });
-      const path = request.url.split('?')[0];
-      if ((path === '/chats' || path.startsWith('/chats/')) && existsSync(join(staticRoot, 'fleet-index.html'))) return reply.redirect((request.url.includes('?') ? '/fleet/chats' : '/fleet') + (request.url.includes('?') ? request.url.slice(request.url.indexOf('?')) : ''));
-      const fleetEntry = (path === '/fleet' || path.startsWith('/fleet/')) && existsSync(join(staticRoot, 'fleet-index.html'));
-      return reply.sendFile(fleetEntry ? 'fleet-index.html' : 'index.html');
-    });
-  }
+  // Fleet has no pages of its own; every screen belongs to the App.
+  app.setNotFoundHandler((_request, reply) => reply.code(404).send({ error: 'not found' }));
 
   return {
     app, auth, audit, events,
@@ -1157,10 +1137,6 @@ function promoteRequest(body: unknown): { ids: string[]; configRevision: string;
 }
 
 function cryptoRandomId(): string { return randomBytes(12).toString('hex'); }
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]!));
-}
 
 function requireSubprotocol(request: FastifyRequest, expected: string): void {
   const protocols = String(request.headers['sec-websocket-protocol'] ?? '')

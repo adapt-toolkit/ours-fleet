@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { FleetError, safeLine } from '../application/errors.js';
 import { stateRoot } from '../paths.js';
 
-export type WebControlCommand = 'open' | 'revoke-all' | 'link-device';
+export type WebControlCommand = 'revoke-all' | 'link-device';
 
 export const webControlPath = (dir = join(stateRoot(), 'web')) => privateSocketPath(join(dir, 'control.sock'));
 
@@ -16,7 +16,6 @@ export interface WebControlServer {
 
 export async function startWebControlServer(options: {
   dir?: string;
-  onOpen(): void | Promise<void>;
   onLinkDevice?(): Record<string, unknown> | Promise<Record<string, unknown>>;
   onRevokeAll(): void | Promise<void>;
   now?: () => number;
@@ -47,7 +46,6 @@ export async function startWebControlServer(options: {
           const parsed = JSON.parse(body.slice(0, body.indexOf('\n'))) as { command?: unknown };
           let result: Record<string,unknown> | undefined;
           if (parsed.command === 'link-device' && options.onLinkDevice) result = await options.onLinkDevice();
-          else if (parsed.command === 'open') await options.onOpen();
           else if (parsed.command === 'revoke-all') await options.onRevokeAll();
           else throw new FleetError('invalid_request', 'unknown local web control command');
           socket.end(JSON.stringify({ ok: true, result }) + '\n');

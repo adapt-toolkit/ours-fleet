@@ -20,8 +20,7 @@ async function testServer(overrides: Record<string, unknown> = {}) {
   const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
   const isolatedServices = { ...services(), ...overrides };
   isolatedServices.audit = new AuditSink(join(dir, 'audit'));
-  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Fleet</title>');
-  return buildWebServer(isolatedServices, boundary, { auth, staticRoot: dir });
+  return buildWebServer(isolatedServices, boundary, { auth });
 }
 
 function services() {
@@ -191,11 +190,15 @@ describe('secure local web host', () => {
     const calls:unknown[]=[];const {server,cookie}=await authenticated({session:async(id:string)=>({agentContacts:async()=>{calls.push({id,operation:'contacts'});return {contacts:[{name:'Peer'}]};},agentHistory:async(query:unknown)=>{calls.push({id,query});return {items:[],next_cursor:null};}}),oursTools:{call:()=>{throw Error('must not call MCP');}}});
     try{const headers={host:boundary.host,cookie};expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers})).json()).toMatchObject({contacts:[{name:'Peer'}]});const peer='B'.repeat(64);expect((await server.app.inject({method:'GET',url:`/api/v1/roles/Selected/messages?peer_cid=${peer}&limit=10&before_seq=4`,headers})).statusCode).toBe(200);expect(calls).toEqual([{id:'Selected',operation:'contacts'},{id:'Selected',query:{peer_cid:peer,limit:10,before_seq:4}}]);expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers:{host:boundary.host}})).statusCode).toBe(401);}finally{await server.close();}
   });
-  it('serves the login document on an external link without relaxing API fetch metadata', async () => {
+  it('rejects an external link to any address, page or API alike', async () => {
     const { server } = await authenticated();
     const headers = { host: boundary.host, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
-    expect((await server.app.inject({ method: 'GET', url: '/', headers })).statusCode).toBe(200);
-    expect((await server.app.inject({ method: 'GET', url: '/api/v1/roles', headers })).statusCode).toBe(403);
+    for (const url of ['/', '/fleet', '/fleet?workspace-frame=1', '/api/v1/roles']) {
+      const response = await server.app.inject({ method: 'GET', url, headers });
+      expect(response.statusCode).toBe(403); expect(response.headers['content-type']).toContain('application/json');
+    }
+    const framed = await server.app.inject({ method: 'GET', url: '/fleet?workspace-frame=1', headers: { ...headers, 'sec-fetch-dest': 'iframe' } });
+    expect(framed.statusCode).toBe(403);
     await server.close();
   });
   it('exposes authenticated task-list and assignment routes through the shared service', async () => {
@@ -365,7 +368,7 @@ describe('secure local web host', () => {
     }
     await server.app.close();
   });
-  it('accepts localhost and explains an unconfigured browser host as HTML', async () => {
+  it('accepts localhost and refuses an unconfigured host as JSON', async () => {
     const server = await testServer();
     server.auth.setBoundary(boundary.origin, boundary.host, {
       hosts: ['localhost:49271'], origins: ['http://localhost:49271'],
@@ -375,8 +378,9 @@ describe('secure local web host', () => {
     expect(localhost.statusCode).toBe(200);
     const wrong = await server.app.inject({ method: 'GET', url: '/',
       headers: { host: 'vps.invalid' } });
-    expect(wrong.statusCode).toBe(421);
-    expect(wrong.headers['content-type']).toContain('text/html');
+    expect(wrong.statusCode).toBe(403);
+    expect(wrong.headers['content-type']).toContain('application/json');
+    expect(wrong.json()).toMatchObject({ error: { code: 'forbidden' } });
     expect(wrong.body).toContain('not configured');
     expect(wrong.body).not.toContain('invalid Host header');
     await server.close();
@@ -454,7 +458,7 @@ describe('secure local web host', () => {
       method: 'GET', url: '/api/v1/meta',
       headers: { host: '127.0.0.1:49271', cookie },
     });
-    expect(response.headers['content-security-policy']).toContain("frame-ancestors 'self' https://app.ours.network");
+    expect(response.headers['content-security-policy']).toBe("default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     expect(response.headers['referrer-policy']).toBe('no-referrer');
     expect(response.headers['access-control-allow-origin']).toBeUndefined();
     expect(response.headers['cache-control']).toBe('no-store');
@@ -684,26 +688,15 @@ describe('watchdog read endpoints', () => {
 });
 
 
-it('serves Fleet installation metadata in initial HTML and preserves standalone entry', async () => {
-  mkdirSync('.test-artifacts', { recursive: true });
-  const dir = mkdtempSync('.test-artifacts/fleet-entry-');
-  writeFileSync(join(dir, 'index.html'), '<link rel="manifest" href="/manifest.webmanifest">');
-  writeFileSync(join(dir, 'fleet-index.html'), '<link rel="manifest" href="/fleet.webmanifest">');
-  const server = await buildWebServer({}, boundary, { staticRoot: join(process.cwd(), dir) });
+it('serves no page: former console addresses answer JSON 404 with no redirect', async () => {
+  const server = await buildWebServer({}, boundary);
   try {
-    for (const url of ['/fleet', '/fleet/chats?chat=A', '/fleet/settings/notifications']) {
-      const response = await server.app.inject({ url, headers: {host:boundary.host} });
-      expect(response.statusCode).toBe(200); expect(response.body).toContain('href="/fleet.webmanifest"');
+    for (const url of ['/', '/index.html', '/fleet', '/fleet/chats?chat=A', '/chats', '/chats?chat=A&detail=1', '/sw.js', '/fleet.webmanifest', '/assets/index.js', '/api/not-a-route']) {
+      const response = await server.app.inject({ url, headers: { host: boundary.host } });
+      expect(response.statusCode, url).toBe(404); expect(response.headers.location, url).toBeUndefined();
+      expect(response.headers['content-type'], url).toContain('application/json'); expect(response.json(), url).toEqual({ error: 'not found' });
     }
-    const standalone = await server.app.inject({ url: '/chats', headers:{host:boundary.host} });
-    expect(standalone.statusCode).toBe(302); expect(standalone.headers.location).toBe('/fleet');
-    const oldTarget = await server.app.inject({url:'/chats?chat=A&detail=1',headers:{host:boundary.host}});
-    expect(oldTarget.headers.location).toBe('/fleet/chats?chat=A&detail=1');
-    const standaloneIndex = await server.app.inject({ url:'/index.html', headers:{host:boundary.host} });
-    expect(standaloneIndex.body).toContain('href="/manifest.webmanifest"');
-    const missingApi = await server.app.inject({ url: '/api/not-a-route', headers:{host:boundary.host} });
-    expect(missingApi.statusCode).not.toBe(200);
-  } finally { await server.close(); rmSync(dir, { recursive: true }); }
+  } finally { await server.close(); }
 });
 
 it('layout machine grant uses its own authorization and cannot authenticate browser control', async () => {

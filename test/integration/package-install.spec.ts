@@ -4,9 +4,9 @@
  * suite can safely use the dist built by its global setup.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 
@@ -55,20 +55,20 @@ describe('packed root package', () => {
         const auth=new WebAuth(boundary.origin,boundary.host,Date.now,undefined,{version:1,mode:'none'});
         const server=await buildWebServer({},boundary,{auth});
         try {
-          const shell=await server.app.inject({url:'/fleet?workspace-frame=1&account-origin=https%3A%2F%2Fapp.ours-tunnel.com',headers:{host:boundary.host}});
-          if(shell.statusCode!==200 || !shell.body.includes('/fleet.webmanifest'))throw Error('Packed Fleet iframe entry missing');
-          const assets=[...shell.body.matchAll(new RegExp('(?:src|href)="(/assets/[^"]+)"','g'))].map(row=>row[1]);
-          if(!assets.length)throw Error('Packed Fleet entry has no assets');
-          for(const url of [...assets,'/sw.js','/fleet.webmanifest']){
+          for(const url of ['/','/index.html','/fleet','/fleet?workspace-frame=1','/chats','/sw.js','/fleet.webmanifest']){
             const response=await server.app.inject({url,headers:{host:boundary.host}});
-            if(response.statusCode!==200)throw Error('Packed Fleet asset unavailable');
+            if(response.statusCode!==404 || !String(response.headers['content-type']).includes('application/json'))throw Error('Packed Fleet answered a page address: '+url+' '+response.statusCode);
           }
           const api=await server.app.inject({url:'/api/v1/auth/mode',headers:{host:boundary.host}});
           if(api.statusCode!==200)throw Error('Packed Fleet auth API unavailable');
         }finally{await server.close();}
       `;
       execFileSync(process.execPath,['--input-type=module','--eval',webProbe],{cwd:consumerDir,encoding:'utf8'});
-      execFileSync(process.execPath,[resolve('scripts/packed-web-browser.mjs'),consumerDir,resolve('.web-source/node_modules/@playwright/test/index.mjs')],{cwd:process.cwd(),encoding:'utf8',timeout:60000});
+      // The package carries an HTTP service only: no bundled page, script bundle or static-file server.
+      expect(existsSync(join(fleetRoot, 'dist', 'web-app'))).toBe(false);
+      const shipped = readdirSync(fleetRoot, { recursive: true, encoding: 'utf8' }).filter(file => !file.split(sep).includes('node_modules'));
+      expect(shipped.filter(file => /\.(html?|webmanifest)$/.test(file) || /(^|[\\/])sw\.js$/.test(file))).toEqual([]);
+      expect(Object.keys(JSON.parse(readFileSync(join(fleetRoot, 'package.json'), 'utf8')).dependencies)).not.toContain('@fastify/static');
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
         import { join, resolve } from 'node:path';

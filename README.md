@@ -139,76 +139,55 @@ the caller's owner channel with the caller and spawned-role details. This is an
 honest-actor convenience and attribution path, not a security boundary; host
 shells and deliberately bypassed absolute binaries retain direct behavior.
 
-## Local web API
+## Local HTTP service
 
-Frontend source and builds are maintained in the standalone `ours-web` repository. Fleet builds only its backend API. Configure a separately built frontend static root when serving the unified application through the gateway. The former console source is preserved there under `legacy-fleet/`.
-
-### Console API usage
-
-The interactive console is packaged with `@ours.network/fleet` and binds to
-IPv4 loopback by default. Remote or proxy exposure is always explicit:
+Fleet is an HTTP backend. It serves no pages, bundles no frontend and opens no
+browser: every screen belongs to the App, which calls this API with a device
+credential. Any address outside `/api/` answers JSON `404`.
 
 ```sh
-npm run build
-ours-fleet web
+ours-fleet setup-tunnel                # connect this host to your App workspace
+ours-fleet link-device                 # connect another browser or device
 # choose a free port for an isolated test:
-ours-fleet web serve --port 0 --no-open
-# nginx/TLS terminates at the declared browser origin; fleet remains loopback-bound
+ours-fleet web serve --port 0
+# nginx/TLS terminates at the declared origin; fleet remains loopback-bound
 ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password
-# Intentional no-password mode, for example when nginx already authenticates:
-ours-fleet web install --public-origin https://fleet.example.com --no-password
 ```
 
-The normal `ours-fleet web` command installs or updates an owner-level native
-service, starts it on stable `127.0.0.1:49271`, and opens/re-pairs the browser.
-Linux uses a systemd user unit and macOS uses a LaunchAgent; both restart after
-process failures and send logs to the native supervisor. Service management is
-explicit through `ours-fleet web install|start|stop|restart|status|uninstall`.
-Use `ours-fleet web serve` for a foreground development process. Linux login
-persistence requires linger; the installer reports when it is missing but
+`ours-fleet web` installs or updates an owner-level native service and starts
+it on stable `127.0.0.1:49271`. Linux uses a systemd user unit and macOS uses a
+LaunchAgent; both restart after process failures and send logs to the native
+supervisor. Service management is explicit through
+`ours-fleet web install|start|stop|restart|status|uninstall`. Use
+`ours-fleet web serve` for a foreground development process. `--no-open` is
+still accepted because installed service units pass it; it has no effect. Linux
+login persistence requires linger; the installer reports when it is missing but
 never enables it or requests root privileges.
 
-The normal command opens a one-time five-minute fragment directly in the local
-browser; it does not print a reusable secret. If the browser needs pairing
-again while the server is running, use `ours-fleet web open`. The fragment is
-exchanged once and removed from history. A paired browser receives a rotating,
-30-day `HttpOnly; SameSite=Strict` device credential and can return after a
-session idle timeout or server restart. Use **Sign out** to revoke the current
-browser, or `ours-fleet web revoke-all` to revoke every trusted browser and
-active web session.
-
-Only a domain-separated SHA-256 device-secret hash and bounded timestamps are
-stored in the owner-private fleet state directory (`0700` directory, `0600`
-atomic file). The re-pair and revoke controls use an owner-private Unix socket;
-local processes running as the same OS user are therefore inside the trust
-boundary.
+Use `ours-fleet web revoke-all` to revoke every linked device and active
+session. Only a domain-separated SHA-256 device-secret hash and bounded
+timestamps are stored in the owner-private fleet state directory (`0700`
+directory, `0600` atomic file). The link and revoke controls use an
+owner-private Unix socket; local processes running as the same OS user are
+therefore inside the trust boundary.
 
 On first setup, the CLI requires an explicit access choice: `--password-file`
 or `--pairing` for protected access, or `--no-password` for intentional
 unprotected access. `--password-file` stores only a salted scrypt verifier in
-the owner-private web state; the source file remains operator-managed. New
-browsers sign in and then receive the same rotating HttpOnly trusted-device
-credential. `--no-password` is deliberately named and prints a warning: anyone
-who can reach that origin can control the fleet.
+the owner-private web state; the source file remains operator-managed.
+`--no-password` is deliberately named and prints a warning: anyone who can
+reach that origin can control the fleet.
 
 For nginx on a VPS, keep the default loopback bind and set the exact external
 `--public-origin` (scheme, hostname, optional port). nginx should proxy HTTP and
 WebSocket upgrades to `127.0.0.1:49271` and provide TLS; rewriting the upstream
-Host is not required because the declared browser Origin remains authoritative. To listen beyond
+Host is not required because the declared Origin remains authoritative. To listen beyond
 loopback, add an explicit `--bind`; fleet refuses a non-loopback bind without a
 public origin. Host and Origin validation use that declaration rather than
 trusting forwarded headers. `localhost` and `127.0.0.1` both work in normal
-local mode; an unconfigured hostname gets a self-describing HTML page instead
-of raw internal Host-header JSON.
+local mode; an unconfigured hostname is refused with a JSON error.
 
-The console is installable as a standalone PWA. Its service worker caches only
-the data-free offline page and successful content-hashed JavaScript/CSS assets.
-HTML stays network-first and no API, authentication, bootstrap, device,
-WebSocket, terminal, event, audit, log, session, query-bearing, or error response
-is cached. When the local daemon is unavailable, the PWA shows an explicit
-offline shell and no stale fleet state.
-
-The console provides evidence-separated inventory and status, ACP activity and
+The API provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, and transactional permanent/temporary creation. Identity is fixed to
 the role name. Creation uses the authenticated

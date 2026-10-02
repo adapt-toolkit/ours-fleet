@@ -63,11 +63,11 @@ describe('generic service prefix transport', () => {
     expect(authorized.headers.vary).toBe('Origin');
     expect(seen).toEqual(['GET /api/contacts']);
   });
-  it('allows external top-level page links but rejects cross-site API and subresource requests', async () => {
+  it('rejects every cross-site request, external page links included', async () => {
     const { publicOrigin } = await setup((_req, res) => res.end('page'));
     const status = (path: string, headers: Record<string,string>, method = 'GET') => new Promise<number>((resolve,reject) => { const req = sendHttp(publicOrigin + path, { method, headers }, res => { res.resume(); resolve(res.statusCode!); }); req.on('error',reject);req.end(); });
     const headers = { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
-    expect(await status('/fleet', headers)).toBe(200);
+    for (const path of ['/', '/fleet', '/fleet?workspace-frame=1']) expect(await status(path, headers)).toBe(403);
     for (const path of ['/fleet/api/v1/roles', '/api/v1/roles', '/messenger/api/contacts'])
       expect(await status(path, headers)).toBe(403);
     expect(await status('/fleet', { ...headers, 'sec-fetch-dest': 'iframe' })).toBe(403);

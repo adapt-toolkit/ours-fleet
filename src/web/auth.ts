@@ -80,7 +80,7 @@ export class WebAuth {
     return this.workspaceDevices && request.headers.origin === this.appOrigin ? this.appOrigin : undefined;
   }
 
-  validateBoundary(request: FastifyRequest, requireOrigin: boolean, allowPageNavigation = false): void {
+  validateBoundary(request: FastifyRequest, requireOrigin: boolean): void {
     const host = request.headers.host;
     const hosts = this.allowedHosts.size ? this.allowedHosts : new Set([this.host]);
     const origins = this.allowedOrigins.size ? this.allowedOrigins : new Set([this.origin]);
@@ -92,10 +92,7 @@ export class WebAuth {
     if (requireOrigin && !workspaceRequest && (!request.headers.origin || !origins.has(request.headers.origin)))
       throw new FleetError('forbidden', 'request Origin does not match the configured control-panel origin');
     const fetchSite = request.headers['sec-fetch-site'];
-    const pageNavigation = allowPageNavigation && !requireOrigin && request.method === 'GET'
-      && request.headers['sec-fetch-mode'] === 'navigate'
-      && (request.headers['sec-fetch-dest'] === 'document' || (Boolean(this.workspaceDevices) && request.headers['sec-fetch-dest'] === 'iframe' && new URL(request.url || '/',this.origin).searchParams.get('workspace-frame')==='1'));
-    if (!workspaceRequest && !pageNavigation && fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
+    if (!workspaceRequest && fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
       throw new FleetError('forbidden', 'cross-site request rejected');
   }
 

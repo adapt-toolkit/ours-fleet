@@ -172,34 +172,29 @@ rollback; inspect host integration and private init stage/recovery evidence.
 Attachment also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`,
 and \`/detach\`.
 
-## Local web console
+## Local HTTP service
 
-The npm package includes the web console; installed users do not clone the repo
-or run \`npm run build\`:
+Fleet runs an HTTP service for the App. It serves no pages and opens no
+browser; every screen is in the App.
 
 \`\`\`sh
 npm i -g @ours.network/fleet
-ours-fleet init
-ours-fleet doctor
-ours-fleet web                         # install/update service, start, pair browser
+ours-fleet setup-tunnel                # connect this host to your App workspace
+ours-fleet link-device                 # connect another browser or device
 \`\`\`
 
-The normal command uses stable \`http://127.0.0.1:49271/\`, installs an
-owner-level systemd user service (Linux) or LaunchAgent (macOS), and opens a
-five-minute one-use pairing link in the local browser. After pairing, bookmark
-the plain URL or install the PWA. To pair a new, signed-out, or revoked browser,
-run \`ours-fleet web open\`.
+The service listens on \`http://127.0.0.1:49271/\` and is installed as an
+owner-level systemd user service (Linux) or LaunchAgent (macOS).
 
 \`\`\`sh
 ours-fleet web status
 ours-fleet web start|stop|restart
-ours-fleet web open
-ours-fleet web revoke-all              # revoke every browser and active session
+ours-fleet web revoke-all              # revoke every device and active session
 ours-fleet web uninstall
-ours-fleet web serve --port 0 --no-open # isolated foreground/testing mode
+ours-fleet web serve --port 0          # isolated foreground/testing mode
 \`\`\`
 
-The console is IPv4-loopback-only by default. Both \`localhost\` and
+The service is IPv4-loopback-only by default. Both \`localhost\` and
 \`127.0.0.1\` are accepted locally. For an nginx/TLS reverse proxy, keep the
 default bind and declare the exact browser origin:
 

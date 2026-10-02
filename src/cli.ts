@@ -1279,14 +1279,14 @@ cOpt(program.command('migrate-role-defaults')
     } catch (error) { die(error); }
   });
 
-const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
+const webCommand = cOpt(program.command('web').description('start the Fleet HTTP service used by the App'))
   .enablePositionalOptions()
   .option('--port <port>', 'loopback service port (default: 49271)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid port');
     return port;
   })
-  .option('--no-open', 'do not open a browser automatically')
+  .option('--no-open', 'accepted for existing service units; Fleet opens no browser')
   .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
   .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
   .option('--password-file <path>', 'configure password protection from an owner-readable file')
@@ -1302,10 +1302,7 @@ const webCommand = cOpt(program.command('web').description('start or open the se
         process.stdout.write(line + '\n');
       if (accessNotice) process.stdout.write(accessNotice + '\n');
       await manager.start();
-      if (opts.open !== false) {
-        await requestWebControlWhenReady('open');
-        process.stdout.write('Control-panel authentication opened in the browser.\n');
-      } else process.stdout.write('Web service started; run `ours-fleet web open` to pair a browser.\n');
+      process.stdout.write('Fleet service started.\n');
     } catch (e) { die(e); }
   });
 
@@ -1316,7 +1313,7 @@ const webPort = (command: Command) => cOpt(command)
     return port;
   });
 
-const webServe = cOpt(webCommand.command('serve').description('run the web console in the foreground'))
+const webServe = cOpt(webCommand.command('serve').description('run the Fleet HTTP service in the foreground'))
   .option('--port <port>', 'loopback port (default: 49271; 0 chooses a free port)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('invalid port');
@@ -1324,7 +1321,7 @@ const webServe = cOpt(webCommand.command('serve').description('run the web conso
   });
 
 webServe
-  .option('--no-open', 'do not open a browser automatically')
+  .option('--no-open', 'accepted for existing service units; Fleet opens no browser')
   .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
   .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
   .option('--password-file <path>', 'configure password protection from an owner-readable file')
@@ -1335,14 +1332,11 @@ webServe
       const accessNotice = configureWebAccess(opts);
       const consoleServer = await startWebConsole({
         configPath: opts.configuration, port: opts.port,
-        open: opts.open !== false, binPath, bind: opts.bind, publicOrigin: opts.publicOrigin,
+        binPath, bind: opts.bind, publicOrigin: opts.publicOrigin,
         log: line => process.stderr.write(line + '\n'),
       });
       if (accessNotice) process.stdout.write(accessNotice + '\n');
       process.stdout.write(`ours-fleet web listening on ${consoleServer.address}\n`);
-      process.stdout.write(opts.open !== false
-        ? 'Control-panel authentication opened in the browser.\n'
-        : 'Run `ours-fleet web open` to authenticate a browser.\n');
       const shutdown = async () => { await consoleServer.close(); process.exit(0); };
       process.once('SIGINT', () => { void shutdown(); });
       process.once('SIGTERM', () => { void shutdown(); });
@@ -1387,14 +1381,6 @@ webCommand.command('uninstall').description('stop and uninstall the owner web se
   .action(async () => {
     try { process.stdout.write(await new WebServiceManager().uninstall() + '\n'); }
     catch (e) { die(e); }
-  });
-
-webCommand.command('open').description('securely open or re-pair a browser with the running console')
-  .action(async () => {
-    try {
-      await requestWebControl('open');
-      process.stdout.write('Control-panel authentication opened in the browser.\n');
-    } catch (e) { die(e); }
   });
 
 async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean }, setupTunnel = false): Promise<void> { try {
@@ -1493,15 +1479,6 @@ webCommand.command('revoke-all').description('revoke all trusted browsers and ac
       process.stdout.write('Revoked all trusted browsers and active web sessions.\n');
     } catch (e) { die(e); }
   });
-
-async function requestWebControlWhenReady(command: 'open' | 'revoke-all'): Promise<void> {
-  let last: unknown;
-  for (let attempt = 0; attempt < 40; attempt++) {
-    try { await requestWebControl(command, undefined, 500); return; }
-    catch (error) { last = error; await new Promise(resolve => setTimeout(resolve, 125)); }
-  }
-  throw last;
-}
 
 function configureWebAccess(opts: {
   passwordFile?: string; password?: boolean; pairing?: boolean; publicOrigin?: string;

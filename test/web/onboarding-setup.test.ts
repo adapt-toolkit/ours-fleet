@@ -36,7 +36,6 @@ describe('first-time setup through the API', () => {
     const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
     await ensureMinimalSetup(configPath);
     const dir = mkdtempSync(join(root, 'web-'));
-    writeFileSync(join(dir, 'index.html'), '<!doctype html>');
     const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
     const configuration = new FleetConfigService({ configPath });
     let hostSetups = 0;
@@ -45,7 +44,7 @@ describe('first-time setup through the API', () => {
       onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
         await executeInitAnswers(answers, configPath, { async hostSetup() { hostSetups++; }, publish: publishSetup });
       },
-    } as any, boundary, { auth, staticRoot: dir });
+    } as any, boundary, { auth });
     try {
       const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
       const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
@@ -79,7 +78,6 @@ describe('first-time setup through the API', () => {
     const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
     await ensureMinimalSetup(configPath);
     const dir = mkdtempSync(join(root, 'web-'));
-    writeFileSync(join(dir, 'index.html'), '<!doctype html>');
     const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
     const configuration = new FleetConfigService({ configPath });
     const server = await buildWebServer({
@@ -87,7 +85,7 @@ describe('first-time setup through the API', () => {
       onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
         await executeInitAnswers(answers, configPath, { async hostSetup() { await new Promise(resolve => setTimeout(resolve, 50)); }, publish: publishSetup });
       },
-    } as any, boundary, { auth, staticRoot: dir });
+    } as any, boundary, { auth });
     try {
       const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
       const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
@@ -106,7 +104,6 @@ describe('first-time setup through the API', () => {
     const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
     await ensureMinimalSetup(configPath);
     const dir = mkdtempSync(join(root, 'web-'));
-    writeFileSync(join(dir, 'index.html'), '<!doctype html>');
     const appOrigin = 'https://app.ours-tunnel.com';
     const store = new WorkspaceDeviceStore(mkdtempSync(join(root, 'devices-')));
     const auth = new WebAuth(boundary.origin, boundary.host, Date.now, undefined, undefined, store, appOrigin);
@@ -117,7 +114,7 @@ describe('first-time setup through the API', () => {
       onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
         await executeInitAnswers(answers, configPath, { async hostSetup() { hostSetups++; }, publish: publishSetup });
       },
-    } as any, boundary, { auth, staticRoot: dir });
+    } as any, boundary, { auth });
     try {
       const issue = () => { const link = store.mint(); return store.enroll(link.enrollment, link.workspaceId, 'device'); };
       const device = issue(), revoked = issue();
