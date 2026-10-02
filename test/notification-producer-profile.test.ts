@@ -52,6 +52,15 @@ it('refuses, visibly, a producer credential bound to another server or installat
   }
 });
 
+it('never quotes a malformed secret-bearing producer file in its warning', () => {
+  const { dir, profile } = profileDir();
+  writeFileSync(join(dir, 'notifications-producer.json'), 'FAKE_PRODUCER_SECRET_' + token, { mode: 0o600 });
+  const warnings: string[] = [];
+  expect(producerConfig({}, () => profile, w => warnings.push(w))).toBeUndefined();
+  expect(warnings).toHaveLength(1); expect(warnings[0]).toContain('not valid producer JSON');
+  expect(warnings[0]).not.toMatch(/FAKE|p{10}/);
+});
+
 it('refuses a non-private producer credential file', () => {
   const warnings: string[] = [];
   const { dir, profile } = profileDir('http://127.0.0.1:3050', { schema: 1, serverUrl: 'http://127.0.0.1:3050', expectedInstanceId: 'instance-1', token });

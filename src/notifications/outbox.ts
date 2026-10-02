@@ -33,17 +33,24 @@ export function producerConfig(env: NodeJS.ProcessEnv = process.env, profile: ()
   if (!selected) return;
   const file = join(dirname(selected.credentialPath), PRODUCER_CREDENTIAL_FILE);
   if (!existsSync(file)) return;
+  // Reasons are fixed text: parser and file errors can quote the secret-bearing contents.
+  let reason = 'it is not a private owner-only file';
   try {
-    const bound = JSON.parse(readPrivateFile(file, 4096).toString('utf8'));
-    if (!bound || bound.schema !== 1 || bound.serverUrl !== selected.serverUrl || bound.expectedInstanceId !== selected.expectedInstanceId)
-      throw new Error('it belongs to another server installation');
-    if (typeof bound.token !== 'string' || bound.token.length < 32) throw new Error('its credential is invalid');
+    const text = readPrivateFile(file, 4096).toString('utf8');
+    reason = 'it is not valid producer JSON';
+    const bound = JSON.parse(text);
+    reason = 'it belongs to another server installation';
+    if (!bound || bound.schema !== 1 || bound.serverUrl !== selected.serverUrl || bound.expectedInstanceId !== selected.expectedInstanceId) throw new Error();
+    reason = 'its credential is invalid';
+    if (typeof bound.token !== 'string' || bound.token.length < 32) throw new Error();
+    reason = 'the server requires HTTPS or loopback';
     const server = new URL(selected.serverUrl);
-    if (server.protocol !== 'https:' && !(server.protocol === 'http:' && loopback(server))) throw new Error('the server requires HTTPS or loopback');
+    if (server.protocol !== 'https:' && !(server.protocol === 'http:' && loopback(server))) throw new Error();
+    reason = 'the client credential is unreadable';
     const gatewayCredential = readPrivateFile(selected.credentialPath, 4096).toString('utf8').trim();
     return { origin: selected.serverUrl.replace(/\/$/, '') + '/notifications', token: bound.token, gatewayCredential };
-  } catch (error) {
-    warn(`Notifications are not produced: ${file} is unusable (${(error as Error).message}). Re-run the installer to repair it.`);
+  } catch {
+    warn(`Notifications are not produced: ${file} is unusable (${reason}). Re-run the installer to repair it.`);
     return;
   }
 }
