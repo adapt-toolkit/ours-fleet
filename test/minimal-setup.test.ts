@@ -23,3 +23,12 @@ test('partial existing split setup is retained without manufacturing an unrelate
  await assert.rejects(ensureMinimalSetup(config),/without its manifest/);
  assert.equal(readFileSync(join(split,'retained.txt'),'utf8'),'retained');
 });
+
+test('existing manifest and nonempty split configuration remain byte identical',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'fleet-minimal-retained-'));cleanup.push(root);
+ const config=join(root,'fleet.yaml');await ensureMinimalSetup(config);
+ const retainedManifest='api_version: ours.network/fleet/v2\n# Retained operator settings\n';writeFileSync(config,retainedManifest,{mode:0o600});
+ const brains=join(splitRootFor(config),'brains');mkdirSync(brains,{mode:0o700});
+ const path=join(brains,'retained.yaml'),contents='harness: codex\nsession: acp\nmodel: gpt-6.1-sol\neffort: medium\n';writeFileSync(path,contents,{mode:0o600});
+ await ensureMinimalSetup(config);assert.equal(readFileSync(config,'utf8'),retainedManifest);assert.equal(readFileSync(path,'utf8'),contents);
+});
