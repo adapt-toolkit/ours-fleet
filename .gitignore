@@ -10,3 +10,5 @@ docs/superpowers/
 .env
 
 .test-artifacts/
+
+.web-source/

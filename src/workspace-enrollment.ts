@@ -57,5 +57,17 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const origin=`https://${payload.hostname}`;
   replaceFileAtomically(join(dir,'tunnel.json'),JSON.stringify({origin,tokenFile:join(dir,'connector')})+'\n',0o600);
   replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase()})+'\n',0o600);
-  loadConfig(configuration);return {origin,hostWorkspaceId};
+  loadConfig(configuration);return {origin,hostWorkspaceId,rootCid:result.rootCid};
+}
+
+/** Only the existing signed-root receipt authorizes the scoped tunnel target. */
+export async function configureWorkspacePort(payload:WorkspacePayload,hostWorkspaceId:string,rootCid:string,port:number):Promise<void> {
+  const deadline=Date.now()+15000;
+  while(true){
+    const response=await fetch(payload.appOrigin+'/account-api/workspace-tunnel-configure',{method:'POST',headers:{Origin:payload.appOrigin,'Content-Type':'application/json'},credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000),body:JSON.stringify({...payload.challenge,hostWorkspaceId,rootCid,port})});
+    if(!response.ok){await response.body?.cancel();throw Error('Workspace tunnel target configuration failed (HTTP '+response.status+')');}
+    const receipt=await response.json() as {configured?:boolean};if(receipt.configured===true)return;
+    if(Date.now()>=deadline)throw Error('Signed workspace binding is not confirmed; tunnel target was not changed');
+    await new Promise(resolve=>setTimeout(resolve,500));
+  }
 }

@@ -71,6 +71,32 @@ describe('native supervised web service', () => {
     expect(await manager.uninstall()).toContain(WEB_LAUNCHD_LABEL);
   });
 
+  it('reloads a loaded macOS job with the retained actual listener and profile', async () => {
+    const root=mkdtempSync(join(tmpdir(),'fleet-launchd-retain-'));
+    const executable=join(root,'fleet.js');writeFileSync(executable,'// fixture');
+    let loadedPort:number|undefined=49271;
+    const events:string[]=[];
+    let manager:WebServiceManager;
+    const exec:Exec=async (_command,args)=>{
+      events.push(args[0]);
+      if(args[0]==='print')return {code:loadedPort===undefined?1:0,stdout:'',stderr:''};
+      if(args[0]==='bootout')loadedPort=undefined;
+      if(args[0]==='bootstrap'){
+        const plist=readFileSync(manager.definitionPath,'utf8');
+        const match=plist.match(/<string>--port<\/string>\s*<string>(\d+)<\/string>/);
+        if(!match)throw Error('No persisted launchd listener');
+        loadedPort=Number(match[1]);
+      }
+      return {code:0,stdout:'',stderr:''};
+    };
+    manager=new WebServiceManager({platform:'darwin',exec,homeDir:root,stateDir:join(root,'state'),uid:123,environment:{OURS_CONFIG:join(root,'profile.json')}});
+    await manager.retainBoundPort(executable,49272,join(root,'fleet.yaml'),{bind:'127.0.0.1',publicOrigin:'https://fixture.ours-tunnel.com'});
+    expect(loadedPort).toBe(49272);
+    expect(events).toEqual(['bootout','print','bootstrap']);
+    expect(manager.readMetadata()).toMatchObject({port:49272,publicOrigin:'https://fixture.ours-tunnel.com',environment:{OURS_CONFIG:join(root,'profile.json')}});
+    await manager.restart();expect(loadedPort).toBe(49272);
+  });
+
   it('quotes template arguments without shell interpolation', () => {
     const unit = systemdUnit('/runtime/node', '/tmp/a";%n', 49_271, '/tmp/$(touch nope)');
     expect(unit).toContain('/tmp/a\\";%%n');

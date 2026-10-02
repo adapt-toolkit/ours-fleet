@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { configureWorkspacePort } from './workspace-enrollment.js';
+import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
 import { readWorkspacePayload,enrollWorkspace } from './workspace-enrollment.js';
 import { waitForRoleDaemon } from './startup-readiness.js';
@@ -6,7 +8,7 @@ import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
 import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -21,7 +23,7 @@ import {
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath, stateRoot } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -1398,11 +1400,28 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
   .option('--preserve-profile','retain the existing human profile without creating or rewriting it')
   .option('--migrate-app-origin','explicitly migrate the same workspace to its new account origin after verified signed proof')
   .action(async opts=>{try {
-    const result=await enrollWorkspace(readWorkspacePayload(opts.file),opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:opts.preserveProfile});
+    const payload=readWorkspacePayload(opts.file);
+    const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:opts.preserveProfile});
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
-    const manager=new WebServiceManager();await manager.install(binPath,49271,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
-    const controlDeadline=Date.now()+20000;
-    while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
+    const manager=new WebServiceManager(),previous=manager.readMetadata();
+    if(previous)await manager.stop();
+    const selectedPort=await availableWebPort(previous?.port ?? 49271);
+    mkdirSync(joinPath(stateRoot(),'web'),{recursive:true,mode:0o700});
+    writeFileSync(joinPath(stateRoot(),'web','port-selection.json'),JSON.stringify({expiresAt:Date.now()+60000})+'\n',{mode:0o600});
+    await manager.install(binPath,selectedPort,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});await manager.restart();
+    const waitForControl=async()=>{
+      const controlDeadline=Date.now()+20000;
+      while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
+    };
+    await waitForControl();
+    const bound=JSON.parse(readFileSync(joinPath(stateRoot(),'web','workspace-port.json'),'utf8')) as {port:number};
+    if(!Number.isInteger(bound.port) || bound.port<1 || bound.port>65535)throw Error('Invalid workspace listener port');
+    if(bound.port!==selectedPort){
+      await manager.retainBoundPort(binPath,bound.port,opts.configuration,{bind:'127.0.0.1',publicOrigin:result.origin});
+      await waitForControl();
+    }
+    await configureWorkspacePort(payload,result.hostWorkspaceId,result.rootCid,bound.port);
+    rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
     const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
     process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
     process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');

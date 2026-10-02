@@ -27,7 +27,7 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json && node scripts/build-info.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-web.mjs && node scripts/build-info.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "npm run typecheck",
     "test": "vitest run",

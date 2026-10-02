@@ -1,3 +1,4 @@
+import { replaceFileAtomically } from '../atomic-file.js';
 import {validateAccountOrigin} from '../account-origin.js';
 import { startWorkspaceTunnel } from './workspace-tunnel.js';
 import {createPrefixGateway,type ServiceTarget} from './prefix-gateway.js';
@@ -82,7 +83,7 @@ export interface RunningWebConsole extends WebServer {
 
 export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
   const notificationConfig = producerConfig();
-  const requestedPort = options.port ?? 49_271;
+  let requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
   const webDir = options.webStateDir ?? resolve(stateRoot(), 'web');
@@ -241,7 +242,16 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     const basePath=provider.pathname.replace(/\/$/,'');
     const services:ServiceTarget[]=['daemon','cowork','messenger'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})}}));
     gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services});
-    await new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(requestedPort,bind,()=>{gateway!.server.off('error',reject);resolve();});});
+    const listen = (port:number) => new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(port,bind,()=>{gateway!.server.off('error',reject);resolve();});});
+    try { await listen(requestedPort); }
+    catch(error) {
+      const selection=resolve(webDir,'port-selection.json');
+      if((error as NodeJS.ErrnoException).code!=='EADDRINUSE' || !existsSync(selection) || JSON.parse(readPrivateFile(selection,4096).toString()).expiresAt<=Date.now())throw error;
+      await listen(0);
+    }
+    const bound=gateway.server.address();if(!bound || typeof bound==='string')throw Error('Workspace listener did not bind');
+    requestedPort=bound.port;
+    replaceFileAtomically(resolve(webDir,'workspace-port.json'),JSON.stringify({port:requestedPort})+'\n',0o600);
   }catch(error){await gateway?.close().catch(()=>{});await server.close();lock.release();throw error;}
   server.auth.setBoundary(browserOrigin, browserHost, publicOrigin ? {
     // nginx's safe default uses the loopback upstream as Host. The declared

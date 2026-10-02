@@ -41,3 +41,23 @@ trust changes only after the fresh challenge has a confirmed signed root receipt
 Default enrollment refuses an origin change. The runtime restarts, device records
 remain local, and each browser signs in and links a new device on the new account
 origin. Follow ours-app/server/DEPLOYMENT.md; do not edit private binding files.
+
+Workspace releases include the pinned standalone frontend under `dist/web-app`.
+Hosted builds first build the immutable ours-app commit in `web-source.json`,
+then copy its complete entry/assets/service worker before stamping and packing
+Fleet. Source-only API builds can omit it; they do not qualify workspace UI delivery.
+
+Enrollment stops only its previously recorded managed web service, checks the
+recorded/default loopback port, and selects an OS-assigned free replacement when
+occupied. A one-minute private enrollment marker permits recovery from a bind
+race. The actual bound port is saved in private web metadata and the managed unit;
+normal restarts do not silently relocate a retained tunnel. Cloudflare target
+configuration uses a bounded receipt of the previously SDK-verified signed root
+binding, never a client assertion of root identity. The app must expose the
+matching workspace-tunnel-configure endpoint before this Fleet release is used.
+
+Private repository access is not a release prerequisite: `assets/web-source.pack`
+contains only the immutable pinned commit and its complete source tree, without
+ancestor history. `prepare-web.mjs` verifies SHA256, restores that exact Git
+commit in an isolated directory, then builds it with its lockfile. Only compiled
+web files are included in the Fleet npm package, not the source pack.
