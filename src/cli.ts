@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ensureMinimalSetup } from './minimal-setup.js';
 import { configureWorkspacePort } from './workspace-enrollment.js';
 import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
@@ -1395,13 +1396,10 @@ webCommand.command('open').description('securely open or re-pair a browser with 
     } catch (e) { die(e); }
   });
 
-cOpt(program.command('workspace-enroll').description('enroll this host using a private account setup file'))
-  .requiredOption('--file <path>','owned private payload file')
-  .option('--preserve-profile','retain the existing human profile without creating or rewriting it')
-  .option('--migrate-app-origin','explicitly migrate the same workspace to its new account origin after verified signed proof')
-  .action(async opts=>{try {
+async function workspaceEnrollmentCommand(opts: { file: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean }, setupTunnel = false): Promise<void> { try {
     const payload=readWorkspacePayload(opts.file);
-    const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:opts.preserveProfile});
+    if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
+    const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
     const manager=new WebServiceManager(),previous=manager.readMetadata();
     if(previous)await manager.stop();
@@ -1422,10 +1420,22 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
     }
     await configureWorkspacePort(payload,result.hostWorkspaceId,result.rootCid,bound.port);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
+    if (setupTunnel) { process.stdout.write('Tunnel setup submitted. Check verified binding and tunnel health in the App, then run ours-fleet link-device and paste its private code. Configure Fleet agents and models in the App after linking.\n'); return; }
     const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
     process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
     process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
-  }catch(error){die(error);}});
+  }catch(error){die(error);} }
+
+cOpt(program.command('workspace-enroll').description('enroll this host using a private account setup file'))
+  .requiredOption('--file <path>', 'owned private payload file')
+  .option('--preserve-profile', 'retain the existing human profile without creating or rewriting it')
+  .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
+  .action(async opts => workspaceEnrollmentCommand(opts));
+
+cOpt(program.command('setup-tunnel').description('connect an installed host using scoped expiring App credentials; preserves identities and agent configuration'))
+  .requiredOption('--file <path>', 'owned private App payload file (chmod 600)')
+  .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
+  .action(async opts => workspaceEnrollmentCommand(opts, true));
 
 program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
   .action(async () => {
