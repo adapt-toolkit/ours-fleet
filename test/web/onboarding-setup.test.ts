@@ -100,7 +100,8 @@ describe('first-time setup through the API', () => {
       const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
       const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
       const done = await server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string, 'content-type': 'application/json' }, payload: { models: { coordination: sol, development: sol, review: sol } } });
-      expect(done.statusCode).not.toBe(200);
+      expect(done.statusCode).toBe(409);
+      expect(done.json().error).toMatchObject({ code: 'conflict', message: 'Fleet was set up with different models; review its configuration' });
       expect(done.json().configured).toBeUndefined();
       expect(readFileSync(kept, 'utf8')).toBe(customized);
     } finally { await server.close(); }
