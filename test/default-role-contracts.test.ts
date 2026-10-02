@@ -43,7 +43,9 @@ describe('packaged default role contract', () => {
       expect(coordinator.persona).toMatch(/Own progress and workflow, not execution quality/);
       expect(coordinator.persona).toMatch(/Immediately before room creation/);
       expect(coordinator.persona).toMatch(/Brain, harness, session, model, reasoning effort/);
-      expect(coordinator.persona).toMatch(/Wait for `send_message` to confirm delivery/);
+      // The coordinator speaks in its own conversation; nothing waits on a named owner channel.
+      expect(coordinator.persona).toMatch(/introduce yourself in your first reply/);
+      expect(coordinator.persona).not.toMatch(/owner channel|confirm delivery|If delivery fails/i);
       expect(coordinator.bio).not.toBe(coordinator.persona);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -70,7 +72,7 @@ describe('packaged default role contract', () => {
     ]) expect(role).toMatch(marker);
     expect(role).not.toMatch(/engineer-mini|8hats/i);
     expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
-    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: development }');
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
     const room = String(files.get('room_templates/engineering.yaml'));
     expect(room).toContain('role: Engineer');
     expect(room).toContain('agent_template: Engineer');

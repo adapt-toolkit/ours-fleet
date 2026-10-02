@@ -76,6 +76,13 @@ class FakeAppServer implements CodexAppServerConnection {
           this.ignoreSigterm = true;
         } else {
           const missingTerminal = input[0]?.text?.includes('missing terminal');
+          if (input[0]?.text?.includes('with commentary')) {
+            const note = { type: 'agentMessage', id: `commentary-${turnId}`, text: 'Reading the file first.',
+              phase: 'commentary', memoryCitation: null, delivery: null };
+            this.options.onNotification?.('item/started', { threadId: 'thread-native-1', turnId, item: { ...note, text: '' } });
+            this.options.onNotification?.('item/agentMessage/delta', { threadId: 'thread-native-1', turnId, itemId: note.id, delta: note.text });
+            this.options.onNotification?.('item/completed', { threadId: 'thread-native-1', turnId, item: note });
+          }
           this.complete(turnId, 'native final', missingTerminal);
           if (input[0]?.text?.includes('stale idle')) {
             this.threadStatus = 'active';
@@ -303,6 +310,22 @@ describe('CodexAppServerSession', () => {
       await session.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('keeps native commentary in the conversation the owner reads and out of the final output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-native-'));
+    try {
+      const session = await start(dir);
+      const result = await session.submitPrompt('hello with commentary');
+      expect(result).toMatchObject({ accepted: true, outcome: 'completed', output: 'native final' });
+      const chunks = session.conversationPage({ limit: 100 }).events.filter(event => event.kind === 'message.chunk')
+        .map(event => (event.payload as { content: { text?: string; redacted?: boolean } }).content);
+      expect(chunks.map(content => content.text)).toEqual(['Reading the file first.', 'native final']);
+      expect(chunks.some(content => content.redacted)).toBe(false);
+      await session.submitPrompt('wake with commentary', { origin: { kind: 'scheduled-loop', loop: 'l1', runId: 'r1' } });
+      expect(JSON.stringify(session.conversationPage({ limit: 100 }).events).match(/Reading the file first/g)).toHaveLength(1);
+      await session.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('runs a native turn, preserves final phase, and persists its thread id', async () => {

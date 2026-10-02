@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -8,6 +8,7 @@ import { TrustedDeviceStore } from '../../src/web/device-store.js';
 import { buildWebServer } from '../../src/web/server.js';
 import { FleetConfigService } from '../../src/web/fleet-config-service.js';
 import { ensureMinimalSetup } from '../../src/minimal-setup.js';
+import { splitRootFor } from '../../src/config.js';
 import { WorkspaceDeviceStore } from '../../src/web/workspace-devices.js';
 import { executeInitAnswers, publishSetup } from '../../src/init-wizard.js';
 import '../../src/harness/claude-code.js';
@@ -64,13 +65,45 @@ describe('first-time setup through the API', () => {
       expect(done.statusCode).toBe(200);
       expect(hostSetups).toBe(1);
       const model = configuration.read(true).model;
-      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'coordination' });
-      expect(model.brains?.review).toMatchObject({ harness: 'codex', model: 'gpt-6-astra', effort: 'medium' });
+      // Each prepared agent references the packaged Brain preset of its chosen model; no Brain is named after a kind of work.
+      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
+      expect(model.agent_templates.Developer.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
+      expect(model.agent_templates.Critic.brain).toEqual({ ref: 'codex-gpt-6-astra-medium' });
+      expect(model.brains?.['codex-gpt-6-astra-medium']).toMatchObject({ harness: 'codex', model: 'gpt-6-astra', effort: 'medium' });
+      for (const work of ['coordination', 'development', 'review']) expect(model.brains?.[work]).toBeUndefined();
       expect(Object.keys(model.agent_templates).sort()).toEqual(['Critic', 'Developer', 'Engineer', 'LocalCoordinator']);
       expect((await server.app.inject({ method: 'GET', url: '/api/v1/onboarding', headers: session })).json().configured).toBe(true);
 
       expect((await setup({ coordination: sol, development: sol, review: sol })).statusCode).toBe(409);
       expect(hostSetups).toBe(1);
+    } finally { await server.close(); }
+  });
+
+  it.each([
+    ['another reasoning', 'harness: codex\nsession: acp\nmodel: gpt-6.1-sol\neffort: high\n'],
+    ['another session', 'harness: codex\nsession: codex-app-server\nmodel: gpt-6.1-sol\neffort: medium\n'],
+  ])('does not report setup done over a preserved Brain of a packaged name with %s', async (_name, customized) => {
+    const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
+    await ensureMinimalSetup(configPath);
+    const kept = join(splitRootFor(configPath), 'brains', 'codex-gpt-6-1-sol-medium.yaml');
+    mkdirSync(join(splitRootFor(configPath), 'brains'), { recursive: true, mode: 0o700 });
+    writeFileSync(kept, customized, { mode: 0o600 });
+    const dir = mkdtempSync(join(root, 'web-'));
+    const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
+    const server = await buildWebServer({
+      audit: new AuditSink(join(dir, 'audit')), configuration: new FleetConfigService({ configPath }),
+      onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
+        await executeInitAnswers(answers, configPath, { async hostSetup() {}, publish: publishSetup });
+      },
+    } as any, boundary, { auth });
+    try {
+      const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
+      const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
+      const done = await server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string, 'content-type': 'application/json' }, payload: { models: { coordination: sol, development: sol, review: sol } } });
+      expect(done.statusCode).toBe(409);
+      expect(done.json().error).toMatchObject({ code: 'conflict', message: 'Fleet was set up with different models; review its configuration' });
+      expect(done.json().configured).toBeUndefined();
+      expect(readFileSync(kept, 'utf8')).toBe(customized);
     } finally { await server.close(); }
   });
 
@@ -95,8 +128,9 @@ describe('first-time setup through the API', () => {
         server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: session, payload: { models: { coordination: model, development: model, review: model } } })));
       expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);
       const winner = first.statusCode === 200 ? 'gpt-6.1-sol' : 'gpt-6-astra';
-      const brains = configuration.read(true).model.brains!;
-      for (const work of ['coordination', 'development', 'review']) expect(brains[work].model).toBe(winner);
+      const published = configuration.read(true).model;
+      for (const holder of [published.agents.FleetCoordinator, published.agent_templates.Developer, published.agent_templates.Critic])
+        expect(published.brains![(holder.brain as { ref: string }).ref].model).toBe(winner);
     } finally { await server.close(); }
   });
 

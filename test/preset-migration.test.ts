@@ -207,6 +207,39 @@ describe('packaged role-default adoption', () => {
     expect(rerun.replacements).toEqual([]);
   });
 
+  it.each(['8', '9'])('adopts the untouched revision-%s Coordinator role, which addressed a named owner channel', revision => {
+    const config = join(dir, `coordinator-${revision}.yaml`);
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    const path = join(root, 'roles', 'Coordinator.yaml');
+    const previous = readFileSync(new URL(`./fixtures/presets/Coordinator.revision-${revision}.yaml`, import.meta.url), 'utf8');
+    expect(previous).toContain('Coordinator Owner Channel');
+    writeFileSync(path, previous, { mode: 0o600 });
+    expect(migratePackagedRoleDefaults(config).replacements).toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(previous);
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: `coordinator-${revision}` });
+    const current = readFileSync(path, 'utf8');
+    expect(current).toBe(readFileSync(join(packagedPresetRoot(), 'fleet', 'roles', 'Coordinator.yaml'), 'utf8'));
+    expect(current).not.toMatch(/owner channel/i);
+    expect(current).not.toContain('send_message` to');
+    expect(current).not.toContain('If delivery fails');
+    expect(current).toContain('introduce yourself in your first reply');
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: `coordinator-${revision}-again` }).replacements).toEqual([]);
+  });
+
+  it('preserves an edited Coordinator role byte-for-byte', () => {
+    const config = join(dir, 'coordinator-custom.yaml');
+    bootstrapPresets(config);
+    const path = join(splitRootFor(config), 'roles', 'Coordinator.yaml');
+    const custom = readFileSync(new URL('./fixtures/presets/Coordinator.revision-9.yaml', import.meta.url), 'utf8')
+      .replace('Keep fleet development moving', 'Keep my fleet moving');
+    writeFileSync(path, custom, { mode: 0o600 });
+    const result = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'coordinator-custom' });
+    expect(result.preserved).toContain(path);
+    expect(result.replacements).not.toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(custom);
+  });
+
   it('preserves a customized revision-5 Agent Template byte-for-byte', () => {
     const config = join(dir, 'custom-v5-template.yaml');
     bootstrapPresets(config);

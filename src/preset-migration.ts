@@ -79,6 +79,15 @@ const V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
   'agent_templates/Critic.yaml': '3e98a28f17876061cfadf984351aa59fdbe19629e514eff52c74546545c64a91',
 });
 
+// The packaged Coordinator role of revisions 8 and 9 addressed a named owner channel that a
+// fresh installation does not have. Untouched copies adopt the current role; edited ones stay.
+const OWNER_CHANNEL_COORDINATOR_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'roles/Coordinator.yaml': [
+    '8c8ad28d9bb9ddf9dba8c5c9c7859f25edd8fa10ebf833e2340124a6e49583ec',
+    'f0d8b169ad0a18051b57e5280b93cf01e05faa5c12f4e12bdf89973edf2ef58a',
+  ],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'roles/Engineer.yaml',
@@ -232,6 +241,7 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(V3_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V4_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V5_ROLE_DEFAULT_FINGERPRINTS),
+      ...Object.keys(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -243,6 +253,7 @@ export function migratePackagedRoleDefaults(
         V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
         V5_ROLE_DEFAULT_FINGERPRINTS[relative],
         V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
+        ...(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
