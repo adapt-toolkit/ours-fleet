@@ -190,7 +190,10 @@ describe('packaged role-default adoption', () => {
         'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
         '',
       ].join('\n') : readFileSync(path, 'utf8')
-        .replace('monitor: { mode: fleet, interrupt: after_tool }\n', '');
+        .replace('monitor: { mode: fleet, interrupt: after_tool }\n', '')
+        // Revision 5 asked before acting; the packaged files have since been given the testing default.
+        .replace('permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
+          'permissions: { approval: ask, filesystem: workspace, unattended: deny }');
       writeFileSync(path, previous, { mode: 0o600 });
     }
     const dry = migratePackagedRoleDefaults(config);
