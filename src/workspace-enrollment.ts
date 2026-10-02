@@ -116,6 +116,18 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
 }
 
 /** Only the existing signed-root receipt authorizes the scoped tunnel target. */
+/**
+ * The enrollment server contact exists only to carry the signed binding. Once the account has confirmed
+ * that binding, remove exactly that contact from this host's Messenger, so it does not stay in the
+ * person's chats. The server identity is the one recorded with the binding; nothing else is touched.
+ */
+export async function removeEnrollmentContact():Promise<boolean> {
+  let serverCid:unknown;
+  try{serverCid=JSON.parse(readFileSync(join(stateRoot(),'workspace','binding.json'),'utf8')).serverCid;}catch{return false;}
+  if(typeof serverCid!=='string' || !/^[A-F0-9]{64}$/i.test(serverCid))return false;
+  try{await hostMessenger()('contacts/remove',{contact:serverCid.toUpperCase()});}catch{throw Error('Messenger did not remove it');}
+  return true;
+}
 export async function configureWorkspacePort(payload:Pick<WorkspacePayload,'appOrigin'|'challenge'>,hostWorkspaceId:string,rootCid:string,port:number):Promise<void> {
   const deadline=Date.now()+15000;
   while(true){

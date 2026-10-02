@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { ensureMinimalSetup } from './minimal-setup.js';
-import { configureWorkspacePort } from './workspace-enrollment.js';
+import { configureWorkspacePort, removeEnrollmentContact } from './workspace-enrollment.js';
 import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
 import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
@@ -1458,6 +1458,9 @@ async function finishWorkspaceService(pending: PendingTunnelSetup, configuration
       // Record the request first: if its answer is lost, a later resume must not assume the default target.
       if(record){pending={...pending,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
       await configureWorkspacePort(pending,pending.hostWorkspaceId,pending.rootCid,bound.port);
+      // The account answers this only for a confirmed signed binding, so the enrollment contact has done its work.
+      // Leaving it in place is harmless; a failure to remove it must not fail a finished setup.
+      await removeEnrollmentContact().catch(error=>{process.stderr.write(`The enrollment contact could not be removed from Messenger (${error instanceof Error ? error.message : String(error)}); it can be removed there by hand.\n`);});
     } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
 }
