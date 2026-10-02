@@ -22,12 +22,11 @@ const tree=():Row[]=>[{name:'alice@home',cid:ROOT,kind:'root',temp:null,session:
 async function host(rows:Row[]=tree()) {
   const dir=mkdtempSync(join(tmpdir(),'fleet-child-')),prior={...process.env};
   const messenger:Array<{path:string;body?:unknown}>=[];const daemon:Array<[string,unknown?]>=[];
-  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD};
+  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase(),releaseFailed:0,preserveProfile:true};
   const server:Server=createServer(async(req,res)=>{res.setHeader('Content-Type','application/json');const path=new URL(req.url!,'http://host').pathname.replace(/^\/messenger\/api\//,'');
     if(req.method==='GET'){messenger.push({path});
-      // Messenger answers the root-only question with a refusal when it does not run as the root.
-      if(path==='workspace/enrollment-identity'){res.statusCode=400;res.end('{}');return;}
-      res.end(JSON.stringify({cid:behaviour.messengerCid,name:'Alice Tester'}));return;}
+      // Messenger names the root the daemon describes for the identity it runs as.
+      res.end(JSON.stringify({cid:behaviour.messengerCid,rootCid:behaviour.messengerRoot,...(behaviour.preserveProfile?{preserveProfile:true}:{})}));return;}
     const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(chunk);messenger.push({path,body:JSON.parse(Buffer.concat(chunks).toString())});
     res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:{}));});
   server.listen(0,'127.0.0.1');await once(server,'listening');
@@ -44,14 +43,14 @@ async function host(rows:Row[]=tree()) {
     async listContacts(){daemon.push(['listContacts']);return {contacts:behaviour.contacts.map(container_id=>({container_id}))};},
     async sendCommand(args:unknown){daemon.push(['sendCommand',args]);return {sent:behaviour.sent};},
     async removeContact(args:unknown){daemon.push(['removeContact',args]);return {};},
-    async releaseLease(){daemon.push(['releaseLease']);return {released:0,failed:0};},
+    async releaseLease(){daemon.push(['releaseLease']);return {released:1,failed:behaviour.releaseFailed};},
     async close(){daemon.push(['close']);},
   };}) as unknown as AttachDaemonClient;
   const config=join(dir,'fleet.yaml'),workspace=join(dir,'.ours-fleet','workspace'),invite=join(workspace,'owner.invite');
   const payload:WorkspacePayload={version:1,appOrigin:'https://app.ours-tunnel.com',hostname:'alice-home.ours-tunnel.com',rootName:'alice@home',name:'Alice',surname:'Tester',connectorToken:'fixture-scoped',invitation:'fixture-invite',serverCid:SERVER.toLowerCase(),challenge:{nonce:'n'.repeat(43),accountId:'c'.repeat(43),workspaceId:'w'.repeat(43),expiresAt:Date.now()+600000}};
   const did=(name:string)=>daemon.filter(([call])=>call===name);
   const posted=(path:string)=>messenger.filter(call=>call.path===path && call.body!==undefined);
-  return {dir,config,workspace,invite,payload,messenger,daemon,behaviour,attach,did,posted,enroll:()=>enrollWorkspace(payload,config,{preserveProfile:true,attach})};
+  return {dir,config,workspace,invite,payload,messenger,daemon,behaviour,attach,did,posted,enroll:(extra:Parameters<typeof enrollWorkspace>[2]={})=>enrollWorkspace(payload,config,{preserveProfile:true,attach,contactWaitMs:300,...extra})};
 }
 /** A configured host that was enrolled while Messenger still ran as the Human root. */
 const enrolledAsRoot=(h:Awaited<ReturnType<typeof host>>,owner:Record<string,unknown>={},binding:Record<string,unknown>={})=>{
@@ -89,6 +88,8 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     ['a quarantined identity',tree().map(row=>row.name==='Alice Tester'?{name:'Alice Tester',status:'awaiting-root'}:row)],
     ['a host without a Human root',tree().filter(row=>row.kind!=='root')],
     ['a second root rather than a role',tree().map(row=>row.name==='Alice Tester'?{...row,kind:'root'}:row).filter(row=>row.name!=='alice@home')],
+    ['two Human roots beside the identity',[...tree(),{name:'other@host',cid:'9'.repeat(64),kind:'root',temp:null,session:null}]],
+    ['a host whose only root is not the one Messenger names',tree().map(row=>row.kind==='root'?{...row,cid:'9'.repeat(64)}:row)],
   ];
   it.each(notUnderRoot)('refuses %s as the Messenger identity and changes nothing',async(_name,rows)=>{
     const h=await host(rows);await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');
@@ -103,6 +104,32 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     ['the invitation belongs to another server',h=>{h.behaviour.peer='F'.repeat(64);},/Enrollment server identity mismatch/],
     ['the binding is not sent',h=>{h.behaviour.sent=false;},/Workspace proof was not sent/],
   ];
+  it('refuses a Messenger that names itself or nothing usable as its root',async()=>{
+    for(const named of [CHILD,'not-a-cid','']){
+      const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');h.behaviour.messengerRoot=named;
+      await expect(h.enroll()).rejects.toThrow();expect(h.did('chooseIdentity')).toEqual([]);expect(readFileSync(h.config,'utf8')).toBe(before);
+    }
+  });
+
+  it('requires the profile-preservation answer from Messenger for an existing host',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);h.behaviour.preserveProfile=false;
+    await expect(h.enroll()).rejects.toThrow('requires Messenger profile-preservation support');expect(h.did('chooseIdentity')).toEqual([]);
+  });
+
+  it('gives the root back when the enrollment contact does not appear in time',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');h.behaviour.contacts=[];
+    await expect(h.enroll()).rejects.toThrow('Enrollment contact is not ready');
+    expect(h.did('listContacts').length).toBeGreaterThan(1);expect(h.did('sendCommand')).toEqual([]);expect(h.did('releaseLease')).toHaveLength(1);
+    expect(h.posted('invites')).toEqual([]);expect(readFileSync(h.config,'utf8')).toBe(before);expect(existsSync(h.invite)).toBe(false);
+  });
+
+  it('does not report setup done while the root may still be held',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');h.behaviour.releaseFailed=1;
+    await expect(h.enroll()).rejects.toThrow('Human root was not given back completely');
+    expect(h.did('releaseLease')).toHaveLength(1);expect(h.did('close')).toHaveLength(h.did('attach').length);
+    expect(h.posted('invites')).toEqual([]);expect(readFileSync(h.config,'utf8')).toBe(before);expect(existsSync(h.invite)).toBe(false);expect(existsSync(join(h.workspace,'binding.json'))).toBe(false);
+  });
+
   it.each(failures)('gives the root back and changes nothing when %s',async(_name,arrange,message)=>{
     const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');arrange(h);
     await expect(h.enroll()).rejects.toThrow(message);
@@ -124,10 +151,20 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     const after=readFileSync(h.config,'utf8');
     expect(after).toContain('# kept comment');expect(parse(after)).toEqual({...parse(before),rooms:{...parse(before).rooms,owner:{...parse(before).rooms.owner,expected_cid:CHILD}}});
     expect(readFileSync(h.invite,'utf8')).toBe('fixture-child-public-invite\n');
-    // A setup interrupted after the invitation and before the entry is the same case again: the entry still names the root.
-    writeFileSync(h.config,before,{mode:0o600});await checkWorkspaceConfiguration(h.config,h.attach);await h.enroll();expect(readFileSync(h.config,'utf8')).toBe(after);
     // Once moved, another run changes nothing.
     await h.enroll();expect(readFileSync(h.config,'utf8')).toBe(after);
+    expect(JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')).proofRootCid).toBe(ROOT);
+  });
+
+  it('finishes a move that stopped between the invitation and the Owner entry on the next run',async()=>{
+    const h=await host();enrolledAsRoot(h);const before=readFileSync(h.config,'utf8');
+    // The invitation and the entry are two files. Stop after the first: the entry still names the root.
+    await expect(h.enroll({afterInvitation(){throw Error('stopped here');}})).rejects.toThrow('stopped here');
+    expect(readFileSync(h.invite,'utf8')).toBe('fixture-child-public-invite\n');expect(readFileSync(h.config,'utf8')).toBe(before);
+    // That is the same recognised case again, so setup can simply be run once more.
+    await checkWorkspaceConfiguration(h.config,h.attach);await h.enroll();
+    expect(parse(readFileSync(h.config,'utf8')).rooms.owner.expected_cid).toBe(CHILD);expect(readFileSync(h.invite,'utf8')).toBe('fixture-child-public-invite\n');
+    expect(loadConfig(h.config,{yamlMode:'strict'}).rooms?.owner.expected_cid.toLowerCase()).toBe(CHILD.toLowerCase());
   });
 
   const kept:Array<[string,(h:Awaited<ReturnType<typeof host>>)=>void]>=[
@@ -135,6 +172,9 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     ['an Owner entry naming someone else',h=>enrolledAsRoot(h,{expected_cid:'E'.repeat(64)})],
     ['an Owner entry with another role',h=>enrolledAsRoot(h,{role:'Lead'})],
     ['a binding to another enrollment server',h=>enrolledAsRoot(h,{},{serverCid:'F'.repeat(64)})],
+    ['room defaults someone changed',h=>{enrolledAsRoot(h);writeFileSync(h.config,readFileSync(h.config,'utf8').replace('close_when_task_done: true','close_when_task_done: false'),{mode:0o600});}],
+    ['room defaults someone removed',h=>{enrolledAsRoot(h);writeFileSync(h.config,readFileSync(h.config,'utf8').replace(/\n\s+close_when_task_done: true/,''),{mode:0o600});}],
+    ['a rooms section with more than setup writes',h=>{enrolledAsRoot(h);writeFileSync(h.config,readFileSync(h.config,'utf8')+'  provider: messenger-server\n',{mode:0o600});}],
   ];
   it.each(kept)('keeps %s exactly as it is and refuses',async(_name,arrange)=>{
     const h=await host();arrange(h);const before=readFileSync(h.config,'utf8'),invite=readFileSync(h.invite,'utf8');
@@ -144,12 +184,19 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
   });
 
   it('removes the enrollment contact from the root that sent the binding, not from Messenger',async()=>{
-    const h=await host();enrolledAsRoot(h);
+    const h=await host();enrolledAsRoot(h,{},{proofRootCid:ROOT});
     expect(await removeEnrollmentContact(h.attach)).toBe(true);
     expect(h.did('chooseIdentity')).toEqual([['chooseIdentity',{name:'alice@home',force:false}]]);
     expect(h.did('removeContact')).toEqual([['removeContact',{contact:SERVER}]]);expect(h.did('releaseLease')).toHaveLength(1);
     expect(h.posted('contacts/remove')).toEqual([]);
     h.behaviour.choose=()=>{throw Object.assign(Error('held'),{code:'IDENTITY_IN_USE'});};
     await expect(removeEnrollmentContact(h.attach)).rejects.toThrow('the Human root did not remove it');expect(h.did('releaseLease')).toHaveLength(2);
+    expect(h.messenger).toEqual([]);
+  });
+
+  it('leaves the contact of a binding the root did not send to Messenger, as before',async()=>{
+    const h=await host();enrolledAsRoot(h);
+    expect(await removeEnrollmentContact(h.attach)).toBe(true);
+    expect(h.posted('contacts/remove')).toEqual([{path:'contacts/remove',body:{contact:SERVER}}]);expect(h.daemon).toEqual([]);
   });
 });

@@ -58,39 +58,48 @@ const daemon=(attach:AttachDaemonClient,purpose:string)=>{const profile=readClie
 const CID=/^[a-f0-9]{64}$/i,same=(a:string,b:string)=>a.toLowerCase()===b.toLowerCase();
 interface HumanRoot {name:string;cid:string}
 /**
- * Who this host's Messenger is. Earlier installations run Messenger as the Human root itself, and Messenger
- * says so. Otherwise Messenger runs as the person's own identity, and it is accepted only when this host's
- * daemon lists that identity as a permanent one under its Human root; nothing Messenger claims decides that.
+ * Who this host's Messenger is. Messenger either runs as the Human root itself, or as the person's own
+ * identity and then names the root the daemon describes for it. That is accepted only when this host's
+ * daemon, asked by Fleet itself, lists exactly one Human root, that root is the named one, and the
+ * Messenger identity is listed as a permanent identity under it.
  */
 async function messengerIdentity(request:ReturnType<typeof hostMessenger>,attach:AttachDaemonClient):Promise<{cid:string;preserveProfile:boolean;root?:HumanRoot}> {
-  try{const bound=await request('workspace/enrollment-identity');return {cid:bound.cid,preserveProfile:bound.preserveProfile===true};}
-  catch(error){if((error as {status?:number}).status!==400)throw error;}
-  const own=await request('identity');
-  if(typeof own.cid!=='string' || !CID.test(own.cid))throw Error('Bound Messenger identity unavailable');
+  const bound=await request('workspace/enrollment-identity');
+  if(bound.rootCid===undefined)return {cid:bound.cid,preserveProfile:bound.preserveProfile===true};
+  if(typeof bound.cid!=='string' || !CID.test(bound.cid) || typeof bound.rootCid!=='string' || !CID.test(bound.rootCid) || same(bound.cid,bound.rootCid))throw Error('Bound Messenger identity unavailable');
+  const root=await humanRoot(attach,bound.rootCid,bound.cid);
+  return {cid:bound.cid,preserveProfile:bound.preserveProfile===true,root};
+}
+/** This host's only Human root, as its daemon lists it; optionally with a permanent identity that must be listed under it. */
+async function humanRoot(attach:AttachDaemonClient,rootCid:string,under?:string):Promise<HumanRoot> {
   const client=await daemon(attach,'identities');
   const rows=await client.listIdentities().finally(()=>client.close());
-  const root=rows.find(row=>'kind' in row && row.kind==='root'),row=rows.find(row=>'cid' in row && same(row.cid,own.cid));
-  if(!root || !('kind' in root) || !row || !('kind' in row) || row.kind!=='role' || row.temp!==null)
+  const roots=rows.filter(row=>'kind' in row && row.kind==='root'),root=roots[0],row=under===undefined?undefined:rows.find(row=>'cid' in row && same(row.cid,under));
+  if(roots.length!==1 || !('kind' in root) || !same(root.cid,rootCid) || (under!==undefined && (!row || !('kind' in row) || row.kind!=='role' || row.temp!==null)))
     throw Error("This host's Messenger identity is not a permanent identity under this host's Human root. Tunnel setup changed nothing.");
-  return {cid:own.cid,preserveProfile:true,root:{name:root.name,cid:root.cid}};
+  return {name:root.name,cid:root.cid};
 }
 /** Run one operation as the Human root and always give the root back, whatever happens. */
 async function asHumanRoot<T>(attach:AttachDaemonClient,root:HumanRoot,purpose:string,use:(client:DaemonClient)=>Promise<T>):Promise<T> {
-  const client=await daemon(attach,purpose);
+  const client=await daemon(attach,purpose);let done=false;
   try{
     const bound=await client.chooseIdentity({name:root.name,force:false}).catch((error:{code?:string;message?:string})=>{
       throw Error(`This host's Human root cannot be used right now (${error.code ?? error.message}). Close the session that holds it, then run setup again. Nothing was changed.`);});
     if(!same(bound.cid,root.cid))throw Error("This host's Human root changed while setup was running. Nothing was changed.");
-    return await use(client);
-  }finally{try{await client.releaseLease();}finally{await client.close();}}
+    const result=await use(client);
+    // The operation is not reported as done while the root may still be held.
+    const released=await client.releaseLease();done=true;
+    if(released.failed>0)throw Error("This host's Human root was not given back completely. Run setup again.");
+    return result;
+  }finally{try{if(!done)await client.releaseLease();}finally{await client.close();}}
 }
 /** The signed workspace binding, sent by the Human root itself: the same command Messenger sends when it runs as the root. */
-async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,payload:WorkspacePayload,hostWorkspaceId:string):Promise<void> {
+async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,payload:WorkspacePayload,hostWorkspaceId:string,contactWaitMs:number):Promise<void> {
   const serverCid=payload.serverCid.toUpperCase();
   await asHumanRoot(attach,root,'proof',async client=>{
     const peer=await client.addContact({invite:payload.invitation});
     if(peer.cid.toUpperCase()!==serverCid)throw Error('Enrollment server identity mismatch');
-    const deadline=Date.now()+10000;
+    const deadline=Date.now()+contactWaitMs;
     while(!(await client.listContacts()).contacts.some(contact=>contact.container_id.toUpperCase()===serverCid)){
       if(Date.now()>=deadline)throw Error('Enrollment contact is not ready; obtain a fresh setup payload before retrying');
       await new Promise(resolve=>setTimeout(resolve,100));
@@ -107,9 +116,11 @@ async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,paylo
 function managedRootOwner(configuration:string,rooms:NonNullable<ReturnType<typeof loadConfig>['rooms']>,root:HumanRoot):boolean {
   if(!same(rooms.owner.expected_cid,root.cid) || rooms.owner.public_invite_file!==workspaceOwnerInvite() || rooms.defaults?.attach_owner===false)return false;
   if(!existsSync(join(stateRoot(),'workspace','binding.json')))return false;
-  let owner:unknown;try{owner=parseDocument(readFileSync(configuration,'utf8')).toJS()?.rooms?.owner;}catch{return false;}
-  const entry=owner as Record<string,unknown>|undefined;
-  return !!entry && Object.keys(entry).sort().join()==='expected_cid,provider,public_invite_file,role' && entry.provider==='messenger-server' && entry.role==='Owner' && typeof entry.expected_cid==='string' && same(entry.expected_cid,root.cid);
+  let written:{owner?:Record<string,unknown>;defaults?:Record<string,unknown>}|undefined;try{written=parseDocument(readFileSync(configuration,'utf8')).toJS()?.rooms;}catch{return false;}
+  const entry=written?.owner,defaults=written?.defaults,keys=(value:object)=>Object.keys(value).sort().join();
+  // Exactly the Owner entry and defaults tunnel setup writes; anything added or changed beside them is someone's own configuration.
+  return !!written && keys(written)==='defaults,owner' && !!entry && keys(entry)==='expected_cid,provider,public_invite_file,role' && entry.provider==='messenger-server' && entry.role==='Owner' && typeof entry.expected_cid==='string' && same(entry.expected_cid,root.cid)
+    && !!defaults && keys(defaults)==='attach_owner,close_when_task_done' && defaults.attach_owner===true && defaults.close_when_task_done===true;
 }
 /**
  * Check the Fleet configuration tunnel setup will use, before the one-time command is used.
@@ -131,7 +142,7 @@ export async function checkWorkspaceConfiguration(configuration=defaultConfigPat
   if(loaded.rooms.owner.expected_cid.toLowerCase()!==cid.toLowerCase() && !recordsLostEnrollment(paths.configPath) && !(root && managedRootOwner(paths.configPath,loaded.rooms,root)))
     throw Error(`${paths.configPath}: rooms.owner.expected_cid names a different Owner than this host's Messenger identity. Tunnel setup does not replace an existing Owner.`);
 }
-export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;attach?:AttachDaemonClient}={}) {
+export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;attach?:AttachDaemonClient;contactWaitMs?:number;afterInvitation?:()=>void}={}) {
   const attach=options.attach ?? attachOursClient;
   const request=hostMessenger();
   if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
@@ -158,11 +169,11 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   let result:{submitted?:boolean;rootCid:string;ownerInvite:string},ownerCid:string;
   if(identity.root){
     // The Human root signs the binding; the person's own Messenger identity is the room Owner and issues the Owner invitation.
-    await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId);
+    await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000);
     const invite=await request('invites',{mode:'public'});
     if(typeof invite.blob!=='string' || !invite.blob)throw Error('Malformed workspace enrollment response');
-    const after=await request('identity');
-    if(typeof after.cid!=='string' || !same(after.cid,identity.cid))throw Error("This host's Messenger identity changed while setup was running; local configuration is unchanged");
+    const after=await request('workspace/enrollment-identity');
+    if(typeof after.cid!=='string' || !same(after.cid,identity.cid) || typeof after.rootCid!=='string' || !same(after.rootCid,identity.root.cid))throw Error("This host's Messenger identity changed while setup was running; local configuration is unchanged");
     result={submitted:true,rootCid:identity.root.cid,ownerInvite:invite.blob};ownerCid=identity.cid;
   }else{
     result=await request('workspace/enroll',options.preserveProfile?{...proofPayload,hostWorkspaceId,preserveProfile:true}:{...payload,hostWorkspaceId});
@@ -182,7 +193,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
       await new Promise(resolve=>setTimeout(resolve,500));
     }
   }
-  replaceFileAtomically(inviteFile,result.ownerInvite+'\n',0o600);
+  replaceFileAtomically(inviteFile,result.ownerInvite+'\n',0o600);options.afterInvitation?.();
   const split=splitRootFor(configuration);mkdirSync(split,{recursive:true,mode:0o700});
   if(!loaded.rooms)replaceFileAtomically(configuration,readFileSync(configuration,'utf8')+'\n'+stringify(generatedRooms(ownerCid,inviteFile)),0o600);
   else if(lost && loaded.rooms.owner.expected_cid.toLowerCase()!==ownerCid.toLowerCase())replaceFileAtomically(configuration,`api_version: ${GENERATED_VERSION}\n\n`+stringify(generatedRooms(ownerCid,inviteFile)),0o600);
@@ -195,7 +206,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   replaceFileAtomically(join(dir,'connector'),payload.connectorToken+'\n',0o600);
   const origin=`https://${payload.hostname}`;
   replaceFileAtomically(join(dir,'tunnel.json'),JSON.stringify({origin,tokenFile:join(dir,'connector')})+'\n',0o600);
-  replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase()})+'\n',0o600);
+  replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase(),...(identity.root?{proofRootCid:identity.root.cid}:{})})+'\n',0o600);
   loadConfig(configuration);return {origin,hostWorkspaceId,rootCid:result.rootCid};
 }
 
@@ -206,14 +217,15 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
  * person's chats. The server identity is the one recorded with the binding; nothing else is touched.
  */
 export async function removeEnrollmentContact(attach:AttachDaemonClient=attachOursClient):Promise<boolean> {
-  let serverCid:unknown;
-  try{serverCid=JSON.parse(readFileSync(join(stateRoot(),'workspace','binding.json'),'utf8')).serverCid;}catch{return false;}
+  let serverCid:unknown,proofRootCid:unknown;
+  try{({serverCid,proofRootCid}=JSON.parse(readFileSync(join(stateRoot(),'workspace','binding.json'),'utf8')));}catch{return false;}
   if(typeof serverCid!=='string' || !/^[A-F0-9]{64}$/i.test(serverCid))return false;
   const contact=serverCid.toUpperCase();
-  // The contact belongs to whoever sent the binding: the Human root itself when Messenger runs as the person's own identity.
-  let root:HumanRoot|undefined;
-  try{root=(await messengerIdentity(hostMessenger(),attach)).root;}catch{throw Error('Messenger did not remove it');}
-  if(root){try{await asHumanRoot(attach,root,'cleanup',client=>client.removeContact({contact}));}catch{throw Error('the Human root did not remove it');}return true;}
+  // The contact belongs to whoever sent the binding. When that was the Human root itself, the binding records it.
+  if(typeof proofRootCid==='string' && CID.test(proofRootCid)){
+    try{const root=await humanRoot(attach,proofRootCid);await asHumanRoot(attach,root,'cleanup',client=>client.removeContact({contact}));}catch{throw Error('the Human root did not remove it');}
+    return true;
+  }
   try{await hostMessenger()('contacts/remove',{contact});}catch{throw Error('Messenger did not remove it');}
   return true;
 }
