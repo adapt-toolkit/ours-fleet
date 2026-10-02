@@ -138,3 +138,13 @@ export async function configureWorkspacePort(payload:Pick<WorkspacePayload,'appO
     await new Promise(resolve=>setTimeout(resolve,500));
   }
 }
+
+/**
+ * Point the tunnel at this host's port. The account answers only for a confirmed signed binding, and
+ * only after that answer is the enrollment contact removed; a refused or unconfirmed target leaves it,
+ * so the setup can be finished later. A removal that fails is reported and does not undo the setup.
+ */
+export async function confirmWorkspaceTarget(payload:Pick<WorkspacePayload,'appOrigin'|'challenge'>,hostWorkspaceId:string,rootCid:string,port:number,cleanupFailed:(error:unknown)=>void=()=>{}):Promise<void> {
+  await configureWorkspacePort(payload,hostWorkspaceId,rootCid,port);
+  await removeEnrollmentContact().catch(cleanupFailed);
+}
