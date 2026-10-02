@@ -506,7 +506,8 @@ describe('ours-fleet CLI', () => {
     // the config chip clears too, once the watchdog is no longer held down
     const cfgAfter = await run(['config']);
     expect(cfgAfter.stdout).not.toContain('(held down)');
-  });
+  // Four CLI processes in a row: each takes over a second on a busy runner.
+  }, 30_000);
 
   it('spawn --help exposes only Brain/Role agent configuration', async () => {
     const r = await run(['spawn', '--help']);
