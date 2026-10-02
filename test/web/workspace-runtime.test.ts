@@ -5,12 +5,10 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {once} from 'node:events';
 import {startWebConsole} from '../../src/web/runtime.js';
-import {writeV2Fixture} from '../v2-fixture.js';
 import {WebAccessStore} from '../../src/web/access.js';
 import {ensureMinimalSetup} from '../../src/minimal-setup.js';
 import {requestWebControl} from '../../src/web/control.js';
 import {enrollWorkspace} from '../../src/workspace-enrollment.js';
-import {WorkspaceDeviceStore} from '../../src/web/workspace-devices.js';
 async function browserRequest(url:string,options:{method?:string;headers?:Record<string,string>;body?:string}={}) {
  return new Promise<Response>((resolve,reject)=>{const req=request(url,{method:options.method,headers:options.headers},res=>{const chunks:Buffer[]=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve(new Response(Buffer.concat(chunks),{status:res.statusCode,headers:res.headers as Record<string,string>})));res.on('error',reject);});req.on('error',reject);req.end(options.body);});
 }
@@ -44,7 +42,7 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
    expect(reservation.listening).toBe(true);
   }else expect(bound.port).toBe(port);
   const origin='http://127.0.0.1:'+bound.port,host='fixture.ours-tunnel.com';
-  const link=await requestWebControl('link-device');
+  const link=await requestWebControl('link-device');if(!link)throw Error('Expected a device enrollment code');
   const enrolled=await browserRequest(origin+'/fleet/api/v1/devices/enroll',{method:'POST',headers:{Host:host,Origin:appOrigin,'Content-Type':'application/json','Sec-Fetch-Site':'cross-site'},body:JSON.stringify({...link,label:'Browser fixture'})});expect(enrolled.status, enrolled.status===200?undefined:await enrolled.clone().text()).toBe(200);const first=await enrolled.json() as {token:string;device:{id:string}};
   const opposite=appOrigin==='https://app.ours.network'?'https://app.ours-tunnel.com':'https://app.ours.network';
   expect((await browserRequest(origin+'/fleet/api/v1/devices',{headers:{Host:host,Origin:opposite,Authorization:'Bearer '+first.token}})).status).toBe(403);
