@@ -64,8 +64,12 @@ describe('first-time setup through the API', () => {
       expect(done.statusCode).toBe(200);
       expect(hostSetups).toBe(1);
       const model = configuration.read(true).model;
-      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'coordination' });
-      expect(model.brains?.review).toMatchObject({ harness: 'codex', model: 'gpt-6-astra', effort: 'medium' });
+      // Each prepared agent references the packaged Brain preset of its chosen model; no Brain is named after a kind of work.
+      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
+      expect(model.agent_templates.Developer.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
+      expect(model.agent_templates.Critic.brain).toEqual({ ref: 'codex-gpt-6-astra-medium' });
+      expect(model.brains?.['codex-gpt-6-astra-medium']).toMatchObject({ harness: 'codex', model: 'gpt-6-astra', effort: 'medium' });
+      for (const work of ['coordination', 'development', 'review']) expect(model.brains?.[work]).toBeUndefined();
       expect(Object.keys(model.agent_templates).sort()).toEqual(['Critic', 'Developer', 'Engineer', 'LocalCoordinator']);
       expect((await server.app.inject({ method: 'GET', url: '/api/v1/onboarding', headers: session })).json().configured).toBe(true);
 
@@ -95,8 +99,9 @@ describe('first-time setup through the API', () => {
         server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: session, payload: { models: { coordination: model, development: model, review: model } } })));
       expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);
       const winner = first.statusCode === 200 ? 'gpt-6.1-sol' : 'gpt-6-astra';
-      const brains = configuration.read(true).model.brains!;
-      for (const work of ['coordination', 'development', 'review']) expect(brains[work].model).toBe(winner);
+      const published = configuration.read(true).model;
+      for (const holder of [published.agents.FleetCoordinator, published.agent_templates.Developer, published.agent_templates.Critic])
+        expect(published.brains![(holder.brain as { ref: string }).ref].model).toBe(winner);
     } finally { await server.close(); }
   });
 

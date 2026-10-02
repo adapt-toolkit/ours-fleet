@@ -39,11 +39,11 @@ describe('current Brain presets', () => {
     const model = catalog.models.find(model => model.model === 'gpt-6.1-sol')!;
     const setup = generateSetup({ subscriptions: ['codex'], assignmentStrategy: 'one-model',
       models: { development: model, review: model, coordination: model }, reasoning });
-    for (const work of ['development', 'review', 'coordination']) {
-      expect(parse(setup.files.get(`brains/${work}.yaml`)!)).toEqual({
-        harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort,
-      });
-    }
+    expect(parse(setup.files.get(`brains/codex-gpt-6-1-sol-${effort}.yaml`)!)).toEqual({
+      harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort,
+    });
+    for (const holder of ['agent_templates/Developer.yaml', 'agent_templates/Critic.yaml', 'agents/FleetCoordinator.yaml'])
+      expect(setup.files.get(holder)).toContain(`brain: { ref: codex-gpt-6-1-sol-${effort} }`);
   });
 
   it('keeps Haiku effort-free in the picker and rejects assigning wizard reasoning to it', () => {

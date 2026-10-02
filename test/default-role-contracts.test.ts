@@ -72,7 +72,7 @@ describe('packaged default role contract', () => {
     ]) expect(role).toMatch(marker);
     expect(role).not.toMatch(/engineer-mini|8hats/i);
     expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
-    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: development }');
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
     const room = String(files.get('room_templates/engineering.yaml'));
     expect(room).toContain('role: Engineer');
     expect(room).toContain('agent_template: Engineer');

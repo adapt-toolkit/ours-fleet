@@ -259,8 +259,11 @@ export async function buildWebServer(
       try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});}
       catch(error){throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);}
       // Setup preserves files it finds, so confirm the published models are the ones this request chose.
-      const brains=configuration.read(true).model.brains ?? {};
-      for(const work of ONBOARDING_WORK)if(brains[work]?.harness!==models[work].harness || brains[work]?.model!==models[work].model)
+      // The prepared agents reference packaged Brain presets, so resolve what each of them now points at.
+      const published=configuration.read(true).model,brains=published.brains ?? {};
+      const brainOf=(holder:Record<string,unknown>|undefined)=>brains[String((holder?.brain as {ref?:unknown}|undefined)?.ref ?? '')];
+      const assigned:Record<WorkKind,Record<string,unknown>|undefined>={coordination:brainOf(published.agents.FleetCoordinator),development:brainOf(published.agent_templates?.Developer),review:brainOf(published.agent_templates?.Critic)};
+      for(const work of ONBOARDING_WORK)if(assigned[work]?.harness!==models[work].harness || assigned[work]?.model!==models[work].model)
         throw new FleetError('conflict','Fleet was set up with different models; review its configuration');
       return {configured:true};
     });

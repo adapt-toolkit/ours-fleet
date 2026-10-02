@@ -11,7 +11,8 @@ import type {
 import { registerAdapter } from './registry.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import { bundledAcpAgent } from './acp-agent.js';
+import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
+import { hostClaude } from './claude-runtime.js';
 import { ClaudeCodeAgentSessionAdapter } from './claude-code-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 
@@ -316,6 +317,15 @@ export function makeClaudeCodeAdapter(
         OURS_BIND_IDENTITY: role.identity,
       };
       if (!memPalace) env.MEMPALACE_DISABLED = 'true';
+
+      // The bundled adapter runs the Claude Code shipped with its SDK unless told otherwise. A host
+      // Claude Code at least as new as that copy is the one the person updates, so sessions run it.
+      if (!customAcpCommand(role)) {
+        const host = hostClaude(
+          resolveBundledAcpAgent('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp').manifestPath,
+          { ...process.env, ...role.env }, dirs.runCwd);
+        if (host) env.CLAUDE_CODE_EXECUTABLE = host.path;
+      }
 
       // Per-role harness runtime home. Created before sandbox entry so the
       // bind has something to mount; harmless for un-isolated roles.

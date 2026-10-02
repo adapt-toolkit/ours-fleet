@@ -84,7 +84,6 @@ const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 export const CODEX_DISABLE_INHERITED_MCP_ENV = 'OURS_FLEET_CODEX_DISABLE_INHERITED_MCP';
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
-const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
 const MAX_CANONICAL_SYMLINK_DEPTH = 40;
 
 const scheduledTurn = (turn: { origin?: PromptOrigin } | undefined): boolean =>
@@ -1854,7 +1853,7 @@ export class AcpSession implements AgentSession {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;
-    this.recordConversationUpdate(update, scheduled, messagePhase === 'commentary');
+    this.recordConversationUpdate(update, scheduled);
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
     if (update.sessionUpdate === 'usage_update') {
@@ -1933,16 +1932,16 @@ export class AcpSession implements AgentSession {
     return phase === 'commentary' || phase === 'final_answer' ? phase : 'ambiguous';
   }
 
-  /** Normalize every ACP update losslessly into the durable ledger. */
-  private recordConversationUpdate(
-    update: acp.SessionUpdate, scheduled: boolean, commentary = false,
-  ): void {
+  /**
+   * Normalize every ACP update losslessly into the durable ledger. The ledger is the conversation the
+   * owner reads, so the agent's commentary between its tools is kept as written, like its final answer.
+   */
+  private recordConversationUpdate(update: acp.SessionUpdate, scheduled: boolean): void {
     const normalized = normalizeSessionUpdate(update,
       scheduled ? {
         redactText: SCHEDULED_LOOP_REDACTION,
         redactToolCallId: 'scheduled-loop-tool',
-      }
-        : commentary ? { redactText: OWNER_COMMENTARY_REDACTION } : {});
+      } : {});
     this.conversation.appendSafe({
       kind: normalized.kind,
       sessionGeneration: this.sessionGeneration,

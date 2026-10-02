@@ -243,6 +243,7 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     '  Team: LocalCoordinator + Developer + Critic',
     '  Gated engineering: Engineer (gate pipeline) + independent Critic',
     '  FleetCoordinator: coordination model',
+    '  Brains: the packaged presets; each prepared agent references the preset of its chosen model',
     '',
     'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
     'A hard termination after that Yes can leave host integration or private stage/recovery evidence to inspect.',
@@ -251,6 +252,12 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
 
 function preset(relative: string): string {
   return readFileSync(join(packagedPresetRoot(), 'fleet', relative), 'utf8');
+}
+
+/** The packaged Brain preset for a catalog model at one effort; the same naming the presets are generated with. */
+export function brainPresetId(model: Pick<CatalogModel, 'harness' | 'model'>, effort: string): string {
+  return `${model.harness === 'claude-code' ? 'claude' : 'codex'}-${model.model
+    .replace(/^claude-/, '').replace(/\./g, '-').toLowerCase()}-${effort}`;
 }
 
 /** Build the exact, deterministic default experience without writing to disk. */
@@ -272,6 +279,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     '  permissions: { approval: ask, filesystem: workspace, unattended: deny }',
     '',
   ].join('\n'));
+  const assigned = {} as Record<WorkKind, string>;
   for (const work of WORK_KINDS) {
     const proposed = answers.models[work];
     if (!proposed || !answers.subscriptions.includes(subscriptionFor(proposed)))
@@ -283,14 +291,14 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (JSON.stringify(proposed.efforts) !== JSON.stringify(model.efforts))
       throw new Error(`${work} contains tampered model capabilities`);
     if (!model.efforts.includes(effort)) throw new Error(`${MODEL_LABELS[model.model]} does not support ${answers.reasoning} reasoning`);
-    files.set(`brains/${work}.yaml`, [
-      `harness: ${model.harness}`,
-      `session: ${model.session}`,
-      `model: ${model.model}`,
-      `effort: ${effort}`,
-      '',
-    ].join('\n'));
+    // The chosen model is assigned by reference to its packaged Brain preset; setup defines no Brain of its own.
+    const id = brainPresetId(model, effort);
+    if (!existsSync(join(packagedPresetRoot(), 'fleet', 'brains', `${id}.yaml`)))
+      throw new Error(`no packaged Brain preset for ${MODEL_LABELS[model.model]} at ${effort} reasoning`);
+    assigned[work] = id;
   }
+  for (const name of readdirSync(join(packagedPresetRoot(), 'fleet', 'brains')).filter(name => name.endsWith('.yaml')).sort())
+    files.set(`brains/${name}`, preset(`brains/${name}`));
   if (answers.assignmentStrategy === 'one-model') {
     const tuples = new Set(WORK_KINDS.map(work => {
       const model = answers.models[work];
@@ -304,7 +312,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (role === 'Coordinator') continue;
     files.set(`agent_templates/${role}.yaml`, [
       `role: { ref: ${role} }`,
-      `brain: { ref: ${ROLE_WORK[role]} }`,
+      `brain: { ref: ${assigned[ROLE_WORK[role]]} }`,
       'coordinator: FleetCoordinator',
       // Temporary default while the product is being tested: prepared agents work without asking.
       'permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
@@ -313,7 +321,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     ].join('\n'));
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
-    .replace('brain: { ref: claude-default }', 'brain: { ref: coordination }'));
+    .replace('brain: { ref: claude-default }', `brain: { ref: ${assigned.coordination} }`));
   for (const name of ['single', 'pair', 'team', 'engineering']) {
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
     files.set(`room_layouts/${name}.yaml`, preset(`room_layouts/${name}.yaml`));

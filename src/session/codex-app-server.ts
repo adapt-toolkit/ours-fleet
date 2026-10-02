@@ -35,7 +35,6 @@ const INTERRUPT_TERMINATE_GRACE_MS = 5_000;
 const TERMINAL_RECONCILE_QUIET_MS = 2_000;
 const TERMINAL_RECONCILE_REQUEST_TIMEOUT_MS = 5_000;
 const SCHEDULED_REDACTION = '[scheduled-loop content redacted]';
-const COMMENTARY_REDACTION = '[assistant commentary redacted]';
 const OWNER_ADMIN_CONTEXT_KEY =
   'ours-fleet://prompt-provenance?source=owner_admin_console';
 const OWNER_CHANNEL_CONTEXT_KEY =
@@ -796,7 +795,7 @@ export class CodexAppServerSession implements AgentSession {
       messageId: id, source: 'agent',
       payload: {
         role: 'assistant', content: textBlock(delta,
-          scheduled ? SCHEDULED_REDACTION : phase === 'commentary' ? COMMENTARY_REDACTION : undefined),
+          scheduled ? SCHEDULED_REDACTION : undefined),
       },
     });
   }

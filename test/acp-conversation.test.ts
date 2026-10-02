@@ -257,6 +257,22 @@ describe('AcpSession conversation ledger', () => {
     expect(JSON.stringify(all)).not.toContain('loop wake');
   });
 
+  it('keeps the agent commentary between its tools in the conversation the owner reads', async () => {
+    const { session } = await start();
+    await session.submitPrompt('phased response', { origin: { kind: 'owner', requestId: 'request-1' } });
+    const text = events(session).filter(event => event.kind === 'message.chunk')
+      .map(event => (event.payload as MessageChunkPayload).content);
+    expect(text).toEqual([
+      expect.objectContaining({ type: 'text', text: 'Checking the implementation.\n' }),
+      expect.objectContaining({ type: 'text', text: 'Implementation is ready.' }),
+    ]);
+    expect(text.some(content => (content as { redacted?: boolean }).redacted)).toBe(false);
+    expect(JSON.stringify(events(session))).not.toContain('commentary redacted');
+    // A scheduled wake stays private even when the agent comments on it.
+    await session.submitPrompt('phased wake', { origin: { kind: 'scheduled-loop', loop: 'l1', runId: 'r1' } });
+    expect(JSON.stringify(events(session)).match(/Checking the implementation/g)).toHaveLength(1);
+  });
+
   it('retains the exact owner message body for display without making it restartable', async () => {
     const { session } = await start();
     await session.submitPrompt('[fleet-owner]\nwrapped', {
