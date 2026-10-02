@@ -20,7 +20,7 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(9);
+    expect(seeded.revision).toBe(10);
     expect(seeded.created).toHaveLength(102);
     // The standard experiences are also seeded as editable, web-visible room layouts.
     expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
