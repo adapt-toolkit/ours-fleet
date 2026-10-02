@@ -87,11 +87,15 @@ async function asHumanRoot<T>(attach:AttachDaemonClient,root:HumanRoot,purpose:s
       throw Error(`This host's Human root cannot be used right now (${error.code ?? error.message}). Close the session that holds it, then run setup again. Nothing was changed.`);});
     if(!same(bound.cid,root.cid))throw Error("This host's Human root changed while setup was running. Nothing was changed.");
     const result=await use(client);
-    // The operation is not reported as done while the root may still be held.
-    const released=await client.releaseLease();done=true;
+    // The operation is not reported as done while the root may still be held. The release is attempted exactly once.
+    done=true;const released=await client.releaseLease();
     if(released.failed>0)throw Error("This host's Human root was not given back completely. Run setup again.");
     return result;
-  }finally{try{if(!done)await client.releaseLease();}finally{await client.close();}}
+  }finally{
+    // After a failure the root is released once as well; what failed first is what is reported.
+    if(!done)await client.releaseLease().catch(()=>{});
+    await client.close().catch(()=>{});
+  }
 }
 /** The signed workspace binding, sent by the Human root itself: the same command Messenger sends when it runs as the root. */
 async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,payload:WorkspacePayload,hostWorkspaceId:string,contactWaitMs:number):Promise<void> {

@@ -123,6 +123,16 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     expect(h.posted('invites')).toEqual([]);expect(readFileSync(h.config,'utf8')).toBe(before);expect(existsSync(h.invite)).toBe(false);
   });
 
+  it('tries to give the root back exactly once, and reports what failed first',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');
+    const rejecting=(async(options:Parameters<AttachDaemonClient>[0])=>{const client=await h.attach(options);return {...client,async releaseLease(){await client.releaseLease();throw Error('release refused');}};}) as unknown as AttachDaemonClient;
+    // The release itself fails after a successful proof: that failure is the one reported, and it is not retried.
+    await expect(h.enroll({attach:rejecting})).rejects.toThrow('release refused');expect(h.did('releaseLease')).toHaveLength(1);
+    // The proof fails and the release fails too: the proof failure is reported, after one release attempt.
+    h.behaviour.sent=false;await expect(h.enroll({attach:rejecting})).rejects.toThrow('Workspace proof was not sent');expect(h.did('releaseLease')).toHaveLength(2);
+    expect(h.did('close')).toHaveLength(h.did('attach').length);expect(readFileSync(h.config,'utf8')).toBe(before);expect(existsSync(h.invite)).toBe(false);
+  });
+
   it('does not report setup done while the root may still be held',async()=>{
     const h=await host();await ensureMinimalSetup(h.config);const before=readFileSync(h.config,'utf8');h.behaviour.releaseFailed=1;
     await expect(h.enroll()).rejects.toThrow('Human root was not given back completely');
