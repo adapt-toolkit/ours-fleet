@@ -13,7 +13,7 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
-import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast } from './codex-runtime.js';
+import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast, hostCodex } from './codex-runtime.js';
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
@@ -284,7 +284,9 @@ function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string,
     [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
     [CODEX_PROXY_SANDBOX_ENV]: acpRuntimeSandbox(role),
     [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
-    [CODEX_PROXY_REAL_PATH_ENV]: role.env?.CODEX_PATH ?? process.env.CODEX_PATH ?? '',
+    // Same choice as probeCodexRuntime: an explicit CODEX_PATH, else a host Codex at least as new as the bundled one.
+    [CODEX_PROXY_REAL_PATH_ENV]: role.env?.CODEX_PATH ?? process.env.CODEX_PATH
+      ?? hostCodex(resolution.manifestPath, { ...process.env, ...role.env }, dirs.runCwd)?.path ?? '',
   };
 }
 

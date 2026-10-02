@@ -41,6 +41,7 @@ import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
 import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
+import type { OfferedModels } from '../subscriptions/cli.js';
 import type { SubscriptionService } from '../subscriptions/service.js';
 
 import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
@@ -70,6 +71,8 @@ export interface WebServices {
   subscriptions?: SubscriptionService;
   /** First-time setup from the packaged presets; the account App supplies only the model choices. */
   onboardingSetup?(answers: InitAnswers): Promise<void>;
+  /** The Codex models the runtime that sessions will use offers the active account. Absent: this server cannot tell, and filters nothing. */
+  codexModels?(): Promise<OfferedModels>;
 }
 
 export interface WebServer {
@@ -229,7 +232,11 @@ export async function buildWebServer(
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));
     const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
-    return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    // Codex models are offered only when the runtime itself listed them for the active account.
+    // When it could not be asked, none is offered and the reason is reported.
+    const codexModels=services.codexModels ? await services.codexModels() : undefined;
+    const offered=(model:CatalogModel)=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model));
+    return {harnesses,catalog:catalog.models.filter(offered),...(codexModels?{codexModels:codexModels.state==='known'?{state:'known'}:codexModels}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
   });
 
   // First-time setup is what creates the persistent coordinator. A configuration that loads and
@@ -244,7 +251,9 @@ export async function buildWebServer(
     auth.authenticate(request,true);
     if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
     const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown}>}|undefined)?.models;
-    const supported=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8'))).models;
+    const codexModels=services.codexModels ? await services.codexModels() : undefined;
+    const supported=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8'))).models
+      .filter(model=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model)));
     const models={} as Record<WorkKind,CatalogModel>;
     for(const work of ONBOARDING_WORK){
       const matches=supported.filter(model=>model.harness===requested?.[work]?.harness && model.model===requested?.[work]?.model);
