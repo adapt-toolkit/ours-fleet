@@ -81,7 +81,7 @@ export interface RunningWebConsole extends WebServer {
 }
 
 export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
-  const notificationConfig = producerConfig();
+  const notificationConfig = producerConfig(process.env, undefined, options.log);
   let requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
@@ -250,7 +250,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   if(workspaceGateway)try{
     const profile=readClientProfile(),provider=new URL(profile.serverUrl),credential=readPrivateFile(profile.credentialPath,4096).toString('utf8').trim();
     const basePath=provider.pathname.replace(/\/$/,'');
-    const services:ServiceTarget[]=['daemon','cowork','messenger'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})}}));
+    const services:ServiceTarget[]=['daemon','cowork','messenger','notifications'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})}}));
     gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services});
     const listen = (port:number) => new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(port,bind,()=>{gateway!.server.off('error',reject);resolve();});});
     try { await listen(requestedPort); }

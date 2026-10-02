@@ -63,6 +63,18 @@ describe('generic service prefix transport', () => {
     expect(authorized.headers.vary).toBe('Origin');
     expect(seen).toEqual(['GET /api/contacts']);
   });
+  it('never forwards a browser-supplied notification producer selector', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const { publicOrigin, headers } = await setup((req, res) => { seen.push(req.headers); res.end('{}'); });
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = sendHttp(publicOrigin + '/messenger/api/v1/summary', { headers: { ...headers, 'x-ours-notifications-producer': 'p'.repeat(43) } }, res => { res.resume(); resolve(res.statusCode!); });
+      req.on('error', reject); req.end();
+    });
+    expect(status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]['x-ours-notifications-producer']).toBeUndefined();
+    expect(seen[0]['x-ours-api-token']).toBe('server-credential');
+  });
   it('rejects every cross-site request, external page links included', async () => {
     const { publicOrigin } = await setup((_req, res) => res.end('page'));
     const status = (path: string, headers: Record<string,string>, method = 'GET') => new Promise<number>((resolve,reject) => { const req = sendHttp(publicOrigin + path, { method, headers }, res => { res.resume(); resolve(res.statusCode!); }); req.on('error',reject);req.end(); });
