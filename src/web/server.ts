@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { packagedPresetRoot } from '../preset-bootstrap.js';
-import { validateCatalog } from '../init-wizard.js';
+import { validateCatalog, type CatalogModel, type InitAnswers, type Subscription, type WorkKind } from '../init-wizard.js';
 import { getAdapter } from '../harness/registry.js';
 import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
 import { readChatIdle } from '../temp-idle.js';
@@ -45,6 +45,8 @@ import type { SubscriptionService } from '../subscriptions/service.js';
 
 import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
 
+const ONBOARDING_WORK = ['coordination', 'development', 'review'] as const;
+
 export interface WebServices {
   layoutBindings?: Pick<LayoutBindingGrants, 'control'>;
   query: FleetQueryService;
@@ -66,6 +68,8 @@ export interface WebServices {
   presetProvenance?: PresetProvenance;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
   subscriptions?: SubscriptionService;
+  /** First-time setup from the packaged presets; the account App supplies only the model choices. */
+  onboardingSetup?(answers: InitAnswers): Promise<void>;
 }
 
 export interface WebServer {
@@ -225,7 +229,45 @@ export async function buildWebServer(
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));
     const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
-    return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator'};
+    return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+  });
+
+  // First-time setup is what creates the persistent coordinator. A configuration that loads and
+  // has it is set up, whatever its brains are called; its models are then changed by editing it.
+  const onboardingConfigured=():boolean=>{
+    if(!services.configuration)return false;
+    try{return Boolean(services.configuration.read(false).model.agents.FleetCoordinator);}catch{return false;}
+  };
+  let onboardingSetupQueue:Promise<unknown>=Promise.resolve();
+
+  app.post('/api/v1/onboarding/setup',async request=>{
+    auth.authenticate(request,true);
+    if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
+    const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown}>}|undefined)?.models;
+    const supported=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8'))).models;
+    const models={} as Record<WorkKind,CatalogModel>;
+    for(const work of ONBOARDING_WORK){
+      const matches=supported.filter(model=>model.harness===requested?.[work]?.harness && model.model===requested?.[work]?.model);
+      if(matches.length!==1)throw new FleetError('invalid_request',`choose a supported model for ${work}`);
+      models[work]=matches[0];
+    }
+    const chosen=Object.values(models);
+    const subscriptions=[...new Set(chosen.map(model=>model.harness==='codex'?'codex':'claude'))] as Subscription[];
+    const oneModel=new Set(chosen.map(model=>`${model.harness}\0${model.model}`)).size===1;
+    const configuration=services.configuration,setup=services.onboardingSetup;
+    // One setup at a time: the first-time check and the publication it guards must not interleave.
+    const run=onboardingSetupQueue.then(async()=>{
+      if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});}
+      catch(error){throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);}
+      // Setup preserves files it finds, so confirm the published models are the ones this request chose.
+      const brains=configuration.read(true).model.brains ?? {};
+      for(const work of ONBOARDING_WORK)if(brains[work]?.harness!==models[work].harness || brains[work]?.model!==models[work].model)
+        throw new FleetError('conflict','Fleet was set up with different models; review its configuration');
+      return {configured:true};
+    });
+    onboardingSetupQueue=run.catch(()=>{});
+    return run;
   });
 
   app.get('/api/v1/creation-capabilities', async request => {

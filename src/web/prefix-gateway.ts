@@ -73,12 +73,30 @@ export function createPrefixGateway(options: GatewayOptions) {
     timer.unref();
     return () => { clearInterval(timer); unbind(); };
   };
+  // The account App calls workspace services directly from its own origin with a device
+  // credential. Only that exact configured origin is answered; the reply grants nothing by
+  // itself, every request is still authenticated below.
+  const accountCors = (req: IncomingMessage): Record<string, string> => {
+    const origin = auth?.accountOrigin(req as unknown as FastifyRequest);
+    return origin ? { 'access-control-allow-origin': origin, vary: 'Origin',
+      'access-control-expose-headers': 'Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag' } : {};
+  };
   const server = createServer((req, res) => {
+    const cors = accountCors(req);
     let route: ReturnType<typeof prepare>;
-    try { route = prepare(req); }
+    try {
+      if (req.method === 'OPTIONS' && cors.vary && req.headers['access-control-request-method'] && select(req).service) {
+        auth!.validateBoundary({ headers: req.headers, method: req.method, url: req.url } as FastifyRequest, false);
+        res.writeHead(204, { ...cors, 'cache-control': 'no-store', 'access-control-max-age': '600',
+          'access-control-allow-methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
+          'access-control-allow-headers': 'Authorization, Content-Type, Idempotency-Key, If-None-Match, Range, X-CSRF-Token, X-Ours-Messenger-CSRF, X-Voice-Duration' });
+        res.end(); return;
+      }
+      route = prepare(req);
+    }
     catch (error) {
       const code = (error as { code?: string }).code;
-      res.writeHead(code === 'unauthorized' ? 401 : 403, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.writeHead(code === 'unauthorized' ? 401 : 403, { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store' });
       res.end(JSON.stringify({ error: { code: code ?? 'forbidden', message: (error as Error).message } }));
       return;
     }
@@ -87,7 +105,11 @@ export function createPrefixGateway(options: GatewayOptions) {
       method: req.method, path: route.path, headers: route.headers,
     }, response => {
       const headers = headersFor(response);
-      if (route.service) delete headers['set-cookie'];
+      if (route.service) {
+        delete headers['set-cookie'];
+        for (const key of Object.keys(headers)) if (key.startsWith('access-control-')) delete headers[key];
+        Object.assign(headers, cors);
+      }
       res.writeHead(response.statusCode ?? 502, headers);
       response.on('error', () => res.destroy());
       response.on('aborted', () => res.destroy());
@@ -96,7 +118,7 @@ export function createPrefixGateway(options: GatewayOptions) {
       res.on('close', () => response.destroy());
     });
     upstream.on('error', () => {
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+      if (!res.headersSent) res.writeHead(502, { ...(route.service ? cors : {}), 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { code: 'upstream_unavailable', message: 'Service is unavailable' } }));
     });
     const untrack = track(req, route.session, () => { upstream.destroy(); res.destroy(); });
