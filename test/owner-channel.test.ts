@@ -146,7 +146,8 @@ const dirs: string[] = [];
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  // A channel may still be writing into its outbox when a test ends; removal retries instead of failing on a directory that just gained a file.
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 function deferred<T = void>() {
