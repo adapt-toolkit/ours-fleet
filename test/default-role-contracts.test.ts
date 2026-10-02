@@ -43,7 +43,9 @@ describe('packaged default role contract', () => {
       expect(coordinator.persona).toMatch(/Own progress and workflow, not execution quality/);
       expect(coordinator.persona).toMatch(/Immediately before room creation/);
       expect(coordinator.persona).toMatch(/Brain, harness, session, model, reasoning effort/);
-      expect(coordinator.persona).toMatch(/Wait for `send_message` to confirm delivery/);
+      // The coordinator speaks in its own conversation; nothing waits on a named owner channel.
+      expect(coordinator.persona).toMatch(/introduce yourself in your first reply/);
+      expect(coordinator.persona).not.toMatch(/owner channel|confirm delivery|If delivery fails/i);
       expect(coordinator.bio).not.toBe(coordinator.persona);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
