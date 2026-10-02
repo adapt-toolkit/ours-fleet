@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Exec } from '../src/exec.js';
 import {
-  clearPendingTunnelSetup, readPendingTunnelSetup, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup,
+  clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup,
 } from '../src/setup-tunnel-preflight.js';
 
 const answers = (overrides: Record<string, { code: number; stdout?: string; stderr?: string }> = {}) => {
@@ -40,6 +40,7 @@ describe('tunnel setup preflight', () => {
   it('refuses a missing or too old cloudflared', async () => {
     await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 127 } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/cloudflared is not installed/);
     await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 0, stdout: 'OPTIONS:\n   --token value\n' } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/too old.*--token-file/);
+    await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 1, stderr: 'unknown command; see --token-file' } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/too old/);
   });
 });
 
@@ -47,11 +48,17 @@ describe('unfinished tunnel setup record', () => {
   const pending: PendingTunnelSetup = {
     appOrigin: 'https://app.ours-tunnel.com', origin: 'https://alex-home.ours-tunnel.com', hostWorkspaceId: 'h'.repeat(43), rootCid: 'A'.repeat(64),
     challenge: { nonce: 'n'.repeat(43), workspaceId: 'w'.repeat(43), accountId: 'a'.repeat(43), expiresAt: 1_800_000_000_000 },
+    configuration: '/home/alex/fleet.yaml',
   };
   let previousHome: string | undefined;
   beforeEach(() => { previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = mkdtempSync(join(tmpdir(), 'ours-fleet-pending-')); });
   afterEach(() => { if (previousHome === undefined) delete process.env.OURS_FLEET_HOME; else process.env.OURS_FLEET_HOME = previousHome; });
 
+  it('only assumes the default tunnel target after expiry when no other port was ever requested', () => {
+    expect(requiredPortAfterExpiry(pending)).toBe(49_271);
+    expect(requiredPortAfterExpiry({ ...pending, attemptedPort: 49_271 })).toBe(49_271);
+    expect(() => requiredPortAfterExpiry({ ...pending, attemptedPort: 51_000 })).toThrow(/unknown whether the tunnel points at port 51000 or 49271/);
+  });
   it('reports that there is nothing to finish', () => {
     expect(() => readPendingTunnelSetup()).toThrow(/No unfinished tunnel setup/);
   });
@@ -62,7 +69,7 @@ describe('unfinished tunnel setup record', () => {
     savePendingTunnelSetup(pending);
     const path = join(stateRoot(), 'workspace', 'pending-setup.json');
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(Object.keys(JSON.parse(readFileSync(path, 'utf8'))).sort()).toEqual(['appOrigin', 'challenge', 'hostWorkspaceId', 'origin', 'rootCid']);
+    expect(Object.keys(JSON.parse(readFileSync(path, 'utf8'))).sort()).toEqual(['appOrigin', 'challenge', 'configuration', 'hostWorkspaceId', 'origin', 'rootCid']);
     expect(readPendingTunnelSetup()).toEqual(pending);
     chmodSync(path, 0o644);
     expect(() => readPendingTunnelSetup()).toThrow(/owned private file/);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { ensureMinimalSetup } from './minimal-setup.js';
 import { configureWorkspacePort } from './workspace-enrollment.js';
-import { clearPendingTunnelSetup, readPendingTunnelSetup, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
+import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
 import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
 import { readWorkspacePayload,enrollWorkspace } from './workspace-enrollment.js';
@@ -1398,20 +1398,26 @@ webCommand.command('open').description('securely open or re-pair a browser with 
   });
 
 async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean }, setupTunnel = false): Promise<void> { try {
+    if (setupTunnel && opts.check && opts.resume) throw Error('Use either --check or --resume');
+    if (setupTunnel && (opts.check || opts.resume) && (opts.file || opts.migrateAppOrigin)) throw Error('--check and --resume take no payload file or migration flag');
     if (setupTunnel && opts.check) { await setupTunnelPreflight(); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
     let pending: PendingTunnelSetup;
-    if (setupTunnel && opts.resume) pending=readPendingTunnelSetup();
+    if (setupTunnel && opts.resume) {
+      pending=readPendingTunnelSetup();
+      if (opts.configuration && resolvePath(opts.configuration)!==pending.configuration) throw Error(`This setup started with configuration ${pending.configuration}; resume it without --configuration`);
+      await setupTunnelPreflight();
+    }
     else {
       if (!opts.file) throw Error('setup-tunnel requires --file <path> (or --resume to finish an interrupted setup)');
       const payload=readWorkspacePayload(opts.file);
       if (setupTunnel) { await setupTunnelPreflight(); await ensureMinimalSetup(opts.configuration ?? defaultConfigPath()); }
       const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
-      pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge};
+      pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge,configuration:resolvePath(opts.configuration ?? defaultConfigPath())};
       // The proof is one-time: keep what the remaining steps need so they can be finished without a new command.
       if (setupTunnel) savePendingTunnelSetup(pending);
     }
     try {
-      await finishWorkspaceService(pending,opts.configuration);
+      await finishWorkspaceService(pending,opts.resume ? pending.configuration : opts.configuration,setupTunnel);
     } catch (error) {
       if (!setupTunnel) throw error;
       throw Error(`${error instanceof Error ? error.message : String(error)}\nThis host is already bound to the workspace; do not request a new command. Fix the problem above, then run: ours-fleet setup-tunnel --resume`);
@@ -1424,13 +1430,14 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
   }catch(error){die(error);} }
 
 /** Everything after the root proof: supervised web service, its bound port, and the tunnel target. Safe to repeat. */
-async function finishWorkspaceService(pending: PendingTunnelSetup, configuration?: string): Promise<void> {
+async function finishWorkspaceService(pending: PendingTunnelSetup, configuration: string | undefined, record: boolean): Promise<void> {
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
     const manager=new WebServiceManager(),previous=manager.readMetadata();
     if(previous)await manager.stop();
     // Once the challenge has expired the account can no longer retarget the tunnel, which then keeps its default port.
     const expired=pending.challenge.expiresAt<=Date.now();
-    const selectedPort=await availableWebPort(expired ? 49271 : previous?.port ?? 49271);
+    const requiredPort=expired ? requiredPortAfterExpiry(pending) : undefined;
+    const selectedPort=await availableWebPort(requiredPort ?? previous?.port ?? 49271);
     mkdirSync(joinPath(stateRoot(),'web'),{recursive:true,mode:0o700});
     writeFileSync(joinPath(stateRoot(),'web','port-selection.json'),JSON.stringify({expiresAt:Date.now()+60000})+'\n',{mode:0o600});
     const notes=await manager.install(binPath,selectedPort,configuration,{bind:'127.0.0.1',publicOrigin:pending.origin});await manager.restart();
@@ -1447,8 +1454,11 @@ async function finishWorkspaceService(pending: PendingTunnelSetup, configuration
       await manager.retainBoundPort(binPath,bound.port,configuration,{bind:'127.0.0.1',publicOrigin:pending.origin});
       await waitForControl();
     }
-    if(!expired)await configureWorkspacePort(pending,pending.hostWorkspaceId,pending.rootCid,bound.port);
-    else if(bound.port!==49271)throw Error(`The setup window has expired and the tunnel still points at port 49271, but this host could only bind port ${bound.port}. Free port 49271 on this host`);
+    if(requiredPort===undefined){
+      // Record the request first: if its answer is lost, a later resume must not assume the default target.
+      if(record)savePendingTunnelSetup({...pending,attemptedPort:bound.port});
+      await configureWorkspacePort(pending,pending.hostWorkspaceId,pending.rootCid,bound.port);
+    } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
 }
 

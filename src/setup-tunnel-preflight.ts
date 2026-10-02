@@ -27,7 +27,7 @@ export async function setupTunnelPreflight(
   }
   const help = await exec('cloudflared', ['tunnel', 'run', '--help'], { timeout: 10_000 });
   if (help.code === 127) throw Error(`cloudflared is not installed or not on PATH. Install it, then run a fresh tunnel setup command. ${UNCHANGED}`);
-  if (!`${help.stdout}\n${help.stderr}`.includes('--token-file'))
+  if (help.code !== 0 || !`${help.stdout}\n${help.stderr}`.includes('--token-file'))
     throw Error(`This cloudflared is too old for tunnel setup (no --token-file support). Update cloudflared, then run a fresh tunnel setup command. ${UNCHANGED}`);
 }
 
@@ -35,6 +35,10 @@ export async function setupTunnelPreflight(
 export interface PendingTunnelSetup {
   appOrigin: string; origin: string; hostWorkspaceId: string; rootCid: string;
   challenge: WorkspacePayload['challenge'];
+  /** Fleet configuration the setup started with; a resume must use the same one. */
+  configuration: string;
+  /** Port last sent to the account as the tunnel target. Its answer may have been lost, so the remote target is this port or the default. */
+  attemptedPort?: number;
 }
 const pendingPath = (): string => join(stateRoot(), 'workspace', 'pending-setup.json');
 
@@ -49,6 +53,17 @@ export function readPendingTunnelSetup(): PendingTunnelSetup {
   if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) throw Error('Unfinished tunnel setup record must be an owned private file');
   const pending = JSON.parse(readFileSync(path, 'utf8')) as PendingTunnelSetup;
   if (typeof pending?.appOrigin !== 'string' || typeof pending.origin !== 'string' || typeof pending.hostWorkspaceId !== 'string'
-    || typeof pending.rootCid !== 'string' || !pending.challenge || !Number.isSafeInteger(pending.challenge.expiresAt)) throw Error('Unfinished tunnel setup record is invalid');
+    || typeof pending.rootCid !== 'string' || !pending.challenge || !Number.isSafeInteger(pending.challenge.expiresAt) || typeof pending.configuration !== 'string'
+    || (pending.attemptedPort !== undefined && !Number.isInteger(pending.attemptedPort))) throw Error('Unfinished tunnel setup record is invalid');
   return pending;
+}
+
+export const DEFAULT_TUNNEL_PORT = 49_271;
+/**
+ * The port the web service must bind when the account can no longer retarget
+ * the tunnel. Unknown when a different port was requested and never confirmed.
+ */
+export function requiredPortAfterExpiry(pending: PendingTunnelSetup): number {
+  if (pending.attemptedPort === undefined || pending.attemptedPort === DEFAULT_TUNNEL_PORT) return DEFAULT_TUNNEL_PORT;
+  throw Error(`The setup window has expired and it is unknown whether the tunnel points at port ${pending.attemptedPort} or ${DEFAULT_TUNNEL_PORT}: the account's answer to the last port request was not received. This setup cannot be finished automatically`);
 }
