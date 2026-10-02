@@ -99,11 +99,13 @@ export class CodexAppServer {
     });
   }
 
-  static async start(bin: string, env: NodeJS.ProcessEnv): Promise<CodexAppServer> {
+  static async start(bin: string, env: NodeJS.ProcessEnv, initializeTimeoutMs = 20_000): Promise<CodexAppServer> {
     const child = spawn(bin, ['app-server'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
     await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
     const server = new CodexAppServer(child);
-    await server.call('initialize', { clientInfo: { name: 'ours-fleet', title: 'Ours Fleet', version: '1' } });
+    // A server that does not answer is not handed out, so nobody else can close it: end it here.
+    try { await server.call('initialize', { clientInfo: { name: 'ours-fleet', title: 'Ours Fleet', version: '1' } }, initializeTimeoutMs); }
+    catch (error) { server.close(); throw error; }
     child.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`);
     return server;
   }
@@ -151,8 +153,8 @@ export class CodexAppServer {
 }
 
 /** One-shot use of an app-server for a profile. */
-export async function withCodex<T>(bin: string, env: NodeJS.ProcessEnv, fn: (s: CodexAppServer) => Promise<T>): Promise<T> {
-  const server = await CodexAppServer.start(bin, env);
+export async function withCodex<T>(bin: string, env: NodeJS.ProcessEnv, fn: (s: CodexAppServer) => Promise<T>, initializeTimeoutMs?: number): Promise<T> {
+  const server = await CodexAppServer.start(bin, env, initializeTimeoutMs);
   try { return await fn(server); } finally { server.close(); }
 }
 
@@ -165,21 +167,24 @@ interface ModelPage { data?: unknown; nextCursor?: unknown }
  * Ask this Codex executable, with this profile's environment, which models it offers (`model/list`,
  * the call the ACP adapter itself uses). Nothing is inferred when it does not answer.
  */
-export async function codexOfferedModels(bin: string, env: NodeJS.ProcessEnv): Promise<OfferedModels> {
+export async function codexOfferedModels(bin: string, env: NodeJS.ProcessEnv, budgetMs = 30_000): Promise<OfferedModels> {
+  // One budget for the whole question: onboarding waits for this answer.
+  const deadline = Date.now() + budgetMs;
+  const left = () => Math.max(1, deadline - Date.now());
   try {
     return await withCodex(bin, env, async server => {
       const models: string[] = [];
       let cursor: string | null = null;
-      for (let page = 0; page < 20; page++) {
-        const answer: ModelPage | undefined = await server.call<ModelPage | undefined>('model/list', { cursor, limit: null }, 15_000);
+      while (Date.now() < deadline) {
+        const answer: ModelPage | undefined = await server.call<ModelPage | undefined>('model/list', { cursor, limit: null }, left());
         if (!Array.isArray(answer?.data)) return { state: 'unknown', reason: 'Codex did not return a model list' } as const;
         for (const model of answer.data as Array<{ id?: unknown; hidden?: unknown }>)
           if (model && typeof model.id === 'string' && model.id && model.hidden !== true) models.push(model.id);
         cursor = typeof answer.nextCursor === 'string' && answer.nextCursor ? answer.nextCursor : null;
         if (!cursor) return { state: 'known', models: [...new Set(models)] } as const;
       }
-      return { state: 'unknown', reason: 'Codex model list did not end' } as const;
-    });
+      return { state: 'unknown', reason: 'Codex did not finish listing its models in time' } as const;
+    }, left());
   } catch (error) {
     return { state: 'unknown', reason: error instanceof Error ? error.message : String(error) };
   }

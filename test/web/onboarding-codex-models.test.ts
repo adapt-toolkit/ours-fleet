@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -156,6 +156,18 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     chmodSync(path, 0o700);
     return path;
   }
+  it('ends a runtime that never answers and one that keeps listing, within the budget', async () => {
+    const pidFile = join(root, 'app-server.pid');
+    const silent = join(mkdtempSync(join(root, 'bin-')), 'codex');
+    writeFileSync(silent, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nprocess.stdin.resume();\n`);
+    chmodSync(silent, 0o700);
+    const gone = async (pid: number) => { for (let i = 0; i < 50; i++) { try { process.kill(pid, 0); } catch { return true; } await new Promise(resolve => setTimeout(resolve, 100)); } return false; };
+    const started = Date.now();
+    expect(await codexOfferedModels(silent, process.env, 1_500)).toEqual({ state: 'unknown', reason: 'initialize timed out' });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(await gone(Number(readFileSync(pidFile, 'utf8')))).toBe(true);
+    expect((await codexOfferedModels(appServer({ '': { data: [{ id: 'a' }], nextCursor: 'loop' }, loop: { data: [{ id: 'b' }], nextCursor: 'loop' } }), process.env, 1_000)).state).toBe('unknown');
+  });
   it('reads every page of the runtime model list, leaving hidden models out', async () => {
     const bin = appServer({ '': { data: [{ id: 'gpt-6-sol' }, { id: 'gpt-reserve', hidden: true }], nextCursor: 'next' }, next: { data: [{ id: 'gpt-5.5', hidden: false }, { id: 7 }], nextCursor: null } });
     expect(await codexOfferedModels(bin, process.env)).toEqual({ state: 'known', models: ['gpt-6-sol', 'gpt-5.5'] });
