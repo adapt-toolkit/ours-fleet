@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import type {
   RoomsConfig, RoomsOwnerConfig, RoomsCoworkConfig, RoomsDefaults,
@@ -57,7 +57,8 @@ function resolveInvite(
   if (file) {
     const resolved = file.replace(/\$\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
     // Tunnel setup writes this one file itself after enrollment; until then it may be absent.
-    if (!existsSync(resolved) && deferredInviteFile !== undefined && resolvePath(resolved) === resolvePath(deferredInviteFile)) return undefined;
+    // Only the literal absolute path counts: a relative spelling that happens to reach it does not.
+    if (!existsSync(resolved) && deferredInviteFile !== undefined && isAbsolute(deferredInviteFile) && resolved === deferredInviteFile) return undefined;
     if (!existsSync(resolved))
       throw new RoomsTasksConfigError(path, `rooms.owner.public_invite_file: not found: ${resolved}`);
     raw = readFileSync(resolved, 'utf8').trim();

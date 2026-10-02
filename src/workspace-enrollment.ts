@@ -91,6 +91,8 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const {name,surname,...proofPayload}=payload;
   const result=await request('workspace/enroll',options.preserveProfile?{...proofPayload,hostWorkspaceId,preserveProfile:true}:{...payload,hostWorkspaceId});
   if(!result.submitted || !/^[a-f0-9]{64}$/i.test(result.rootCid) || typeof result.ownerInvite!=='string')throw Error('Malformed workspace enrollment response');
+  // Whatever the configuration said before, what is recorded from here on is this host's own root.
+  if(result.rootCid.toLowerCase()!==identity.cid.toLowerCase())throw Error('Workspace enrollment answered for a different root than this host identity; local configuration is unchanged');
   if(loaded.rooms && !lost && loaded.rooms.owner.expected_cid.toLowerCase()!==result.rootCid.toLowerCase())throw Error('Retained room owner CID conflicts with the Human root');
   if(migrating){
     const deadline=Date.now()+15000;
