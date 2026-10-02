@@ -10,6 +10,8 @@ import { FleetConfigService } from '../../src/web/fleet-config-service.js';
 import { ensureMinimalSetup } from '../../src/minimal-setup.js';
 import { WorkspaceDeviceStore } from '../../src/web/workspace-devices.js';
 import { executeInitAnswers, publishSetup } from '../../src/init-wizard.js';
+import '../../src/harness/claude-code.js';
+import '../../src/harness/codex.js';
 
 const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
 const headers = { host: '127.0.0.1:49271', origin: 'http://127.0.0.1:49271' };
