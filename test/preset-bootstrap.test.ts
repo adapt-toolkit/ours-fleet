@@ -20,7 +20,7 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(8);
+    expect(seeded.revision).toBe(9);
     expect(seeded.created).toHaveLength(102);
     // The standard experiences are also seeded as editable, web-visible room layouts.
     expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
@@ -47,7 +47,7 @@ describe('packaged preset bootstrap', () => {
         expect(definition, `${template.name}:${member.agent_template}`).toBeDefined();
         expect(definition?.role).toEqual({ inline: expect.objectContaining({}) });
         expect(definition?.brain).toEqual({ inline: expect.objectContaining({ harness: 'claude-code' }) });
-        expect(definition?.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
+        expect(definition?.permissions).toMatchObject({ approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' });
       }
     }
     expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(83);

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import type {
   RoomsConfig, RoomsOwnerConfig, RoomsCoworkConfig, RoomsDefaults,
@@ -45,6 +46,7 @@ function resolveInvite(
   owner: Record<string, unknown>,
   vars: Record<string, string>,
   path: string,
+  deferredInviteFile?: string,
 ): { value: string; fingerprint: string } | undefined {
   const inline = owner.public_invite as string | undefined;
   const file = owner.public_invite_file as string | undefined;
@@ -54,6 +56,9 @@ function resolveInvite(
   let raw: string;
   if (file) {
     const resolved = file.replace(/\$\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+    // Tunnel setup writes this one file itself after enrollment; until then it may be absent.
+    // Only the literal absolute path counts: a relative spelling that happens to reach it does not.
+    if (!existsSync(resolved) && deferredInviteFile !== undefined && isAbsolute(deferredInviteFile) && resolved === deferredInviteFile) return undefined;
     if (!existsSync(resolved))
       throw new RoomsTasksConfigError(path, `rooms.owner.public_invite_file: not found: ${resolved}`);
     raw = readFileSync(resolved, 'utf8').trim();
@@ -68,6 +73,7 @@ export function validateRoomsConfig(
   raw: unknown,
   vars: Record<string, string>,
   path: string,
+  deferredInviteFile?: string,
 ): RoomsConfig & { _invite?: { value: string; fingerprint: string } } {
   if (!isPlainObject(raw)) throw new RoomsTasksConfigError(path, 'rooms: must be a mapping');
   // Migration-only input: provider selection was exposed before rooms shipped,
@@ -101,7 +107,7 @@ export function validateRoomsConfig(
   if (!CID_RE.test(expectedCid))
     throw new RoomsTasksConfigError(path, 'rooms.owner.expected_cid: must be exactly 64 hexadecimal characters');
   const ownerRole = (raw.owner.role as string | undefined) ?? 'Owner';
-  const invite = resolveInvite(raw.owner, vars, path);
+  const invite = resolveInvite(raw.owner, vars, path, deferredInviteFile);
 
   const owner: RoomsOwnerConfig = {
     provider: ownerProvider,

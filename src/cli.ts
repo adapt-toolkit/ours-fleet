@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { ensureMinimalSetup } from './minimal-setup.js';
-import { configureWorkspacePort } from './workspace-enrollment.js';
+import { confirmWorkspaceTarget } from './workspace-enrollment.js';
 import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
 import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
-import { readWorkspacePayload,enrollWorkspace } from './workspace-enrollment.js';
+import { readWorkspacePayload,enrollWorkspace,checkWorkspaceConfiguration } from './workspace-enrollment.js';
 import { waitForRoleDaemon } from './startup-readiness.js';
 import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
 import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
@@ -1400,7 +1400,7 @@ webCommand.command('open').description('securely open or re-pair a browser with 
 async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean }, setupTunnel = false): Promise<void> { try {
     if (setupTunnel && opts.check && opts.resume) throw Error('Use either --check or --resume');
     if (setupTunnel && (opts.check || opts.resume) && (opts.file || opts.migrateAppOrigin)) throw Error('--check and --resume take no payload file or migration flag');
-    if (setupTunnel && opts.check) { await setupTunnelPreflight(); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
+    if (setupTunnel && opts.check) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
     let pending: PendingTunnelSetup;
     if (setupTunnel && opts.resume) {
       pending=readPendingTunnelSetup();
@@ -1410,7 +1410,7 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
     else {
       if (!opts.file) throw Error('setup-tunnel requires --file <path> (or --resume to finish an interrupted setup)');
       const payload=readWorkspacePayload(opts.file);
-      if (setupTunnel) { await setupTunnelPreflight(); await ensureMinimalSetup(opts.configuration ?? defaultConfigPath()); }
+      if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); await ensureMinimalSetup(opts.configuration ?? defaultConfigPath()); }
       const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
       pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge,configuration:resolvePath(opts.configuration ?? defaultConfigPath())};
       // The proof is one-time: keep what the remaining steps need so they can be finished without a new command.
@@ -1457,7 +1457,7 @@ async function finishWorkspaceService(pending: PendingTunnelSetup, configuration
     if(requiredPort===undefined){
       // Record the request first: if its answer is lost, a later resume must not assume the default target.
       if(record){pending={...pending,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
-      await configureWorkspacePort(pending,pending.hostWorkspaceId,pending.rootCid,bound.port);
+      await confirmWorkspaceTarget(pending,pending.hostWorkspaceId,pending.rootCid,bound.port,error=>{process.stderr.write(`The enrollment contact could not be removed from Messenger (${error instanceof Error ? error.message : String(error)}); it can be removed there by hand.\n`);});
     } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
 }

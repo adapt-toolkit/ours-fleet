@@ -887,7 +887,9 @@ export function loadRoomsConfig(configPath = defaultConfigPath()): ReturnType<ty
 /** Load a v2 manifest and bare Agent/Role/Brain documents from its stem directory. */
 export function loadConfig(
   configPath?: string,
-  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean }; skipWatchdogs?: boolean } = {},
+  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean }; skipWatchdogs?: boolean;
+    /** The one Owner invitation file that tunnel setup writes itself and that may therefore still be absent. */
+    deferredOwnerInviteFile?: string } = {},
 ): FleetConfig {
   const base = configPath ?? defaultConfigPath();
   const files: string[] = [];
@@ -1079,7 +1081,7 @@ export function loadConfig(
   for (const { file, doc } of docs) {
     if (doc.rooms !== undefined) {
       if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
-      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file);
+      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file, options.deferredOwnerInviteFile);
       ownerInviteFingerprint = validated._invite?.fingerprint;
       ownerInvite = validated._invite?.value;
       const { _invite: _, ...clean } = validated;

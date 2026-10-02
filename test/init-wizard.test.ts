@@ -774,7 +774,7 @@ it('adds engineering to an existing wizard install with the selected development
   expect(result.replacements).toEqual([]);
   const cfg = loadConfig(config, { yamlMode: 'strict' });
   expect(cfg.agentTemplates?.Engineer.brain).toEqual(cfg.agentTemplates?.Developer.brain);
-  expect(cfg.agentTemplates?.Engineer.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
+  expect(cfg.agentTemplates?.Engineer.permissions).toMatchObject({ approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' });
   const after = treeSnapshot(split);
   for (const [path, bytes] of Object.entries(before)) expect(after[path], path).toBe(bytes);
   expect(migratePackagedRoleDefaults(config, { write: true }).additions).toEqual([]);
