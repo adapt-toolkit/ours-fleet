@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -8,6 +8,7 @@ import { TrustedDeviceStore } from '../../src/web/device-store.js';
 import { buildWebServer } from '../../src/web/server.js';
 import { FleetConfigService } from '../../src/web/fleet-config-service.js';
 import { ensureMinimalSetup } from '../../src/minimal-setup.js';
+import { splitRootFor } from '../../src/config.js';
 import { WorkspaceDeviceStore } from '../../src/web/workspace-devices.js';
 import { executeInitAnswers, publishSetup } from '../../src/init-wizard.js';
 import '../../src/harness/claude-code.js';
@@ -75,6 +76,33 @@ describe('first-time setup through the API', () => {
 
       expect((await setup({ coordination: sol, development: sol, review: sol })).statusCode).toBe(409);
       expect(hostSetups).toBe(1);
+    } finally { await server.close(); }
+  });
+
+  it.each([
+    ['another reasoning', 'harness: codex\nsession: acp\nmodel: gpt-6.1-sol\neffort: high\n'],
+    ['another session', 'harness: codex\nsession: codex-app-server\nmodel: gpt-6.1-sol\neffort: medium\n'],
+  ])('does not report setup done over a preserved Brain of a packaged name with %s', async (_name, customized) => {
+    const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
+    await ensureMinimalSetup(configPath);
+    const kept = join(splitRootFor(configPath), 'brains', 'codex-gpt-6-1-sol-medium.yaml');
+    mkdirSync(join(splitRootFor(configPath), 'brains'), { recursive: true, mode: 0o700 });
+    writeFileSync(kept, customized, { mode: 0o600 });
+    const dir = mkdtempSync(join(root, 'web-'));
+    const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
+    const server = await buildWebServer({
+      audit: new AuditSink(join(dir, 'audit')), configuration: new FleetConfigService({ configPath }),
+      onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
+        await executeInitAnswers(answers, configPath, { async hostSetup() {}, publish: publishSetup });
+      },
+    } as any, boundary, { auth });
+    try {
+      const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
+      const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
+      const done = await server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string, 'content-type': 'application/json' }, payload: { models: { coordination: sol, development: sol, review: sol } } });
+      expect(done.statusCode).not.toBe(200);
+      expect(done.json().configured).toBeUndefined();
+      expect(readFileSync(kept, 'utf8')).toBe(customized);
     } finally { await server.close(); }
   });
 
