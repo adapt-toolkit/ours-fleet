@@ -3,13 +3,14 @@ import { basename, join } from 'node:path';
 import { withFileLock } from './atomic-file.js';
 import { loadConfig, splitRootFor } from './config.js';
 import { preflightInitPaths } from './init-wizard.js';
+import { workspaceOwnerInvite } from './paths.js';
 
 /** Prepare only the web configuration; App onboarding chooses agents and brains later. */
 export async function ensureMinimalSetup(configuration: string): Promise<void> {
   const initial = preflightInitPaths(configuration);
   await withFileLock(join(initial.parent, `.${basename(initial.splitRoot)}.init.lock`), async () => {
     const selected = preflightInitPaths(configuration);
-    if (selected.manifestExisted) { loadConfig(selected.configPath, { yamlMode: 'strict' }); return; }
+    if (selected.manifestExisted) { loadConfig(selected.configPath, { yamlMode: 'strict', deferredOwnerInviteFile: workspaceOwnerInvite() }); return; }
     if (selected.rootExisted) throw new Error('Fleet split configuration exists without its manifest; retain it and recover the existing setup before setting up a tunnel');
     const stage = mkdtempSync(join(selected.parent, '.fleet-web-setup-'));
     const manifest = join(stage, 'fleet.yaml');
