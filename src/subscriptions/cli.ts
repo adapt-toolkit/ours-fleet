@@ -159,6 +159,8 @@ export async function withCodex<T>(bin: string, env: NodeJS.ProcessEnv, fn: (s: 
 /** What a Codex runtime offers the account it is signed in to. An empty list is an answer; unknown is not. */
 export type OfferedModels = { state: 'known'; models: string[] } | { state: 'unknown'; reason: string };
 
+interface ModelPage { data?: unknown; nextCursor?: unknown }
+
 /**
  * Ask this Codex executable, with this profile's environment, which models it offers (`model/list`,
  * the call the ACP adapter itself uses). Nothing is inferred when it does not answer.
@@ -169,7 +171,7 @@ export async function codexOfferedModels(bin: string, env: NodeJS.ProcessEnv): P
       const models: string[] = [];
       let cursor: string | null = null;
       for (let page = 0; page < 20; page++) {
-        const answer = await server.call<{ data?: unknown; nextCursor?: unknown } | undefined>('model/list', { cursor, limit: null }, 15_000);
+        const answer: ModelPage | undefined = await server.call<ModelPage | undefined>('model/list', { cursor, limit: null }, 15_000);
         if (!Array.isArray(answer?.data)) return { state: 'unknown', reason: 'Codex did not return a model list' } as const;
         for (const model of answer.data as Array<{ id?: unknown; hidden?: unknown }>)
           if (model && typeof model.id === 'string' && model.id && model.hidden !== true) models.push(model.id);
