@@ -89,7 +89,7 @@ export function createPrefixGateway(options: GatewayOptions) {
         auth!.validateBoundary({ headers: req.headers, method: req.method, url: req.url } as FastifyRequest, false);
         res.writeHead(204, { ...cors, 'cache-control': 'no-store', 'access-control-max-age': '600',
           'access-control-allow-methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
-          'access-control-allow-headers': 'Authorization, Content-Type, Idempotency-Key, If-None-Match, Range, X-CSRF-Token, X-Ours-Messenger-CSRF' });
+          'access-control-allow-headers': 'Authorization, Content-Type, Idempotency-Key, If-None-Match, Range, X-CSRF-Token, X-Ours-Messenger-CSRF, X-Voice-Duration' });
         res.end(); return;
       }
       route = prepare(req);

@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
 import { producerConfig } from '../notifications/outbox.js';
 import { SubscriptionService } from '../subscriptions/service.js';
-import { existsSync, realpathSync,readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync,readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
@@ -24,7 +24,8 @@ import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
-import { home, stateRoot, agentsRoot, tmpRoot } from '../paths.js';
+import { home, stateRoot, agentsRoot, tmpRoot, logsRoot } from '../paths.js';
+import { executeInitAnswers, publishSetup } from '../init-wizard.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
@@ -207,6 +208,16 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),
     presetProvenance: new PresetProvenance(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
+    // Same boundary as `ours-fleet init --settings`: existing files are preserved, missing defaults are added.
+    onboardingSetup: async answers => {
+      await executeInitAnswers(answers, configuration.path, {
+        async hostSetup() {
+          for (const directory of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(directory, { recursive: true });
+          await pickBackend().init(options.binPath);
+        },
+        publish: publishSetup,
+      });
+    },
     subscriptions: new SubscriptionService({
       agents: async () => (await query.list(true)).map(({ role, status }) => ({
         roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',
