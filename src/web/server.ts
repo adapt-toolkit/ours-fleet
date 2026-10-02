@@ -232,14 +232,13 @@ export async function buildWebServer(
     return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
   });
 
-  // Setup is complete when the persistent coordinator exists and each kind of work has a model.
+  // First-time setup is what creates the persistent coordinator. A configuration that loads and
+  // has it is set up, whatever its brains are called; its models are then changed by editing it.
   const onboardingConfigured=():boolean=>{
     if(!services.configuration)return false;
-    try{
-      const model=services.configuration.read(true).model;
-      return Boolean(model.agents.FleetCoordinator) && ONBOARDING_WORK.every(work=>model.brains?.[work]);
-    }catch{return false;}
+    try{return Boolean(services.configuration.read(false).model.agents.FleetCoordinator);}catch{return false;}
   };
+  let onboardingSetupQueue:Promise<unknown>=Promise.resolve();
 
   app.post('/api/v1/onboarding/setup',async request=>{
     auth.authenticate(request,true);
@@ -252,12 +251,22 @@ export async function buildWebServer(
       if(matches.length!==1)throw new FleetError('invalid_request',`choose a supported model for ${work}`);
       models[work]=matches[0];
     }
-    if(services.configuration.read(false).model.agents.FleetCoordinator)throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
     const chosen=Object.values(models);
     const subscriptions=[...new Set(chosen.map(model=>model.harness==='codex'?'codex':'claude'))] as Subscription[];
     const oneModel=new Set(chosen.map(model=>`${model.harness}\0${model.model}`)).size===1;
-    await services.onboardingSetup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});
-    return {configured:onboardingConfigured()};
+    const configuration=services.configuration,setup=services.onboardingSetup;
+    // One setup at a time: the first-time check and the publication it guards must not interleave.
+    const run=onboardingSetupQueue.then(async()=>{
+      if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
+      await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});
+      // Setup preserves files it finds, so confirm the published models are the ones this request chose.
+      const brains=configuration.read(true).model.brains ?? {};
+      for(const work of ONBOARDING_WORK)if(brains[work]?.harness!==models[work].harness || brains[work]?.model!==models[work].model)
+        throw new FleetError('conflict','Fleet was set up with different models; review its configuration');
+      return {configured:true};
+    });
+    onboardingSetupQueue=run.catch(()=>{});
+    return run;
   });
 
   app.get('/api/v1/creation-capabilities', async request => {
