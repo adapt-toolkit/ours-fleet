@@ -1432,11 +1432,11 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
 /** Everything after the root proof: supervised web service, its bound port, and the tunnel target. Safe to repeat. */
 async function finishWorkspaceService(pending: PendingTunnelSetup, configuration: string | undefined, record: boolean): Promise<void> {
     if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
-    const manager=new WebServiceManager(),previous=manager.readMetadata();
-    if(previous)await manager.stop();
-    // Once the challenge has expired the account can no longer retarget the tunnel, which then keeps its default port.
+    // Once the challenge has expired the account can no longer retarget the tunnel. Decide before touching a running service.
     const expired=pending.challenge.expiresAt<=Date.now();
     const requiredPort=expired ? requiredPortAfterExpiry(pending) : undefined;
+    const manager=new WebServiceManager(),previous=manager.readMetadata();
+    if(previous)await manager.stop();
     const selectedPort=await availableWebPort(requiredPort ?? previous?.port ?? 49271);
     mkdirSync(joinPath(stateRoot(),'web'),{recursive:true,mode:0o700});
     writeFileSync(joinPath(stateRoot(),'web','port-selection.json'),JSON.stringify({expiresAt:Date.now()+60000})+'\n',{mode:0o600});
@@ -1456,7 +1456,7 @@ async function finishWorkspaceService(pending: PendingTunnelSetup, configuration
     }
     if(requiredPort===undefined){
       // Record the request first: if its answer is lost, a later resume must not assume the default target.
-      if(record)savePendingTunnelSetup({...pending,attemptedPort:bound.port});
+      if(record){pending={...pending,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
       await configureWorkspacePort(pending,pending.hostWorkspaceId,pending.rootCid,bound.port);
     } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});

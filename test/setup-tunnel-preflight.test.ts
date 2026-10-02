@@ -56,8 +56,10 @@ describe('unfinished tunnel setup record', () => {
 
   it('only assumes the default tunnel target after expiry when no other port was ever requested', () => {
     expect(requiredPortAfterExpiry(pending)).toBe(49_271);
-    expect(requiredPortAfterExpiry({ ...pending, attemptedPort: 49_271 })).toBe(49_271);
-    expect(() => requiredPortAfterExpiry({ ...pending, attemptedPort: 51_000 })).toThrow(/unknown whether the tunnel points at port 51000 or 49271/);
+    expect(requiredPortAfterExpiry({ ...pending, requestedPorts: [49_271, 49_271] })).toBe(49_271);
+    expect(() => requiredPortAfterExpiry({ ...pending, requestedPorts: [51_000] })).toThrow(/unknown whether the tunnel points at port 51000 or 49271/);
+    // A later default request does not prove an earlier lost one was replaced.
+    expect(() => requiredPortAfterExpiry({ ...pending, requestedPorts: [51_000, 49_271] })).toThrow(/unknown whether the tunnel points at port 51000 or 49271/);
   });
   it('reports that there is nothing to finish', () => {
     expect(() => readPendingTunnelSetup()).toThrow(/No unfinished tunnel setup/);
