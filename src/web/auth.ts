@@ -75,6 +75,11 @@ export class WebAuth {
     return this._bootstrapSecret;
   }
 
+  /** The configured account origin, when this request comes from it and workspace devices are enabled. */
+  accountOrigin(request: Pick<FastifyRequest, 'headers'>): string | undefined {
+    return this.workspaceDevices && request.headers.origin === this.appOrigin ? this.appOrigin : undefined;
+  }
+
   validateBoundary(request: FastifyRequest, requireOrigin: boolean, allowPageNavigation = false): void {
     const host = request.headers.host;
     const hosts = this.allowedHosts.size ? this.allowedHosts : new Set([this.host]);

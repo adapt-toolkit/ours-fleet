@@ -1,5 +1,5 @@
 import { request as sendHttp, createServer, type Server, type RequestListener } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
@@ -8,6 +8,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { createPrefixGateway } from '../../src/web/prefix-gateway.js';
 import { WebAuth } from '../../src/web/auth.js';
 import { TrustedDeviceStore } from '../../src/web/device-store.js';
+import { WorkspaceDeviceStore } from '../../src/web/workspace-devices.js';
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.reverse()) await cleanup(); cleanups.length = 0; });
 async function listen(server: Server) {
@@ -25,6 +26,42 @@ async function setup(handler: RequestListener) {
   cleanups.push(() => gateway.close()); return { backend, gateway, auth, session, publicOrigin, headers };
 }
 describe('generic service prefix transport', () => {
+  it('answers only the configured account origin on service prefixes and still requires the device credential', async () => {
+    const seen: string[] = [];
+    const backend = createServer((req, res) => { seen.push(`${req.method} ${req.url}`); res.writeHead(200, { 'content-type': 'text/plain', 'access-control-allow-origin': '*' }); res.end('ok'); });
+    const origin = await listen(backend);
+    cleanups.push(async () => { backend.closeAllConnections(); await new Promise<void>(resolve => backend.close(() => resolve())); });
+    const dir = mkdtempSync(join(tmpdir(), 'gateway-account-origin-')); const store = new WorkspaceDeviceStore(dir);
+    const appOrigin = 'https://app.ours-tunnel.com';
+    const auth = new WebAuth('http://localhost', 'localhost', Date.now, undefined, undefined, store, appOrigin);
+    const gateway = createPrefixGateway({ auth, fleetOrigin: origin, services: [{ prefix: '/messenger', origin }] });
+    const publicOrigin = await listen(gateway.server); auth.setBoundary(publicOrigin, new URL(publicOrigin).host);
+    cleanups.push(async () => { await gateway.close(); auth.shutdown(); rmSync(dir, { recursive: true, force: true }); });
+    const link = store.mint(); const { token } = store.enroll(link.enrollment, link.workspaceId, 'device');
+    const call = (method: string, headers: Record<string, string>) => new Promise<{ status: number; headers: Record<string, unknown> }>((resolve, reject) => {
+      const req = sendHttp(publicOrigin + '/messenger/api/contacts', { method, headers: { 'sec-fetch-site': 'cross-site', ...headers } }, res => { res.resume(); res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers })); });
+      req.on('error', reject); req.end();
+    });
+    const preflight = await call('OPTIONS', { origin: appOrigin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'authorization,content-type' });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers['access-control-allow-origin']).toBe(appOrigin);
+    expect(String(preflight.headers['access-control-allow-headers'])).toContain('Authorization');
+    const foreignPreflight = await call('OPTIONS', { origin: 'https://attacker.invalid', 'access-control-request-method': 'POST' });
+    expect(foreignPreflight.status).toBeGreaterThanOrEqual(400);
+    expect(foreignPreflight.headers['access-control-allow-origin']).toBeUndefined();
+    const anonymous = await call('GET', { origin: appOrigin });
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers['access-control-allow-origin']).toBe(appOrigin);
+    const foreign = await call('GET', { origin: 'https://attacker.invalid', authorization: `Bearer ${token}` });
+    expect(foreign.status).toBe(403);
+    expect(foreign.headers['access-control-allow-origin']).toBeUndefined();
+    expect(seen).toEqual([]);
+    const authorized = await call('GET', { origin: appOrigin, authorization: `Bearer ${token}` });
+    expect(authorized.status).toBe(200);
+    expect(authorized.headers['access-control-allow-origin']).toBe(appOrigin);
+    expect(authorized.headers.vary).toBe('Origin');
+    expect(seen).toEqual(['GET /api/contacts']);
+  });
   it('allows external top-level page links but rejects cross-site API and subresource requests', async () => {
     const { publicOrigin } = await setup((_req, res) => res.end('page'));
     const status = (path: string, headers: Record<string,string>, method = 'GET') => new Promise<number>((resolve,reject) => { const req = sendHttp(publicOrigin + path, { method, headers }, res => { res.resume(); resolve(res.statusCode!); }); req.on('error',reject);req.end(); });
