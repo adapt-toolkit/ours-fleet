@@ -258,7 +258,8 @@ export async function buildWebServer(
     // One setup at a time: the first-time check and the publication it guards must not interleave.
     const run=onboardingSetupQueue.then(async()=>{
       if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
-      await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});}
+      catch(error){throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);}
       // Setup preserves files it finds, so confirm the published models are the ones this request chose.
       const brains=configuration.read(true).model.brains ?? {};
       for(const work of ONBOARDING_WORK)if(brains[work]?.harness!==models[work].harness || brains[work]?.model!==models[work].model)

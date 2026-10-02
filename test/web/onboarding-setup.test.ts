@@ -59,8 +59,8 @@ describe('first-time setup through the API', () => {
       expect(configuration.read(false).model.agents.FleetCoordinator).toBeUndefined();
 
       const done = await setup({ coordination: sol, development: sol, review: { harness: 'codex', model: 'gpt-6-astra' } });
-      expect(done.statusCode).toBe(200);
       expect(done.json()).toEqual({ configured: true });
+      expect(done.statusCode).toBe(200);
       expect(hostSetups).toBe(1);
       const model = configuration.read(true).model;
       expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'coordination' });
