@@ -43,14 +43,14 @@ export function createPrefixGateway(options: GatewayOptions) {
     const path = raw.split('?')[0];
     const service = services.find(x => path === x.prefix || path.startsWith(x.prefix + '/'));
     const fleet = path === '/fleet/api' || path.startsWith('/fleet/api/');
-    return { service, page: !service && !fleet && !path.startsWith('/api/'), origin: service?.origin ?? options.fleetOrigin,
+    return { service, origin: service?.origin ?? options.fleetOrigin,
       path: service ? (service.upstreamPrefix || '')+(raw.slice(service.prefix.length) || '/').replace(/^\?/, '/?') : fleet ? raw.slice('/fleet'.length) : raw };
   };
   const prepare = (req: IncomingMessage, upgrade = false) => {
     const route = select(req);
     const request = { headers: req.headers, method: req.method, url: route.path } as FastifyRequest;
     if (!auth && (req.headers.origin || req.headers['sec-fetch-site'] || !route.service)) throw new Error('machine-client listener rejects browser requests');
-    auth?.validateBoundary(request, upgrade, route.page);
+    auth?.validateBoundary(request, upgrade);
     const session = route.service && auth ? auth.authenticate(request, !upgrade && !['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) : undefined;
     const headers = headersFor(req);
     // Forward only the explicit browser context, never an attacker-selected forwarding chain.
@@ -100,7 +100,6 @@ export function createPrefixGateway(options: GatewayOptions) {
       res.end(JSON.stringify({ error: { code: code ?? 'forbidden', message: (error as Error).message } }));
       return;
     }
-    if (req.url === '/') { res.writeHead(302, { location: '/fleet' }); res.end(); return; }
     const upstream = (route.origin.startsWith('https:') ? httpsRequest : httpRequest)(route.origin, {
       method: req.method, path: route.path, headers: route.headers,
     }, response => {

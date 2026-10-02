@@ -234,12 +234,15 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(c);
   });
 
-  it('web help exposes secure re-pair and revocation commands', async () => {
+  it('web help exposes the service and revocation commands and no browser command', async () => {
     const r = await run(['web', '--help']);
     expect(r.code).toBe(0);
     for (const command of [
-      'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'open', 'revoke-all',
+      'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'revoke-all',
     ]) expect(r.stdout).toContain(command);
+    expect(r.stdout).not.toMatch(/^\s+open\b/m);
+    // Installed service units still pass it.
+    expect(r.stdout).toContain('--no-open');
     for (const option of ['--bind', '--public-origin', '--password-file', '--no-password', '--pairing'])
       expect(r.stdout).toContain(option);
     expect(r.stdout).not.toContain('#bootstrap=');
@@ -317,8 +320,9 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');
       expect(r.stdout).toContain('monitor.mode');
-      expect(r.stdout).toContain('## Local web console');
-      expect(r.stdout).toContain('ours-fleet web open');
+      expect(r.stdout).toContain('## Local HTTP service');
+      expect(r.stdout).toContain('It serves no pages and opens no');
+      expect(r.stdout).not.toContain('ours-fleet web open');
       expect(r.stdout).toContain('ours-fleet web revoke-all');
       expect(r.stdout).toContain('IPv4-loopback-only by default');
       expect(r.stdout).toContain('--public-origin');

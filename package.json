@@ -27,7 +27,7 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-web.mjs && node scripts/build-info.mjs",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/build-info.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "npm run typecheck",
     "test": "vitest run",
@@ -39,7 +39,6 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
-    "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@ours.network/cli": "2.8.1-nightly.13",
     "@ours.network/mcp": "1.2.0-nightly.10",

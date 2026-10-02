@@ -10,25 +10,25 @@ describe('owner-only local web control', () => {
     const calls: string[] = [];
     const control = await startWebControlServer({
       dir,
-      onOpen() { calls.push('open'); },
       onRevokeAll() { calls.push('revoke-all'); },
     });
     expect(statSync(dir).mode & 0o777).toBe(0o700);
     expect(statSync(control.path).mode & 0o777).toBe(0o600);
-    await requestWebControl('open', control.path);
     await requestWebControl('revoke-all', control.path);
-    expect(calls).toEqual(['open', 'revoke-all']);
+    expect(calls).toEqual(['revoke-all']);
+    // Fleet opens no browser: the former command is no longer known.
+    await expect(requestWebControl('open' as never, control.path)).rejects.toThrow(/unknown local web control command/);
     await control.close();
-    await expect(requestWebControl('open', control.path, 100)).rejects.toThrow(/unavailable/);
+    await expect(requestWebControl('revoke-all', control.path, 100)).rejects.toThrow(/unavailable/);
   });
 
   it('rate-limits local control requests', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-fleet-control-rate-'));
     const control = await startWebControlServer({
-      dir, rateLimit: 1, onOpen() {}, onRevokeAll() {},
+      dir, rateLimit: 1, onRevokeAll() {},
     });
-    await requestWebControl('open', control.path);
-    await expect(requestWebControl('open', control.path)).rejects.toThrow(/rate limit/);
+    await requestWebControl('revoke-all', control.path);
+    await expect(requestWebControl('revoke-all', control.path)).rejects.toThrow(/rate limit/);
     await control.close();
   });
 });

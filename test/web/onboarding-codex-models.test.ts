@@ -32,14 +32,13 @@ async function webConsole(answer?: () => OfferedModels) {
   const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
   await ensureMinimalSetup(configPath);
   const dir = mkdtempSync(join(root, 'web-'));
-  writeFileSync(join(dir, 'index.html'), '<!doctype html>');
   const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
   let setups = 0;
   const server = await buildWebServer({
     audit: new AuditSink(join(dir, 'audit')), configuration: new FleetConfigService({ configPath }),
     onboardingSetup: async () => { setups++; },
     ...(answer ? { codexModels: async () => answer() } : {}),
-  } as any, boundary, { auth, staticRoot: dir });
+  } as any, boundary, { auth });
   const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
   const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
   const session = { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string };

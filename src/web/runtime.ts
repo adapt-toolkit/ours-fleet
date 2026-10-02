@@ -6,7 +6,6 @@ import {readClientProfile} from '../client-profile.js';
 import {readPrivateFile} from '@ours.network/sdk/connector';
 import { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
 import { RoomLayoutService } from '../rooms-tasks/layout-service.js';
-import { spawn } from 'node:child_process';
 import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
 import { producerConfig } from '../notifications/outbox.js';
 import { SubscriptionService } from '../subscriptions/service.js';
@@ -69,9 +68,7 @@ export interface StartWebOptions {
   /** Separate console state for an independently launched gateway. */
   webStateDir?: string;
   control?: boolean;
-  staticRoot?: string;
   port?: number;
-  open?: boolean;
   binPath: string;
   log?(line: string): void;
   bind?: string;
@@ -237,7 +234,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       }
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
-    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth, staticRoot: options.staticRoot });
+    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth });
   } catch (error) {
     lock.release();
     throw error;
@@ -278,11 +275,6 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   try {
     if (options.control !== false) control = await startWebControlServer({
       dir: webDir,
-      onOpen() {
-        const url = access.mode === 'pairing'
-          ? `${browserOrigin}/#bootstrap=${server.auth.mintBootstrap()}` : `${browserOrigin}/`;
-        openBrowser(url);
-      },
       onLinkDevice() { return {version:1,origin:browserOrigin,...server.auth.workspaceEnrollment()}; },
       onRevokeAll() { server.auth.revokeAllTrustedDevices(); },
     });
@@ -292,8 +284,6 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     lock.release();
     throw error;
   }
-  if (options.open !== false) openBrowser(access.mode === 'pairing'
-    ? `${browserOrigin}/#bootstrap=${server.auth.bootstrapSecret}` : `${browserOrigin}/`);
   let stopTunnel:()=>Promise<void>;
   try { stopTunnel=startWorkspaceTunnel(browserOrigin); }
   catch(error) {
@@ -314,13 +304,4 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
 
 function isLoopback(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1'].includes(host);
-}
-
-function openBrowser(url: string): void {
-  const command = process.platform === 'darwin' ? 'open'
-    : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
-  const child = spawn(command, args, { stdio: 'ignore', detached: true, shell: false });
-  child.on('error', () => undefined);
-  child.unref();
 }

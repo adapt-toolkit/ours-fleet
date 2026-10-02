@@ -36,12 +36,11 @@ async function authenticated() {
   const dir = mkdtempSync(join(root, 'web-'));
   const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
   const audit = new AuditSink(join(dir, 'audit'));
-  writeFileSync(join(dir, 'index.html'), '<!doctype html>');
   const subscriptions = new SubscriptionService({
     agents: async () => [],
     binaries: { claude: join(fixtures, 'fake-claude.mjs'), codex: join(fixtures, 'fake-codex.mjs'), script: 'script' },
   });
-  const server = await buildWebServer({ audit, subscriptions } as any, boundary, { auth, staticRoot: dir });
+  const server = await buildWebServer({ audit, subscriptions } as any, boundary, { auth });
   const exchange = await server.app.inject({
     method: 'POST', url: '/api/v1/auth/exchange',
     headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` },
