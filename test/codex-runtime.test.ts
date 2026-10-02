@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { probeCodexRuntime, codexVersionAtLeast } from '../src/harness/codex-runtime.js';
+import { probeCodexRuntime, codexVersionAtLeast, hostCodex, codexOfferedModels } from '../src/harness/codex-runtime.js';
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { makeCodexAdapter, codexAcpLaunchForResolution } from '../src/harness/codex.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
@@ -23,6 +23,52 @@ function binary(version: string): string {
 }
 const role = (env: Record<string, string> = {}): ResolvedRole => ({
   name: 'Runtime', identity: 'Runtime', harness: 'codex', session: 'acp', sourceFile: 'fixture', env,
+});
+
+/** A PATH holding only a `codex` that reports `version`. */
+function hostPath(version: string): string {
+  const dir = temp();
+  writeFileSync(join(dir, 'codex'), `#!/bin/sh\nprintf 'codex-cli ${version}\\n'\n`);
+  chmodSync(join(dir, 'codex'), 0o700);
+  return dir;
+}
+
+describe('host Codex selection', () => {
+  it('runs a host Codex that is newer than the bundled one, for the check and for the session alike', async () => {
+    const dir = hostPath('99.0.0');
+    const runtime = await probeCodexRuntime(adapter(), { PATH: dir });
+    expect(runtime).toEqual({ source: 'host', entry: join(dir, 'codex'), executable: join(dir, 'codex'), version: '99.0.0' });
+    vi.stubEnv('PATH', `${dir}:${process.env.PATH}`);
+    const state = temp();
+    const prep = await makeCodexAdapter().prepareSession(role(), { stateDir: state, runCwd: state });
+    expect(prep.env.OURS_FLEET_REAL_CODEX_PATH).toBe(join(dir, 'codex'));
+  });
+  it('keeps the bundled Codex when the host one is older, missing or unreadable', async () => {
+    expect((await probeCodexRuntime(adapter(), { PATH: hostPath('0.1.0') })).source).toBe('bundled');
+    expect((await probeCodexRuntime(adapter(), { PATH: temp() })).source).toBe('bundled');
+    const broken = temp(); writeFileSync(join(broken, 'codex'), '#!/bin/sh\nexit 3\n'); chmodSync(join(broken, 'codex'), 0o700);
+    expect((await probeCodexRuntime(adapter(), { PATH: broken })).source).toBe('bundled');
+  });
+  it('lets an explicit CODEX_PATH decide, including an empty one that selects the bundled Codex', async () => {
+    const dir = hostPath('99.0.0'), chosen = binary('0.153.4');
+    expect(hostCodex(adapter().manifestPath, { PATH: dir, CODEX_PATH: '' })).toBeUndefined();
+    expect((await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: '' })).source).toBe('bundled');
+    expect(await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: chosen })).toMatchObject({ source: 'CODEX_PATH', entry: chosen });
+  });
+});
+
+describe('models offered to a Codex account', () => {
+  it('reads the listed models Codex recorded for the profile and nothing else', () => {
+    const home = temp();
+    expect(codexOfferedModels(home)).toBeUndefined();
+    writeFileSync(join(home, 'models_cache.json'), JSON.stringify({ client_version: '0.153.4', models: [
+      { slug: 'gpt-6-sol', visibility: 'list' }, { slug: 'gpt-reserve', visibility: 'hide' }, { slug: 7, visibility: 'list' }] }));
+    expect([...codexOfferedModels(home)!]).toEqual(['gpt-6-sol']);
+    writeFileSync(join(home, 'models_cache.json'), '{not json');
+    expect(codexOfferedModels(home)).toBeUndefined();
+    writeFileSync(join(home, 'models_cache.json'), JSON.stringify({ models: [] }));
+    expect(codexOfferedModels(home)).toBeUndefined();
+  });
 });
 
 describe('Codex runtime provenance', () => {

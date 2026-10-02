@@ -40,7 +40,8 @@ import type { RoomLayoutDefinitions } from '../application/room-layout-definitio
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
-import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
+import { isProvider, profileHome, readSubscriptionState, type SubscriptionProvider } from '../subscriptions/store.js';
+import { codexOfferedModels } from '../harness/codex-runtime.js';
 import type { SubscriptionService } from '../subscriptions/service.js';
 
 import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
@@ -229,7 +230,10 @@ export async function buildWebServer(
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));
     const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
-    return {harnesses,catalog:catalog.models,providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    // Offer only the Codex models the active account is known to have; an account with no recorded list keeps the full catalog.
+    let offered:Set<string>|undefined;
+    try{offered=codexOfferedModels(profileHome('codex',readSubscriptionState().providers.codex.activeProfileId));}catch{offered=undefined;}
+    return {harnesses,catalog:catalog.models.filter(model=>model.harness!=='codex' || !offered || offered.has(model.model)),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
   });
 
   // First-time setup is what creates the persistent coordinator. A configuration that loads and
