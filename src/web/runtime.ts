@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
 import { producerConfig } from '../notifications/outbox.js';
 import { SubscriptionService } from '../subscriptions/service.js';
+import { createCodexModelDiscovery } from '../application/codex-models.js';
 import { existsSync, mkdirSync, realpathSync,readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
@@ -218,6 +219,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         publish: publishSetup,
       });
     },
+    codexModels: createCodexModelDiscovery(),
     subscriptions: new SubscriptionService({
       agents: async () => (await query.list(true)).map(({ role, status }) => ({
         roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',

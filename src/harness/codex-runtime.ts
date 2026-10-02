@@ -102,16 +102,3 @@ export function codexVersionAtLeast(version: string, minimum: string): boolean {
   }
   return true;
 }
-
-/**
- * The models this Codex account is offered, as Codex itself last recorded them for the profile.
- * Undefined when Codex has not recorded a list yet (nothing is known, so nothing is ruled out).
- */
-export function codexOfferedModels(codexHome: string): Set<string> | undefined {
-  let cache: unknown;
-  try { cache = JSON.parse(readFileSync(join(codexHome, 'models_cache.json'), 'utf8')); } catch { return undefined; }
-  const models = (cache as { models?: unknown })?.models;
-  if (!Array.isArray(models)) return undefined;
-  const offered = models.filter(model => model && typeof model.slug === 'string' && model.visibility === 'list').map(model => model.slug as string);
-  return offered.length ? new Set(offered) : undefined;
-}

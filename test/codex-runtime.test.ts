@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { probeCodexRuntime, codexVersionAtLeast, hostCodex, codexOfferedModels } from '../src/harness/codex-runtime.js';
+import { probeCodexRuntime, codexVersionAtLeast, hostCodex } from '../src/harness/codex-runtime.js';
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { makeCodexAdapter, codexAcpLaunchForResolution } from '../src/harness/codex.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
@@ -54,20 +54,6 @@ describe('host Codex selection', () => {
     expect(hostCodex(adapter().manifestPath, { PATH: dir, CODEX_PATH: '' })).toBeUndefined();
     expect((await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: '' })).source).toBe('bundled');
     expect(await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: chosen })).toMatchObject({ source: 'CODEX_PATH', entry: chosen });
-  });
-});
-
-describe('models offered to a Codex account', () => {
-  it('reads the listed models Codex recorded for the profile and nothing else', () => {
-    const home = temp();
-    expect(codexOfferedModels(home)).toBeUndefined();
-    writeFileSync(join(home, 'models_cache.json'), JSON.stringify({ client_version: '0.153.4', models: [
-      { slug: 'gpt-6-sol', visibility: 'list' }, { slug: 'gpt-reserve', visibility: 'hide' }, { slug: 7, visibility: 'list' }] }));
-    expect([...codexOfferedModels(home)!]).toEqual(['gpt-6-sol']);
-    writeFileSync(join(home, 'models_cache.json'), '{not json');
-    expect(codexOfferedModels(home)).toBeUndefined();
-    writeFileSync(join(home, 'models_cache.json'), JSON.stringify({ models: [] }));
-    expect(codexOfferedModels(home)).toBeUndefined();
   });
 });
 
