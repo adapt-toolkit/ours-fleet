@@ -15,7 +15,10 @@ export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;ro
 export function readWorkspacePayload(file:string):WorkspacePayload {
   const path=resolve(file),stat=lstatSync(path);
   if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>32768)throw Error('Setup payload requires an owned private regular file (chmod 600)');
-  let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(readFileSync(path,'utf8').trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
+  return decodeWorkspacePayload(readFileSync(path,'utf8'));
+}
+export function decodeWorkspacePayload(input:string):WorkspacePayload {
+  let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
   if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || p.challenge.expiresAt<=Date.now() || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
   for(const k of ['connectorToken','invitation','name','surname'] as const)if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');
   return p;
