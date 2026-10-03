@@ -536,9 +536,9 @@ export async function provisionMembers(input: ProvisionMembersInput): Promise<Ro
     if (input.append) {
       const task = input.taskId ? getTask(input.taskId) : undefined;
       const room = getRoomRecord(input.roomId);
-      if (!task || !['active', 'review'].includes(task.state) || task.blocked || room?.state !== 'active'
+      if (!task || !['active', 'review'].includes(task.state) || room?.state !== 'active'
           || room.task_id !== task.task_id || room.room_identity_cid !== task.room_identity_cid)
-        throw new Error('Adding an agent requires the exact active, unblocked task room');
+        throw new Error('Adding an agent requires the exact active task room');
       const names = expandMembers(input.template, shortId(task.task_id)).map(m => m.name);
       if (room.member_seats.some(seat => names.includes(seat.role_name)))
         throw new Error('Member slot is already recorded; inspect its existing launch');

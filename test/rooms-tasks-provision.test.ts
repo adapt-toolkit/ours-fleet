@@ -33,7 +33,7 @@ import { withFileLock } from '../src/atomic-file.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
 import { activateRoom, beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
-import { beginTaskTerminalIntent, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
+import { beginTaskTerminalIntent, blockTask, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
 } from '../src/rooms-tasks/cowork-adapter.js';
@@ -256,12 +256,14 @@ describe('simple Cowork room member startup', () => {
     beginTaskTerminalIntent(task.task_id,{kind:'cancelled',roomId:'room-add'});
     await expect(provisionMembers({...input,template:{...extra,members:[{...extra.members[0],slot:'another'}]},append:true})).rejects.toThrow('terminal intent');
   });
-  it('deduplicates member additions by durable request ID and rejects changed settings', async () => {
+  it('adds to a blocked task without clearing its blocker and deduplicates durable requests', async () => {
     const {requestMemberAddition,memberAddition}=await import('../src/rooms-tasks/add-member.js');
     const task=createTask({title:'Addition receipt',origin:{type:'cli'}});
     createRoomRecord({room_id:'room-receipt',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:template(1)});
     updateTaskRoom(task.task_id,'room-receipt','room-cid');const h=coworkHarness();
     await provisionMembers({cfg:cfg(),cowork:h.cowork,roomId:'room-receipt',taskId:task.task_id,template:template(1),binPath:'/fleet'});
+    blockTask(task.task_id,'external dependency unavailable');
+    const blocker=getTask(task.task_id).blocked;
     const configuration=cfg({rolePresets:{Critic:{mission:'Review'}},brainPresets:{test:{harness:'codex'}},resolveAgentDefinition:()=>caller});
     const input={taskId:task.task_id,request:{requestId:'test-request-123',slot:'Review',role:'Critic',brain:'test',agentTemplate:'Critic'},cfg:configuration,cowork:h.cowork,binPath:'/fleet'};
     const results=await Promise.allSettled([requestMemberAddition(input),requestMemberAddition({...input,request:{...input.request,requestId:'second-request-123'}})]);
@@ -269,6 +271,7 @@ describe('simple Cowork room member startup', () => {
     await requestMemberAddition(input);
     await expect.poll(()=>memberAddition(task.task_id,input.request.requestId).state).toBe('succeeded');
     if(results[1].status==='fulfilled')await expect.poll(()=>memberAddition(task.task_id,'second-request-123').state).toBe('failed');
+    expect(getTask(task.task_id).blocked).toEqual(blocker);
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     await expect(requestMemberAddition({...input,request:{...input.request,slot:'Other'}})).rejects.toThrow('different settings');
     for(const changed of [{role:''},{slot:'invalid slot'}]) {
@@ -282,6 +285,10 @@ describe('simple Cowork room member startup', () => {
     const path=join(stateRoot(),'member-additions',task.task_id,input.request.requestId+'.json');
     const stored=JSON.parse(readFileSync(path,'utf8'));stored.state='running';writeFileSync(path,JSON.stringify(stored));
     expect((await requestMemberAddition(input)).state).toBe('attention');
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    await expect(requestMemberAddition({...input,request:{...input.request,requestId:'duplicate-slot-123'}})).rejects.toThrow('slot already exists');
+    beginRoomClose('room-receipt');
+    await expect(requestMemberAddition({...input,request:{...input.request,requestId:'closing-room-123',slot:'Another'}})).rejects.toThrow('active task room');
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
   });
 

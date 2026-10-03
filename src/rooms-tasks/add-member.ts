@@ -44,9 +44,9 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
       return memberAddition(taskId,r.requestId);
     }
     const task=getTask(taskId);const room=task.room_id&&getRoomRecord(task.room_id);
-    if(!room || !['active','review'].includes(task.state) || task.terminal_intent || task.blocked || room.state!=='active'
+    if(!room || !['active','review'].includes(task.state) || task.terminal_intent || room.state!=='active'
         || room.task_id!==taskId || room.room_identity_cid!==task.room_identity_cid)
-      throw new MemberAdditionRejected('Adding an agent requires an active, unblocked task room');
+      throw new MemberAdditionRejected('Adding an agent requires an active task room');
     const roleId=`${taskId.slice(0,8)}-${r.slot}-1`;
     if(room.member_seats.some(s=>s.role_name===roleId))throw new MemberAdditionRejected('This member slot already exists');
     const plan=(()=>{try{return prepareExecutionPlan({name:'additional-member',version:1,description:'Additional task participant',
