@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, findRole, validateMonitorConfig, ConfigError } from '../src/config.js';
+import { loadConfig, findRole, validateMonitorConfig, resolveSnapshotMonitor, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import '../src/harness/hermes.js';
@@ -567,6 +567,12 @@ describe('loadConfig monitor', () => {
     expect(findRole(cfg, 'B').monitor.interrupt).toBe('after_tool');
     expect(findRole(cfg, 'N').monitor.interrupt).toBe('after_tool');
     expect(findRole(cfg, 'H').monitor.interrupt).toBe(false);
+  });
+
+  it('resolves a temporary snapshot without interrupt to the delivery it ran with', () => {
+    expect(resolveSnapshotMonitor({ mode: 'fleet' }).interrupt).toBe(false);
+    expect(resolveSnapshotMonitor({ mode: 'fleet', interrupt: 'after_tool' }).interrupt).toBe('after_tool');
+    expect(resolveSnapshotMonitor({ enabled: true, interrupt: true }).interrupt).toBe(true);
   });
 
   it('keeps an explicit interrupt over the harness default', () => {
