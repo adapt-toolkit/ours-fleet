@@ -8,3 +8,10 @@ it('retains resume state after connection issue, QR rendering or output failure'
  for(const failure of ['link','qr','write']){let cleared=false;
  await expect(completeTunnelSetup({link:async()=>{if(failure==='link')throw Error('unavailable');return {};},qr:async()=>{if(failure==='qr')throw Error('render');return 'QR';},write:()=>{if(failure==='write')throw Error('output');},clear:()=>{cleared=true;}})).rejects.toThrow(/setup-tunnel --resume/);expect(cleared).toBe(false);}
 });
+
+it('retains pending record while asynchronous output is unflushed or rejected',async()=>{
+ let cleared=false,release!:()=>void;
+ const done=completeTunnelSetup({link:async()=>({}),qr:async()=> 'QR',write:()=>new Promise<void>(resolve=>{release=resolve;}),clear:()=>{cleared=true;}});
+ await new Promise(resolve=>setImmediate(resolve));expect(cleared).toBe(false);release();await done;expect(cleared).toBe(true);
+ cleared=false;await expect(completeTunnelSetup({link:async()=>({}),qr:async()=> 'QR',write:async()=>{throw Error('EPIPE');},clear:()=>{cleared=true;}})).rejects.toThrow(/--resume/);expect(cleared).toBe(false);
+});

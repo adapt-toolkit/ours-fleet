@@ -1415,7 +1415,10 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       throw Error(`${error instanceof Error ? error.message : String(error)}\nThis host is already bound to the workspace; do not request a new command. Fix the problem above, then run: ours-fleet setup-tunnel --resume`);
     }
     if (setupTunnel) {
-      await completeTunnelSetup({link:()=>requestWebControl('link-device'),qr:code=>QRCode.toString(code,{type:'terminal',small:true}),write:text=>process.stdout.write(text),clear:clearPendingTunnelSetup});
+      await completeTunnelSetup({link:()=>requestWebControl('link-device'),qr:code=>QRCode.toString(code,{type:'terminal',small:true}),write:text=>new Promise<void>((resolve,reject)=>{
+        const onError=(error:Error)=>reject(error);process.stdout.once('error',onError);
+        process.stdout.write(text,error=>{if(error)reject(error);else{process.stdout.removeListener('error',onError);resolve();}});
+      }),clear:clearPendingTunnelSetup});
     } else {
       const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
       process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
