@@ -1044,14 +1044,25 @@ describe('runOnce ACP startup outcome', () => {
     let controlSession: SessionHandle | undefined;
     let alive = true;
     let startupQueued = false;
+    const completedListeners = new Set<(event: any) => void>();
     let settleStartup!: (result: TurnResult) => void;
     const queuePrompt: SessionHandle['queuePrompt'] = async (text, options = {}) => {
       if (!startupQueued) {
         startupQueued = true;
+        setImmediate(async () => {
+          await controlSession!.interrupt('local-console');
+          await controlSession!.submitPrompt('control recovery');
+        });
         return {
           promptId: 'startup', queuedBehind: 0, origin: options.origin,
           completion: new Promise<TurnResult>(resolve => { settleStartup = resolve; }),
         };
+      }
+      if (text === 'control recovery') {
+        return {promptId:'control-recovery', queuedBehind:0, completion:Promise.resolve().then(() => {
+          for (const listener of completedListeners) listener({kind:'turn.completed',payload:{outcome:'completed'}});
+          return turnResult(true, 'completed');
+        })};
       }
       expect(text).toBe('queued wake after interrupt');
       return {
@@ -1072,6 +1083,7 @@ describe('runOnce ACP startup outcome', () => {
       respondPermission: () => false,
       eventsSince: () => [],
       subscribe: () => () => {},
+      subscribeConversation: listener => { completedListeners.add(listener); return () => {completedListeners.delete(listener);}; },
       setControllerAttached: () => {},
       exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test stop' }),
       close: async () => { alive = false; },
@@ -1093,11 +1105,7 @@ describe('runOnce ACP startup outcome', () => {
     runnerDeps.createMonitor = opts => ({
       prime: async () => {},
       run: async () => {
-        // The daemon notification remains pending while the independent
-        // control interrupt settles the startup turn. Delivery must still be
-        // possible through the same live session immediately afterwards.
-        const interrupted = await controlSession!.interrupt('local-console');
-        expect(interrupted).toMatchObject({ state: 'settled' });
+        // Independent control recovery has completed before monitor delivery.
         for (let i = 0; i < 100; i++) {
           if (logs.some(line => line.includes('keeping temporary supervisor alive'))) break;
           await new Promise<void>(resolve => setTimeout(resolve, 5));
@@ -1403,68 +1411,69 @@ describe('runOnce ACP startup outcome', () => {
     expect(logs.some(line => line.includes('scheduled loop manager unavailable'))).toBe(true);
   });
 
-  it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
-    writeCfg({ A: {
-      harness: 'fake-acp',
-      session: 'acp',
-      monitor: { mode: 'fleet', interrupt: true },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
-    } });
-    const d = agentDir('A');
-    mkdirSync(d, { recursive: true });
-    const { deps } = acpDeps();
-    let startupWasActive = false;
-    let wakeOutcome: string | undefined;
-    deps.createMonitor = opts => ({
-      prime: async () => {},
-      run: async () => {
-        const before = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-        startupWasActive = !before.includes('"kind":"turn_stop"');
-        const result = await opts.deps.delivery!.submit('wake during startup', { interrupt: true });
-        wakeOutcome = result.outcome;
-      },
-      stop: () => {},
-    });
 
-    await runOnce('A', {}, deps);
-    expect(startupWasActive).toBe(true);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
-    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-    expect(events).not.toContain('"stopReason":"cancelled"');
-    expect(events).toContain('"kind":"turn_stop"');
-  });
-
-  it('steers after_tool directly during ACP startup without waiting or cancelling', async () => {
-    writeCfg({ A: {
-      harness: 'fake-acp',
-      session: 'acp',
-      monitor: { mode: 'fleet', interrupt: 'after_tool' },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
-    } });
-    const d = agentDir('A');
-    mkdirSync(d, { recursive: true });
-    const { deps } = acpDeps();
-    let wakeOutcome: string | undefined;
-    deps.createMonitor = opts => ({
-      prime: async () => {},
-      run: async () => {
-        const result = await opts.deps.delivery!.submit(
-          'after_tool wake during startup', { interrupt: 'after_tool' });
-        wakeOutcome = result.outcome;
-      },
-      stop: () => {},
-    });
-
-    await runOnce('A', {}, deps);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
-    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-    expect(events).not.toContain('"kind":"monitor_delivery"');
-    expect(events).not.toContain('"cancellationSource":"fleet-monitor"');
-    expect(events).not.toContain('"stopReason":"cancelled"');
-  });
 });
 
 describe('runOnce monitor integration', () => {
+  it.each([false, true, 'after_tool'] as const)('defers %s wakes until startup success while keeping the early baseline', async policy => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet', interrupt: policy } } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const world = fakeWorld();
+    let finish!: (value: TurnResult) => void;
+    const terminal = new Promise<TurnResult>(r => { finish = r; });
+    let admitted!: () => void;
+    const admission = new Promise<void>(r => { admitted = r; });
+    let startupComplete = false, primed = 0, deliveries = 0;
+    const arrivals: string[] = [];
+    const startSession = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await startSession(...args);
+      const queue = session.queuePrompt;
+      session.queuePrompt = async text => {
+        if (text.startsWith('Read and follow')) {
+          arrivals.push('arrived after baseline during startup'); admitted();
+          return { promptId:'startup', queuedBehind:0, completion:terminal };
+        }
+        expect(startupComplete).toBe(true); deliveries++; return queue(text);
+      };
+      session.submitPrompt = async text => (await session.queuePrompt(text)).completion;
+      return session;
+    };
+    world.deps.createMonitor = opts => ({
+      prime: async () => { primed++; },
+      run: async () => {
+        expect(startupComplete).toBe(true);
+        for (const text of arrivals) await opts.deps.delivery!.submit(text, { interrupt:policy });
+      },
+      stop: () => {},
+    });
+    const running = runOnce('A', {}, world.deps);
+    await admission;
+    expect(primed).toBe(1); expect(deliveries).toBe(0);
+    startupComplete = true; finish(turnResult(true, 'completed'));
+    await running;
+    expect(primed).toBe(1); expect(deliveries).toBe(1);
+  });
+
+  it.each(['failed', 'refused', 'cancelled'] as const)('never starts monitor delivery after %s startup', async outcome => {
+    writeCfg({ A: { harness:'fake' } }); mkdirSync(agentDir('A'), { recursive:true });
+    const world = fakeWorld(); const startSession = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await startSession(...args);
+      session.queuePrompt = async () => ({promptId:'startup', queuedBehind:0, completion:Promise.resolve(turnResult(false,outcome))});
+      return session;
+    };
+    await expect(runOnce('A', {}, world.deps)).rejects.toThrow(`startup prompt ${outcome}`);
+    expect(world.monitor.ranPid).toBeNull(); expect(world.monitor.stopped).toBe(true);
+  });
+
+  it('does not start monitor delivery when shutdown was requested during startup', async () => {
+    writeCfg({ A: { harness:'fake' } }); mkdirSync(agentDir('A'), {recursive:true});
+    const world = fakeWorld();
+    await runOnce('A', {}, {...world.deps, shouldStop:()=>true});
+    expect(world.monitor.ranPid).toBeNull(); expect(world.monitor.stopped).toBe(true);
+  });
+
   it('primes the monitor before creating the session and stops it after pid death', async () => {
     writeCfg({ A: { harness: 'fake' } });   // monitor.mode defaults to fleet
     const d = agentDir('A'); mkdirSync(d, { recursive: true });

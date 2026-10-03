@@ -750,6 +750,16 @@ export async function runOnce(
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let sessionStartupComplete = false;
+  let startupRecoveryAllowed = false;
+  let successfulTurnObserved = false;
+  let monitorMayStart = false;
+  let monitorStarted = false;
+  const startMonitorAfterStartup = () => {
+    if (!monitorStarted && monitorMayStart && sessionStartupComplete && !deps.shouldStop?.()) {
+      monitorStarted = true;
+      monitorLoop = monitor?.run(pid);
+    }
+  };
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
@@ -778,12 +788,21 @@ export async function runOnce(
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
-    unsubscribeRecovery = agentSession.subscribe(event => {
+    const unsubscribeFailure = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text || event.origin?.kind === 'stall-watchdog') return;
       const evidence = classifyFailureText(
         event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
+    const unsubscribeStartup = agentSession.subscribeConversation?.(event => {
+      if (event.kind !== 'turn.completed' || !('outcome' in event.payload) || event.payload.outcome !== 'completed') return;
+      successfulTurnObserved = true;
+      if (startupRecoveryAllowed) {
+        sessionStartupComplete = true;
+        startMonitorAfterStartup();
+      }
+    });
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
@@ -857,10 +876,8 @@ export async function runOnce(
       // refusal or a cancellation reached the agent and was not acted on, so
       // the monitor must keep its cursor and try again.
       submit: async (text, options) => {
-        // Cancelling the runner-owned startup prompt makes startup look failed
-        // and closes the session before the wake turn can run. During startup,
-        // steer into the live turn instead; after it completes, honor the
-        // configured interrupt policy normally.
+        // Delivery starts after the protected startup turn succeeds. Honor the
+        // configured interrupt policy for subsequent turns.
         const policy = options?.interrupt;
         const interrupt = policy === true && sessionStartupComplete;
         const promptOptions = {
@@ -868,8 +885,7 @@ export async function runOnce(
           ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
           origin: { kind: 'fleet-monitor' as const },
         };
-        // Startup is already a protected boundary: as with immediate mode,
-        // steer rather than waiting on/cancelling the runner-owned first turn.
+        // after_tool waits for a safe boundary in subsequent active turns.
         const result = policy === 'after_tool' && sessionStartupComplete
           ? await arbiter!.submitPromptAfterTool(text, promptOptions)
           : await arbiter!.submitPrompt(text, promptOptions);
@@ -905,10 +921,8 @@ export async function runOnce(
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
     const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
-    // Monitoring starts immediately. The delivery adapter above downgrades
-    // interruption to steering until this startup turn reaches a terminal
-    // success, so there is neither a deaf gap nor a boot-cancellation loop.
-    monitorLoop = monitor?.run(pid);
+    // Keep the early cursor baseline; do not deliver wakes into the protected
+    // first turn. Steering can pre-empt startup just like cancellation.
     // Owner traffic and agent replies must be observed during a long first
     // turn. Ordinary owner input steers until startup has proved successful.
     if (ownerChannel) {
@@ -965,7 +979,8 @@ export async function runOnce(
     else if (interruptedForWake)
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
-    sessionStartupComplete = true;
+    startupRecoveryAllowed = interruptedForWake;
+    sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -1020,9 +1035,10 @@ export async function runOnce(
   deps.log(
     `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
 
-  // The monitor loop lives exactly as long as the session: it starts once the
-  // pane pid is known and is stopped when that pid dies (task dies with runner).
-  monitorLoop ??= monitor?.run(pid);
+  // Keep arrivals behind the early prime() cursor; never re-prime at startup.
+  // Recoverable cancellation preserves the supervisor, not monitor readiness.
+  monitorMayStart = true;
+  startMonitorAfterStartup();
 
   recoveryController = new RoleRecoveryController({
     role: name, identity: role.identity, stateDir: dir, now: deps.now, sleep: deps.sleep,
@@ -1121,6 +1137,7 @@ export async function runOnce(
       }
     }
   }
+  monitorMayStart = false;
   if (loopManager) {
     control?.setLoopManager(undefined);
     await loopManager.stop();
