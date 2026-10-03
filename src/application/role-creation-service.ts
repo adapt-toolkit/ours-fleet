@@ -264,7 +264,7 @@ export class RoleCreationService {
       reasoningEffort: resolved.effort,
       cwd, lifetime: request.lifetime,
       permissions: resolvePermissions(defaults.permissions, request.permissions),
-      monitor: resolveMonitorConfig(defaults.monitor, request.monitor),
+      monitor: resolveMonitorConfig(defaults.monitor, request.monitor, { harness: resolved.harness }),
     };
     const warnings: string[] = [];
     if (request.permissions.approval === 'allow')

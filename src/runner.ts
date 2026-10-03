@@ -532,8 +532,11 @@ export function loadTempRole(name: string): ResolvedRole {
   if (!existsSync(p)) throw new Error(`temp role '${name}' has no snapshot at ${p}`);
   const role = parse(readFileSync(p, 'utf8')) as ResolvedRole;
   // Upgrade snapshots written before monitor.mode/interrupt existed. A snapshot
-  // with no monitor block keeps the historical native/no-supervisor behavior.
-  if (role.monitor) role.monitor = resolveMonitorConfig(undefined, role.monitor);
+  // with no monitor block keeps the historical native/no-supervisor behavior,
+  // and one without interrupt keeps the non-interrupting delivery it ran with.
+  if (role.monitor) role.monitor = resolveMonitorConfig(undefined, {
+    interrupt: false, ...(role.monitor as Partial<ResolvedRole['monitor']>),
+  });
   (role as ResolvedRole & { __temp?: boolean }).__temp = true;
   return role;
 }

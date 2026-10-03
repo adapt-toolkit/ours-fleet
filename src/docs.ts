@@ -769,10 +769,12 @@ Temporary agents and macOS services retain their existing lifecycle behavior.
 - \`native\`: ours-fleet starts no supervisor monitor; the generated briefing
   instructs Claude Code or Codex to arm its harness-native wake mechanism.
 
-Set \`monitor.interrupt: true\` in fleet mode to cancel active work before every
-configured wake. Set it to \`after_tool\` to preserve an active ACP tool (and any
-pending permission), then steer the wake at the first tool-terminal boundary
-without cancellation. A hung boundary is bounded at 120 seconds and falls back
+\`monitor.interrupt\` defaults to \`after_tool\` for every harness except Hermes,
+which defaults to \`false\`; an explicit value always wins, and temporary snapshots
+written without one keep \`false\`. Set \`monitor.interrupt: true\` in fleet mode to
+cancel active work before every configured wake. \`after_tool\` preserves an active
+ACP tool (and any pending permission), then steers the wake at the first
+tool-terminal boundary without cancellation. A hung boundary is bounded at 120 seconds and falls back
 to non-cancelling steering/queueing; adapters without authenticated tool events
 use the same conservative fallback. Explicit human/control interrupts remain
 immediate. The policy is content-blind because the supervisor cannot inspect

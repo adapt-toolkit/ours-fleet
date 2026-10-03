@@ -964,12 +964,12 @@ export function loadConfig(
         if (problems.length)
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
-      const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
+      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
+      const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name, harness });
       const ownerChannel = resolveOwnerChannelConfig(
         defaults.owner_channel, r.owner_channel, session, file, name);
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
-      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
       if (session === 'codex-app-server' && harness !== 'codex')
         throw new ConfigError(
           `${file}: role '${name}' session: codex-app-server requires harness: codex`);
@@ -1498,9 +1498,18 @@ function resolveStartStaggerMs(raw: unknown, base: string): number {
  * malformed block so a typo fails loudly rather than silently disarming a monitor.
  * Exported so temp-spawn (which builds a ResolvedRole by hand) resolves identically.
  */
+/**
+ * A monitor without an explicit `interrupt` steers wakes at the next tool
+ * boundary. Hermes cannot, so its default stays non-interrupting; sessions
+ * without tool-boundary steering fall back to non-cancelling delivery.
+ */
+export function defaultMonitorInterrupt(harness: string | undefined): MonitorInterrupt {
+  return harness === 'hermes' ? false : 'after_tool';
+}
+
 export function resolveMonitorConfig(
   defMonitor: unknown, roleMonitor?: Partial<MonitorConfig>,
-  labels: { base?: string; file?: string; name?: string } = {},
+  labels: { base?: string; file?: string; name?: string; harness?: string } = {},
 ): MonitorConfig {
   const where = labels.file && labels.name ? `${labels.file}: role '${labels.name}' ` : '';
   if (defMonitor !== undefined && !isPlainObject(defMonitor))
@@ -1534,7 +1543,7 @@ export function resolveMonitorConfig(
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
-    interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? false,
+    interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? defaultMonitorInterrupt(labels.harness),
     ...(merged.stall_recovery !== undefined ? { stall_recovery: merged.stall_recovery as boolean } : {}),
     ...(merged.stall_timeout_ms !== undefined ? { stall_timeout_ms: merged.stall_timeout_ms as number } : {}),
     turn_fail_threshold:
