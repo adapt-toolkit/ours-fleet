@@ -1,9 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { redeemTunnelSetup, readTunnelSetupStdin } from '../src/tunnel-setup-input.js';
+import { redeemTunnelSetup, readTunnelSetupStdin, readTunnelSetupArgument } from '../src/tunnel-setup-input.js';
 const encode=(value:unknown)=>Buffer.from(JSON.stringify(value)).toString('base64url');
 const payload={version:1,appOrigin:'https://app.ours.network',hostname:'home.ours-tunnel.com',rootName:'human@home',name:'Name',surname:'Surname',connectorToken:'connector-secret',invitation:'invite-secret',serverCid:'A'.repeat(64),challenge:{nonce:'n'.repeat(43),workspaceId:'w'.repeat(43),accountId:'a'.repeat(43),expiresAt:Date.now()+600000}};
 const grant={version:2,appOrigin:payload.appOrigin,code:'c'.repeat(43),expiresAt:Date.now()+600000};
-describe('private tunnel setup input',()=>{
+describe('tunnel setup input',()=>{
+  it('accepts only minimal v2 arguments and never echoes rejected input',()=>{
+    expect(readTunnelSetupArgument(encode(grant))).toBe(encode(grant));
+    for(const value of [payload,{...grant,expiresAt:0},{...grant,appOrigin:'https://evil.example'},{...grant,connectorToken:'long-lived-secret'},null]){
+      const input=encode(value);let message='';try{readTunnelSetupArgument(input);}catch(error){message=(error as Error).message;}
+      expect(message).toMatch(/invalid|expired/i);expect(message).not.toContain(input);expect(message).not.toContain('long-lived-secret');
+    }
+  });
   it('redeems a minimal grant over POST body without credentials in URL',async()=>{
     const calls:any[]=[];
     const result=await redeemTunnelSetup(encode(grant),(async(url:any,init:any)=>{calls.push([url,init]);return new Response(JSON.stringify({payload:encode(payload)}));}) as typeof fetch);

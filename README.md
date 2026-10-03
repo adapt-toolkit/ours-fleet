@@ -146,7 +146,7 @@ browser: every screen belongs to the App, which calls this API with a device
 credential. Any address outside `/api/` answers JSON `404`.
 
 ```sh
-ours-fleet setup-tunnel --file /private/setup.txt # connect host; prints QR and connection code
+ours-fleet setup-tunnel <encoded-v2-grant> # App command; prints QR and connection code
 ours-fleet link-device                 # connect another browser or device
 # choose a free port for an isolated test:
 ours-fleet web serve --port 0
@@ -1809,24 +1809,29 @@ Existing-host enrollment: `ours-fleet workspace-enroll --file <private-file> --p
 
 ### Connect an installed host to the App
 
-Install Ours network first. In the App's tunnel step, download the private
-`ours-tunnel-setup.txt` file. On the intended host (securely transfer it for a VPS):
+Install Ours network first. In the App's tunnel step, copy the single command and
+paste it on the intended host, including in an SSH session on a VPS:
 
 ```sh
-chmod 600 ~/Downloads/ours-tunnel-setup.txt
-ours-fleet setup-tunnel --file ~/Downloads/ours-tunnel-setup.txt
+ours-fleet setup-tunnel <encoded-v2-grant>
 ```
 
-Adjust the path to where you saved it. The file contains the existing v2 grant:
-`version: 2`, allowed `appOrigin`, one-use `code`, and `expiresAt`. It names the
-workspace indirectly through a server-held grant; it includes no broad Cloudflare
-credential or installer script. Fleet checks host prerequisites before redeeming
-it over HTTPS POST. The response supplies only the existing scoped connector and
-signed-root enrollment data; authorization, account-origin checks and private
-connector token-file storage remain enforced. Keep the file private and delete it
-after use. For an existing secure pipe, `setup-tunnel --stdin` reads the same input
-with a 32KiB limit; it refuses a terminal. Never put the grant in argv, shell history
-or a URL. Legacy v1 owned private files still work.
+The base64url argument contains only the existing v2 grant: `version: 2`, allowed
+`appOrigin`, one-use `code`, and `expiresAt`. It names the workspace indirectly
+through a server-held grant; it includes no broad Cloudflare credential or
+installer script. The grant can appear in shell history and process listings:
+keep the command private and remove it from history after use. Base64 is encoding,
+not encryption. The server enforces its short expiry and one-time redemption.
+Fleet never prints the grant; it checks host prerequisites before redeeming it
+over HTTPS POST, with the code in the body rather than a URL. The response supplies
+only the existing scoped connector and signed-root enrollment data; authorization,
+account-origin checks and private connector token-file storage remain enforced.
+
+Optional private transports remain available: `setup-tunnel --file /private/grant`
+requires an owned regular file with mode 600; `setup-tunnel --stdin` reads a secure
+pipe with a 32KiB limit and refuses a terminal. Legacy v1 payloads, which contain
+long-lived scoped credentials, are accepted only through file/stdin, never as
+command arguments. Use only one payload transport.
 
 After service and signed tunnel-target confirmation, setup prints both a QR and
 ordinary private single-use connection code. The App checks readiness automatically
