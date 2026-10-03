@@ -1507,6 +1507,15 @@ export function defaultMonitorInterrupt(harness: string | undefined): MonitorInt
   return harness === 'hermes' ? false : 'after_tool';
 }
 
+/**
+ * Resolve a persisted temporary-role monitor. A snapshot written before
+ * monitor.interrupt existed keeps the non-interrupting delivery it ran with.
+ */
+export function resolveSnapshotMonitor(monitor: unknown): MonitorConfig {
+  if (!isPlainObject(monitor)) return resolveMonitorConfig(undefined, monitor as Partial<MonitorConfig>);
+  return resolveMonitorConfig(undefined, { interrupt: false, ...monitor } as Partial<MonitorConfig>);
+}
+
 export function resolveMonitorConfig(
   defMonitor: unknown, roleMonitor?: Partial<MonitorConfig>,
   labels: { base?: string; file?: string; name?: string; harness?: string } = {},

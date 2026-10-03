@@ -2,7 +2,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { parse } from 'yaml';
 import {
-  loadConfig, resolveMonitorConfig, resolvePermissions, ROLE_NAME_RE,
+  loadConfig, resolveSnapshotMonitor, resolvePermissions, ROLE_NAME_RE,
   type ResolvedRole, type RoleConfig,
   type SessionBackendId,
 } from '../config.js';
@@ -73,7 +73,7 @@ function snapshot(path: string, name: string): { role?: ResolvedRole; problem?: 
         session, identity: typeof raw.identity === 'string' ? raw.identity : name,
         permissions: resolvePermissions(undefined, raw.permissions),
         permissionsDeclared: raw.permissions !== undefined,
-        monitor: resolveMonitorConfig(undefined, raw.monitor),
+        monitor: resolveSnapshotMonitor(raw.monitor),
         sourceFile: '(temp)',
       },
     };

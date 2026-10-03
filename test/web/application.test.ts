@@ -12,6 +12,7 @@ import type { SupervisorBackend } from '../../src/supervisor/types.js';
 import type { OpsDeps } from '../../src/ops.js';
 import { SessionControlError } from '../../src/session/types.js';
 import { writeV2Fixture } from '../v2-fixture.js';
+import '../../src/harness/hermes.js';
 
 let oldHome: string | undefined;
 afterEach(() => {
@@ -221,6 +222,23 @@ identity: Temp
     });
   }
 
+  it('previews Hermes creation with its non-interrupting default', async () => {
+    const root = fixture();
+    writeV2Fixture(join(root, 'fleet.yaml'), 'roles:\n  Existing: {}\n');
+    const service = new RoleCreationService({
+      configPath: join(root, 'fleet.yaml'),
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
+      identityProvisioner: { async exists() { return false; } },
+      journalDir: join(root, '.ours-fleet', 'web-actions'),
+    });
+    const preview = await service.preview(canonicalWeb({
+      name: 'HermesPreview', harness: 'hermes', session: 'acp', model: 'fixture-model',
+      lifetime: 'temporary', openAfterCreate: true,
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+    }) as any);
+    expect(preview.effective.monitor).toMatchObject({ interrupt: false });
+  });
+
   it('previews monitor defaults/provenance and rejects unsupported or invalid web monitor input', async () => {
     const root = fixture();
     writeV2Fixture(join(root, 'fleet.yaml'), `defaults:
@@ -250,12 +268,12 @@ roles:
       },
     };
     const inherited = await service.preview(canonicalWeb(base) as any);
-    expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000 });
+    expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000, interrupt: 'after_tool' });
     expect(inherited.provenance.monitor).toBe('fleet-default');
     const creationCapabilities = await service.capabilities();
     expect(creationCapabilities.monitor).toMatchObject({
       modes: ['fleet', 'native'], injectModes: ['notification'],
-      defaults: { mode: 'native', batch_ms: 5000 },
+      defaults: { mode: 'native', batch_ms: 5000, interrupt: 'after_tool' },
     });
     const explicit = await service.preview({
       ...canonicalWeb(base),

@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
 import {
-  loadConfig, findRole, isolationContextFor, resolveMonitorConfig, resolvePermissions,
+  loadConfig, findRole, isolationContextFor, resolveSnapshotMonitor, resolvePermissions,
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
@@ -532,11 +532,8 @@ export function loadTempRole(name: string): ResolvedRole {
   if (!existsSync(p)) throw new Error(`temp role '${name}' has no snapshot at ${p}`);
   const role = parse(readFileSync(p, 'utf8')) as ResolvedRole;
   // Upgrade snapshots written before monitor.mode/interrupt existed. A snapshot
-  // with no monitor block keeps the historical native/no-supervisor behavior,
-  // and one without interrupt keeps the non-interrupting delivery it ran with.
-  if (role.monitor) role.monitor = resolveMonitorConfig(undefined, {
-    interrupt: false, ...(role.monitor as Partial<ResolvedRole['monitor']>),
-  });
+  // with no monitor block keeps the historical native/no-supervisor behavior.
+  if (role.monitor) role.monitor = resolveSnapshotMonitor(role.monitor);
   (role as ResolvedRole & { __temp?: boolean }).__temp = true;
   return role;
 }
