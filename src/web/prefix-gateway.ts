@@ -57,6 +57,8 @@ export function createPrefixGateway(options: GatewayOptions) {
     for (const key of Object.keys(headers)) if (key.startsWith('x-forwarded-') || key === 'forwarded') delete headers[key];
     if (route.service) {
       if (auth) for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-ours-api-token']) delete headers[name];
+      // The server gateway lets this header choose a producer credential; only machine producers send it directly there.
+      delete headers['x-ours-notifications-producer'];
       if (route.service.stripBrowserContext) {
         for (const name of ['origin', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user']) delete headers[name];
       }

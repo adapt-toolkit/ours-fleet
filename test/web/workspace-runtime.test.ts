@@ -55,6 +55,10 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
   const upstream=await browserRequest(origin+'/messenger/api/workspace/enroll',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:'{}'});expect(upstream.status).toBe(200);
   expect(observed.at(-1)).toEqual({url:'/messenger/api/workspace/enroll',authorization:undefined,token:'fixture-server-credential-32-characters',origin:providerOrigin,csrf:'1'});
   expect((await browserRequest(origin+'/messenger/api/identity',{headers:{...headers,Authorization:'Bearer invalid'}})).status).toBe(401);
+  // The account App reads the shared notification inbox through the same authenticated server gateway.
+  const summary=await browserRequest(origin+'/notifications/api/v1/summary',{headers:{...headers,Origin:appOrigin,'Sec-Fetch-Site':'cross-site','X-Ours-Notifications-Producer':'p'.repeat(43)}});expect(summary.status).toBe(200);
+  expect(summary.headers.get('access-control-allow-origin')).toBe(appOrigin);
+  expect(observed.at(-1)).toEqual({url:'/notifications/api/v1/summary',authorization:undefined,token:'fixture-server-credential-32-characters',origin:undefined,csrf:undefined});
   const linked=await browserRequest(origin+'/fleet/api/v1/devices/link',{method:'POST',headers});expect(linked.status).toBe(200);const secondLink=await linked.json();
   const secondResponse=await browserRequest(origin+'/fleet/api/v1/devices/enroll',{method:'POST',headers:{Host:host,Origin:appOrigin,'Content-Type':'application/json'},body:JSON.stringify({...secondLink,label:'Second browser'})});const second=await secondResponse.json();
   expect((await browserRequest(origin+'/fleet/api/v1/devices/'+first.device.id,{method:'DELETE',headers})).status).toBe(200);

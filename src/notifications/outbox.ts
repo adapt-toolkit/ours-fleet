@@ -1,17 +1,58 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { readPrivateFile } from '@ours.network/sdk/connector';
+import { readClientProfile } from '../client-profile.js';
 
 export interface NotificationInput { eventId: string; title: string; body: string; url: string; }
 interface Entry { id: string; value: unknown; payload?: NotificationInput; }
-export interface ProducerConfig { origin: string; token: string; }
-export function producerConfig(env: NodeJS.ProcessEnv = process.env): ProducerConfig | undefined {
+export interface ProducerConfig {
+  /** Service base URL. With a gateway credential it is the server gateway's notifications route. */
+  origin: string;
+  token: string;
+  /** Daemon API credential that authenticates this client to the server gateway. */
+  gatewayCredential?: string;
+}
+type ProfileLocation = { serverUrl: string; expectedInstanceId: string; credentialPath: string };
+function defaultProfile(): ProfileLocation | undefined {
+  try { return readClientProfile(); } catch { return undefined; }
+}
+/** The installer delivers the producer credential beside the profile credential, bound to that server installation. */
+export const PRODUCER_CREDENTIAL_FILE = 'notifications-producer.json';
+const loopback = (url: URL) => ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname);
+export function producerConfig(env: NodeJS.ProcessEnv = process.env, profile: () => ProfileLocation | undefined = defaultProfile,
+  warn: (message: string) => void = () => {}): ProducerConfig | undefined {
   const origin = env.OURS_NOTIFICATIONS_ORIGIN, token = env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;
-  if (!origin && !token) return;
-  if (!origin || !token || token.length < 32) throw new Error('notifications producer requires origin and scoped token');
-  const url = new URL(origin);
-  if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin || url.username || url.password) throw new Error('invalid notification service origin');
-  if (url.protocol === 'http:' && !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)) throw new Error('notification credentials require HTTPS or loopback');
-  return { origin, token };
+  if (origin || token) {
+    if (!origin || !token || token.length < 32) throw new Error('notifications producer requires origin and scoped token');
+    const url = new URL(origin);
+    if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin || url.username || url.password) throw new Error('invalid notification service origin');
+    if (url.protocol === 'http:' && !loopback(url)) throw new Error('notification credentials require HTTPS or loopback');
+    return { origin, token };
+  }
+  const selected = profile();
+  if (!selected) return;
+  const file = join(dirname(selected.credentialPath), PRODUCER_CREDENTIAL_FILE);
+  if (!existsSync(file)) return;
+  // Reasons are fixed text: parser and file errors can quote the secret-bearing contents.
+  let reason = 'it is not a private owner-only file';
+  try {
+    const text = readPrivateFile(file, 4096).toString('utf8');
+    reason = 'it is not valid producer JSON';
+    const bound = JSON.parse(text);
+    reason = 'it belongs to another server installation';
+    if (!bound || bound.schema !== 1 || bound.serverUrl !== selected.serverUrl || bound.expectedInstanceId !== selected.expectedInstanceId) throw new Error();
+    reason = 'its credential is invalid';
+    if (typeof bound.token !== 'string' || bound.token.length < 32) throw new Error();
+    reason = 'the server requires HTTPS or loopback';
+    const server = new URL(selected.serverUrl);
+    if (server.protocol !== 'https:' && !(server.protocol === 'http:' && loopback(server))) throw new Error();
+    reason = 'the client credential is unreadable';
+    const gatewayCredential = readPrivateFile(selected.credentialPath, 4096).toString('utf8').trim();
+    return { origin: selected.serverUrl.replace(/\/$/, '') + '/notifications', token: bound.token, gatewayCredential };
+  } catch {
+    warn(`Notifications are not produced: ${file} is unusable (${reason}). Re-run the installer to repair it.`);
+    return;
+  }
 }
 
 /** Durable producer queue. Service dedupe makes crash-after-acceptance replay safe. */
@@ -60,7 +101,9 @@ export class NotificationOutbox {
         if (!entry.payload) this.persist(this.entries.map(e => e.id === entry.id ? { ...e, payload: value } : e));
         const response = await fetch(this.config.origin + '/api/v1/send', {
           method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
-          headers: { Authorization: `Bearer ${this.config.token}`, 'Content-Type': 'application/json' },
+          headers: { ...(this.config.gatewayCredential
+            ? { 'X-Ours-Api-Token': this.config.gatewayCredential, 'X-Ours-Notifications-Producer': this.config.token }
+            : { Authorization: `Bearer ${this.config.token}` }), 'Content-Type': 'application/json' },
           body: JSON.stringify(value),
         });
         await response.body?.cancel();

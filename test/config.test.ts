@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { loadConfig, findRole, validateMonitorConfig, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
 import { writeV2Fixture } from './v2-fixture.js';
+import '../src/harness/hermes.js';
 
 let dir: string;
 beforeEach(() => {
@@ -553,7 +554,29 @@ describe('loadConfig monitor', () => {
     ]);
     expect(a.monitor.batch_ms).toBe(2000);
     expect(a.monitor.inject).toBe('notification');
-    expect(a.monitor.interrupt).toBe(false);
+    expect(a.monitor.interrupt).toBe('after_tool');
+  });
+
+  it('defaults every supporting harness to after_tool and Hermes to no interrupt', () => {
+    base(
+      'defaults:\n  harness: codex\nroles:\n  A: {}\n  B:\n    harness: claude-code\n'
+      + '  H:\n    harness: hermes\n    model: fixture-model\n  N:\n    monitor:\n      mode: native\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'N').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'H').monitor.interrupt).toBe(false);
+  });
+
+  it('keeps an explicit interrupt over the harness default', () => {
+    base(
+      'defaults:\n  monitor:\n    interrupt: false\nroles:\n  A: {}\n'
+      + '  B:\n    monitor:\n      interrupt: true\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe(false);
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe(true);
   });
 
   it('inherits defaults.monitor.enabled and lets a role override it', () => {

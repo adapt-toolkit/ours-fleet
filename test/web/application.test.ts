@@ -401,7 +401,7 @@ roles: {}
       name: 'TrustedCaller', harness: 'codex', session: 'acp', identity: 'TrustedCaller',
       agentSelections: { brain: { inline: { harness: 'codex' } }, role: { inline: {} } },
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
-      monitor: { mode: 'native', interrupt: false }, sourceFile: configPath,
+      monitor: { mode: 'native', interrupt: 'after_tool' }, sourceFile: configPath,
     } as any;
     const managedPlan = direct.previewSpawn({ origin: 'managed', caller,
       options: { name: 'ManagedParity', temp: true } });
@@ -431,6 +431,9 @@ roles: {}
     const directRole = role('DirectParity');
     const managedRole = role('ManagedParity');
     const webRole = role('WebParity');
+    // Without an explicit interrupt, every creation path persists the after_tool default.
+    expect(directRole.monitor).toMatchObject({ interrupt: 'after_tool' });
+    expect(preview.effective.monitor).toMatchObject({ interrupt: 'after_tool' });
     for (const key of ['harness', 'session', 'permissions', 'monitor']) {
       expect(webRole[key]).toEqual(directRole[key]);
       expect(managedRole[key]).toEqual(directRole[key]);
