@@ -179,7 +179,7 @@ browser; every screen is in the App.
 
 \`\`\`sh
 npm i -g @ours.network/fleet
-ours-fleet setup-tunnel                # connect this host to your App workspace
+ours-fleet setup-tunnel --file /private/setup.txt # connect host; prints QR and connection code
 ours-fleet link-device                 # connect another browser or device
 \`\`\`
 

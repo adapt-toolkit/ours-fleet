@@ -146,7 +146,7 @@ browser: every screen belongs to the App, which calls this API with a device
 credential. Any address outside `/api/` answers JSON `404`.
 
 ```sh
-ours-fleet setup-tunnel                # connect this host to your App workspace
+ours-fleet setup-tunnel <encoded-v2-grant> # App command; prints QR and connection code
 ours-fleet link-device                 # connect another browser or device
 # choose a free port for an isolated test:
 ours-fleet web serve --port 0
@@ -1806,3 +1806,42 @@ See [Room layouts](docs/room-layouts.md) for YAML examples and CLI commands.
 Configure the web backend with `OURS_NOTIFICATIONS_ORIGIN` and a Fleet-scoped `OURS_NOTIFICATIONS_PRODUCER_TOKEN`. It reads each local supervisor ledger incrementally with persistent checkpoints under web state, correlating owner browser/channel prompts with terminal completion. Monitor/startup turns do not notify. First installation skips existing history; no agent restart or conversation controller is needed. Persist web state across deployment/restarts. Reads are bounded to 256 KiB per role per tick, and oversized model/media records are skipped across chunks. Expose `/notifications` through the generic authenticated prefix gateway with a server-side user token and `stripBrowserContext: true`; producer tokens stay server-side. All browser sessions of this single-owner console map to one stable notification account. See [ours-notifications](https://github.com/adapt-toolkit/ours-notifications) for configuration/API/release details.
 
 Existing-host enrollment: `ours-fleet workspace-enroll --file <private-file> --preserve-profile` requires Messenger to advertise preservation support before any enrollment POST. It omits Name/Surname and leaves existing/absent profile untouched. Existing Fleet models and agents are retained; the installer must skip init when its configuration exists. Signed root proof, tunnel setup and device QR issuance remain the normal enrollment flow. Older Messenger fails closed and requires its preservation-capable release.
+
+### Connect an installed host to the App
+
+Install Ours network first. In the App's tunnel step, copy the single command and
+paste it on the intended host, including in an SSH session on a VPS:
+
+```sh
+ours-fleet setup-tunnel <encoded-v2-grant>
+```
+
+The base64url argument contains only the existing v2 grant: `version: 2`, allowed
+`appOrigin`, one-use `code`, and `expiresAt`. It names the workspace indirectly
+through a server-held grant; it includes no broad Cloudflare credential or
+installer script. The grant can appear in shell history and process listings:
+keep the command private and remove it from history after use. Base64 is encoding,
+not encryption. The server enforces its short expiry and one-time redemption.
+Fleet never prints the grant; it checks host prerequisites before redeeming it
+over HTTPS POST, with the code in the body rather than a URL. The response supplies
+only the existing scoped connector and signed-root enrollment data; authorization,
+account-origin checks and private connector token-file storage remain enforced.
+
+Optional private transports remain available: `setup-tunnel --file /private/grant`
+requires an owned regular file with mode 600; `setup-tunnel --stdin` reads a secure
+pipe with a 32KiB limit and refuses a terminal. Legacy v1 payloads, which contain
+long-lived scoped credentials, are accepted only through file/stdin, never as
+command arguments. Use only one payload transport.
+
+After service and signed tunnel-target confirmation, setup prints both a QR and
+ordinary private single-use connection code. The App checks readiness automatically
+and immediately opens the code field. If setup or code output fails after binding,
+fix the reported problem and run `ours-fleet setup-tunnel --resume`; its private
+pending record remains until the code is printed, including confirmed nondefault
+ports. `ours-fleet link-device` still generates another code for additional browsers
+or expired codes. `--check` checks prerequisites without consuming a grant.
+
+Prerelease rollout requires this Fleet capability to be published first, then the
+installer's normal generated version/integrity lock updated, then installer and
+App released. The currently pinned Fleet nightly.41 does not support v2 grants.
+These source changes do not publish, merge, or deploy any component.

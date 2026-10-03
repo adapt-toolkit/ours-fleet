@@ -37,8 +37,10 @@ export interface PendingTunnelSetup {
   challenge: WorkspacePayload['challenge'];
   /** Fleet configuration the setup started with; a resume must use the same one. */
   configuration: string;
-  /** Every port sent to the account as the tunnel target. No answer was confirmed while this record exists, so the remote target is any of these or the default. */
+  /** Every port sent to the account as the tunnel target. Without confirmedPort, the remote target may be any of these or the default. */
   requestedPorts?: number[];
+  /** Last positively confirmed target; cleared before any new retarget request. */
+  confirmedPort?: number;
 }
 const pendingPath = (): string => join(stateRoot(), 'workspace', 'pending-setup.json');
 
@@ -55,6 +57,7 @@ export function readPendingTunnelSetup(): PendingTunnelSetup {
   if (typeof pending?.appOrigin !== 'string' || typeof pending.origin !== 'string' || typeof pending.hostWorkspaceId !== 'string'
     || typeof pending.rootCid !== 'string' || !pending.challenge || !Number.isSafeInteger(pending.challenge.expiresAt) || typeof pending.configuration !== 'string'
     || (pending.requestedPorts !== undefined && (!Array.isArray(pending.requestedPorts) || !pending.requestedPorts.every(Number.isInteger)))) throw Error('Unfinished tunnel setup record is invalid');
+  if (pending.confirmedPort !== undefined && (!Number.isInteger(pending.confirmedPort) || pending.confirmedPort < 1024 || pending.confirmedPort > 65535)) throw Error('Unfinished tunnel setup record is invalid');
   return pending;
 }
 
@@ -64,6 +67,7 @@ export const DEFAULT_TUNNEL_PORT = 49_271;
  * the tunnel. Unknown when a different port was requested and never confirmed.
  */
 export function requiredPortAfterExpiry(pending: PendingTunnelSetup): number {
+  if (pending.confirmedPort !== undefined) return pending.confirmedPort;
   const other = [...new Set(pending.requestedPorts ?? [])].filter(port => port !== DEFAULT_TUNNEL_PORT);
   if (!other.length) return DEFAULT_TUNNEL_PORT;
   throw Error(`The setup window has expired and it is unknown whether the tunnel points at port ${[...other, DEFAULT_TUNNEL_PORT].join(' or ')}: the account's answer to a port request was not received. This setup cannot be finished automatically`);
