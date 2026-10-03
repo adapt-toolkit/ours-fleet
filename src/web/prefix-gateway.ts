@@ -13,12 +13,31 @@ export interface ServiceTarget {
   headers?: Record<string, string>;
   /** Dedicated credential-authenticated services reject direct browser context. */
   stripBrowserContext?: boolean;
+  /**
+   * Service paths (below the prefix) where the account App may open a WebSocket with its device
+   * credential. A browser cannot set Authorization on a WebSocket, so only there it is accepted
+   * as a subprotocol.
+   */
+  deviceSocketPaths?: string[];
 }
 export interface GatewayOptions {
   /** Backend mode is for a separate loopback machine-client listener; browsers are rejected. */
   auth: WebAuth | 'backend';
   fleetOrigin: string;
   services: ServiceTarget[];
+}
+/** The App offers exactly these two subprotocols; only the marker is ever answered or forwarded. */
+const DEVICE_SOCKET_PROTOCOL = 'ours.workspace.v1';
+const DEVICE_SOCKET_BEARER = 'ours.workspace.bearer.';
+/** The device credential a WebSocket offered as a subprotocol; undefined when it offered none of ours. */
+function deviceSocketCredential(req: IncomingMessage): string | undefined {
+  const offered = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  if (!offered.some(value => value === DEVICE_SOCKET_PROTOCOL || value.startsWith(DEVICE_SOCKET_BEARER))) return undefined;
+  const credentials = offered.filter(value => value.startsWith(DEVICE_SOCKET_BEARER));
+  const token = credentials[0]?.slice(DEVICE_SOCKET_BEARER.length) ?? '';
+  if (offered.length !== 2 || credentials.length !== 1 || !offered.includes(DEVICE_SOCKET_PROTOCOL) || !/^[A-Za-z0-9_.-]{16,256}$/.test(token))
+    throw new Error('invalid workspace socket subprotocol');
+  return token;
 }
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 function headersFor(message: IncomingMessage): OutgoingHttpHeaders {
@@ -48,7 +67,18 @@ export function createPrefixGateway(options: GatewayOptions) {
   };
   const prepare = (req: IncomingMessage, upgrade = false) => {
     const route = select(req);
-    const request = { headers: req.headers, method: req.method, url: route.path } as FastifyRequest;
+    // The device credential of an App WebSocket: accepted only on an upgrade, from the exact
+    // account origin, on a path the service declares, and never beside another credential.
+    const socketCredential = upgrade && auth ? deviceSocketCredential(req) : undefined;
+    if (socketCredential !== undefined) {
+      const path = route.service ? (req.url ?? '/').split('?')[0].slice(route.service.prefix.length) : undefined;
+      if (!route.service?.deviceSocketPaths?.includes(path ?? '') || req.headers.authorization !== undefined || req.headers.cookie !== undefined
+          || !req.headers.origin || auth!.accountOrigin(req as unknown as FastifyRequest) !== req.headers.origin)
+        throw new Error('workspace socket credential is not accepted here');
+    }
+    // Authentication sees the credential as the bearer it is; the request's own headers are untouched.
+    const authHeaders = socketCredential !== undefined ? { ...req.headers, authorization: `Bearer ${socketCredential}` } : req.headers;
+    const request = { headers: authHeaders, method: req.method, url: route.path } as FastifyRequest;
     if (!auth && (req.headers.origin || req.headers['sec-fetch-site'] || !route.service)) throw new Error('machine-client listener rejects browser requests');
     auth?.validateBoundary(request, upgrade);
     const session = route.service && auth ? auth.authenticate(request, !upgrade && !['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) : undefined;
@@ -66,12 +96,14 @@ export function createPrefixGateway(options: GatewayOptions) {
       headers.host = new URL(route.origin).host;
     }
     if (upgrade) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }
-    return { ...route, headers, session };
+    // The credential subprotocol ends here: the service is not offered it, on any request.
+    if (socketCredential !== undefined || String(headers['sec-websocket-protocol'] ?? '').includes(DEVICE_SOCKET_BEARER)) delete headers['sec-websocket-protocol'];
+    return { ...route, headers, session, authHeaders, deviceSocket: socketCredential !== undefined };
   };
-  const track = (req: IncomingMessage, session: { id: string } | undefined, close: () => void) => {
+  const track = (authHeaders: IncomingMessage['headers'], session: { id: string } | undefined, close: () => void) => {
     if (!session) return () => {};
     const unbind = auth!.bindTransport(session.id, close);
-    const timer = setInterval(() => { try { auth!.authenticate({ headers: req.headers } as FastifyRequest); } catch { close(); } }, 30_000);
+    const timer = setInterval(() => { try { auth!.authenticate({ headers: authHeaders } as FastifyRequest); } catch { close(); } }, 30_000);
     timer.unref();
     return () => { clearInterval(timer); unbind(); };
   };
@@ -122,7 +154,7 @@ export function createPrefixGateway(options: GatewayOptions) {
       if (!res.headersSent) res.writeHead(502, { ...(route.service ? cors : {}), 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { code: 'upstream_unavailable', message: 'Service is unavailable' } }));
     });
-    const untrack = track(req, route.session, () => { upstream.destroy(); res.destroy(); });
+    const untrack = track(route.authHeaders, route.session, () => { upstream.destroy(); res.destroy(); });
     res.on('close', untrack);
     req.on('aborted', () => upstream.destroy());
     res.on('close', () => upstream.destroy());
@@ -141,10 +173,12 @@ export function createPrefixGateway(options: GatewayOptions) {
       const headers = headersFor(response);
       headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
       delete headers['set-cookie'];
+      // A browser that offered subprotocols needs one answered; only the marker, never the credential.
+      if (route.deviceSocket) headers['sec-websocket-protocol'] = DEVICE_SOCKET_PROTOCOL;
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(headers).flatMap(([k, v]) => (Array.isArray(v) ? v : [v]).map(value => `${k}: ${value}\r\n`)).join('')}\r\n`);
       if (head.length) peer.write(head);
       if (upstreamHead.length) socket.write(upstreamHead);
-      const untrack = track(req, route.session, () => { peer.destroy(); socket.destroy(); });
+      const untrack = track(route.authHeaders, route.session, () => { peer.destroy(); socket.destroy(); });
       socket.on('close', untrack);
       peer.pipe(socket); socket.pipe(peer);
       peer.on('error', () => socket.destroy()); socket.on('error', () => peer.destroy());

@@ -138,6 +138,72 @@ describe('generic service prefix transport', () => {
     const response = await fetch(s.publicOrigin + '/messenger/interrupted', { headers: s.headers, signal: AbortSignal.timeout(1000) });
     await expect(response.arrayBuffer()).rejects.not.toThrow(/timeout/i);
   });
+  it('accepts the App device credential as a WebSocket subprotocol only on a declared service path', async () => {
+    const plainSeen: Array<Record<string, unknown>> = [];
+    const backend = createServer((req, res) => { plainSeen.push({ ...req.headers }); res.end(); }); const origin = await listen(backend);
+    const upstream = new WebSocketServer({ server: backend }); const seen: Array<Record<string, unknown>> = [];
+    upstream.on('connection', (socket, req) => { seen.push({ url: req.url, ...req.headers }); socket.on('message', (bytes, binary) => socket.send(bytes, { binary })); });
+    const dir = mkdtempSync(join(tmpdir(), 'gateway-device-socket-')); const store = new WorkspaceDeviceStore(dir);
+    const appOrigin = 'https://app.ours-tunnel.com';
+    const auth = new WebAuth('http://localhost', 'localhost', Date.now, undefined, undefined, store, appOrigin);
+    const gateway = createPrefixGateway({ auth, fleetOrigin: origin, services: [
+      { prefix: '/notifications', origin, stripBrowserContext: true, headers: { 'x-ours-api-token': 'server-credential' }, deviceSocketPaths: ['/api/v1/presence'] },
+      { prefix: '/messenger', origin, headers: { 'x-ours-api-token': 'server-credential' } },
+    ] });
+    const publicOrigin = await listen(gateway.server); auth.setBoundary(publicOrigin, new URL(publicOrigin).host);
+    cleanups.push(async () => { await gateway.close(); auth.shutdown(); await new Promise<void>(resolve => upstream.close(() => resolve())); backend.closeAllConnections(); await new Promise<void>(resolve => backend.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); });
+    const link = store.mint(); const { token, device } = store.enroll(link.enrollment, link.workspaceId, 'device');
+    const marker = 'ours.workspace.v1', bearer = `ours.workspace.bearer.${token}`;
+    const open = (path: string, protocols: string[], headers: Record<string, string> = { origin: appOrigin }) => new Promise<{ socket?: WebSocket; status?: number; raw?: string }>(resolve => {
+      const socket = new WebSocket(publicOrigin.replace('http:', 'ws:') + path, protocols, { headers });
+      socket.once('open', () => resolve({ socket }));
+      socket.once('unexpected-response', (_req, res) => { resolve({ status: res.statusCode, raw: JSON.stringify(res.headers) }); res.destroy(); });
+      socket.once('error', () => resolve({ status: 0 }));
+    });
+
+    const accepted = await open('/notifications/api/v1/presence', [marker, bearer]);
+    expect(accepted.socket?.protocol).toBe(marker);
+    const reply = once(accepted.socket!, 'message'); accepted.socket!.send('hello'); expect(String((await reply)[0])).toBe('hello');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ url: '/api/v1/presence', 'x-ours-api-token': 'server-credential' });
+    for (const name of ['sec-websocket-protocol', 'authorization', 'origin', 'cookie']) expect(seen[0][name], name).toBeUndefined();
+    expect(JSON.stringify(seen[0])).not.toContain(token);
+    // Revoking the device closes its open socket.
+    const closed = once(accepted.socket!, 'close'); store.revoke(device.id); await closed;
+
+    const again = store.mint(); const second = store.enroll(again.enrollment, again.workspaceId, 'device').token;
+    const good = `ours.workspace.bearer.${second}`;
+    const refused: Array<[string, string, string[], Record<string, string>]> = [
+      ['no Origin', '/notifications/api/v1/presence', [marker, good], {}],
+      ['another Origin', '/notifications/api/v1/presence', [marker, good], { origin: 'https://evil.example' }],
+      ['the host\'s own Origin', '/notifications/api/v1/presence', [marker, good], { origin: publicOrigin }],
+      ['an undeclared path', '/notifications/api/v1/summary', [marker, good], { origin: appOrigin }],
+      ['a service that declares none', '/messenger/api/presence', [marker, good], { origin: appOrigin }],
+      ['a credential without the marker', '/notifications/api/v1/presence', [good], { origin: appOrigin }],
+      ['the marker without a credential', '/notifications/api/v1/presence', [marker], { origin: appOrigin }],
+      ['two credentials', '/notifications/api/v1/presence', [marker, good, bearer], { origin: appOrigin }],
+      ['an extra subprotocol', '/notifications/api/v1/presence', [marker, good, 'chat'], { origin: appOrigin }],
+      ['a malformed credential', '/notifications/api/v1/presence', [marker, 'ours.workspace.bearer.short'], { origin: appOrigin }],
+      ['a revoked credential', '/notifications/api/v1/presence', [marker, bearer], { origin: appOrigin }],
+      ['an Authorization header beside it', '/notifications/api/v1/presence', [marker, good], { origin: appOrigin, authorization: `Bearer ${second}` }],
+      ['a cookie beside it', '/notifications/api/v1/presence', [marker, good], { origin: appOrigin, cookie: 'ofs_session=x' }],
+    ];
+    for (const [name, path, protocols, headers] of refused) {
+      const result = await open(path, protocols, headers);
+      expect(result.socket, name).toBeUndefined(); expect(result.status, name).toBe(401);
+      expect(result.raw ?? '', name).not.toContain(second);
+    }
+    expect(seen).toHaveLength(1);
+    // The machine credential of the server is no device credential.
+    expect((await open('/notifications/api/v1/presence', [marker, 'ours.workspace.bearer.server-credential-server-credential'])).status).toBe(401);
+    // A plain request cannot carry the credential subprotocol to the service either.
+    const plain = await new Promise<number>((resolve, reject) => { const req = sendHttp(publicOrigin + '/notifications/api/v1/summary', { headers: { origin: appOrigin, authorization: `Bearer ${second}`, 'sec-websocket-protocol': `${marker}, ${good}` } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); }); req.on('error', reject); req.end(); });
+    expect(plain).toBe(200);
+    expect(plainSeen).toHaveLength(1);
+    expect(plainSeen[0]['sec-websocket-protocol']).toBeUndefined(); expect(JSON.stringify(plainSeen[0])).not.toContain(second);
+    expect(seen).toHaveLength(1);
+  });
+
   it('proxies WebSocket bytes and closes authenticated connections on logout', async () => {
     const s = await setup((_req, res) => res.end()); const upstream = new WebSocketServer({ server: s.backend });
     upstream.on('connection', socket => socket.on('message', (bytes, binary) => socket.send(bytes, { binary })));
