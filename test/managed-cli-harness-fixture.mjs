@@ -86,8 +86,12 @@ trust_level="trusted"
     assert.equal(outcome.succeeded, true, `${command}\n${JSON.stringify(outcome)}${log}`);
     assert.ifError(providerError);
     const blocks = Array.isArray(result) ? result : [{ text: result }];
-    const execution = blocks.map(b => { try { return JSON.parse(b.text); } catch { return undefined; } }).find(v => v?.exit_code !== undefined);
-    assert(execution, `No completed real shell execution: ${JSON.stringify(result)}${log}`);
+    // Codex truncates a long output (`docs`) in the middle of its JSON envelope; the exit code survives.
+    const raw = blocks.map(b => String(b.text ?? '')).join('\n');
+    const truncated = /"exit_code":(\d+)/u.exec(raw);
+    const execution = blocks.map(b => { try { return JSON.parse(b.text); } catch { return undefined; } }).find(v => v?.exit_code !== undefined)
+      ?? (truncated ? { exit_code: Number(truncated[1]), output: raw } : undefined);
+    assert(execution, `No completed real shell execution: ${JSON.stringify(result).slice(0, 2000)}${log}`);
     return { exitCode: execution.exit_code, output: String(execution.output ?? ''), log };
   } finally { clearTimeout(timeout); await session?.close(); await close(server); }
 }
