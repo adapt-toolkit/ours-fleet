@@ -193,9 +193,18 @@ Linux x86_64 host (kernel 7.0, Node 22.23.1, Codex 0.160.0, Claude Code 2.1.289)
 
 | Full-stack lifecycle (real runner, room, spawned member) | Result |
 | --- | --- |
-| Codex native app-server | PASS |
-| Bundled Codex ACP | PASS (`task finish` re-run once) |
-| Bundled Claude ACP, OS sandbox enabled | PASS (`task start` and `task finish` each re-run once) |
+| Codex native app-server Coordinator, Codex native member | PASS |
+| Bundled Codex ACP Coordinator, Codex ACP member | PASS |
+| Bundled Claude ACP Coordinator (OS sandbox enabled), Codex native member | PASS |
+
+Across repeated runs the re-runs described above occurred zero or one time per
+command; each run prints how many. The spawned member's Agent Template declares
+`managed_cli` itself, and the run asserts what that member's own launch
+prepared: a Codex native member gets its own record, rules in its own workspace
+and a temporary holder; a Codex ACP member with `approval: allow` has no command
+sandbox, so its launch records `not-required` and generates nothing. After
+`task finish` the run asserts that the member's live state, Fleet's room record
+and the Cowork room are gone, and that the member's rules were removed.
 
 Not qualified, and not claimed:
 

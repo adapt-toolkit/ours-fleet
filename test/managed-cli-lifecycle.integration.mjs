@@ -340,13 +340,22 @@ trust_level="trusted"
 
   // The new agent got its own policy from its own launch: record, rules, and a temporary holder.
   assert(member?.name, 'task start created no member state');
-  assert.equal(member.record?.state, 'supported', JSON.stringify(member.record));
-  assert.equal(member.record.mechanism, 'codex-workspace-rules');
-  assert.equal(member.record.paths.configuration, config);
+  assert.equal(member.record?.paths.configuration, config, JSON.stringify(member.record));
   assert.notEqual(member.record.workspace, project, 'the member has its own workspace');
-  assert(member.record.artifact.startsWith(join(member.record.workspace, '.codex', 'rules')), member.record.artifact);
-  assert(member.rules?.includes(`"--managed-configuration",${JSON.stringify(config)},"task","start"]`), `member rules: ${member.rules}`);
-  assert.deepEqual(member.holders, [`temp:${member.name}`]);
+  if (memberSession === 'acp') {
+    // `approval: allow` runs bundled Codex ACP without a command sandbox, so Fleet's launch
+    // preparation correctly generates nothing for this member, and says why.
+    assert.equal(member.record.state, 'not-required', JSON.stringify(member.record));
+    assert.match(member.record.reasons.join(' '), /no command sandbox stands between it and the supervisor/u);
+    assert.equal(member.rules, undefined);
+    assert.equal(existsSync(join(member.record.workspace, '.codex', 'rules')), false);
+  } else {
+    assert.equal(member.record.state, 'supported', JSON.stringify(member.record));
+    assert.equal(member.record.mechanism, 'codex-workspace-rules');
+    assert(member.record.artifact.startsWith(join(member.record.workspace, '.codex', 'rules')), member.record.artifact);
+    assert(member.rules?.includes(`"--managed-configuration",${JSON.stringify(config)},"task","start"]`), `member rules: ${member.rules}`);
+    assert.deepEqual(member.holders, [`temp:${member.name}`]);
+  }
 
   // Retirement, checked where it happened rather than inferred from the task state.
   assert.equal(existsSync(member.stateDir), false, 'the member\'s live state is still there');
@@ -357,7 +366,10 @@ trust_level="trusted"
   assert.equal((await adapter.listRooms()).some(room => room.room_id === roomId), false);
   // The member's rules go with it: the next setup finds no holder left and removes the file.
   const after = JSON.parse((await operator(['managed-cli', 'setup', '--configuration', config, '--json'])).stdout);
-  assert.equal(existsSync(member.record.artifact), false, JSON.stringify(after.removed));
+  if (member.record.artifact) assert.equal(existsSync(member.record.artifact), false, JSON.stringify(after.removed));
+  const prepared = memberSession === 'acp'
+    ? 'its own launch recorded that no policy is required (Codex ACP with approval: allow has no command sandbox) and generated nothing'
+    : 'its own launch prepared it (record supported, rules in its workspace, temporary holder)';
   const ledger = JSON.parse(readFileSync(join(agentDir('Coordinator'), '.fleet-command-audit.json'), 'utf8')).attempts;
   // Finishing the task erases its rows' words to hashes; the pin flag stays recognisable.
   const { erasedArg } = await import('../dist/erased-resources.js');
@@ -372,7 +384,7 @@ trust_level="trusted"
   for (const form of ['task create', 'task start', 'task review', 'task finish', 'room show', 'room members']) assert(observed.includes(form), `${form} not observed: ${JSON.stringify(status.observed)}`);
   console.log(`PASS ${label}: real runner launched the Coordinator with Fleet-prepared policy; unpinned CLI denied at the socket`);
   console.log(`PASS ${label}: task create -> start (room ${roomId} provisioned, member spawned) -> show/room show/room members -> block/unblock -> review -> finish${reruns ? ` (re-run ${reruns}x while the member was still stopping)` : ''}, all pinned, all audited; task is done`);
-  console.log(`PASS ${label}: the spawned member ${member.name} declared the workflow through its Agent Template and its own launch prepared it (record supported, rules in its workspace, temporary holder); after finish its live state, the Fleet room record and the Cowork room are gone and its rules were removed`);
+  console.log(`PASS ${label}: the spawned member ${member.name} declared the workflow through its Agent Template and ${prepared}; after finish its live state, the Fleet room record and the Cowork room are gone${member.record.artifact ? ' and its rules were removed' : ''}`);
   console.log(`QUALIFIED ${label}: node ${process.version}; ${audited.length} audited pinned invocations`);
 } catch (error) { failure = error; throw error; } finally {
   clearTimeout(watchdog);
