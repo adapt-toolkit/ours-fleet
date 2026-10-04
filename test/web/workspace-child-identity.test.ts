@@ -213,6 +213,22 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
 });
 
 describe('signed registration retirement from an existing installation',()=>{
+  it('waits for signed absence confirmation when the migrated service has no old registration',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')),before=readFileSync(join(h.workspace,'binding.json'),'utf8');
+    h.payload.challenge.workspaceId='r'.repeat(43);
+    const sent=h.did('sendCommand').length;let polls=0;
+    const request=(async()=>{
+      expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+      if(++polls===1)return new Response(null,{status:404});
+      expect(h.did('sendCommand')).toHaveLength(sent+1);
+      return new Response(JSON.stringify({deleted:true,retired:true}));
+    }) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(polls).toBe(2);
+    expect(h.did('sendCommand').at(-1)?.[1]).toMatchObject({contact:SERVER,command:'unregister-workspace',arguments:{workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,replacement:{workspaceId:'r'.repeat(43)}}});
+    expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+  });
   it('uses the bound Messenger root without taking a second root lease',async()=>{
     const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);const installed=await h.enroll();
     const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));h.behaviour.messengerCid=ROOT;h.behaviour.messengerRoot=undefined;
