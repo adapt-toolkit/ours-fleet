@@ -91,9 +91,9 @@ export async function finishWorkspaceReplacement(record: PendingWorkspaceReplace
 } = {}): Promise<{origin: string; hostWorkspaceId: string; rootCid: string}> {
   const current = readWorkspaceBinding();
   if (!current || (current.workspaceId===record.previous.workspaceId ? (current.appOrigin!==record.previous.appOrigin || current.serverCid.toUpperCase()!==record.previous.serverCid.toUpperCase() || current.hostWorkspaceId!==record.previous.hostWorkspaceId) : !sameWorkspaceBinding(current, record.payload))) throw Error('Workspace binding changed during replacement; review it before continuing');
-  if (record.cleaned && sameWorkspaceBinding(current, record.payload)) {
-    return {origin: `https://${record.payload.hostname}`, hostWorkspaceId: current.hostWorkspaceId, rootCid: record.rootCid!};
-  }
+  // A saved successor binding may predate a refreshed challenge. Enrollment
+  // checks the exact proof receipt: it reuses confirmed proof, or signs the new
+  // challenge, rather than assuming every challenge for this binding is done.
   if (!record.retired) {
     const manager=new WebServiceManager(),service=manager.readMetadata();
     if(service?.configuration && resolve(service.configuration)!==record.configuration)throw Error('Installed web service uses another configuration; existing setup preserved');

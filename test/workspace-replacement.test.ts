@@ -41,5 +41,14 @@ describe('registration replacement consent and recovery',()=>{
    }
    expect(()=>refreshWorkspaceReplacement(record,h.payload,join(h.dir,'other.yaml'))).toThrow('original configuration');
  });
+ it('proves a refreshed challenge even when the successor binding committed before setup recovery was saved',async()=>{
+   const h=host(),record=beginWorkspaceReplacement(h.previous,h.payload,h.config);record.retired=true;record.cleaned=true;record.rootCid=ROOT;
+   writeFileSync(join(h.workspace,'binding.json'),JSON.stringify({...h.previous,workspaceId:h.payload.challenge.workspaceId}),{mode:0o600});
+   const fresh={...h.payload,challenge:{...h.payload.challenge,nonce:'f'.repeat(43),expiresAt:Date.now()+600000}};
+   refreshWorkspaceReplacement(record,fresh,h.config);
+   const unregister=vi.fn(),cleanup=vi.fn(),enroll=vi.fn(async()=>({origin:'https://new-home.ours-tunnel.com',hostWorkspaceId:h.previous.hostWorkspaceId,rootCid:ROOT}));
+   await finishWorkspaceReplacement(readWorkspaceReplacement()!,{unregister,cleanup,enroll});
+   expect(enroll).toHaveBeenCalledOnce();expect(enroll.mock.calls[0][0].challenge.nonce).toBe(fresh.challenge.nonce);expect(unregister).not.toHaveBeenCalled();expect(cleanup).not.toHaveBeenCalled();
+ });
  it('revokes only account links and pending link codes; preserves host ID, local data and owner invite',async()=>{const h=host();writeFileSync(h.config,'retained agents config');writeFileSync(join(h.workspace,'owner.invite'),'retained owner');for(const file of ['connector','tunnel.json','pending-setup.json'])writeFileSync(join(h.workspace,file),'old');const devices=new WorkspaceDeviceStore();const code=devices.mint(),link=devices.enroll(code.enrollment,code.workspaceId,'old browser'),pending=devices.mint();devices.close();await clearReplacedWorkspaceLocalState();const after=new WorkspaceDeviceStore();try{expect(after.workspaceId).toBe(h.previous.hostWorkspaceId);expect(()=>after.authenticate(link.token)).toThrow();expect(()=>after.enroll(pending.enrollment,pending.workspaceId,'late old browser')).toThrow();}finally{after.close();}expect(readFileSync(h.config,'utf8')).toBe('retained agents config');expect(readFileSync(join(h.workspace,'owner.invite'),'utf8')).toBe('retained owner');expect(existsSync(join(h.workspace,'binding.json'))).toBe(true);for(const file of ['connector','tunnel.json','pending-setup.json'])expect(existsSync(join(h.workspace,file))).toBe(false);});
 });
