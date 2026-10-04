@@ -286,9 +286,32 @@ ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
+ours-fleet managed-cli setup [--enable <Agent>]... | status [--json]   native harness policy for the task workflow
 ours-fleet version [--json]         build identity, capabilities, installs on PATH
 ours-fleet init
 ```
+
+### Fleet task commands from a harness command sandbox
+
+A Codex or Claude command sandbox refuses the supervisor socket, so a managed
+`ours-fleet` call fails with `connect EPERM` before it parses anything. Fleet
+prepares the native harness policy for the packaged Coordinator task workflow;
+you do not write Codex rules or Claude sandbox settings by hand:
+
+```sh
+ours-fleet managed-cli setup --enable FleetCoordinator   # adds managed_cli: [task-workflow] to that Agent
+ours-fleet managed-cli status                            # static setup, session policy, observed commands
+```
+
+The opt-in is an explicit Agent key and changes no permission. Setup starts no
+session or model, is repeated at every agent start, and `ours-install` runs it
+for you. It prepares `task create|start|finish|block|unblock|review|list|show`,
+`room show|members` and template/plan/help inspection for one pinned
+configuration, and nothing else; `task start`/`task finish` are real authority.
+Qualified end to end on Linux with Codex (native and ACP) and Claude ACP; macOS
+is prepared the same way but not yet qualified. Scope, boundaries, unsupported
+combinations and the evidence are in
+[docs/validation/managed-cli-permissions.md](docs/validation/managed-cli-permissions.md).
 
 ### Which build am I running?
 

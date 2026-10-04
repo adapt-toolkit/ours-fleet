@@ -1,5 +1,170 @@
 # Managed Fleet CLI from Codex and Claude Code workspace sandboxes
 
+> **Use the generated setup.** Since `managed-cli.setup-v1`, Fleet prepares the
+> native policy for the packaged task workflow itself. The hand-written rules
+> further down remain as background and for operations outside that workflow
+> (for example `room delete`).
+
+## Fleet-generated setup (issue #233)
+
+Declare the workflow on the Agent, or let Fleet add the one key for you:
+
+```sh
+ours-fleet managed-cli setup --enable FleetCoordinator   # adds managed_cli: [task-workflow]
+ours-fleet managed-cli setup                             # generate / reconcile, starts nothing
+ours-fleet managed-cli status                            # compare only, exit 1 when not current
+```
+
+The declaration is explicit configuration. It is never inferred from a role or
+display name, and `--enable` changes no permission. The same preparation runs at
+every agent start (`up`, `restart`, `spawn`, task-room agents), so newly created
+agents need no separate step. `ours-install` runs `managed-cli setup` from the
+exact Fleet it installed after `init` and on update.
+
+An agent invokes a prepared command through the pinned entry form printed in its
+briefing:
+
+```sh
+/abs/node /abs/fleet/dist/cli.js --managed-configuration /abs/fleet.yaml task create --title "..." --backlog --no-room
+```
+
+### What is prepared
+
+| Prepared (runs outside the command sandbox) | Not prepared (stays sandboxed) |
+| --- | --- |
+| `task create`, `task start`, `task finish`, `task block`, `task unblock`, `task review`, `task list`, `task show` | `task cancel`, `task delete` |
+| `room show`, `room members` | `room create`, `room delete`, `room close` |
+| `template list`, `template show`, `template validate`, `config`, `docs` | `spawn`, `ours tools`, `ours call`, `status`, `peek`, `send` |
+| `--help`, `task --help`, `room --help`, `template --help` | service administration, identity and contact commands, oversight |
+
+`task start` and `task finish` provision and retire rooms and agents. That is
+real authority, and it is disclosed by `setup`, `status` and the installer.
+
+### Actual invocation boundary
+
+- The native rule fixes four things: the Node executable, this Fleet CLI, the
+  pinned configuration and the command words. It is an argv **prefix** and admits
+  every trailing option and argument. It is not argument validation, target
+  authorization or per-agent isolation.
+- A later `-c`/`--configuration` naming another file is refused by the Fleet CLI
+  after the process has already started outside the sandbox and been audited.
+  That is Fleet runtime validation, not a native policy denial.
+- The pinned form requires a managed session. Outside one, where no supervisor
+  would audit it, the CLI refuses it. Commands outside the inventory are refused
+  by the CLI even if a hand-written rule would admit them.
+- The supervisor audit, CLI validation, confirmations, SDK credential checks and
+  any outer container or host sandbox are unchanged. There is no blanket
+  Node/Bash/Fleet grant, no sandbox is disabled, and no new transport exists.
+- Compound (`&&`, `;`), piped, redirected, `$(...)`, backslash-escaped and
+  `VAR=value`-prefixed command lines do not match and stay sandboxed.
+
+### Quoting, measured natively
+
+Measured with real Codex 0.160.0 and Claude Code 2.1.289 on Linux:
+
+| Spelling | Codex | Claude |
+| --- | --- | --- |
+| Single-quoted CLI / configuration path or option value containing spaces | matches | matches |
+| Double-quoted later token | matches | does not match |
+| Quoted **executable** token | never matches | never matches |
+| Unquoted symlinked executable | matches | matches |
+
+Fleet therefore spells a CLI or configuration path containing spaces in single
+quotes (Codex >= 0.160.0 required; older or unreadable versions are reported as
+unsupported for such paths), and requires the Node executable at a path needing
+no quoting. A path containing a quote, backslash or control character, or one
+inside the agent's workspace, is reported as unsupported rather than widened.
+
+### What is written, and ownership
+
+- **Codex**: `<workspace>/.codex/rules/ours-fleet-<id>.rules`, one file per Fleet
+  configuration, carrying a Fleet marker header. It applies to every trusted
+  Codex session in that workspace, not to one identity, and Codex must already
+  trust the workspace: Fleet reports missing trust and never changes it. A file
+  shared by several agents is held in `~/.ours-fleet/managed-cli/registry.json`
+  and removed only when its last holder is gone. Files without the Fleet marker,
+  including a hand-written `ours-fleet.rules`, are never modified; one occupying
+  the generated name is reported as a conflict.
+- **Claude**: `permissions.allow` and `sandbox.excludedCommands` entries in the
+  agent's own Fleet settings overlay, delivered to the bundled ACP adapter. The
+  operator's Claude settings are not modified. Fleet never sets
+  `sandbox.enabled`; if no readable settings file enables the OS sandbox, or a
+  `deny` rule would override the entries, `status` and `doctor` say so.
+- Setup is idempotent. Changed Node/CLI/configuration paths rewrite the Fleet
+  entries; entries for agents or configurations that no longer exist are removed
+  and listed.
+
+### Diagnostics
+
+`ours-fleet doctor` and `managed-cli status` report three separate facts:
+
+| Row | Source | Meaning |
+| --- | --- | --- |
+| setup | generated files compared with this installation | static configuration only |
+| session | the role's launch record | whether the last start loaded the current policy, or a restart is required |
+| observed | the supervisor audit ledger | which pinned forms actually completed since that start |
+
+A prepared setup is not evidence of supervisor access. An observed `--help`
+proves only its own audited path; lifecycle forms that were never observed are
+listed as such. Rows from before the current launch are reported as historical.
+
+### Unsupported combinations
+
+Reported, with the reason, and left exactly as sandboxed as before: Windows and
+other platforms; Hermes and other harnesses; custom ACP or app-server session
+commands; roles declaring `isolation:`; unspellable or in-workspace paths; a
+Node path needing quotes; Codex older than 0.160.0 with quoted paths.
+
+### Qualification
+
+`test/managed-cli-workflow.integration.mjs` runs real Codex / Claude Code through
+Fleet's own adapters and launch preparation against a real supervisor control
+server and audit ledger. A scripted local provider only requests commands; no
+external model, account, production identity or room is used.
+
+```sh
+FLEET_TEST_HARNESS=codex FLEET_CODEX_BIN=/absolute/codex FLEET_TEST_SESSION=codex-app-server \
+FLEET_TEST_TMP_PREFIX=/absolute/private-test-parent/fleet-mc- \
+node test/managed-cli-workflow.integration.mjs
+```
+
+Use `FLEET_TEST_SESSION=acp` for bundled Codex ACP, and
+`FLEET_TEST_HARNESS=claude FLEET_CLAUDE_BIN=/absolute/claude` for bundled Claude
+ACP. `FLEET_TEST_QUOTED=1` installs the CLI and configuration under paths
+containing spaces. `FLEET_TEST_CLAUDE_SANDBOX=0` checks the diagnostics when the
+operator has not enabled Claude's sandbox. `FLEET_TEST_NESTED_SANDBOX=1` is for
+unprivileged containers only. `FLEET_TEST_EVIDENCE=/file.json` records every
+command, exit code and output.
+
+Each run checks: unpinned `--help` denied at the socket; an unrelated write
+outside the workspace still denied by the OS; pinned help; `task create` with
+quoted variable options, `task list|show|block|unblock`, template and plan
+inspection completing with audit rows; `task review|start|finish` and
+`room show|members` reaching the supervisor and Fleet validation; a late
+`--configuration` refused by Fleet; unprepared commands, a missing or different
+pin, preload injection, chaining and redirection staying sandboxed; and `status`
+listing exactly the forms the audit ledger observed.
+
+Linux x86_64 host (kernel 7.0, Node 22.23.1, Codex 0.160.0, Claude Code 2.1.289):
+
+| Harness / session | Plain paths | Paths with spaces |
+| --- | --- | --- |
+| Codex native app-server | PASS | PASS |
+| Bundled Codex ACP | PASS | PASS |
+| Bundled Claude ACP, OS sandbox enabled | PASS | PASS |
+| Bundled Claude ACP, OS sandbox not enabled (diagnostic) | PASS | not run |
+
+Not qualified, and not claimed:
+
+- **macOS.** The generated setup has not been run there. `managed-cli status`
+  discloses this on macOS. The mechanisms are the ones the hand-written policy
+  below used on macOS, but that is not a run of this matrix.
+- **Real provisioning.** `task start`, `task finish`, `task review` and
+  `room show|members` are proven to leave the sandbox, be audited and reach
+  Fleet validation. A live room with launched agents was not provisioned.
+- Claude standalone, Hermes, Windows, isolated roles, and service-managed
+  (systemd / launchd) supervisors: the fixture uses an in-process supervisor.
+
 A managed Fleet CLI invocation sends `fleet_audit_begin` to the supervisor's Unix
 socket before parsing commands, including `--help`. A socket that exists and is
 owned by the current user can still return `connect EPERM` from a restricted
@@ -7,7 +172,7 @@ command sandbox. This is not evidence that the supervisor is down or Fleet needs
 reinstallation. Check filesystem permissions too: `EACCES`/`EPERM` alone does not
 identify which policy denied access.
 
-## Use native execution rules, without a new transport
+## Background: hand-written native execution rules
 
 Keep the role's `approval: auto`, `filesystem: workspace`, and `unattended: deny`.
 For an operator authorized to manage rooms, explicitly approve the necessary CLI
@@ -57,8 +222,9 @@ No runtime services or installed packages need restarting for this policy change
   outside the command sandbox. These restrictions take precedence; do not remove
   them implicitly to make Fleet work.
 - On tested Codex 0.159.0, quoting the executable/script tokens prevented the rule
-  from granting execution outside the sandbox. Use the canonical simple-token
-  invocation above. Paths needing shell quoting have not been qualified.
+  from granting execution outside the sandbox. For hand-written rules use the
+  canonical simple-token invocation above. The generated setup qualifies quoted
+  script and argument paths on Codex 0.160.0; see "Quoting, measured natively".
 - Merely enabling network inside the Linux command sandbox was insufficient:
   its user namespace maps ancestor directory owners to UID 65534, which the SDK's
   strict credential ancestry checks reject. Approved CLI execution avoids that

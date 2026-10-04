@@ -449,7 +449,7 @@ async function spawnTempInner(
   storeRoomSecret(role);
   if (role.roomMemberStartup) role.roomMemberStartup = { ...role.roomMemberStartup, invite: '' };
   onStage?.('writing_role');
-  const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
+  const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified', configPath: o.configPath });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
     settings: provenanceSettings(o, cfg.defaults, preparedRole.temporaryLoops),

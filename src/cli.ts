@@ -81,6 +81,11 @@ import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import './harness/hermes.js';
 import { registerLayoutCommands } from './rooms-tasks/layout-cli.js';
+import {
+  MANAGED_CONFIGURATION_FLAG, assertPinnedConfiguration, enableManagedCli, managedCliReport,
+  parseManagedEntry, type ManagedCliReport,
+} from './managed-cli.js';
+import { MANAGED_CLI_WORKFLOW_IDS, type ManagedCliWorkflowId } from './config.js';
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 import { RoleCreationService } from './application/role-creation-service.js';
 import { RoleRemovalService } from './application/role-removal-service.js';
@@ -129,6 +134,20 @@ const program = new Command()
   .version(VERSION);
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'manifest (default: ~/fleet.yaml; documents under ~/fleet/)');
+
+/**
+ * Set only for the pinned managed entry form (see src/managed-cli.ts). Checked
+ * against the PARSED option, so every spelling of a later `-c` is covered.
+ */
+let pinnedConfiguration: string | undefined;
+program.hook('preAction', (_program, action) => {
+  if (pinnedConfiguration === undefined) return;
+  try { assertPinnedConfiguration(pinnedConfiguration, (action.opts() as { configuration?: unknown }).configuration); }
+  catch (error) {
+    console.error(`error: ${(error as Error).message}`);
+    throw new FleetCliExit(1, 'validation', 'not_started');
+  }
+});
 
 const collect = (value: string, previous: string[]) => [...previous, value];
 
@@ -1198,6 +1217,67 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
     } catch (e) { die(e); }
   });
 
+function renderManagedCliReport(report: ManagedCliReport): string {
+  const lines = [
+    `Managed CLI setup for ${report.configuration}`,
+    `  node ${report.node}`, `  cli  ${report.cli}`,
+    `  platform ${report.platform.os}${report.platform.declared ? '' : ' (not a declared platform)'}`,
+  ];
+  for (const role of report.roles) {
+    if (role.setup.state === 'not-declared') continue;
+    lines.push('', `${role.role} (${role.harness}/${role.session}) — ${role.workflows.join(', ')}`);
+    lines.push(`  setup (static): ${role.setup.state}${role.setup.action ? ` [${role.setup.action}]` : ''} — ${role.setup.detail}`);
+    if (role.setup.artifact) lines.push(`    ${role.setup.artifact}`);
+    lines.push(`  running session: ${role.session_policy}`);
+    lines.push(`  observed (audit ledger): ${role.observed.summary}`);
+    if (role.commandPrefix) lines.push(`  invoke as: ${role.commandPrefix} <command>`);
+    for (const line of role.scope) lines.push(`  scope: ${line}`);
+    for (const line of role.warnings) lines.push(`  note: ${line}`);
+  }
+  if (!report.roles.some(role => role.setup.state !== 'not-declared'))
+    lines.push('', 'No agent declares managed_cli. Nothing was generated and no permission changed.',
+      'Enable it for one agent with: ours-fleet managed-cli setup --enable <Agent>');
+  for (const item of report.removed) lines.push('', `${item.action}: ${item.path} — ${item.detail ?? ''}`);
+  lines.push('', ...report.disclosure.map(line => `* ${line}`));
+  return lines.join('\n');
+}
+
+const managedCliCommand = program.command('managed-cli')
+  .description('prepare and inspect native harness policy for Fleet commands run from a command sandbox');
+for (const [name, write, description] of [
+  ['setup', true, 'generate the policy for agents declaring managed_cli; starts no session and no model'],
+  ['status', false, 'compare generated policy and observed supervisor access without changing anything'],
+] as const) {
+  const command = cOpt(managedCliCommand.command(name).description(description)).option('--json', 'JSON output');
+  if (write) command.option('--enable <agent>',
+    'first add managed_cli: [task-workflow] to this Agent file (repeatable); its permissions are not changed',
+    (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--workflow <id>', `workflow --enable adds (${MANAGED_CLI_WORKFLOW_IDS.join(', ')})`, 'task-workflow');
+  command.action((opts: { configuration?: string; json?: boolean; enable?: string[]; workflow?: string }) => {
+    try {
+      const enabled = [];
+      if (opts.enable?.length) {
+        if (!(MANAGED_CLI_WORKFLOW_IDS as readonly string[]).includes(opts.workflow ?? ''))
+          throw new Error(`unknown workflow '${opts.workflow}'; supported: ${MANAGED_CLI_WORKFLOW_IDS.join(', ')}`);
+        // Validate every name before the first file is touched.
+        const cfg = loadConfig(opts.configuration);
+        for (const agent of opts.enable) findRole(cfg, agent);
+        for (const agent of opts.enable)
+          enabled.push({ agent, ...enableManagedCli(opts.configuration, agent, opts.workflow as ManagedCliWorkflowId) });
+      }
+      const report = managedCliReport(loadConfig(opts.configuration), opts.configuration, { write });
+      if (opts.json) { console.log(JSON.stringify({ ...report, enabled }, null, 2)); }
+      else {
+        for (const item of enabled)
+          console.log(`${item.changed ? 'Enabled' : 'Already enabled'} ${opts.workflow} for ${item.agent} in ${item.file}`);
+        console.log(renderManagedCliReport(report));
+      }
+      const failing = report.roles.filter(role => ['unsupported', 'conflict', 'stale', 'missing'].includes(role.setup.state));
+      if (failing.length) throw new FleetCliExit(1);
+    } catch (error) { if (error instanceof FleetCliExit) throw error; die(error); }
+  });
+}
+
 cOpt(program.command('doctor').description('prerequisite report'))
   .option('--harness <id>', 'check one harness explicitly')
   .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
@@ -1595,7 +1675,17 @@ async function parseFleetCli(): Promise<void> {
 async function runFleetCli(): Promise<void> {
   const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
   const caller = process.env[FLEET_PROXY_CALLER_ENV];
-  if (!stateDir || !caller) { await parseFleetCli(); return; }
+  const entry = parseManagedEntry(process.argv.slice(2));
+  if (!stateDir || !caller) {
+    // The pinned form exists for managed sessions; outside one there is no
+    // supervisor to audit the call, so it is refused rather than run unaudited.
+    if (entry.kind !== 'none') {
+      console.error(`error: ${entry.kind === 'error' ? entry.message
+        : `${MANAGED_CONFIGURATION_FLAG} is only valid inside a Fleet-managed agent session, where the supervisor audits the call`}`);
+      throw new FleetCliExit(1, 'validation', 'not_started');
+    }
+    await parseFleetCli(); return;
+  }
   const requestId = randomUUID();
   let attempt: FleetAuditAttempt;
   const begun = await controlRequest(stateDir, {
@@ -1622,7 +1712,18 @@ async function runFleetCli(): Promise<void> {
   } else {
     const originalExit = process.exit;
     process.exit = ((code?: number) => { throw new FleetCliExit(code ?? 0); }) as never;
-    try { await parseFleetCli(); }
+    try {
+      if (entry.kind === 'error') {
+        console.error(`error: ${entry.message}`);
+        throw new FleetCliExit(1, 'validation', 'not_started');
+      }
+      if (entry.kind === 'pinned') {
+        // The supervisor audited the argv as typed; Commander parses the ordinary form.
+        pinnedConfiguration = entry.configuration;
+        process.argv = [process.argv[0]!, process.argv[1]!, ...entry.argv];
+      }
+      await parseFleetCli();
+    }
     catch (error) {
       exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
       outcomeClass = error instanceof FleetCliExit ? error.outcomeClass : 'runtime';

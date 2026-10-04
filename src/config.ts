@@ -63,6 +63,13 @@ export type UnattendedMode = 'deny' | 'wait';
 /** Monitor wake policy: preserve legacy booleans and add one explicit safe boundary. */
 export type MonitorInterrupt = boolean | 'after_tool';
 
+/**
+ * Workflows Fleet prepares native harness execution policy for. Declared per
+ * Agent; never inferred from a role's name or persona, and never inherited.
+ */
+export const MANAGED_CLI_WORKFLOW_IDS = ['task-workflow'] as const;
+export type ManagedCliWorkflowId = (typeof MANAGED_CLI_WORKFLOW_IDS)[number];
+
 export interface CommonPermissions {
   approval: ApprovalMode;
   filesystem: FilesystemMode;
@@ -245,6 +252,8 @@ export interface RoleConfig {
   owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
+  /** Fleet-prepared CLI workflows this role may run outside its command sandbox. */
+  managed_cli?: ManagedCliWorkflowId[];
 }
 
 export type AgentSelection<T extends Record<string, unknown> = Record<string, unknown>> =
@@ -266,6 +275,8 @@ export interface AgentDefinition {
   owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
+  /** Fleet-prepared CLI workflows this Agent may run outside its command sandbox. */
+  managed_cli?: ManagedCliWorkflowId[];
   /** Scheduled turns scoped only to temporary launches; persistent Agents reject this field. */
   loops?: AgentLoopsConfig;
 }
@@ -416,7 +427,7 @@ export const ROLE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'effort', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'managed_cli',
 ];
 
 export const ROLE_PRESET_KEYS = ['mission', 'persona', 'bio', 'briefing_file'];
@@ -426,7 +437,7 @@ export const BRAIN_PRESET_KEYS = [
 ];
 export const AGENT_KEYS = [
   'role', 'brain', 'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops', 'managed_cli',
 ];
 const AGENT_INSTANCE_KEYS = ['template', 'overrides'];
 const TEMPLATE_FORBIDDEN_KEYS = ['identity'];
@@ -517,6 +528,13 @@ function validateAgentScalars(value: BarePreset, file: string, id: string): void
     const current = value[key];
     if (current !== undefined && (typeof current !== 'string' || !current.trim()))
       schemaError(file, `/agents/${id}/${key}`, 'must be a non-blank string');
+  }
+  if (value.managed_cli !== undefined) {
+    const ids = value.managed_cli;
+    if (!Array.isArray(ids) || ids.some(entry => !(MANAGED_CLI_WORKFLOW_IDS as readonly unknown[]).includes(entry))
+        || new Set(ids).size !== ids.length)
+      schemaError(file, `/agents/${id}/managed_cli`,
+        `must be a list of distinct workflow IDs; supported: ${MANAGED_CLI_WORKFLOW_IDS.join(', ')}`);
   }
   if (value.coordinator !== undefined
       && (typeof value.coordinator !== 'string' || !ROLE_NAME_RE.test(value.coordinator)))

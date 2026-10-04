@@ -192,7 +192,8 @@ export const fleetProxyTopLevelInventory = Object.freeze({
   hidden: ['_run', '_run-temp', '_run-temp-worker', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
 });
 
-const globalValueOptions = new Set(['-c', '--configuration']);
+// `--managed-configuration <file>` is the pinned managed entry form (src/managed-cli.ts).
+const globalValueOptions = new Set(['-c', '--configuration', '--managed-configuration']);
 
 /** Classify before Commander parsing. Unknown and internal paths fail closed. */
 export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassification {
@@ -235,7 +236,7 @@ const marker = (value: string): string => value === '' ? '[REDACTED:empty]' : '[
 const sensitiveValueFlags = new Set([
   '--identity', '--invite', '--token', '--api-token', '--password', '--password-file',
   '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file', '--loops-file',
-  '--configuration', '-c', '--public-invite', '--public-invite-file', '--invite-file',
+  '--configuration', '-c', '--managed-configuration', '--public-invite', '--public-invite-file', '--invite-file',
   '--args-file', '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
   '--identity-cid', '--owner-cid', '--contact-cid', '--codex-config', '--add-dir',
 ]);

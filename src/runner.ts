@@ -2,6 +2,7 @@ import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
+import { prepareManagedCliLaunch } from './managed-cli.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -641,7 +642,14 @@ export async function runOnce(
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   role = { ...role, monitor: { ...role.monitor, mode: 'fleet' } };
-  const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
+  // Native policy for Fleet commands run from the harness command sandbox. This
+  // is the same step for configured, spawned and task-room agents alike.
+  const prep = prepareManagedCliLaunch(role, {
+    // A temporary agent has no config path threaded through its detached
+    // supervisor; spawn records the one it was created from beside its snapshot.
+    stateDir: dir, runCwd, configPath: configPath ?? resolveConfigPath(dir), temp,
+    prep: await adapter.prepareSession(role, { stateDir: dir, runCwd }), log: deps.log,
+  });
   const sessionBackend = role.session ?? 'acp';
   const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);
