@@ -69,6 +69,14 @@ export function beginWorkspaceReplacement(previous: WorkspaceBinding, payload: W
   const record: PendingWorkspaceReplacement = {version: 1, previous, payload, configuration: resolve(configuration), operationNonce: randomBytes(32).toString('base64url')};
   saveWorkspaceReplacement(record); return record;
 }
+/** A failed/expired one-time command can be renewed only for its pinned successor. */
+export function refreshWorkspaceReplacement(record: PendingWorkspaceReplacement, payload: WorkspacePayload, configuration: string): void {
+  if (resolve(configuration)!==record.configuration) throw Error('Replacement requires its original configuration');
+  if (payload.challenge.workspaceId!==record.payload.challenge.workspaceId || payload.challenge.accountId!==record.payload.challenge.accountId
+    || payload.appOrigin!==record.payload.appOrigin || payload.serverCid.toUpperCase()!==record.payload.serverCid.toUpperCase()
+    || payload.hostname!==record.payload.hostname) throw Error('Unfinished replacement requires a fresh command for the same target workspace');
+  record.payload=payload;saveWorkspaceReplacement(record);
+}
 /** Only tunnel files and account-issued device capabilities belong to this registration. */
 export async function clearReplacedWorkspaceLocalState(): Promise<void> {
   const manager = new WebServiceManager();

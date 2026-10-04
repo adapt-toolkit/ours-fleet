@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { beginWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, sameWorkspaceBinding, saveWorkspaceReplacement } from './workspace-replacement.js';
+import { beginWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, sameWorkspaceBinding, refreshWorkspaceReplacement } from './workspace-replacement.js';
 import { completeTunnelSetup } from './tunnel-setup-completion.js';
 import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup } from './tunnel-setup-input.js';
 import { ensureMinimalSetup } from './minimal-setup.js';
@@ -1492,15 +1492,15 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       const input=setupTunnel ? (argument !== undefined ? readTunnelSetupArgument(argument) : opts.stdin ? await readTunnelSetupStdin() : readTunnelSetupFile(opts.file!)) : undefined;
       const previous=setupTunnel ? readWorkspaceBinding() : undefined;
       const replacement=setupTunnel ? readWorkspaceReplacement() : undefined;
-      if(replacement && !(replacement.retired && opts.replaceRegistration))throw Error('An unfinished replacement exists. Run setup-tunnel --resume before using a new command');
+      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, or use a fresh command for the same target with --replace-registration');
+      if(replacement && resolvePath(opts.configuration ?? defaultConfigPath())!==replacement.configuration)throw Error('Replacement requires its original configuration');
       if(previous && !replacement && !(await confirmWorkspaceReplacement(previous,opts.replaceRegistration)))return;
       if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); }
       const payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
       if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
       let result: {origin:string;hostWorkspaceId:string;rootCid:string};
       if(replacement){
-        if(resolvePath(opts.configuration ?? defaultConfigPath())!==replacement.configuration)throw Error('Replacement requires its original configuration');
-        replacement.payload=payload;saveWorkspaceReplacement(replacement);result=await finishWorkspaceReplacement(replacement);
+        refreshWorkspaceReplacement(replacement,payload,opts.configuration ?? defaultConfigPath());result=await finishWorkspaceReplacement(replacement);
       }else if(previous && !sameWorkspaceBinding(previous,payload) && !(opts.migrateAppOrigin && previous.workspaceId===payload.challenge.workspaceId && previous.serverCid.toUpperCase()===payload.serverCid.toUpperCase())){
         const record=beginWorkspaceReplacement(previous,payload,opts.configuration ?? defaultConfigPath());
         result=await finishWorkspaceReplacement(record);
