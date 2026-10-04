@@ -1874,8 +1874,10 @@ absence; the service has no old provider resources to delete. Installation ident
 profile, agents, history, stable host ID and local pairing are preserved.
 
 Replacement recovery is saved in an owned private `workspace/replacement.json`
-after root, host, service and server-contact preconditions pass. `setup-tunnel
---resume` retries its identical nonce and immutable 24-hour operation deadline.
+after root, host, service and server-contact preconditions pass. The App must
+explicitly support deadline-enforced retirement; an older App without that
+capability preserves the existing setup. `setup-tunnel --resume` retries its nonce
+and saved operation deadline (24 hours less a five-minute clock margin).
 If the enrollment challenge expires, obtain a fresh App command for the same target
 and pass `--replace-registration`; completed retirement is retained. The old server
 identity is pinned: only its own invitation can reconnect it.
@@ -1883,11 +1885,23 @@ identity is pinned: only its own invitation can reconnect it.
 `setup-tunnel --abandon-replacement` removes the private recovery payload only when
 a fresh private receipt confirms no deletion and the operation was never dispatched
 or was terminally rejected. A lost transport response remains uncertain. Expired
-operations require a fresh no-deletion receipt after the deadline plus five minutes
-and an explicit server guarantee that the deadline is enforced;
+operations require a fresh receipt proving the old binding still exists after the
+deadline plus five minutes and an explicit server guarantee that the deadline is enforced;
 older recovery records without that guarantee must be resumed. Abandoning preserves
 the existing binding, connector and installation data. A terminally rejected operation
 requires abandonment and a new App command, rather than reusing its nonce.
+After that deadline, a fresh command for the same target can also resume with a
+new operation nonce after checking the enforced expiry. This confirms signed
+absence if an old successful receipt was lost and later pruned.
+
+If the App accepted the successor proof before Fleet wrote its local binding,
+a fresh command for that target retains the original private connector from the
+recovery record. If that successor cannot be recovered, remove it in the App,
+then use `setup-tunnel --discard-retired-replacement` and a fresh App command.
+Discard is allowed only after retirement and local cleanup, while the old local
+binding remains. It removes only the recovery record. This host has no working
+registration until the new setup completes; the old service was stopped and its
+linked devices revoked.
 
 Renewal commands contain no existing live connector credential. Fleet keeps the
 current private connector byte for byte, and accepts renewal only for its recorded

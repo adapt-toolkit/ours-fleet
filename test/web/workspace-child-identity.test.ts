@@ -213,6 +213,14 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
 });
 
 describe('signed registration retirement from an existing installation',()=>{
+  it.each([404,'legacy'])('refuses replacement preparation against %s receipts without consuming an invitation or saving recovery',async version=>{
+    const {beginWorkspaceReplacement}=await import('../../src/workspace-replacement.js');const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');
+    const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const before=readFileSync(join(h.workspace,'binding.json'),'utf8'),previous=JSON.parse(before),sent=h.did('sendCommand').length,contacts=h.did('addContact').length;
+    h.payload.challenge.workspaceId='r'.repeat(43);
+    const request=(async()=>version===404?new Response(null,{status:404}):Response.json({deleted:false,retired:false})) as typeof fetch;
+    await expect(beginWorkspaceReplacement(previous,h.payload,h.config,{attach:h.attach,preflight:(a,b,c,d,opts)=>unregisterWorkspace(a,b,c,d,{...opts,request})})).rejects.toThrow('does not support replacing');
+    expect(existsSync(join(h.workspace,'replacement.json'))).toBe(false);expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);expect(h.did('sendCommand')).toHaveLength(sent);expect(h.did('addContact')).toHaveLength(contacts);
+  });
   it('waits for signed absence confirmation when the migrated service has no old registration',async()=>{
     const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
     const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')),before=readFileSync(join(h.workspace,'binding.json'),'utf8');

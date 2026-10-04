@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { beginWorkspaceReplacement, clearReplacedWorkspaceLocalState, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceReplacement, sameWorkspaceBinding, refreshWorkspaceReplacement, abandonWorkspaceReplacement, requiresWorkspaceReplacement, readWorkspaceBinding } from '../src/workspace-replacement.js';
+import { beginWorkspaceReplacement, clearReplacedWorkspaceLocalState, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceReplacement, sameWorkspaceBinding, refreshWorkspaceReplacement, abandonWorkspaceReplacement, requiresWorkspaceReplacement, readWorkspaceBinding, discardRetiredWorkspaceReplacement } from '../src/workspace-replacement.js';
 import { WorkspaceDeviceStore } from '../src/web/workspace-devices.js';
 import type { WorkspacePayload } from '../src/workspace-enrollment.js';
 const ROOT='a'.repeat(64), SERVER='b'.repeat(64);
@@ -69,7 +69,7 @@ describe('registration replacement consent and recovery',()=>{
  it('requires the expiry grace and an explicit private expired-rejection receipt before abandonment',async()=>{
    const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT});record.dispatchAttempted=true;record.operationExpiresAt=Date.now()-4*60000;
    const save=()=>writeFileSync(join(h.workspace,'replacement.json'),JSON.stringify(record),{mode:0o600});save();
-   const inspect:typeof import('../src/workspace-enrollment.js').unregisterWorkspace=async(_a,_b,_c,_d,options)=>{options?.onReceipt?.({deleted:false,rejected:true,expired:true});return ROOT;};
+   const inspect:typeof import('../src/workspace-enrollment.js').unregisterWorkspace=async(_a,_b,_c,_d,options)=>{options?.onReceipt?.({deleted:false,rejected:true,expired:true,deadlineEnforced:true,oldBindingPresent:true});return ROOT;};
    await expect(abandonWorkspaceReplacement({inspect})).rejects.toThrow('may already');expect(existsSync(join(h.workspace,'replacement.json'))).toBe(true);
    record.operationExpiresAt=Date.now()-6*60000;save();
    await expect(abandonWorkspaceReplacement({inspect:async(_a,_b,_c,_d,options)=>{options?.onReceipt?.({deleted:false});return ROOT;}})).rejects.toThrow('may already');
@@ -83,8 +83,37 @@ describe('registration replacement consent and recovery',()=>{
    await expect(abandonWorkspaceReplacement({inspect:async()=>ROOT})).rejects.toThrow('may already');
    await expect(abandonWorkspaceReplacement({inspect:async()=>{throw Error('HTTP unavailable');}})).rejects.toThrow('unavailable');
    expect(existsSync(join(h.workspace,'replacement.json'))).toBe(true);
-   await abandonWorkspaceReplacement({inspect:async(_a,_b,_c,_d,options)=>{expect(options?.operationExpiresAt).toBe(record.operationExpiresAt);options?.onReceipt?.({deleted:false,deadlineEnforced:true});return ROOT;}});
+   await expect(abandonWorkspaceReplacement({inspect:async(_a,_b,_c,_d,options)=>{options?.onReceipt?.({deleted:false,rejected:true,expired:true,deadlineEnforced:true});return ROOT;}})).rejects.toThrow('may already');
+   await abandonWorkspaceReplacement({inspect:async(_a,_b,_c,_d,options)=>{expect(options?.operationExpiresAt).toBe(record.operationExpiresAt);options?.onReceipt?.({deleted:false,deadlineEnforced:true,oldBindingPresent:true});return ROOT;}});
    expect(existsSync(join(h.workspace,'replacement.json'))).toBe(false);
+ });
+ it('rekeys a post-deadline unknown retirement for the exact consented pair, but never rekeys before expiry',async()=>{
+   const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT}),original=record.operationNonce;
+   const inspect=vi.fn(async(_a:any,_b:any,_c:any,_d:any,options:any)=>{options.onReceipt({deleted:false,deadlineEnforced:true});return ROOT;});
+   const unregister=vi.fn(async()=>{throw Error('lost acknowledgement');});
+   await expect(finishWorkspaceReplacement(record,{inspect,unregister})).rejects.toThrow('lost');expect(inspect).not.toHaveBeenCalled();expect(record.operationNonce).toBe(original);
+   record.operationExpiresAt=Date.now()-6*60000;
+   const complete=vi.fn(async(previous,payload,nonce,_attach,options)=>{expect(previous).toEqual(h.previous);expect(payload.challenge.workspaceId).toBe(h.payload.challenge.workspaceId);expect(nonce).not.toBe(original);expect(readWorkspaceReplacement()!.operationNonce).toBe(nonce);expect(options?.operationExpiresAt).toBeGreaterThan(Date.now()+23*3600000);return ROOT;});
+   await finishWorkspaceReplacement(record,{inspect,unregister:complete,cleanup:async()=>{},enroll:async()=>({origin:'https://new-home.ours-tunnel.com',hostWorkspaceId:h.previous.hostWorkspaceId,rootCid:ROOT})});expect(inspect).toHaveBeenCalledOnce();expect(complete).toHaveBeenCalledOnce();
+ });
+ it('retains the private target connector after accepted proof and before local binding when refreshed with tokenless renewal',async()=>{
+   const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT});
+   await expect(finishWorkspaceReplacement(record,{unregister:async()=>ROOT,cleanup:async()=>{},enroll:async()=>{throw Error('server proof accepted; local write failed');}})).rejects.toThrow('local write');
+   const saved=readWorkspaceReplacement()!;expect(saved.retired).toBe(true);expect(saved.cleaned).toBe(true);expect(readWorkspaceBinding()!.workspaceId).toBe(h.previous.workspaceId);
+   saved.payload.challenge.expiresAt=Date.now()-1;
+   const fresh={...h.payload,connectorToken:undefined,challenge:{...h.payload.challenge,nonce:'f'.repeat(43),expiresAt:Date.now()+600000}};
+   refreshWorkspaceReplacement(saved,fresh,h.config);expect(readWorkspaceReplacement()!.payload.connectorToken).toBe('fixture-private-token');
+   const unregister=vi.fn();await finishWorkspaceReplacement(readWorkspaceReplacement()!,{unregister,enroll:async payload=>{expect(payload.connectorToken).toBe('fixture-private-token');expect(payload.challenge.nonce).toBe(fresh.challenge.nonce);return {origin:'https://new-home.ours-tunnel.com',hostWorkspaceId:h.previous.hostWorkspaceId,rootCid:ROOT};}});expect(unregister).not.toHaveBeenCalled();
+ });
+ it('discards only fully retired local recovery before successor commit and enables a new signed-absence replacement',async()=>{
+   const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT}),before=readFileSync(join(h.workspace,'binding.json'),'utf8');
+   expect(()=>discardRetiredWorkspaceReplacement()).toThrow('fully retired');
+   await expect(finishWorkspaceReplacement(record,{unregister:async()=>ROOT,cleanup:async()=>{},enroll:async()=>{throw Error('successor removed');}})).rejects.toThrow('removed');
+   discardRetiredWorkspaceReplacement();expect(existsSync(join(h.workspace,'replacement.json'))).toBe(false);expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+   const next={...h.payload,challenge:{...h.payload.challenge,workspaceId:'z'.repeat(43)}};
+   const restarted=await beginWorkspaceReplacement(h.previous,next,h.config,{preflight:async()=>ROOT});
+   await finishWorkspaceReplacement(restarted,{unregister:async()=>ROOT,cleanup:async()=>{},enroll:async()=>({origin:'https://new-home.ours-tunnel.com',hostWorkspaceId:h.previous.hostWorkspaceId,rootCid:ROOT})});
+   writeFileSync(join(h.workspace,'binding.json'),JSON.stringify({...h.previous,workspaceId:next.challenge.workspaceId}));expect(()=>discardRetiredWorkspaceReplacement()).toThrow('committed');
  });
  it('resumes after local failure, then enrollment failure without repeating retirement',async()=>{const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT}),unregister=vi.fn(async()=>ROOT);let failCleanup=true;const cleanup=vi.fn(async()=>{if(failCleanup)throw Error('stop failed');});const enroll=vi.fn(async()=>{throw Error('proof failed');});await expect(finishWorkspaceReplacement(record,{unregister,cleanup,enroll})).rejects.toThrow('stop failed');expect(readWorkspaceReplacement()!.retired).toBe(true);failCleanup=false;await expect(finishWorkspaceReplacement(readWorkspaceReplacement()!,{unregister,cleanup,enroll})).rejects.toThrow('proof failed');expect(unregister).toHaveBeenCalledOnce();expect(readWorkspaceReplacement()!.cleaned).toBe(true);const done=vi.fn(async()=>({origin:'https://new-home.ours-tunnel.com',hostWorkspaceId:h.previous.hostWorkspaceId,rootCid:ROOT}));expect(await finishWorkspaceReplacement(readWorkspaceReplacement()!,{unregister,cleanup,enroll:done})).toMatchObject({rootCid:ROOT});expect(cleanup).toHaveBeenCalledTimes(2);expect(unregister).toHaveBeenCalledOnce();});
  it('retains recovery after expiry and rejects public recovery files',async()=>{const h=host(),record=await beginWorkspaceReplacement(h.previous,h.payload,h.config,{preflight:async()=>ROOT});record.retired=true;record.cleaned=true;record.rootCid=ROOT;record.payload.challenge.expiresAt=Date.now()-1;writeFileSync(join(h.workspace,'replacement.json'),JSON.stringify(record),{mode:0o600});await expect(finishWorkspaceReplacement(readWorkspaceReplacement()!,{enroll:vi.fn()})).rejects.toThrow('window expired');chmodSync(join(h.workspace,'replacement.json'),0o644);expect(()=>readWorkspaceReplacement()).toThrow('private');});

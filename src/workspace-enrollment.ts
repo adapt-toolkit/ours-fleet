@@ -173,10 +173,10 @@ export async function checkWorkspaceConfiguration(configuration=defaultConfigPat
     throw Error(`${paths.configPath}: rooms.owner.expected_cid names a different Owner than this host's Messenger identity. Tunnel setup does not replace an existing Owner.`);
 }
 export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;replacingWorkspace?:string;attach?:AttachDaemonClient;contactWaitMs?:number;afterInvitation?:()=>void}={}) {
-  checkWorkspaceConnector(payload);
   const attach=options.attach ?? attachOursClient;
   const request=hostMessenger();
   if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
+  checkWorkspaceConnector(payload);
   const dir=join(stateRoot(),'workspace');mkdirSync(dir,{recursive:true,mode:0o700});
   const appOrigin=validateAccountOrigin(payload.appOrigin);
   const previousFile=join(dir,'binding.json');
@@ -296,7 +296,7 @@ export async function confirmWorkspaceTarget(payload:Pick<WorkspacePayload,'appO
 }
 
 /** Retire exactly the original registration using the same signed Human root that bound it. */
-export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number;checkOnly?:boolean;beforeSend?:()=>void;operationExpiresAt?:number;onReceipt?:(status:{deleted?:boolean;retired?:boolean;absent?:boolean;rejected?:boolean;expired?:boolean;deadlineEnforced?:boolean})=>void}={}):Promise<string> {
+export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number;checkOnly?:boolean;beforeSend?:()=>void;operationExpiresAt?:number;onReceipt?:(status:{deleted?:boolean;retired?:boolean;absent?:boolean;rejected?:boolean;expired?:boolean;deadlineEnforced?:boolean;oldBindingPresent?:boolean})=>void}={}):Promise<string> {
   const appOrigin=validateAccountOrigin(previous.appOrigin);
   const messenger=hostMessenger();
   const identity=await messengerIdentity(messenger,attach);
@@ -308,17 +308,18 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
   const deadlineField:Record<string,number>=options.operationExpiresAt===undefined?{}:{operationExpiresAt:options.operationExpiresAt};
   const receiptInput={workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,rootCid:root.cid,...deadlineField};
   const request=options.request ?? fetch;
-  const receipt=async():Promise<{deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean}>=>{
+  const receipt=async():Promise<{deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean;oldBindingPresent?:boolean}>=>{
     let response:Response;
     try{response=await request(appOrigin+'/account-api/workspace-unregister-receipt',{method:'POST',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000),headers:{Origin:appOrigin,'Content-Type':'application/json'},body:JSON.stringify(receiptInput)});}
     catch{throw Error('Registration retirement could not be confirmed; local setup preserved. Run setup-tunnel --resume to retry');}
     if(response.status===404){await response.body?.cancel();return {};}
     if(!response.ok){await response.body?.cancel();throw Error(`Registration retirement receipt failed (HTTP ${response.status}); local setup preserved`);}
-    try{return await response.json() as {deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean};}catch{throw Error('Invalid registration retirement receipt; local setup preserved');}
+    try{return await response.json() as {deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean;oldBindingPresent?:boolean};}catch{throw Error('Invalid registration retirement receipt; local setup preserved');}
   };
   let status=await receipt();
   options.onReceipt?.(status);
   if(options.checkOnly){
+    if(status.deleted!==true && !(status.deleted===false && status.deadlineEnforced===true))throw Error('Account service does not support replacing a registration yet; existing setup preserved');
     // No invitation is consumed and no command is sent during preparation.
     // A different server cannot be reconnected with the successor's invitation.
     if(status.deleted!==true && status.rejected!==true && !same(previous.serverCid,payload.serverCid)){

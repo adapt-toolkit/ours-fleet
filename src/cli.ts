@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { beginWorkspaceReplacement, abandonWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
+import { beginWorkspaceReplacement, abandonWorkspaceReplacement, discardRetiredWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
 import { completeTunnelSetup } from './tunnel-setup-completion.js';
 import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup, inspectTunnelSetup, verifyTunnelSetupTarget } from './tunnel-setup-input.js';
 import { ensureMinimalSetup } from './minimal-setup.js';
@@ -1466,7 +1466,11 @@ webCommand.command('uninstall').description('stop and uninstall the owner web se
     catch (e) { die(e); }
   });
 
-async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean; replaceRegistration?: boolean; abandonReplacement?:boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
+async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean; replaceRegistration?: boolean; abandonReplacement?:boolean;discardRetiredReplacement?:boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
+    if(opts.discardRetiredReplacement){
+      if(!setupTunnel || argument!==undefined || opts.file || opts.stdin || opts.check || opts.resume || opts.migrateAppOrigin || opts.replaceRegistration || opts.configuration || opts.abandonReplacement)throw Error('--discard-retired-replacement takes no payload or other setup options');
+      discardRetiredWorkspaceReplacement();process.stdout.write('Retired replacement recovery discarded. This host has no working registration: the old service was stopped and linked devices revoked. After removing the failed successor in the App, use a fresh command to complete a new registration. Installation data and the old local binding are preserved.\n');return;
+    }
     if(opts.abandonReplacement){
       if(!setupTunnel || argument!==undefined || opts.file || opts.stdin || opts.check || opts.resume || opts.migrateAppOrigin || opts.replaceRegistration || opts.configuration)throw Error('--abandon-replacement takes no payload or other setup options');
       await abandonWorkspaceReplacement();process.stdout.write('Unsent or rejected replacement abandoned; existing local setup preserved. Obtain a fresh App command for another setup.\n');return;
@@ -1496,20 +1500,21 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       const input=setupTunnel ? (argument !== undefined ? readTunnelSetupArgument(argument) : opts.stdin ? await readTunnelSetupStdin() : readTunnelSetupFile(opts.file!)) : undefined;
       const previous=setupTunnel ? readWorkspaceBinding() : undefined;
       const replacement=setupTunnel ? readWorkspaceReplacement() : undefined;
-      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, use a fresh command for the same target with --replace-registration, or --abandon-replacement when retirement was never sent or definitively rejected');
+      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, use a fresh command for the same target with --replace-registration, or --abandon-replacement when retirement was never sent or definitively rejected. If retirement and cleanup completed but the successor cannot be recovered, remove the successor in the App and use --discard-retired-replacement');
       if(replacement && resolvePath(opts.configuration ?? defaultConfigPath())!==replacement.configuration)throw Error('Replacement requires its original configuration');
       const target=previous && !replacement ? await inspectTunnelSetup(input!) : undefined;
       const different=previous && !replacement && (!target || requiresWorkspaceReplacement(previous,target,opts.migrateAppOrigin));
       if(different && !(await confirmWorkspaceReplacement(previous!,opts.replaceRegistration))){if(!process.stdin.isTTY)throw Error('Replacement confirmation required; existing setup and grant preserved');return;}
       if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); }
-      const payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
+      let payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
       verifyTunnelSetupTarget(target,payload);
       const replace=previous && !replacement && requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,serverCid:payload.serverCid,appOrigin:payload.appOrigin},opts.migrateAppOrigin);
+      if(replacement){refreshWorkspaceReplacement(replacement,payload,opts.configuration ?? defaultConfigPath());payload=replacement.payload;}
       checkWorkspaceConnector(payload);
       if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
       let result: {origin:string;hostWorkspaceId:string;rootCid:string};
       if(replacement){
-        refreshWorkspaceReplacement(replacement,payload,opts.configuration ?? defaultConfigPath());result=await finishWorkspaceReplacement(replacement);
+        result=await finishWorkspaceReplacement(replacement);
       }else if(replace){
         const record=await beginWorkspaceReplacement(previous!,payload,opts.configuration ?? defaultConfigPath());
         result=await finishWorkspaceReplacement(record);
@@ -1584,6 +1589,7 @@ cOpt(program.command('setup-tunnel').argument('[payload]', 'minimal one-use v2 A
   .option('--stdin', 'read the private App grant or legacy payload from a pipe')
   .option('--check', 'only verify host prerequisites; changes nothing and needs no payload')
   .option('--resume', 'finish an interrupted replacement or setup; needs no new payload')
+  .option('--discard-retired-replacement', 'forget a failed successor after retirement and local cleanup; remove it in the App first')
   .option('--abandon-replacement', 'discard an unsent or definitively rejected replacement after checking its private receipt')
   .option('--replace-registration', 'confirm retirement of the existing account registration when the new one differs')
   .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')

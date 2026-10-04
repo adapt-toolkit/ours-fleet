@@ -73,6 +73,13 @@ export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefi
   return record;
 }
 export function clearWorkspaceReplacement(): void { rmSync(replacementPath(), {force: true}); }
+/** Explicit recovery after the user removes an unsuccessful successor in the App. */
+export function discardRetiredWorkspaceReplacement():void{
+  const record=readWorkspaceReplacement(),current=readWorkspaceBinding();
+  if(!record?.retired || !record.cleaned)throw Error('Only a fully retired and locally cleaned replacement can be discarded; resume or safely abandon this operation');
+  if(!current || current.workspaceId!==record.previous.workspaceId || current.hostWorkspaceId!==record.previous.hostWorkspaceId || current.appOrigin!==record.previous.appOrigin || current.serverCid?.toUpperCase()!==record.previous.serverCid.toUpperCase())throw Error('The successor binding was committed or the binding changed; resume its setup instead of discarding recovery');
+  clearWorkspaceReplacement();
+}
 function checkReplacementService(configuration:string):void {
   const manager=new WebServiceManager(),service=manager.readMetadata();
   if(service?.configuration && resolve(service.configuration)!==resolve(configuration))throw Error('Installed web service uses another configuration; existing setup preserved');
@@ -82,7 +89,7 @@ export async function beginWorkspaceReplacement(previous: WorkspaceBinding, payl
   checkWorkspaceConnector(payload);
   if(!requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,appOrigin:payload.appOrigin,serverCid:payload.serverCid}))throw Error('The same workspace must never be retired');
   checkReplacementService(configuration);
-  const record: PendingWorkspaceReplacement = {version: 2, previous:previous as WorkspaceBinding & {serverCid:string}, payload, configuration: resolve(configuration), operationNonce: randomBytes(32).toString('base64url'),dispatchAttempted:false,operationExpiresAt:Date.now()+86400000};
+  const record: PendingWorkspaceReplacement = {version: 2, previous:previous as WorkspaceBinding & {serverCid:string}, payload, configuration: resolve(configuration), operationNonce: randomBytes(32).toString('base64url'),dispatchAttempted:false,operationExpiresAt:Date.now()+86400000-5*60000};
   record.rootCid=await (effects.preflight??unregisterWorkspace)(record.previous,payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt});
   saveWorkspaceReplacement(record); return record;
 }
@@ -92,9 +99,9 @@ export async function abandonWorkspaceReplacement(effects:{inspect?:typeof unreg
   if(record.retired || record.cleaned || record.version!==2)throw Error('Retirement may already have completed; resume this replacement instead of abandoning it');
   const current=readWorkspaceBinding();
   if(!current || current.workspaceId!==record.previous.workspaceId || current.hostWorkspaceId!==record.previous.hostWorkspaceId || current.appOrigin!==record.previous.appOrigin || current.serverCid?.toUpperCase()!==record.previous.serverCid.toUpperCase())throw Error('Workspace binding changed; replacement was not abandoned');
-  let deleted:boolean|undefined,rejected=false,expired=false,deadlineEnforced=false;
-  const root=await (effects.inspect??unregisterWorkspace)(record.previous,record.payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt,onReceipt:status=>{deleted=status.deleted;rejected=status.rejected===true;expired=status.expired===true;deadlineEnforced=status.deadlineEnforced===true;}});
-  if(root.toUpperCase()!==record.rootCid?.toUpperCase() || deleted!==false || (record.dispatchAttempted && !(rejected && (!expired || Date.now()>record.operationExpiresAt!+5*60000) || deadlineEnforced && Date.now()>record.operationExpiresAt!+5*60000)))throw Error('Retirement may already have been sent; run --resume or abandon only after the account service confirms terminal rejection');
+  let deleted:boolean|undefined,rejected=false,expired=false,deadlineEnforced=false,oldBindingPresent=false;
+  const root=await (effects.inspect??unregisterWorkspace)(record.previous,record.payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt,onReceipt:status=>{deleted=status.deleted;rejected=status.rejected===true;expired=status.expired===true;deadlineEnforced=status.deadlineEnforced===true;oldBindingPresent=status.oldBindingPresent===true;}});
+  if(root.toUpperCase()!==record.rootCid?.toUpperCase() || deleted!==false || (record.dispatchAttempted && !(rejected && !expired && Date.now()<=record.operationExpiresAt! || oldBindingPresent && deadlineEnforced && Date.now()>record.operationExpiresAt!+5*60000)))throw Error('Retirement may already have been sent; run --resume or abandon only after the account service confirms terminal rejection');
   clearWorkspaceReplacement();
 }
 /** A failed/expired one-time command can be renewed only for its pinned successor. */
@@ -103,7 +110,7 @@ export function refreshWorkspaceReplacement(record: PendingWorkspaceReplacement,
   if (payload.challenge.workspaceId!==record.payload.challenge.workspaceId || payload.challenge.accountId!==record.payload.challenge.accountId
     || payload.appOrigin!==record.payload.appOrigin || payload.serverCid.toUpperCase()!==record.payload.serverCid.toUpperCase()
     || payload.hostname!==record.payload.hostname) throw Error('Unfinished replacement requires a fresh command for the same target workspace');
-  record.payload=payload;saveWorkspaceReplacement(record);
+  record.payload=payload.connectorToken===undefined && record.payload.connectorToken!==undefined?{...payload,connectorToken:record.payload.connectorToken}:payload;saveWorkspaceReplacement(record);
 }
 /** Only tunnel files and account-issued device capabilities belong to this registration. */
 export async function clearReplacedWorkspaceLocalState(): Promise<void> {
@@ -115,7 +122,7 @@ export async function clearReplacedWorkspaceLocalState(): Promise<void> {
 }
 /** Persist every irreversible boundary; the original binding stays until enrollment writes its successor. */
 export async function finishWorkspaceReplacement(record: PendingWorkspaceReplacement, effects: {
-  unregister?: typeof unregisterWorkspace; cleanup?: () => Promise<void>; enroll?: typeof enrollWorkspace; attach?: AttachDaemonClient;
+  unregister?: typeof unregisterWorkspace; inspect?:typeof unregisterWorkspace; cleanup?: () => Promise<void>; enroll?: typeof enrollWorkspace; attach?: AttachDaemonClient;
 } = {}): Promise<{origin: string; hostWorkspaceId: string; rootCid: string}> {
   const current = readWorkspaceBinding();
   if (!current || (current.workspaceId===record.previous.workspaceId ? (current.appOrigin!==record.previous.appOrigin || current.serverCid?.toUpperCase()!==record.previous.serverCid.toUpperCase() || current.hostWorkspaceId!==record.previous.hostWorkspaceId) : !sameWorkspaceBinding(current, record.payload))) throw Error('Workspace binding changed during replacement; review it before continuing');
@@ -124,6 +131,17 @@ export async function finishWorkspaceReplacement(record: PendingWorkspaceReplace
   // challenge, rather than assuming every challenge for this binding is done.
   if (!record.retired) {
     checkReplacementService(record.configuration);
+    if(record.version===2 && Date.now()>record.operationExpiresAt!+5*60000){
+      if(record.payload.challenge.expiresAt<=Date.now())throw Error('Retirement deadline passed. Obtain a fresh App command for the same target and pass --replace-registration to continue');
+      let deleted:boolean|undefined,enforced=false;
+      const root=await (effects.inspect??unregisterWorkspace)(record.previous,record.payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt,onReceipt:status=>{deleted=status.deleted;enforced=status.deadlineEnforced===true;}});
+      if(root.toUpperCase()!==record.rootCid?.toUpperCase())throw Error('Original proof root changed; existing recovery preserved');
+      if(deleted===false && enforced){
+        // The expired command cannot act. Existing consent covers this exact
+        // previous/successor pair, including signed absence after a lost receipt.
+        record.operationNonce=randomBytes(32).toString('base64url');record.operationExpiresAt=Date.now()+86400000-5*60000;record.dispatchAttempted=false;saveWorkspaceReplacement(record);
+      }
+    }
     record.rootCid = await (effects.unregister ?? unregisterWorkspace)(record.previous, record.payload, record.operationNonce, effects.attach,{operationExpiresAt:record.operationExpiresAt,beforeSend:()=>{record.dispatchAttempted=true;saveWorkspaceReplacement(record);}});
     record.retired = true; saveWorkspaceReplacement(record);
   }

@@ -110,3 +110,17 @@ it('freezes task association before delivery and preserves it across a retry aft
   producer=new FleetNotificationProducer([root],state,config);fail=false;await producer.drain();await producer.close();
   expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].url).toContain('chat=task-member');
 });
+
+it('delivers completions without optional task metadata when the room inventory is corrupt',async()=>{
+  const {roomsDir}=await import('../src/rooms-tasks/room-state.js');const previous=process.env.OURS_FLEET_HOME;
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','corrupt-task-metadata-'));process.env.OURS_FLEET_HOME=dir;
+  cleanup.push(async()=>{if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;});
+  mkdirSync(roomsDir(),{recursive:true});writeFileSync(join(roomsDir(),'broken.json'),'{');
+  const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
+  const root=join(dir,'agents');mkdirSync(root);const producer=new FleetNotificationProducer([root],join(dir,'outboxes'),{origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)});cleanup.push(()=>producer.close());
+  const store=new ConversationEventStore(join(root,'member','.conversation'),{roleId:'member'});cleanup.push(async()=>store.close());
+  store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});const done=store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
+  producer.poll();await producer.drain();producer.poll();await producer.drain();
+  expect(accepted).toHaveLength(1);expect(accepted[0].eventId).toBe(`member:g:${done.seq}`);expect(accepted[0]).not.toHaveProperty('taskId');
+});

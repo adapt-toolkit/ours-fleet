@@ -63,9 +63,9 @@ export class FleetNotificationProducer {
       }
       return true;
     }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;});
-    let taskRoles:Map<string,string>;
+    let taskRoles:Map<string,string>|undefined;
     try{taskRoles=taskRoleAssociations();}
-    catch{this.warn('Notification task association unavailable; ledger checkpoint retained');return;}
+    catch{this.warn('Notification task association unavailable; delivering unclassified events');}
     for (const root of this.roots) for (const roleId of this.names(root)) {
       const roleDir = join(root, roleId), dir = join(roleDir, '.conversation');
       try {
@@ -119,7 +119,7 @@ export class FleetNotificationProducer {
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { taskId:taskRoles.get(roleId)??null, url: `/fleet/chats?chat=${encodeURIComponent(roleId)}&detail=1#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats?chat=${encodeURIComponent(roleId)}&detail=1#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
