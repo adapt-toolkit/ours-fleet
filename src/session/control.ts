@@ -680,9 +680,15 @@ export async function controlRequest(
     socket.once('error', error => {
       clearTimeout(timer);
       const code = (error as NodeJS.ErrnoException).code;
+      const permissionHint = code === 'EPERM' || code === 'EACCES'
+        ? `; the operating system denied access before '${request.command}' reached the supervisor. `
+          + 'Check socket permissions and the command execution sandbox. '
+          + 'An existing socket does not prove this process can connect; do not bypass Fleet audit. '
+          + 'For managed workspace sessions, see docs/validation/managed-cli-permissions.md.'
+        : '';
       reject(new SessionControlError(
         code === 'ENOENT' || code === 'ECONNREFUSED' ? 'control-unavailable' : 'backend',
-        `role control socket: ${error.message}`));
+        `role control socket: ${error.message}${permissionHint}`));
     });
     socket.on('data', chunk => {
       buffer += chunk;

@@ -20,6 +20,7 @@
     "README.md",
     "docs/task-workspaces.md",
     "docs/room-layouts.md",
+    "docs/validation/managed-cli-permissions.md",
     "LICENSE"
   ],
   "engines": {
