@@ -13,6 +13,7 @@
 //                                  OS sandbox enabled; the spawned member stays on Codex
 //   FLEET_TEST_NESTED_SANDBOX=1    Claude inside an unprivileged container (see the validation doc)
 //   FLEET_TEST_TMP_PREFIX=/abs/private-parent/prefix-   FLEET_TEST_EVIDENCE=/file.json
+//   FLEET_TEST_SOCKET_PREFIX=/short/private/prefix-    (Unix socket paths; default: system temp dir)
 //   FLEET_TEST_KEEP_ARTIFACTS=1
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -20,7 +21,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer as httpServer } from 'node:http';
 import { createServer as netServer } from 'node:net';
 import {
-  chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -36,7 +37,9 @@ const cli = resolve('dist/cli.js');
 const label = `${process.platform} ${claude ? 'claude' : 'codex'}/${session} full-stack lifecycle`;
 
 const root = realpathSync(mkdtempSync(process.env.FLEET_TEST_TMP_PREFIX ?? '/tmp/fleet-managed-lifecycle-'));
-const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), 'fml-')));
+// Sockets (Fleet control, Cowork management, Claude's sandbox bridge) need a SHORT private
+// directory: about 40 characters at most. FLEET_TEST_SOCKET_PREFIX overrides the system temp dir.
+const socketRoot = realpathSync(mkdtempSync(process.env.FLEET_TEST_SOCKET_PREFIX ?? join(tmpdir(), 'fml-')));
 chmodSync(socketRoot, 0o700);
 for (const key of Object.keys(process.env)) if (/^(OURS_|CODEX_|CLAUDE_|ANTHROPIC_|OPENAI_)/u.test(key)) delete process.env[key];
 // Short: Claude's sandbox and Fleet both create Unix sockets below TMPDIR.
@@ -159,7 +162,10 @@ try {
   ].join('\n'), { mode: 0o600 });
   writeFileSync(join(configDir, 'fleet', 'agent_templates', 'Developer.yaml'), [
     'role: { inline: { mission: Implement the task. } }', brain,
-    'permissions: { approval: allow, filesystem: workspace, unattended: deny }', ...acpEnv, '',
+    'permissions: { approval: allow, filesystem: workspace, unattended: deny }',
+    // The template opts its instances in: a member created by `task start` must get its own
+    // generated policy at launch, with no installer or setup run in between.
+    'managed_cli: [task-workflow]', ...acpEnv, '',
   ].join('\n'), { mode: 0o600 });
   writeFileSync(join(configDir, 'fleet', 'room_templates', 'single.yaml'), [
     'version: 1', 'description: "Solo task: one Developer"', 'room: { quiet_membership: false, anonymous: false }',
@@ -177,6 +183,19 @@ try {
   const run = (args) => `${prefix} ${args}`;
   let taskId, roomId, finished = false;
   /** The next command given every completed command output so far, or undefined when done. */
+  // The member `task start` created, looked at while it is alive: what its own launch prepared.
+  let member;
+  function inspectMember() {
+    const tmpRoot = join(root, '.ours-fleet', 'tmp');
+    const name = readdirSync(tmpRoot).find(entry => entry.includes('-developer-'));
+    if (!name) return { name: undefined };
+    const read = file => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return undefined; } };
+    const launched = read(join(tmpRoot, name, '.managed-cli.json'));
+    const registry = read(join(root, '.ours-fleet', 'managed-cli', 'registry.json'));
+    return { name, stateDir: join(tmpRoot, name), record: launched,
+      rules: launched?.artifact && existsSync(launched.artifact) ? readFileSync(launched.artifact, 'utf8') : undefined,
+      holders: launched?.artifact ? registry?.files?.[launched.artifact]?.holders : undefined };
+  }
   let answered = -1, answer;
   function next(outputs) {
     // One decision per completed command, however often the harness asks.
@@ -196,6 +215,7 @@ try {
       return record('task start again (idempotent retry while the member finishes starting)', `sleep 20; true`);
     if (evidence.at(-1).note.startsWith('task start again')) return record('task start (retry)', run(`task start ${taskId} --template single --json`));
     const done = { includes: note => evidence.some(item => item.note === note || item.note.startsWith(`${note} (`)) };
+    if (!member) member = inspectMember();
     if (!evidence.some(item => item.note === 'task show')) return record('task show', run(`task show --json -- ${taskId}`));
     if (!done.includes('room show')) { roomId = firstJson(String(last.output))?.task?.room_id; return record('room show', run(`room show ${roomId} --json`)); }
     if (!done.includes('room members')) return record('room members', run(`room members ${roomId} --json`));
@@ -317,6 +337,27 @@ trust_level="trusted"
   assert(roomId, 'task start did not record a room');
   const final = (await operator(['task', 'show', '--json', '-c', config, '--', taskId]));
   assert.equal(JSON.parse(final.stdout).task.state, 'done', final.stdout);
+
+  // The new agent got its own policy from its own launch: record, rules, and a temporary holder.
+  assert(member?.name, 'task start created no member state');
+  assert.equal(member.record?.state, 'supported', JSON.stringify(member.record));
+  assert.equal(member.record.mechanism, 'codex-workspace-rules');
+  assert.equal(member.record.paths.configuration, config);
+  assert.notEqual(member.record.workspace, project, 'the member has its own workspace');
+  assert(member.record.artifact.startsWith(join(member.record.workspace, '.codex', 'rules')), member.record.artifact);
+  assert(member.rules?.includes(`"--managed-configuration",${JSON.stringify(config)},"task","start"]`), `member rules: ${member.rules}`);
+  assert.deepEqual(member.holders, [`temp:${member.name}`]);
+
+  // Retirement, checked where it happened rather than inferred from the task state.
+  assert.equal(existsSync(member.stateDir), false, 'the member\'s live state is still there');
+  const { getRoomRecord } = await import('../dist/rooms-tasks/room-state.js');
+  assert.equal(getRoomRecord(roomId), undefined, 'Fleet still records the room');
+  const adapter = createCoworkAdapter({ env });
+  assert.equal(await adapter.getRoom(roomId), undefined, 'Cowork still has the room');
+  assert.equal((await adapter.listRooms()).some(room => room.room_id === roomId), false);
+  // The member's rules go with it: the next setup finds no holder left and removes the file.
+  const after = JSON.parse((await operator(['managed-cli', 'setup', '--configuration', config, '--json'])).stdout);
+  assert.equal(existsSync(member.record.artifact), false, JSON.stringify(after.removed));
   const ledger = JSON.parse(readFileSync(join(agentDir('Coordinator'), '.fleet-command-audit.json'), 'utf8')).attempts;
   // Finishing the task erases its rows' words to hashes; the pin flag stays recognisable.
   const { erasedArg } = await import('../dist/erased-resources.js');
@@ -331,6 +372,7 @@ trust_level="trusted"
   for (const form of ['task create', 'task start', 'task review', 'task finish', 'room show', 'room members']) assert(observed.includes(form), `${form} not observed: ${JSON.stringify(status.observed)}`);
   console.log(`PASS ${label}: real runner launched the Coordinator with Fleet-prepared policy; unpinned CLI denied at the socket`);
   console.log(`PASS ${label}: task create -> start (room ${roomId} provisioned, member spawned) -> show/room show/room members -> block/unblock -> review -> finish${reruns ? ` (re-run ${reruns}x while the member was still stopping)` : ''}, all pinned, all audited; task is done`);
+  console.log(`PASS ${label}: the spawned member ${member.name} declared the workflow through its Agent Template and its own launch prepared it (record supported, rules in its workspace, temporary holder); after finish its live state, the Fleet room record and the Cowork room are gone and its rules were removed`);
   console.log(`QUALIFIED ${label}: node ${process.version}; ${audited.length} audited pinned invocations`);
 } catch (error) { failure = error; throw error; } finally {
   clearTimeout(watchdog);
