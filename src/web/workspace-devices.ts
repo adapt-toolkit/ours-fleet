@@ -60,5 +60,11 @@ export class WorkspaceDeviceStore {
   valid(id: string): boolean {return Boolean(this.db.prepare('SELECT id FROM devices WHERE id=? AND revokedAt IS NULL AND expiresAt>?').get(id,this.now()));}
   list(): WorkspaceDevice[] {return this.db.prepare('SELECT id,label,createdAt,lastUsedAt,expiresAt,revokedAt FROM devices ORDER BY createdAt DESC LIMIT 256').all().map(row=>({id:String(row.id),label:String(row.label),createdAt:Number(row.createdAt),lastUsedAt:Number(row.lastUsedAt),expiresAt:Number(row.expiresAt),revokedAt:row.revokedAt===null ? null : Number(row.revokedAt)}));}
   revoke(id: string): void {this.db.prepare('UPDATE devices SET revokedAt=? WHERE id=? AND revokedAt IS NULL').run(this.now(),id);this.db.prepare('DELETE FROM enrollments WHERE issuer=?').run(id);}
+  /** Retire account links without changing the installation's stable host ID or other data. */
+  revokeAll(): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try { this.db.prepare('UPDATE devices SET revokedAt=? WHERE revokedAt IS NULL').run(this.now()); this.db.exec('DELETE FROM enrollments'); this.db.exec('COMMIT'); }
+    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
   close(): void {this.db.close();}
 }

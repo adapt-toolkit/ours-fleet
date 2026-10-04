@@ -17,9 +17,9 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
   if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>32768)throw Error('Setup payload requires an owned private regular file (chmod 600)');
   return decodeWorkspacePayload(readFileSync(path,'utf8'));
 }
-export function decodeWorkspacePayload(input:string):WorkspacePayload {
+export function decodeWorkspacePayload(input:string,options:{allowExpired?:boolean}={}):WorkspacePayload {
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
-  if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || p.challenge.expiresAt<=Date.now() || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
+  if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
   for(const k of ['connectorToken','invitation','name','surname'] as const)if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');
   return p;
 }
@@ -149,7 +149,7 @@ export async function checkWorkspaceConfiguration(configuration=defaultConfigPat
   if(loaded.rooms.owner.expected_cid.toLowerCase()!==cid.toLowerCase() && !recordsLostEnrollment(paths.configPath) && !(root && managedRootOwner(paths.configPath,loaded.rooms,root)))
     throw Error(`${paths.configPath}: rooms.owner.expected_cid names a different Owner than this host's Messenger identity. Tunnel setup does not replace an existing Owner.`);
 }
-export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;attach?:AttachDaemonClient;contactWaitMs?:number;afterInvitation?:()=>void}={}) {
+export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;replacingWorkspace?:string;attach?:AttachDaemonClient;contactWaitMs?:number;afterInvitation?:()=>void}={}) {
   const attach=options.attach ?? attachOursClient;
   const request=hostMessenger();
   if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
@@ -157,7 +157,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const appOrigin=validateAccountOrigin(payload.appOrigin);
   const previousFile=join(dir,'binding.json');
   let migrating=false;
-  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin ?? 'https://app.ours.network');migrating=priorOrigin!==appOrigin;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
+  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin ?? 'https://app.ours.network');migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
   const loaded=loadConfig(configuration,{deferredOwnerInviteFile:workspaceOwnerInvite()});
   // Decided before anything is sent or written: the Owner entry is replaced only when it records an enrollment this host has lost.
   const lost=Boolean(loaded.rooms) && recordsLostEnrollment(resolve(configuration));
@@ -166,7 +166,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   if(!/^[a-f0-9]{64}$/i.test(identity.cid))throw Error('Bound Messenger identity unavailable');
   // An installation that ran Messenger as the Human root and now runs it as the person's own identity keeps its managed Owner entry, moved to that identity.
   const moved=Boolean(loaded.rooms) && !lost && !!identity.root && !same(loaded.rooms!.owner.expected_cid,identity.cid) && managedRootOwner(resolve(configuration),loaded.rooms!,identity.root)
-    && JSON.parse(readFileSync(previousFile,'utf8')).serverCid?.toUpperCase()===payload.serverCid.toUpperCase();
+    && (options.replacingWorkspace!==undefined || JSON.parse(readFileSync(previousFile,'utf8')).serverCid?.toUpperCase()===payload.serverCid.toUpperCase());
   if(options.preserveProfile && identity.preserveProfile!==true)throw Error('Existing-host setup requires Messenger profile-preservation support; update the host Messenger before retrying');
   if(loaded.rooms && !lost && !moved && loaded.rooms.owner.expected_cid.toLowerCase()!==identity.cid.toLowerCase())throw Error('Retained room owner CID conflicts with the Human root');
   const inviteFile=loaded.rooms?.owner.public_invite_file || join(dir,'owner.invite');
@@ -255,4 +255,51 @@ export async function configureWorkspacePort(payload:Pick<WorkspacePayload,'appO
 export async function confirmWorkspaceTarget(payload:Pick<WorkspacePayload,'appOrigin'|'challenge'>,hostWorkspaceId:string,rootCid:string,port:number,cleanupFailed:(error:unknown)=>void=()=>{}):Promise<void> {
   await configureWorkspacePort(payload,hostWorkspaceId,rootCid,port);
   await removeEnrollmentContact().catch(cleanupFailed);
+}
+
+/** Retire exactly the original registration using the same signed Human root that bound it. */
+export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number}={}):Promise<string> {
+  const appOrigin=validateAccountOrigin(previous.appOrigin);
+  const identity=await messengerIdentity(hostMessenger(),attach);
+  if(identity.preserveProfile!==true)throw Error('Existing-host replacement requires Messenger profile-preservation support; existing local setup preserved');
+  const root=identity.root ?? await humanRoot(attach,identity.cid);
+  if(previous.proofRootCid && !same(root.cid,previous.proofRootCid))throw Error('Original workspace proof root differs from this installation; existing local setup preserved');
+  const devices=new WorkspaceDeviceStore();const hostWorkspaceId=devices.workspaceId;devices.close();
+  if(hostWorkspaceId!==previous.hostWorkspaceId)throw Error('Original workspace host ID differs from this installation; existing local setup preserved');
+  const receiptInput={workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,rootCid:root.cid};
+  const request=options.request ?? fetch;
+  const receipt=async():Promise<{deleted?:boolean;retired?:boolean}>=>{
+    let response:Response;
+    try{response=await request(appOrigin+'/account-api/workspace-unregister-receipt',{method:'POST',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000),headers:{Origin:appOrigin,'Content-Type':'application/json'},body:JSON.stringify(receiptInput)});}
+    catch{throw Error('Registration retirement could not be confirmed; local setup preserved. Run setup-tunnel --resume to retry');}
+    if(response.status===404){await response.body?.cancel();return {};}
+    if(!response.ok){await response.body?.cancel();throw Error(`Registration retirement receipt failed (HTTP ${response.status}); local setup preserved`);}
+    try{return await response.json() as {deleted?:boolean;retired?:boolean};}catch{throw Error('Invalid registration retirement receipt; local setup preserved');}
+  };
+  let status=await receipt();
+  if(status.deleted!==true){
+    if(payload.challenge.expiresAt<=Date.now())throw Error('Replacement command expired before retirement; existing setup preserved. Obtain a fresh App command');
+    await asHumanRoot(attach,root,'unregister',async client=>{
+      const serverCid=previous.serverCid.toUpperCase();
+      let contacts=await client.listContacts();
+      if(!contacts.contacts.some(contact=>same(contact.container_id,serverCid))){
+        if(!same(payload.serverCid,serverCid))throw Error('Original enrollment server contact is unavailable. Reconnect it or remove the registration in the original account first; existing local setup preserved');
+        const peer=await client.addContact({invite:payload.invitation});
+        if(!same(peer.cid,serverCid))throw Error('Original enrollment server identity mismatch; existing local setup preserved');
+        const deadline=Date.now()+(options.waitMs ?? 10000);
+        while(!(contacts=await client.listContacts()).contacts.some(contact=>same(contact.container_id,serverCid))){
+          if(Date.now()>=deadline)throw Error('Original enrollment contact is not ready; local setup preserved. Run setup-tunnel --resume');
+          await new Promise(resolve=>setTimeout(resolve,100));
+        }
+      }
+      const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce}});
+      if(!('sent' in outcome) || !outcome.sent)throw Error('Registration retirement was not sent; local setup preserved');
+    });
+  }
+  const deadline=Date.now()+(options.waitMs ?? 30000);
+  while(status.deleted!==true || status.retired!==true){
+    if(Date.now()>=deadline)throw Error('Registration retirement is not complete; local setup preserved. Run setup-tunnel --resume to retry');
+    await new Promise(resolve=>setTimeout(resolve,500));status=await receipt();
+  }
+  return root.cid;
 }
