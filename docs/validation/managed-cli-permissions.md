@@ -108,14 +108,28 @@ inside the agent's workspace, is reported as unsupported rather than widened.
 
 A prepared setup is not evidence of supervisor access. An observed `--help`
 proves only its own audited path; lifecycle forms that were never observed are
-listed as such. Rows from before the current launch are reported as historical.
+listed as such. `task create --help` is reported as `task create --help`, a help
+call, not as `task create`. Rows from before the current launch are reported as
+historical. The ledger stores the pinned configuration as a fingerprint, never
+as its path; a row pinned to another configuration, or to none that can be told,
+is counted separately and is not evidence for this policy. Rows whose content
+was erased with their task or room keep what they prove.
+
+A launch also gives up what the role held before: opting out, losing support or
+moving to another workspace or configuration removes that role's Codex rules at
+the next start, without touching a file another agent still holds.
 
 ### Unsupported combinations
 
 Reported, with the reason, and left exactly as sandboxed as before: Windows and
 other platforms; Hermes and other harnesses; custom ACP or app-server session
-commands; roles declaring `isolation:`; unspellable or in-workspace paths; a
-Node path needing quotes; Codex older than 0.160.0 with quoted paths.
+commands; roles declaring `isolation:`; unspellable paths; a Node path needing
+quotes; Codex older than 0.160.0 with quoted paths; and any pinned file the
+agent could replace — inside its workspace or a `harness_options.add_dirs`
+directory, lexically or through a symlink. Codex roles with
+`harness_options.config` or `harness_options.profile` are unsupported too:
+those change the native sandbox (for example extra writable roots) in ways Fleet
+does not inspect. Native user settings Fleet cannot read are outside this check.
 
 ### Qualification
 
@@ -142,10 +156,31 @@ Each run checks: unpinned `--help` denied at the socket; an unrelated write
 outside the workspace still denied by the OS; pinned help; `task create` with
 quoted variable options, `task list|show|block|unblock`, template and plan
 inspection completing with audit rows; `task review|start|finish` and
-`room show|members` reaching the supervisor and Fleet validation; a late
+`room show|members` reaching the supervisor and Fleet validation (their
+successful run is the lifecycle fixture below); `template show|validate` and
+`docs`; a late
 `--configuration` refused by Fleet; unprepared commands, a missing or different
 pin, preload injection, chaining and redirection staying sandboxed; and `status`
 listing exactly the forms the audit ledger observed.
+
+`test/managed-cli-lifecycle.integration.mjs` is the full stack: the real role
+runner (`ours-fleet _run`) launches the Coordinator, with a real local ours
+daemon and Cowork service (`FLEET_COWORK_CLI=/abs/cowork/dist/cli.js`). From
+inside the command sandbox the Coordinator's session creates a task, starts it —
+a Cowork room is provisioned and a room member agent is really spawned through
+the supervisor — runs `task show`, `room show`, `room members`, `task block`,
+`task unblock`, `task review` and `task finish`, which retires the member and
+the room. Every command is typed in the pinned form and must have a successful
+audit row; the task must end `done`. `FLEET_TEST_HARNESS=claude` puts the
+Coordinator on bundled Claude ACP with its OS sandbox enabled (the member stays
+on Codex). Only the model provider is scripted; the daemon runs without a broker.
+
+Two outcomes of that run are Fleet's existing lifecycle behaviour, not policy,
+and are recorded rather than hidden: the first `task start` can answer
+"readiness is unknown" while the member's session is still starting, and the
+first `task finish` can report that the member's live state disappeared while it
+is still stopping. In both cases the task is already durably in the right state
+and re-running the same command, as its message says, succeeds.
 
 Linux x86_64 host (kernel 7.0, Node 22.23.1, Codex 0.160.0, Claude Code 2.1.289):
 
@@ -156,16 +191,23 @@ Linux x86_64 host (kernel 7.0, Node 22.23.1, Codex 0.160.0, Claude Code 2.1.289)
 | Bundled Claude ACP, OS sandbox enabled | PASS | PASS |
 | Bundled Claude ACP, OS sandbox not enabled (diagnostic) | PASS | not run |
 
+| Full-stack lifecycle (real runner, room, spawned member) | Result |
+| --- | --- |
+| Codex native app-server | PASS |
+| Bundled Codex ACP | PASS (`task finish` re-run once) |
+| Bundled Claude ACP, OS sandbox enabled | PASS (`task start` and `task finish` each re-run once) |
+
 Not qualified, and not claimed:
 
 - **macOS.** The generated setup has not been run there. `managed-cli status`
   discloses this on macOS. The mechanisms are the ones the hand-written policy
   below used on macOS, but that is not a run of this matrix.
-- **Real provisioning.** `task start`, `task finish`, `task review` and
-  `room show|members` are proven to leave the sandbox, be audited and reach
-  Fleet validation. A live room with launched agents was not provisioned.
-- Claude standalone, Hermes, Windows, isolated roles, and service-managed
-  (systemd / launchd) supervisors: the fixture uses an in-process supervisor.
+- **Service-managed supervisors and a real model.** The lifecycle run starts
+  the runner directly (`OURS_FLEET_SUPERVISOR=none`), not through systemd or
+  launchd, uses a scripted provider, attaches no owner to the room and has no
+  broker. The spawned member only starts and stops; it does no work.
+- Paths with spaces in the full-stack lifecycle run (covered by the matrix
+  above), Claude standalone, Hermes, Windows and isolated roles.
 
 A managed Fleet CLI invocation sends `fleet_audit_begin` to the supervisor's Unix
 socket before parsing commands, including `--help`. A socket that exists and is

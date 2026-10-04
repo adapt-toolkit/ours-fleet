@@ -331,7 +331,9 @@ What the native policy does and does not do:
   needs no quoting: neither harness matches a quoted executable against a rule.
   A path containing anything but letters, digits, spaces and \`_@%+=:,./-\`
   (quotes, backslashes, \`*\` and other pattern characters), or located inside
-  the agent's workspace, is reported as unsupported.
+  the agent's workspace or a \`harness_options.add_dirs\` directory (also through
+  a symlink), is reported as unsupported; so is a Codex role with
+  \`harness_options.config\` or \`profile\`, whose sandbox Fleet does not inspect.
 - Prepared for: Codex native app-server and bundled ACP, Claude bundled ACP, on
   Linux and macOS. The generated setup was qualified end to end on Linux
   (Codex 0.160.0, Claude Code 2.1.289); the macOS run of that matrix is

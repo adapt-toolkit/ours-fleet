@@ -69,6 +69,15 @@ for (const file of [config, otherConfig]) {
   writeFileSync(file, 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
   mkdirSync(join(file.replace(/\.yaml$/u, ''), 'agents'), { recursive: true, mode: 0o700 });
 }
+// A room template to inspect: `template show` and `template validate` read these.
+for (const dir of ['agent_templates', 'room_templates']) mkdirSync(join(configDir, 'fleet', dir), { recursive: true, mode: 0o700 });
+writeFileSync(join(configDir, 'fleet', 'agent_templates', 'Developer.yaml'), [
+  'role: { inline: { mission: Implement the task. } }', 'brain: { inline: { harness: codex, session: codex-app-server, model: gpt-5.6-sol } }',
+  'permissions: { approval: allow, filesystem: workspace, unattended: deny }', ''].join('\n'), { mode: 0o600 });
+writeFileSync(join(configDir, 'fleet', 'room_templates', 'single.yaml'), [
+  'version: 1', 'description: "Solo task: one Developer"', 'room: { quiet_membership: false, anonymous: false }',
+  'contract: |', '  Developer owns task execution.', 'members:',
+  '  - { slot: developer, role: Developer, count: 1, agent_template: Developer }', ''].join('\n'), { mode: 0o600 });
 const bin = join(root, 'bin'); mkdirSync(bin);
 if (harness === 'codex') symlinkSync(binary, join(bin, 'codex'));
 const agentFile = join(configDir, 'fleet', 'agents', 'Coordinator.yaml');
@@ -209,7 +218,10 @@ try {
     [`task show --json -- ${id}`, 'task show', output => assert(output.includes(id), output)],
     [`task block ${id} --reason 'waiting for the owner' --json`, 'task block', output => assert(output.includes('waiting for the owner'), output)],
     [`task unblock ${id} --json`, 'task unblock', output => assert(output.includes(id), output)],
-    ['template list --json', 'template list', undefined],
+    ['template list --json', 'template list', output => assert(output.includes('"single"'), output)],
+    ['template show single --json', 'template show', output => assert(output.includes('Solo task: one Developer'), output)],
+    ['template validate --json', 'template validate', output => assert.equal(firstJson(output).valid, true, output)],
+    ['docs', 'docs', output => assert(output.includes('managed_cli'), output)],
     ['config --json', 'config', output => assert(output.includes('"Coordinator"'), output)],
   ]) {
     const result = await run(`${prefix} ${args}`, command);
@@ -217,11 +229,12 @@ try {
     check?.(result.output);
     expectAudited(++audited, command, 'success');
   }
-  console.log(`PASS ${label}: pinned help, task create/list/show/block/unblock and plan inspection ran outside the sandbox, each audited begin+finish`);
+  console.log(`PASS ${label}: pinned help, task create/list/show/block/unblock, template list/show/validate, config and docs ran outside the sandbox, each audited begin+finish`);
 
-  // Lifecycle commands this disposable Fleet cannot complete (no rooms, no Cowork):
-  // what is established is that they reach the supervisor and Fleet's own validation,
-  // not the socket denial. Room provisioning itself is NOT exercised here.
+  // This fixture has no daemon or Cowork, so these cannot complete here: what is
+  // established is that they reach the supervisor and Fleet's own validation, not
+  // the socket denial. Their SUCCESSFUL run — a provisioned room, a spawned member,
+  // review and finish — is test/managed-cli-lifecycle.integration.mjs.
   for (const [args, command] of [
     [`task review ${id} --json`, 'task review'],
     [`task start ${id} --template single --json`, 'task start'],
@@ -233,7 +246,7 @@ try {
     assert.doesNotMatch(result.output, denied, `${command}: ${result.output}`);
     expectAudited(++audited, command);
   }
-  console.log(`PASS ${label}: task review/start/finish and room show/members reached the supervisor and Fleet validation (no socket denial); provisioning not exercised`);
+  console.log(`PASS ${label}: task review/start/finish and room show/members reached the supervisor and Fleet validation (no socket denial); their successful run is the lifecycle fixture`);
 
   // --- Boundaries ---------------------------------------------------------------
   const override = await run(`${prefix} task list --json --configuration ${managedCli.shellSpelling(otherConfig)}`, 'late configuration override');
@@ -292,7 +305,7 @@ try {
   const status = coordinator(await report('status'));
   assert.equal(status.session_policy, 'current', JSON.stringify(status));
   const observed = status.observed.current.filter(item => item.class === 'success').map(item => item.form);
-  for (const form of ['--help', 'task create', 'task list', 'task show', 'task block', 'task unblock', 'template list', 'config'])
+  for (const form of ['--help', 'task create', 'task list', 'task show', 'task block', 'task unblock', 'template list', 'template show', 'template validate', 'config', 'docs'])
     assert(observed.includes(form), `${form} not observed: ${JSON.stringify(status.observed)}`);
   assert.match(status.observed.summary, /lifecycle commands not listed remain unobserved/u);
   console.log(`PASS ${label}: status reports the launched policy as current and lists exactly the forms the audit ledger observed`);

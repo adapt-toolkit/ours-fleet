@@ -1049,7 +1049,10 @@ describe('AcpSession', () => {
 
   it('queues multiple after_tool wakes on one tool boundary without cancellation', async () => {
     const session = await start();
-    const active = session.submitPrompt('toolwait 100');
+    // The tool must still be running when both wakes are queued below. The fixture
+    // completes it on a timer of its own, so leave a wide margin: at 100ms a loaded
+    // runner finished the tool first and both wakes were (correctly) delivered direct.
+    const active = session.submitPrompt('toolwait 1500');
     for (let i = 0; i < 50 && !session.eventsSince(0)
       .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
       await new Promise(resolve => setTimeout(resolve, 5));

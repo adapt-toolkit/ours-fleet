@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
+import { erasedArg } from './erased-resources.js';
 import { managedPinMarker } from './fleet-command-audit.js';
 import {
   MANAGED_CLI_WORKFLOW_IDS, splitRootFor,
@@ -405,6 +406,12 @@ export function analyzeManagedCli(
   } else {
     reasons.push(`harness '${role.harness}' has no qualified native execution policy; supported: codex (native app-server, bundled ACP), claude-code (bundled ACP)`);
   }
+  // Every root this launch lets the agent write: its workspace and the extra
+  // directories the role adds. Native settings Fleet cannot read may add more.
+  const native = (role.harness_options ?? {}) as { add_dirs?: unknown; config?: unknown; profile?: unknown };
+  const writable = [workspace, ...(Array.isArray(native.add_dirs) ? native.add_dirs.filter((dir): dir is string => typeof dir === 'string').map(dir => resolve(workspace, dir)) : [])];
+  if (role.harness === 'codex' && (native.profile != null || (native.config && typeof native.config === 'object' && Object.keys(native.config).length)))
+    reasons.push('harness_native.config or harness_native.profile changes Codex\'s native sandbox in ways Fleet does not inspect (for example extra writable roots), so it cannot tell whether the agent could replace the pinned files; drop them or keep this role sandboxed');
   if (role.isolation)
     reasons.push('the role declares isolation:, and Fleet\'s outer sandbox is kept as-is; the workflow is not qualified inside it');
   if (!plainExecutable(paths.node))
@@ -415,8 +422,9 @@ export function analyzeManagedCli(
     // Lexically and by where the path really leads: a link outside the workspace
     // that points into it is just as replaceable by the agent.
     const real = canonical(value);
-    if (inside(value, workspace) || inside(real, canonical(workspace)))
-      reasons.push(`${label} ${value}${real === value ? '' : ` (which resolves to ${real})`} is inside the agent-writable workspace ${workspace}; a rule on a file the agent can replace would let it run anything outside the sandbox`);
+    const root = writable.find(dir => inside(value, dir) || inside(real, canonical(dir)));
+    if (root !== undefined)
+      reasons.push(`${label} ${value}${real === value ? '' : ` (which resolves to ${real})`} is inside the agent-writable ${root === workspace ? 'workspace' : 'directory (harness_options.add_dirs)'} ${root}; a rule on a file the agent can replace would let it run anything outside the sandbox`);
   }
   if (mechanism === 'codex-workspace-rules' && needsQuoting(paths) && !reasons.length) {
     const version = options.codexVersion ?? codexRuntimeVersion(role, workspace);
@@ -795,9 +803,17 @@ export function observeManagedCli(stateDir: string, record: ManagedCliRecord | u
   } catch { return none('not observed: this role has no supervisor audit ledger yet'); }
   const latest = new Map<string, ManagedCliObservation['current'][number]>();
   let historical = 0, foreign = 0;
+  // Erasing a task or room replaces every argv word of its rows by a hash. The
+  // words that decide what a row is evidence of are a small fixed vocabulary, so
+  // they stay recognisable without the ledger holding any erased content.
+  const vocabulary = [MANAGED_CONFIGURATION_FLAG, '--help', '-h', '--',
+    ...allForms(MANAGED_CLI_WORKFLOW_IDS).flatMap(entry => entry.tokens),
+    ...(record?.paths?.configuration ? [managedPinMarker(record.paths.configuration)] : [])];
+  const erased = new Map(vocabulary.map(word => [erasedArg(word), word]));
   for (const attempt of attempts) {
-    if (!Array.isArray(attempt.argv) || attempt.argv[0] !== MANAGED_CONFIGURATION_FLAG) continue;
-    const argv = attempt.argv.map(String);
+    if (!Array.isArray(attempt.argv)) continue;
+    const argv = attempt.argv.map(String).map(word => erased.get(word) ?? word);
+    if (argv[0] !== MANAGED_CONFIGURATION_FLAG) continue;
     const entry = parseManagedEntry(['--managed-configuration', '/', ...argv.slice(2)]);
     if (entry.kind !== 'pinned' || !attempt.outcome?.completedAt) continue;
     if (!record || attempt.outcome.completedAt < record.preparedAt) { historical++; continue; }

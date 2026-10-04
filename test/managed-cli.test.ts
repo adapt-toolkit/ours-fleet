@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig, type ResolvedRole } from '../src/config.js';
 import { generateBriefing } from '../src/briefing.js';
 import { CAPABILITIES } from '../src/capabilities.js';
+import { erasedArg } from '../src/erased-resources.js';
 import { managedPinMarker, redactFleetArgv } from '../src/fleet-command-audit.js';
 import { doctor } from '../src/doctor.js';
 import '../src/harness/claude-code.js';
@@ -234,6 +235,24 @@ describe('which combinations Fleet prepares', () => {
       expect(result.state).toBe('unsupported');
       expect(result.reasons.join('\n')).toContain('is inside the agent-writable workspace');
     }
+  });
+
+  it('counts every directory the launch lets the agent write, and refuses what it cannot inspect', () => {
+    const extra = join(root, 'agent-writable'); mkdirSync(extra);
+    const added = analyze({ harness_options: { add_dirs: [extra] } }, { paths: { ...PATHS, cli: join(extra, 'cli.js') } });
+    expect(added.state).toBe('unsupported');
+    expect(added.reasons.join('\n')).toMatch(/is inside the agent-writable directory \(harness_options\.add_dirs\)/u);
+    symlinkSync(extra, join(root, 'extra-link'));
+    expect(analyze({ harness_options: { add_dirs: [extra] } }, { paths: { ...PATHS, configuration: join(root, 'extra-link', 'fleet.yaml') } }).state).toBe('unsupported');
+    expect(analyze({ harness: 'claude-code', session: 'acp', harness_options: { add_dirs: ['sub'] } }, { paths: { ...PATHS, cli: join(workspace, 'sub', 'cli.js') } }).state).toBe('unsupported');
+    // An added directory that holds none of the pinned files changes nothing.
+    expect(analyze({ harness_options: { add_dirs: [extra] } }).state).toBe('supported');
+    for (const harness_options of [{ config: { sandbox_workspace_write: { writable_roots: ['/opt'] } } }, { profile: 'wide' }]) {
+      const result = analyze({ harness_options });
+      expect(result.state).toBe('unsupported');
+      expect(result.reasons.join('\n')).toContain('Fleet does not inspect');
+    }
+    expect(analyze({ harness_options: { config: {} } }).state).toBe('supported');
   });
 
   it('follows links: a path outside the workspace that leads into it is refused too', () => {
@@ -785,6 +804,16 @@ describe('configuration, setup report and diagnostics', () => {
     expect(observeManagedCli(stateDir, record)).toMatchObject({ current: [], foreign: 1 });
     ledger(stateDir, [{ argv: ['task', 'create', '--title', 'x'], at: '2026-10-03T00:00:00Z' }]);
     expect(observeManagedCli(stateDir, record).current.map(item => item.form)).toEqual(['task create']);
+
+    // Finishing a task erases its rows word by word; what they prove must survive that.
+    const erase = (argv: string[]) => ({ argv: redactFleetArgv(['--managed-configuration', config, ...argv]).map(erasedArg), erased: true,
+      outcome: { completedAt: '2026-10-03T00:00:00Z', class: 'success' } });
+    writeFileSync(join(stateDir, '.fleet-command-audit.json'), JSON.stringify({ version: 1, attempts: [
+      erase(['task', 'start', 'T', '--template', 'single']), erase(['task', 'finish', 'T', '--help']),
+      { ...erase(['task', 'review', 'T']), argv: redactFleetArgv(['--managed-configuration', '/DIFFERENT/fleet.yaml', 'task', 'review', 'T']).map(erasedArg) }] }));
+    const afterErasure = observeManagedCli(stateDir, record);
+    expect(afterErasure.current.map(item => [item.form, item.effect])).toEqual([['task finish --help', 'help'], ['task start', 'lifecycle']]);
+    expect(afterErasure.foreign).toBe(1);
   });
 
   it('doctor prints the three facts as three rows', async () => {
