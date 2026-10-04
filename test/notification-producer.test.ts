@@ -32,7 +32,7 @@ it('produces only user-correlated completions, retries, and recovers delivery af
   const restarted = new FleetNotificationProducer([root], join(dir, 'outboxes'), config);
   cleanup.push(() => restarted.close()); fail = false; await restarted.drain();
   expect(accepted).toHaveLength(1); expect(accepted[0].eventId).toBe(`agent-one:g:${done.seq}`);
-  expect(accepted[0].url).toBe('/fleet/chats?chat=agent-one&detail=1#fleet-message-reply-human');
+  expect(accepted[0].url).toBe('/fleet/chats?chat=agent-one&detail=1#fleet-message-reply-human');expect(accepted[0].taskId).toBeNull();
 
 });
 
@@ -94,4 +94,19 @@ it('retires a deleted target after the in-flight send and clears persisted pendi
   store.close();rmSync(roleDir,{recursive:true,force:true});await retireNotificationTarget('/fleet/chats?chat=removed-agent',config);expect(events).toEqual(['send-start','delete']);
   producer.poll();release();await draining;await producer.close();expect(events).toEqual(['send-start','delete','send-end','delete']);
   const saved=JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8'));expect(saved.entries).toEqual([]);
+});
+
+it('freezes task association before delivery and preserves it across a retry after the room inventory changes',async()=>{
+  const {roomsDir}=await import('../src/rooms-tasks/room-state.js');const previous=process.env.OURS_FLEET_HOME;
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','task-badge-'));process.env.OURS_FLEET_HOME=dir;
+  cleanup.push(async()=>{if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;});
+  mkdirSync(roomsDir(),{recursive:true});const room=join(roomsDir(),'room.json');writeFileSync(room,JSON.stringify({room_id:'room-one',task_id:'task-one',member_seats:[{role_name:'task-member'}]}));
+  let fail=true;const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;if(fail){res.statusCode=503;}else accepted.push(JSON.parse(raw));res.end('{}');});server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
+  const root=join(dir,'agents');mkdirSync(root);const config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)},state=join(dir,'outboxes');
+  let producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());
+  const store=new ConversationEventStore(join(root,'task-member','.conversation'),{roleId:'task-member'});cleanup.push(async()=>store.close());
+  store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
+  producer.poll();await producer.drain();await producer.close();writeFileSync(room,JSON.stringify({room_id:'room-one',member_seats:[]}));
+  producer=new FleetNotificationProducer([root],state,config);fail=false;await producer.drain();await producer.close();
+  expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].url).toContain('chat=task-member');
 });

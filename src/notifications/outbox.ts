@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 import { readPrivateFile } from '@ours.network/sdk/connector';
 import { readClientProfile } from '../client-profile.js';
 
-export interface NotificationInput { eventId: string; title: string; body: string; url: string; }
+export interface NotificationInput { eventId: string; title: string; body: string; url: string; taskId?:string|null; }
 interface Entry { id: string; value: unknown; payload?: NotificationInput; }
 export interface ProducerConfig {
   /** Service base URL. With a gateway credential it is the server gateway's notifications route. */
