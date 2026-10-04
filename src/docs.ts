@@ -329,7 +329,8 @@ What the native policy does and does not do:
 - A Fleet CLI or configuration path containing spaces is spelled in single
   quotes (Codex >= 0.160.0). The Node executable itself must be at a path that
   needs no quoting: neither harness matches a quoted executable against a rule.
-  A path containing a quote, backslash or control character, or located inside
+  A path containing anything but letters, digits, spaces and \`_@%+=:,./-\`
+  (quotes, backslashes, \`*\` and other pattern characters), or located inside
   the agent's workspace, is reported as unsupported.
 - Prepared for: Codex native app-server and bundled ACP, Claude bundled ACP, on
   Linux and macOS. The generated setup was qualified end to end on Linux

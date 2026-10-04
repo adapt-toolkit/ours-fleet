@@ -19,10 +19,11 @@ import { createRequire } from 'node:module';
 import {
   existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
+import { managedPinMarker } from './fleet-command-audit.js';
 import {
   MANAGED_CLI_WORKFLOW_IDS, splitRootFor,
   type FleetConfig, type ManagedCliWorkflowId, type ResolvedRole,
@@ -184,8 +185,15 @@ export function managedCliPaths(configPath?: string, overrides: Partial<ManagedC
 }
 
 const PLAIN_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/u;
-/** Single quotes are the one spelling both Codex (>=0.160.0) and Claude match against a rule — for words after the executable. */
-const QUOTABLE_TOKEN = /^[^'\\\u0000-\u001f\u007f]+$/u;
+/**
+ * Single quotes are the one spelling both Codex (>=0.160.0) and Claude match
+ * against a rule — for words after the executable. Only a space is admitted
+ * beyond the plain characters: that is what was measured natively. `*`, `?`,
+ * brackets, parentheses and the like are pattern syntax in Claude's permission
+ * and exclusion entries, where a path is inserted verbatim, so a path carrying
+ * one would widen the entry beyond this installation.
+ */
+const QUOTABLE_TOKEN = /^[A-Za-z0-9_@%+=:,./ -]+$/u;
 
 /** The canonical shell spelling of one path token, or undefined when none is qualified. */
 export function shellSpelling(token: string): string | undefined {
@@ -322,6 +330,16 @@ export interface ManagedCliDeps {
 const inside = (child: string, parent: string): boolean =>
   child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
 
+/** Where `path` really is: symlinks resolved through the deepest ancestor that exists. */
+function canonical(path: string): string {
+  const missing: string[] = [];
+  for (let current = resolve(path); ; current = dirname(current)) {
+    try { return join(realpathSync(current), ...missing.reverse()); } catch { /* not there yet */ }
+    if (dirname(current) === current) return resolve(path);
+    missing.push(basename(current));
+  }
+}
+
 export function roleWorkspace(role: ResolvedRole, temp = false): string {
   return role.cwd && existsSync(role.cwd) ? role.cwd : agentDir(role.name, temp);
 }
@@ -393,9 +411,12 @@ export function analyzeManagedCli(
     reasons.push(`Node executable path ${JSON.stringify(paths.node)} would need shell quoting, and neither Codex nor Claude matches a quoted executable against a rule; install or link Node at a path without spaces or shell metacharacters and start Fleet with that Node`);
   for (const [label, value] of [['Node executable', paths.node], ['Fleet CLI', paths.cli], ['configuration', paths.configuration]] as const) {
     if (label !== 'Node executable' && shellSpelling(value) === undefined)
-      reasons.push(`${label} path ${JSON.stringify(value)} contains a quote, backslash or control character and has no qualified shell spelling; install it at a path without them`);
-    if (inside(value, workspace))
-      reasons.push(`${label} ${value} is inside the agent-writable workspace ${workspace}; a rule on a file the agent can replace would let it run anything outside the sandbox`);
+      reasons.push(`${label} path ${JSON.stringify(value)} contains a character other than letters, digits, spaces and _@%+=:,./- and has no qualified literal spelling in a native rule (quotes, backslashes and pattern characters such as * ? [ ] ( ) are not matched literally); install it at a path without them`);
+    // Lexically and by where the path really leads: a link outside the workspace
+    // that points into it is just as replaceable by the agent.
+    const real = canonical(value);
+    if (inside(value, workspace) || inside(real, canonical(workspace)))
+      reasons.push(`${label} ${value}${real === value ? '' : ` (which resolves to ${real})`} is inside the agent-writable workspace ${workspace}; a rule on a file the agent can replace would let it run anything outside the sandbox`);
   }
   if (mechanism === 'codex-workspace-rules' && needsQuoting(paths) && !reasons.length) {
     const version = options.codexVersion ?? codexRuntimeVersion(role, workspace);
@@ -500,6 +521,31 @@ export function acquireCodexRules(
     if (!entry.holders.includes(holder)) entry.holders = [...entry.holders, holder].sort();
     registry.files[path] = entry;
     return { path, action: current === undefined ? 'created' as const : current === content ? 'unchanged' as const : 'updated' as const };
+  });
+}
+
+/**
+ * Drop `holder` from every rules file except `keep`. A file left without a
+ * holder is removed when Fleet still owns it; a file other agents hold is left
+ * exactly as it is. This is what a launch does when the role stopped declaring
+ * the workflow, lost support, or moved to another workspace or configuration.
+ */
+export function releaseCodexRules(holder: string, keep?: string): RulesResult[] {
+  return withRegistry(registry => {
+    const results: RulesResult[] = [];
+    for (const [path, entry] of Object.entries(registry.files)) {
+      if (path === keep || !entry.holders.includes(holder)) continue;
+      entry.holders = entry.holders.filter(name => name !== holder);
+      if (entry.holders.length) continue;
+      const header = readRulesHeader(path);
+      if (header && header !== 'foreign') {
+        rmSync(path, { force: true });
+        results.push({ path, action: 'removed', detail: `${holder} no longer uses it` });
+      } else if (header === 'foreign')
+        results.push({ path, action: 'conflict', detail: `${path} is no longer Fleet-generated; left untouched` });
+      delete registry.files[path];
+    }
+    return results;
   });
 }
 
@@ -677,21 +723,29 @@ export function prepareManagedCliLaunch(
         prep = { ...prep, settingsOverlay: overlayPath };
       }
     }
-    if (analysis.state === 'not-declared') { rmSync(recordPath, { force: true }); return prep; }
+    const holder = holderId(role.name, options.temp === true);
+    const released = (keep?: string): void => {
+      for (const result of releaseCodexRules(holder, keep))
+        options.log(`[${role.name}] managed CLI: Codex rules ${result.action} at ${result.path} (${result.detail})`);
+    };
+    if (analysis.state === 'not-declared') { released(); rmSync(recordPath, { force: true }); return prep; }
 
     let state: ManagedCliRecord['state'] = analysis.state;
     let artifact: string | undefined;
     const reasons = [...analysis.reasons];
     if (analysis.state === 'supported' && analysis.mechanism === 'codex-workspace-rules') {
-      const result = acquireCodexRules(
-        analysis.workspace, analysis.paths, analysis.workflows, holderId(role.name, options.temp === true));
+      const result = acquireCodexRules(analysis.workspace, analysis.paths, analysis.workflows, holder);
       artifact = result.path;
+      // A changed workspace or configuration: the rules this role held before go.
+      released(result.action === 'conflict' ? undefined : result.path);
       if (result.action === 'conflict') { state = 'conflict'; reasons.push(result.detail!); }
       else options.log(`[${role.name}] managed CLI: Codex rules ${result.action} at ${result.path}`);
     } else if (analysis.state === 'supported') {
+      released();
       artifact = prep.settingsOverlay;
       options.log(`[${role.name}] managed CLI: Claude permission and sandbox-exclusion entries written to ${artifact}`);
     }
+    if (analysis.state !== 'supported') released();
     if (state !== 'supported')
       options.log(`[${role.name}] managed CLI: ${state} — ${reasons.join('; ')}`);
     const digest = managedCliDigest(analysis);
@@ -720,40 +774,56 @@ export interface ManagedCliObservation {
   current: { form: string; effect: ManagedCliForm['effect']; at: string; class: string }[];
   /** Pinned invocations that predate the current policy: history, not verification. */
   historical: number;
+  /** Rows pinned to a configuration other than the one this policy was prepared for. */
+  foreign: number;
   summary: string;
 }
 
+/** Whether Commander answers this argv with help text instead of running the command. */
+const asksForHelp = (tail: readonly string[]): boolean => {
+  const terminator = tail.indexOf('--');
+  return (terminator < 0 ? tail : tail.slice(0, terminator)).some(arg => arg === '--help' || arg === '-h');
+};
+
 /** Read the role's audit ledger without mutating or recovering it. */
 export function observeManagedCli(stateDir: string, record: ManagedCliRecord | undefined): ManagedCliObservation {
-  const none = (summary: string): ManagedCliObservation => ({ current: [], historical: 0, summary });
+  const none = (summary: string): ManagedCliObservation => ({ current: [], historical: 0, foreign: 0, summary });
   let attempts: { argv?: unknown; invokedAt?: string; outcome?: { class?: string; completedAt?: string } }[];
   try {
     const parsed = JSON.parse(readFileSync(join(stateDir, '.fleet-command-audit.json'), 'utf8')) as { attempts?: unknown };
     attempts = Array.isArray(parsed.attempts) ? parsed.attempts as typeof attempts : [];
   } catch { return none('not observed: this role has no supervisor audit ledger yet'); }
   const latest = new Map<string, ManagedCliObservation['current'][number]>();
-  let historical = 0;
+  let historical = 0, foreign = 0;
   for (const attempt of attempts) {
     if (!Array.isArray(attempt.argv) || attempt.argv[0] !== MANAGED_CONFIGURATION_FLAG) continue;
-    const entry = parseManagedEntry(['--managed-configuration', '/', ...attempt.argv.slice(2).map(String)]);
+    const argv = attempt.argv.map(String);
+    const entry = parseManagedEntry(['--managed-configuration', '/', ...argv.slice(2)]);
     if (entry.kind !== 'pinned' || !attempt.outcome?.completedAt) continue;
     if (!record || attempt.outcome.completedAt < record.preparedAt) { historical++; continue; }
-    const name = entry.form.tokens.join(' ');
+    // Evidence for THIS policy only: a row pinned to another configuration ran under other
+    // rules. The ledger holds the pin as a fingerprint; a row without one is not attributable.
+    if (argv[1] !== managedPinMarker(record.paths.configuration)) { foreign++; continue; }
+    // The row records what was typed, and `task create --help` only printed help:
+    // it is evidence for the help path of that command, never for the command.
+    const help = entry.form.effect !== 'help' && asksForHelp(argv.slice(2 + entry.form.tokens.length));
+    const name = `${entry.form.tokens.join(' ')}${help ? ' --help' : ''}`;
     // One success is the evidence; a later refusal of the same form does not erase it.
     if (latest.get(name)?.class === 'success' && attempt.outcome.class !== 'success') continue;
-    latest.set(name, { form: name, effect: entry.form.effect, at: attempt.outcome.completedAt, class: attempt.outcome.class ?? 'unknown' });
+    latest.set(name, { form: name, effect: help ? 'help' : entry.form.effect, at: attempt.outcome.completedAt, class: attempt.outcome.class ?? 'unknown' });
   }
   const current = [...latest.values()].sort((a, b) => a.form.localeCompare(b.form));
   const succeeded = current.filter(item => item.class === 'success');
   const lifecycle = succeeded.filter(item => item.effect === 'lifecycle');
   const failed = current.filter(item => item.class !== 'success');
   const past = (failed.length ? ` Audited but not completed successfully: ${failed.map(item => `${item.form} (${item.class})`).join(', ')}.` : '')
-    + (historical ? ` ${historical} earlier pinned invocation(s) predate the current policy and verify nothing about it.` : '');
+    + (historical ? ` ${historical} earlier pinned invocation(s) predate the current policy and verify nothing about it.` : '')
+    + (foreign ? ` ${foreign} invocation(s) pinned to another configuration, or not attributable to one, are not evidence for this policy.` : '');
   if (!succeeded.length)
-    return { current, historical, summary: `not observed: no pinned invocation has completed through the supervisor since the current policy was loaded.${past}` };
+    return { current, historical, foreign, summary: `not observed: no pinned invocation has completed through the supervisor since the current policy was loaded.${past}` };
   if (!lifecycle.length)
-    return { current, historical, summary: `supervisor reached by ${succeeded.map(item => item.form).join(', ')} only; help and read commands prove their own audited path, not the task lifecycle.${past}` };
-  return { current, historical, summary: `supervisor reached by ${succeeded.map(item => item.form).join(', ')}; lifecycle commands not listed remain unobserved.${past}` };
+    return { current, historical, foreign, summary: `supervisor reached by ${succeeded.map(item => item.form).join(', ')} only; help and read commands prove their own audited path, not the task lifecycle.${past}` };
+  return { current, historical, foreign, summary: `supervisor reached by ${succeeded.map(item => item.form).join(', ')}; lifecycle commands not listed remain unobserved.${past}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +916,7 @@ export function managedCliReport(
       role: role.name, harness: role.harness, session: role.session, workflows: analysis.workflows,
       setup, session_policy,
       observed: supported || record ? observeManagedCli(stateDir, session_policy === 'current' ? record : undefined)
-        : { current: [], historical: 0, summary: 'not applicable' },
+        : { current: [], historical: 0, foreign: 0, summary: 'not applicable' },
       ...(analysis.commandPrefix ? { commandPrefix: analysis.commandPrefix } : {}),
       scope: analysis.scope, warnings,
     });

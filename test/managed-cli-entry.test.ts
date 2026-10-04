@@ -72,7 +72,7 @@ function audited(rows: FleetAuditAttempt[], outcome?: string) {
   expect(rows).toHaveLength(1);
   expect(rows[0]!.invocation).toBe('delivered');
   expect(rows[0]!.argv[0]).toBe(PIN);
-  expect(rows[0]!.argv[1]).toBe('[REDACTED:value]');
+  expect(rows[0]!.argv[1]).toMatch(/^\[PIN:[0-9a-f]{16}\]$/u); // a fingerprint, never the path
   if (outcome) expect(rows[0]!.outcome?.class).toBe(outcome);
   else expect(rows[0]!.outcome?.class).not.toBe('success');
   expect(rows[0]!.outcome?.delivery).toBe('delivered');

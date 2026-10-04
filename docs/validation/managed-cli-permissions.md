@@ -72,7 +72,9 @@ Measured with real Codex 0.160.0 and Claude Code 2.1.289 on Linux:
 Fleet therefore spells a CLI or configuration path containing spaces in single
 quotes (Codex >= 0.160.0 required; older or unreadable versions are reported as
 unsupported for such paths), and requires the Node executable at a path needing
-no quoting. A path containing a quote, backslash or control character, or one
+no quoting. A path containing anything but letters, digits, spaces and
+`_@%+=:,./-` (so no quotes, backslashes, `*` or other pattern characters, which
+Claude's entries would not treat literally), or one that is or resolves
 inside the agent's workspace, is reported as unsupported rather than widened.
 
 ### What is written, and ownership

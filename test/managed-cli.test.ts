@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync,
-  statSync, writeFileSync,
+  statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig, type ResolvedRole } from '../src/config.js';
 import { generateBriefing } from '../src/briefing.js';
 import { CAPABILITIES } from '../src/capabilities.js';
+import { managedPinMarker, redactFleetArgv } from '../src/fleet-command-audit.js';
 import { doctor } from '../src/doctor.js';
 import '../src/harness/claude-code.js';
 import { claudeCodeAdapter, makeClaudeCodeAdapter } from '../src/harness/claude-code.js';
@@ -19,7 +20,7 @@ import {
   claudeManagedCliSettings, codexRulesPath, codexWorkspaceTrust, enableManagedCli,
   inspectClaudeSettings, inspectCodexRules, managedCliBriefing, managedCliCommandPrefix,
   managedCliPrefix, managedCliReport, mergeClaudeOverlay, observeManagedCli,
-  prepareManagedCliLaunch, readManagedCliRecord, reconcileCodexRules, renderCodexRules,
+  prepareManagedCliLaunch, readManagedCliRecord, reconcileCodexRules, releaseCodexRules, renderCodexRules,
   shellSpelling, type ManagedCliPaths,
 } from '../src/managed-cli.js';
 import { agentDir } from '../src/paths.js';
@@ -119,8 +120,16 @@ describe('generated native policy', () => {
   it('spells a path that needs quoting in single quotes, and refuses what has no spelling', () => {
     expect(shellSpelling('/opt/node/bin/node')).toBe('/opt/node/bin/node');
     expect(shellSpelling('/Users/a b/Application Support/x')).toBe("'/Users/a b/Application Support/x'");
-    expect(shellSpelling('/home/$USER/x')).toBe("'/home/$USER/x'");
     for (const bad of ["/o'brien/node", '/a\\b', '/a\nb', '/a\tb']) expect(shellSpelling(bad)).toBeUndefined();
+    // Pattern syntax in Claude's entries, where the path is inserted verbatim: real Claude 2.1.289
+    // ran '/x/fleetOTHER/cli.cjs' under an entry written for '/x/fleet*/cli.cjs'. No spelling, no entry.
+    for (const bad of ['/opt/fleet*/dist/cli.js', '/opt/fleet?/cli.js', '/opt/[ab]/cli.js', '/opt/a(b)/cli.js', '/opt/{a,b}/cli.js', '/opt/a b*/cli.js', '/opt/$HOME/x', '/opt/a!b', '/opt/a"b', '/opt/a;b', '/opt/a|b', '/opt/~x'])
+      expect(shellSpelling(bad), bad).toBeUndefined();
+    for (const key of ['cli', 'configuration'] as const) {
+      const starred = { ...PATHS, [key]: '/opt/fleet*/x' };
+      expect(managedCliCommandPrefix(starred)).toBeUndefined();
+      expect(claudeManagedCliSettings(starred, ['task-workflow'])).toBeUndefined();
+    }
     expect(managedCliCommandPrefix(SPACED)).toBe(
       "/opt/node/bin/node '/Users/a b/Application Support/fleet/dist/cli.js' --managed-configuration '/srv/my fleet/fleet.yaml'");
     expect(managedCliCommandPrefix({ ...PATHS, cli: "/o'brien/cli.js" })).toBeUndefined();
@@ -206,7 +215,7 @@ describe('which combinations Fleet prepares', () => {
     ['custom app-server', { session_options: { codex_app_server: { command: 'x app-server' } } }, {}, /custom session_options\.codex_app_server\.command/u],
     ['custom Claude ACP', { harness: 'claude-code', session: 'acp' as const, session_options: { acp: { command: 'x' } } }, {}, /cannot receive Fleet's settings overlay/u],
     ['outer isolation', { isolation: { network: 'none' } as never }, {}, /declares isolation:.*outer sandbox is kept as-is/u],
-    ['unspellable path', {}, { paths: { ...PATHS, cli: "/o'brien/cli.js" } }, /Fleet CLI path .* has no qualified shell spelling/u],
+    ['unspellable path', {}, { paths: { ...PATHS, cli: "/o'brien/cli.js" } }, /Fleet CLI path .* has no qualified literal spelling/u],
     ['Node at a path with spaces', {}, { paths: { ...PATHS, node: '/opt/my node/bin/node' } }, /neither Codex nor Claude matches a quoted executable against a rule/u],
     ['Node at a path with spaces (Claude)', { harness: 'claude-code', session: 'acp' as const }, { paths: { ...PATHS, node: '/Applications/My Node/node' } }, /neither Codex nor Claude matches a quoted executable/u],
     ['quoted path on old Codex', {}, { paths: SPACED, codexVersion: '0.159.0' }, /Codex 0\.159\.0 does not match against rules; upgrade Codex to >=0\.160\.0/u],
@@ -225,6 +234,25 @@ describe('which combinations Fleet prepares', () => {
       expect(result.state).toBe('unsupported');
       expect(result.reasons.join('\n')).toContain('is inside the agent-writable workspace');
     }
+  });
+
+  it('follows links: a path outside the workspace that leads into it is refused too', () => {
+    mkdirSync(join(workspace, 'cfg'));
+    writeFileSync(join(workspace, 'cfg', 'fleet.yaml'), '');
+    symlinkSync(join(workspace, 'cfg', 'fleet.yaml'), join(root, 'linked.yaml'));
+    symlinkSync(join(workspace, 'cfg'), join(root, 'linked-dir'));
+    for (const configuration of [join(root, 'linked.yaml'), join(root, 'linked-dir', 'fleet.yaml'), join(root, 'linked-dir', 'not-yet.yaml')]) {
+      const result = analyze({}, { paths: { ...PATHS, configuration } });
+      expect(result.state, configuration).toBe('unsupported');
+      expect(result.reasons.join('\n')).toMatch(/which resolves to .*is inside the agent-writable workspace/u);
+    }
+    // The workspace itself reached through a link is the same workspace.
+    symlinkSync(workspace, join(root, 'ws-link'));
+    expect(analyze({ cwd: join(root, 'ws-link') }, { workspace: join(root, 'ws-link'), paths: { ...PATHS, cli: join(workspace, 'cli.js') } }).state).toBe('unsupported');
+    // A link that stays outside is fine.
+    writeFileSync(join(root, 'real.yaml'), '');
+    symlinkSync(join(root, 'real.yaml'), join(root, 'ok.yaml'));
+    expect(analyze({}, { paths: { ...PATHS, configuration: join(root, 'ok.yaml') } }).state).toBe('supported');
   });
 
   it('qualifies quoted paths from Codex 0.160.0 and for Claude', () => {
@@ -489,6 +517,44 @@ describe('launch preparation', () => {
     expect(broken).toEqual({ env: { A: '1' } });
   });
 
+  it('gives up the rules it held when the role opts out, loses support or moves', () => {
+    writeFileSync(config, '');
+    const file = codexRulesPath(workspace, config);
+    // Opt-out: the next launch removes the grant, not a later setup.
+    launch(role({ name: 'A', session: 'acp' }));
+    expect(existsSync(file)).toBe(true);
+    const out = launch(role({ name: 'A', session: 'acp', managed_cli: undefined }));
+    expect(existsSync(file)).toBe(false);
+    expect(out.log.join('\n')).toContain(`Codex rules removed at ${file}`);
+    expect(readManagedCliRecord(out.stateDir)).toBeUndefined();
+
+    // Another agent's holding survives this agent's opt-out, byte for byte.
+    launch(role({ name: 'A', session: 'acp' })); launch(role({ name: 'B', session: 'acp' }));
+    const before = readFileSync(file, 'utf8');
+    launch(role({ name: 'A', session: 'acp', managed_cli: undefined }));
+    expect(readFileSync(file, 'utf8')).toBe(before);
+    // ...and losing support releases like opting out does.
+    launch(role({ name: 'B', session: 'acp', isolation: {} as never }));
+    expect(existsSync(file)).toBe(false);
+
+    // A moved workspace: the old workspace's file goes at the launch that writes the new one.
+    const elsewhere = join(root, 'elsewhere'); mkdirSync(elsewhere);
+    launch(role({ name: 'A', session: 'acp' }));
+    const stateDir = agentDir('A');
+    prepareManagedCliLaunch(role({ name: 'A', session: 'acp', cwd: elsewhere }), {
+      stateDir, runCwd: elsewhere, configPath: config, prep: { env: {} }, log: () => {},
+      deps: { paths: { ...PATHS, configuration: config }, platform: 'linux' } });
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(codexRulesPath(elsewhere, config))).toBe(true);
+
+    // A file the operator took over is never deleted, and an operator's own file is never listed.
+    writeFileSync(codexRulesPath(elsewhere, config), '# mine now\n');
+    writeFileSync(join(elsewhere, '.codex', 'rules', 'ours-fleet.rules'), 'prefix_rule(pattern=["x"], decision="allow")\n');
+    expect(releaseCodexRules('A')).toEqual([expect.objectContaining({ action: 'conflict' })]);
+    expect(readFileSync(codexRulesPath(elsewhere, config), 'utf8')).toBe('# mine now\n');
+    expect(existsSync(join(elsewhere, '.codex', 'rules', 'ours-fleet.rules'))).toBe(true);
+  });
+
   it('holds the rules file for a temporary agent under its own holder', () => {
     writeFileSync(config, '');
     launch(role({ name: 'Member' }), { env: {} }, true);
@@ -499,9 +565,10 @@ describe('launch preparation', () => {
 
 describe('configuration, setup report and diagnostics', () => {
   const deps = () => ({ paths: { node: PATHS.node, cli: PATHS.cli }, platform: 'linux' as const, env: { CODEX_HOME: join(root, 'codex') } });
-  const ledger = (stateDir: string, rows: { argv: string[]; at: string; class?: string }[]) => writeFileSync(
+  // Rows exactly as the supervisor stores them: the pin as a fingerprint, never the path.
+  const ledger = (stateDir: string, rows: { argv: string[]; at: string; class?: string; pin?: string }[]) => writeFileSync(
     join(stateDir, '.fleet-command-audit.json'), JSON.stringify({ version: 1, attempts: rows.map(row => ({
-      argv: ['--managed-configuration', '[REDACTED:value]', ...row.argv], invokedAt: row.at,
+      argv: redactFleetArgv(['--managed-configuration', row.pin ?? config, ...row.argv]), invokedAt: row.at,
       outcome: { completedAt: row.at, class: row.class ?? 'success' } })) }));
 
   it('accepts managed_cli only as an explicit list of known workflows', () => {
@@ -678,12 +745,46 @@ describe('configuration, setup report and diagnostics', () => {
     expect(observeManagedCli(stateDir, undefined).summary).toContain('no supervisor audit ledger yet');
     ledger(stateDir, [{ argv: ['task', 'start', 'T'], at: '2026-10-01T00:00:00Z' }]);
     expect(observeManagedCli(stateDir, undefined)).toMatchObject({ current: [], historical: 1 });
-    const record = { preparedAt: '2026-10-02T00:00:00Z' } as never;
+    const record = { preparedAt: '2026-10-02T00:00:00Z', paths: { configuration: config } } as never;
     expect(observeManagedCli(stateDir, record).summary).toMatch(/^not observed: no pinned invocation has completed/u);
     // Unpinned rows are ordinary commands, not evidence about this policy at all.
     writeFileSync(join(stateDir, '.fleet-command-audit.json'), JSON.stringify({ version: 1, attempts: [
       { argv: ['task', 'list'], outcome: { completedAt: '2026-10-03T00:00:00Z', class: 'success' } }] }));
     expect(observeManagedCli(stateDir, record)).toMatchObject({ current: [], historical: 0 });
+  });
+
+  it('counts a row only for the configuration it ran under and the operation it performed', () => {
+    const stateDir = agentDir('X'); mkdirSync(stateDir, { recursive: true });
+    const record = { preparedAt: '2026-10-02T00:00:00Z', paths: { configuration: config } } as never;
+    // The ledger never holds the path, only a fingerprint that tells configurations apart.
+    expect(redactFleetArgv(['--managed-configuration', config, 'task', 'list'])).toEqual(
+      ['--managed-configuration', managedPinMarker(config), 'task', 'list']);
+    expect(managedPinMarker(config)).toMatch(/^\[PIN:[0-9a-f]{16}\]$/u);
+    expect(managedPinMarker(config)).not.toBe(managedPinMarker('/DIFFERENT/fleet.yaml'));
+
+    // Asking a lifecycle command for help ran no lifecycle command.
+    ledger(stateDir, [
+      { argv: ['task', 'create', '--help'], at: '2026-10-03T00:00:00Z' },
+      { argv: ['task', 'start', 'T', '-h'], at: '2026-10-03T00:01:00Z' },
+      { argv: ['task', 'show', '--', '--help'], at: '2026-10-03T00:02:00Z' },
+    ]);
+    const helped = observeManagedCli(stateDir, record);
+    expect(helped.current).toEqual([
+      { form: 'task create --help', effect: 'help', at: '2026-10-03T00:00:00Z', class: 'success' },
+      { form: 'task show', effect: 'read', at: '2026-10-03T00:02:00Z', class: 'success' },
+      { form: 'task start --help', effect: 'help', at: '2026-10-03T00:01:00Z', class: 'success' },
+    ]);
+    expect(helped.summary).toContain('not the task lifecycle');
+
+    // A success pinned to another configuration, or to none that can be told, proves nothing here.
+    ledger(stateDir, [{ argv: ['task', 'create', '--title', 'x'], at: '2026-10-03T00:00:00Z', pin: '/DIFFERENT/fleet.yaml' }]);
+    expect(observeManagedCli(stateDir, record)).toMatchObject({ current: [], foreign: 1 });
+    expect(observeManagedCli(stateDir, record).summary).toMatch(/^not observed: .*1 invocation\(s\) pinned to another configuration/u);
+    writeFileSync(join(stateDir, '.fleet-command-audit.json'), JSON.stringify({ version: 1, attempts: [
+      { argv: ['--managed-configuration', '[REDACTED:value]', 'task', 'create'], outcome: { completedAt: '2026-10-03T00:00:00Z', class: 'success' } }] }));
+    expect(observeManagedCli(stateDir, record)).toMatchObject({ current: [], foreign: 1 });
+    ledger(stateDir, [{ argv: ['task', 'create', '--title', 'x'], at: '2026-10-03T00:00:00Z' }]);
+    expect(observeManagedCli(stateDir, record).current.map(item => item.form)).toEqual(['task create']);
   });
 
   it('doctor prints the three facts as three rows', async () => {

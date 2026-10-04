@@ -1,6 +1,6 @@
 import { erasedArg, redactErasedContent, writePrivacyFilteredLedger } from './erased-resources.js';
 import { existsSync, readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { replaceFileAtomically } from './atomic-file.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
@@ -233,6 +233,13 @@ export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassifi
 }
 
 const marker = (value: string): string => value === '' ? '[REDACTED:empty]' : '[REDACTED:value]';
+/**
+ * The pinned configuration of a managed entry (src/managed-cli.ts) is recorded
+ * as a fingerprint, not as its path: diagnostics must tell which configuration a
+ * row ran under without the ledger holding the path itself.
+ */
+export const managedPinMarker = (configuration: string): string =>
+  `[PIN:${createHash('sha256').update(configuration).digest('hex').slice(0, 16)}]`;
 const sensitiveValueFlags = new Set([
   '--identity', '--invite', '--token', '--api-token', '--password', '--password-file',
   '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file', '--loops-file',
@@ -280,6 +287,9 @@ export function redactFleetArgv(argv: readonly string[]): string[] {
     }
     const equal = /^(--[^=]+)=(.*)$/su.exec(arg);
     if (equal && sensitiveValueFlags.has(equal[1]!)) { result[index] = `${equal[1]}=${marker(equal[2]!)}`; continue; }
+    if (index === 0 && arg === '--managed-configuration' && result.length > 1) {
+      result[1] = managedPinMarker(result[1]!); index++; continue;
+    }
     if (sensitiveValueFlags.has(arg) && index + 1 < result.length) {
       result[index + 1] = marker(result[index + 1]!); index++; continue;
     }
