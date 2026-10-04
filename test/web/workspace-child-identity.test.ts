@@ -1,7 +1,7 @@
-import {afterEach,describe,expect,it} from 'vitest';
+import {afterEach,describe,expect,it,vi} from 'vitest';
 import {createServer,type Server} from 'node:http';
 import {once} from 'node:events';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {chmodSync,existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {parse,stringify} from 'yaml';
@@ -22,13 +22,14 @@ const tree=():Row[]=>[{name:'alice@home',cid:ROOT,kind:'root',temp:null,session:
 async function host(rows:Row[]=tree()) {
   const dir=mkdtempSync(join(tmpdir(),'fleet-child-')),prior={...process.env};
   const messenger:Array<{path:string;body?:unknown}>=[];const daemon:Array<[string,unknown?]>=[];
-  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase(),releaseFailed:0,preserveProfile:true};
+  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase() as string|undefined,releaseFailed:0,preserveProfile:true};
   const server:Server=createServer(async(req,res)=>{res.setHeader('Content-Type','application/json');const path=new URL(req.url!,'http://host').pathname.replace(/^\/messenger\/api\//,'');
     if(req.method==='GET'){messenger.push({path});
+      if(path==='contacts'){res.end(JSON.stringify({contacts:behaviour.contacts.map(container_id=>({container_id})),pending:[]}));return;}
       // Messenger names the root the daemon describes for the identity it runs as.
       res.end(JSON.stringify({cid:behaviour.messengerCid,rootCid:behaviour.messengerRoot,...(behaviour.preserveProfile?{preserveProfile:true}:{})}));return;}
     const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(chunk);messenger.push({path,body:JSON.parse(Buffer.concat(chunks).toString())});
-    res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:{}));});
+    res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:path==='workspace/unregister'?{submitted:true,rootCid:behaviour.messengerCid}:path==='contacts/add'?{cid:behaviour.peer}:{}));});
   server.listen(0,'127.0.0.1');await once(server,'listening');
   undo.push(async()=>{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));for(const key of Object.keys(process.env))if(!(key in prior))delete process.env[key];Object.assign(process.env,prior);rmSync(dir,{recursive:true,force:true});});
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];process.env.OURS_FLEET_HOME=dir;
@@ -208,5 +209,113 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     const h=await host();enrolledAsRoot(h);
     expect(await removeEnrollmentContact(h.attach)).toBe(true);
     expect(h.posted('contacts/remove')).toEqual([{path:'contacts/remove',body:{contact:SERVER}}]);expect(h.daemon).toEqual([]);
+  });
+});
+
+describe('signed registration retirement from an existing installation',()=>{
+  it.each([404,'legacy'])('refuses replacement preparation against %s receipts without consuming an invitation or saving recovery',async version=>{
+    const {beginWorkspaceReplacement}=await import('../../src/workspace-replacement.js');const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');
+    const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const before=readFileSync(join(h.workspace,'binding.json'),'utf8'),previous=JSON.parse(before),sent=h.did('sendCommand').length,contacts=h.did('addContact').length;
+    h.payload.challenge.workspaceId='r'.repeat(43);
+    const request=(async()=>version===404?new Response(null,{status:404}):Response.json({deleted:false,retired:false})) as typeof fetch;
+    await expect(beginWorkspaceReplacement(previous,h.payload,h.config,{attach:h.attach,preflight:(a,b,c,d,opts)=>unregisterWorkspace(a,b,c,d,{...opts,request})})).rejects.toThrow('does not support replacing');
+    expect(existsSync(join(h.workspace,'replacement.json'))).toBe(false);expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);expect(h.did('sendCommand')).toHaveLength(sent);expect(h.did('addContact')).toHaveLength(contacts);
+  });
+  it('waits for signed absence confirmation when the migrated service has no old registration',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')),before=readFileSync(join(h.workspace,'binding.json'),'utf8');
+    h.payload.challenge.workspaceId='r'.repeat(43);
+    const sent=h.did('sendCommand').length;let polls=0;
+    const request=(async()=>{
+      expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+      if(++polls===1)return new Response(null,{status:404});
+      expect(h.did('sendCommand')).toHaveLength(sent+1);
+      return new Response(JSON.stringify({deleted:true,retired:true}));
+    }) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(polls).toBe(2);
+    expect(h.did('sendCommand').at(-1)?.[1]).toMatchObject({contact:SERVER,command:'unregister-workspace',arguments:{workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,replacement:{workspaceId:'r'.repeat(43)}}});
+    expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+  });
+  it('uses the bound Messenger root without taking a second root lease',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);const installed=await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));h.behaviour.messengerCid=ROOT;h.behaviour.messengerRoot=undefined;
+    h.payload.challenge.workspaceId='r'.repeat(43);h.behaviour.contacts=[];
+    const choices=h.did('chooseIdentity').length,releases=h.did('releaseLease').length;
+    h.behaviour.choose=()=>{throw Error('Root lease held by Messenger');};
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    // The root-held Messenger answers with its ready pinned contact after reconnect.
+    const nativeFetch=globalThis.fetch;const spy=vi.spyOn(globalThis,'fetch').mockImplementation(async(input,init)=>{
+      const response=await nativeFetch(input,init);if(String(input).endsWith('/contacts/add'))h.behaviour.contacts=[SERVER];return response;
+    });undo.push(()=>spy.mockRestore());
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(h.did('chooseIdentity')).toHaveLength(choices);expect(h.did('releaseLease')).toHaveLength(releases);
+    expect(h.posted('contacts/add').at(-1)?.body).toEqual({invite:'fixture-invite'});
+    expect(h.posted('workspace/unregister').at(-1)?.body).toEqual({serverCid:SERVER,rootCid:ROOT,type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:installed.hostWorkspaceId,operationNonce:'q'.repeat(43),replacement:{workspaceId:'r'.repeat(43),accountId:'c'.repeat(43),nonce:'n'.repeat(43)}});
+  });
+  it('signs an exact same-service replacement challenge and reuses the ready contact for proof',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));
+    h.payload.challenge={...h.payload.challenge,workspaceId:'r'.repeat(43),nonce:'s'.repeat(43)};
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000});
+    expect(h.did('sendCommand').at(-1)?.[1]).toEqual({contact:SERVER,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43),replacement:{workspaceId:'r'.repeat(43),accountId:'c'.repeat(43),nonce:'s'.repeat(43)}}});
+    const nativeFetch=globalThis.fetch;
+    const spy=vi.spyOn(globalThis,'fetch').mockImplementation((input,init)=>String(input)===h.payload.appOrigin+'/account-api/workspace-proof'?Promise.resolve(new Response(JSON.stringify({verified:false}))):nativeFetch(input,init));
+    undo.push(()=>spy.mockRestore());
+    const invitationCount=h.did('addContact').length;
+    const attach=(async(options:Parameters<AttachDaemonClient>[0])=>{const client=await h.attach(options);return {...client,async addContact(){throw Error('One-time invitation already consumed');}};}) as AttachDaemonClient;
+    const result=await h.enroll({replacingWorkspace:previous.workspaceId,attach});
+    expect(result.rootCid).toBe(ROOT);expect(h.did('addContact')).toHaveLength(invitationCount);
+    expect(h.did('sendCommand').at(-1)?.[1]).toMatchObject({command:'bind-workspace',arguments:{workspaceId:'r'.repeat(43),nonce:'s'.repeat(43),hostWorkspaceId:previous.hostWorkspaceId}});
+    expect(JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')).workspaceId).toBe('r'.repeat(43));
+  });
+  it('does not authorize a replacement challenge at a different account service',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));h.payload.appOrigin='https://app.ours.network';h.payload.challenge.workspaceId='r'.repeat(43);
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000});
+    expect((h.did('sendCommand').at(-1)?.[1] as {arguments:object}).arguments).not.toHaveProperty('replacement');
+  });
+  it('signs only the original workspace/host, releases the root, and waits for exact retirement',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const before=readFileSync(join(h.workspace,'binding.json'),'utf8');
+    let polls=0;const receipts:Array<Record<string,unknown>>=[];
+    const request=(async(url:string,init:RequestInit)=>{expect(url).toBe(h.payload.appOrigin+'/account-api/workspace-unregister-receipt');receipts.push(JSON.parse(init.body as string));return new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}));}) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(h.did('sendCommand').at(-1)).toEqual(['sendCommand',{contact:SERVER,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43)}}]);
+    expect(receipts).toHaveLength(2);expect(receipts[0]).toEqual({workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43),rootCid:ROOT});
+    expect(h.did('releaseLease')).toHaveLength(2);expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+  });
+  it('retries a completed remote retirement without resending the signed command or redeeming an invitation',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const commands=h.did('sendCommand').length,contacts=h.did('addContact').length;
+    const request=(async()=>new Response(JSON.stringify({deleted:true,retired:true}))) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request})).toBe(ROOT);expect(h.did('sendCommand')).toHaveLength(commands);expect(h.did('addContact')).toHaveLength(contacts);
+  });
+  it('refuses mismatched host/root and unavailable original server without local cleanup',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const request=(async()=>new Response(JSON.stringify({deleted:false,retired:false}))) as typeof fetch;
+    await expect(unregisterWorkspace({...previous,hostWorkspaceId:'x'.repeat(43)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('host ID differs');
+    await expect(unregisterWorkspace({...previous,proofRootCid:'f'.repeat(64)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('proof root differs');
+    h.behaviour.contacts=[];await expect(unregisterWorkspace(previous,{...h.payload,serverCid:'f'.repeat(64)},'q'.repeat(43),h.attach,{request})).rejects.toThrow('Original enrollment server contact is unavailable');expect(h.did('sendCommand')).toHaveLength(1);expect(existsSync(join(h.workspace,'connector'))).toBe(true);
+  });
+});
+
+
+describe('credential-free same-registration renewal',()=>{
+  it('keeps the existing private connector byte-identical while renewing root proof',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const connector=join(h.workspace,'connector'),before=readFileSync(connector,'utf8');
+    delete h.payload.connectorToken;
+    await h.enroll();expect(readFileSync(connector,'utf8')).toBe(before);
+  });
+  it('refuses missing credentials on initial setup, a different target or an unsafe retained file before sends or writes',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);const token=h.payload.connectorToken;delete h.payload.connectorToken;
+    await expect(h.enroll()).rejects.toThrow('remove and re-create');expect(h.did('sendCommand')).toEqual([]);expect(h.posted('workspace/enroll')).toEqual([]);
+    h.payload.connectorToken=token;await h.enroll();const binding=readFileSync(join(h.workspace,'binding.json'),'utf8'),sent=h.did('sendCommand').length;
+    delete h.payload.connectorToken;h.payload.challenge.workspaceId='r'.repeat(43);
+    await expect(h.enroll({replacingWorkspace:JSON.parse(binding).workspaceId})).rejects.toThrow('remove and re-create');expect(h.did('sendCommand')).toHaveLength(sent);
+    h.payload.challenge.workspaceId=JSON.parse(binding).workspaceId;
+    chmodSync(join(h.workspace,'connector'),0o644);await expect(h.enroll()).rejects.toThrow('remove and re-create');
+    expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(binding);expect(h.did('sendCommand')).toHaveLength(sent);
   });
 });

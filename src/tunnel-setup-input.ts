@@ -64,3 +64,21 @@ export async function redeemTunnelSetup(input: string, request: typeof fetch = f
   if (payload.appOrigin !== grant.appOrigin) throw Error('Tunnel setup response origin mismatch');
   return payload;
 }
+
+/** Inspect only public destination metadata; this never consumes a one-use grant. */
+export async function inspectTunnelSetup(input:string,request:typeof fetch=fetch):Promise<{workspaceId:string;serverCid:string;appOrigin:string}|undefined> {
+  let version:unknown;try{version=JSON.parse(Buffer.from(input.trim(),'base64url').toString()).version;}catch{}
+  if(version===1){const p=decodeWorkspacePayload(input);return {workspaceId:p.challenge.workspaceId,serverCid:p.serverCid,appOrigin:p.appOrigin};}
+  const grant=decodeTunnelSetupGrant(input);
+  let response:Response;try{response=await request(grant.appOrigin+'/account-api/workspace-install-inspect',{method:'POST',redirect:'error',credentials:'omit',signal:AbortSignal.timeout(15000),headers:{Origin:grant.appOrigin,'Content-Type':'application/json'},body:JSON.stringify({code:grant.code})});}
+  catch{throw Error('Could not inspect the account setup command; existing setup and grant preserved');}
+  if(response.status===404 || response.status===405){await response.body?.cancel();return;}
+  if(!response.ok){await response.body?.cancel();throw Error('Setup command inspection failed; existing setup and grant preserved');}
+  let target:any;try{target=await response.json();}catch{throw Error('Invalid setup command inspection response');}
+  if(!target || Object.keys(target).sort().join(',')!=='serverCid,workspaceId' || typeof target.workspaceId!=='string' || !/^[A-Za-z0-9_-]{43}$/.test(target.workspaceId) || typeof target.serverCid!=='string' || !/^[a-f0-9]{64}$/i.test(target.serverCid))throw Error('Invalid setup command inspection response');
+  return {...target,appOrigin:grant.appOrigin};
+}
+
+export function verifyTunnelSetupTarget(target:{workspaceId:string;serverCid:string;appOrigin:string}|undefined,payload:WorkspacePayload):void {
+  if(target && (target.workspaceId!==payload.challenge.workspaceId || target.serverCid.toUpperCase()!==payload.serverCid.toUpperCase() || target.appOrigin!==payload.appOrigin))throw Error('Redeemed setup command differs from inspected destination; existing setup preserved');
+}
