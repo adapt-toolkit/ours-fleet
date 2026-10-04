@@ -134,12 +134,15 @@ function managedRootOwner(configuration:string,rooms:NonNullable<ReturnType<type
  * Reads only; an existing Owner is compared with this host's own Messenger identity.
  */
 export async function checkWorkspaceConfiguration(configuration=defaultConfigPath(),attach:AttachDaemonClient=attachOursClient):Promise<void> {
+  if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
   const paths=preflightInitPaths(configuration);
   if(!paths.manifestExisted){
     if(paths.rootExisted)throw Error(`${paths.splitRoot} exists without ${paths.configPath}. Restore that file or move the directory away.`);
     return;
   }
   const loaded=loadConfig(paths.configPath,{yamlMode:'strict',deferredOwnerInviteFile:workspaceOwnerInvite()});
+  const inviteFile=loaded.rooms?.owner.public_invite_file || workspaceOwnerInvite();
+  if(existsSync(inviteFile)){const stat=lstatSync(inviteFile);if(!stat.isFile() || stat.isSymbolicLink() || stat.uid!==process.getuid?.() || stat.nlink!==1 || (stat.mode&0o077)!==0)throw Error('Retained Owner invitation file must be owned and private');}
   if(!loaded.rooms)return;
   if(loaded.rooms.defaults?.attach_owner===false)throw Error(`${paths.configPath}: rooms.defaults.attach_owner is disabled; enable it before tunnel setup.`);
   if(!loaded.rooms.owner.public_invite_file)throw Error(`${paths.configPath}: rooms.owner must use public_invite_file before tunnel setup.`);
@@ -174,14 +177,28 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const devices=new WorkspaceDeviceStore();const hostWorkspaceId=devices.workspaceId;devices.close();
   const {name,surname,...proofPayload}=payload;
   let result:{submitted?:boolean;rootCid:string;ownerInvite:string},ownerCid:string;
+  // A replacement can stop after its one-time proof but before local files commit. Read the
+  // account's existing signed receipt first; a verified proof must not be sent a second time.
+  let proofAlreadyConfirmed=false;
+  if(options.replacingWorkspace){
+    let response:Response;
+    try{response=await fetch(appOrigin+'/account-api/workspace-proof',{method:'POST',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000),headers:{Origin:appOrigin,'Content-Type':'application/json'},body:JSON.stringify({...payload.challenge,hostWorkspaceId,rootCid:identity.root?.cid ?? identity.cid})});}
+    catch{throw Error('Replacement proof status could not be confirmed. Run setup-tunnel --resume');}
+    if(!response.ok){await response.body?.cancel();throw Error('Replacement proof status was rejected; request a fresh App command with --replace-registration');}
+    try{proofAlreadyConfirmed=(await response.json() as {verified?:boolean}).verified===true;}catch{throw Error('Invalid replacement proof receipt');}
+  }
   if(identity.root){
     // The Human root signs the binding; the person's own Messenger identity is the room Owner and issues the Owner invitation.
-    await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000);
+    if(!proofAlreadyConfirmed)await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000);
     const invite=await request('invites',{mode:'public'});
     if(typeof invite.blob!=='string' || !invite.blob)throw Error('Malformed workspace enrollment response');
     const after=await request('workspace/enrollment-identity');
     if(typeof after.cid!=='string' || !same(after.cid,identity.cid) || typeof after.rootCid!=='string' || !same(after.rootCid,identity.root.cid))throw Error("This host's Messenger identity changed while setup was running; local configuration is unchanged");
     result={submitted:true,rootCid:identity.root.cid,ownerInvite:invite.blob};ownerCid=identity.cid;
+  }else if(proofAlreadyConfirmed){
+    const invite=await request('invites',{mode:'public'});
+    if(typeof invite.blob!=='string' || !invite.blob)throw Error('Malformed workspace enrollment response');
+    result={submitted:true,rootCid:identity.cid,ownerInvite:invite.blob};ownerCid=identity.cid;
   }else{
     result=await request('workspace/enroll',options.preserveProfile?{...proofPayload,hostWorkspaceId,preserveProfile:true}:{...payload,hostWorkspaceId});
     if(!result.submitted || !/^[a-f0-9]{64}$/i.test(result.rootCid) || typeof result.ownerInvite!=='string')throw Error('Malformed workspace enrollment response');

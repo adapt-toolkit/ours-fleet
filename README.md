@@ -1856,6 +1856,22 @@ pipe with a 32KiB limit and refuses a terminal. Legacy v1 payloads, which contai
 long-lived scoped credentials, are accepted only through file/stdin, never as
 command arguments. Use only one payload transport.
 
+When this host already has a registration, setup describes its workspace/account origin
+and asks `[y/N]` before redeeming the opaque one-use grant. No answer or `no` preserves
+the existing setup and grant. A noninteractive caller must explicitly pass
+`--replace-registration`. The same registration reruns without retirement. For a new
+registration the original Human root signs its unregister command, and setup waits
+for the account's durable tunnel/DNS/invitation cleanup receipt before stopping the
+old local service and revoking its account-linked devices. Installation identities,
+profile, agents, history, stable host ID and local pairing are preserved.
+
+Replacement recovery is stored in an owned private `workspace/replacement.json`;
+`setup-tunnel --resume` retries the same retirement operation and then enrollment.
+If the replacement window expires after retirement, obtain a fresh App command and
+pass `--replace-registration`; completed retirement is retained. The old server CID
+is pinned: if its contact is gone, only an invitation for that same server can
+reconnect it. A different server cannot authorize retirement of the old binding.
+
 After service and signed tunnel-target confirmation, setup prints both a QR and
 ordinary private single-use connection code. The App checks readiness automatically
 and immediately opens the code field. If setup or code output fails after binding,

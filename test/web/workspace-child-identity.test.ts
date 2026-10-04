@@ -210,3 +210,27 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
     expect(h.posted('contacts/remove')).toEqual([{path:'contacts/remove',body:{contact:SERVER}}]);expect(h.daemon).toEqual([]);
   });
 });
+
+describe('signed registration retirement from an existing installation',()=>{
+  it('signs only the original workspace/host, releases the root, and waits for exact retirement',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const before=readFileSync(join(h.workspace,'binding.json'),'utf8');
+    let polls=0;const receipts:Array<Record<string,unknown>>=[];
+    const request=(async(url:string,init:RequestInit)=>{expect(url).toBe(h.payload.appOrigin+'/account-api/workspace-unregister-receipt');receipts.push(JSON.parse(init.body as string));return new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}));}) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(h.did('sendCommand').at(-1)).toEqual(['sendCommand',{contact:SERVER,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43)}}]);
+    expect(receipts).toHaveLength(2);expect(receipts[0]).toEqual({workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43),rootCid:ROOT});
+    expect(h.did('releaseLease')).toHaveLength(2);expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(before);
+  });
+  it('retries a completed remote retirement without resending the signed command or redeeming an invitation',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const commands=h.did('sendCommand').length,contacts=h.did('addContact').length;
+    const request=(async()=>new Response(JSON.stringify({deleted:true,retired:true}))) as typeof fetch;
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request})).toBe(ROOT);expect(h.did('sendCommand')).toHaveLength(commands);expect(h.did('addContact')).toHaveLength(contacts);
+  });
+  it('refuses mismatched host/root and unavailable original server without local cleanup',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const request=(async()=>new Response(JSON.stringify({deleted:false,retired:false}))) as typeof fetch;
+    await expect(unregisterWorkspace({...previous,hostWorkspaceId:'x'.repeat(43)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('host ID differs');
+    await expect(unregisterWorkspace({...previous,proofRootCid:'f'.repeat(64)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('proof root differs');
+    h.behaviour.contacts=[];await expect(unregisterWorkspace(previous,{...h.payload,serverCid:'f'.repeat(64)},'q'.repeat(43),h.attach,{request})).rejects.toThrow('Original enrollment server contact is unavailable');expect(h.did('sendCommand')).toHaveLength(1);expect(existsSync(join(h.workspace,'connector'))).toBe(true);
+  });
+});

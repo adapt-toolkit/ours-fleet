@@ -7,6 +7,7 @@ import { replaceFileAtomically } from './atomic-file.js';
 import { stateRoot } from './paths.js';
 import { decodeWorkspacePayload, enrollWorkspace, unregisterWorkspace, type AttachDaemonClient, type WorkspacePayload } from './workspace-enrollment.js';
 import { WorkspaceDeviceStore } from './web/workspace-devices.js';
+import { webControlPath } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 
 export interface WorkspaceBinding { workspaceId: string; hostWorkspaceId: string; appOrigin: string; serverCid: string; proofRootCid?: string }
@@ -21,7 +22,8 @@ function binding(value: WorkspaceBinding): WorkspaceBinding {
 export function readWorkspaceBinding(): WorkspaceBinding | undefined {
   const file = join(workspaceDir(), 'binding.json');
   if (!existsSync(file)) return;
-  return binding(JSON.parse(readFileSync(file, 'utf8')));
+  let value:WorkspaceBinding;try{value=JSON.parse(readFileSync(file, 'utf8'));}catch{throw Error('Existing workspace binding is invalid');}
+  return binding(value);
 }
 export function sameWorkspaceBinding(previous: WorkspaceBinding, payload: WorkspacePayload): boolean {
   return previous.workspaceId === payload.challenge.workspaceId && previous.appOrigin === payload.appOrigin && previous.serverCid.toUpperCase() === payload.serverCid.toUpperCase();
@@ -54,7 +56,7 @@ export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefi
   const file = replacementPath(); if (!existsSync(file)) return;
   const stat = lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0 || stat.size > 65536) throw Error('Unfinished replacement must be an owned private regular file');
-  const record = JSON.parse(readFileSync(file, 'utf8')) as PendingWorkspaceReplacement;
+  let record:PendingWorkspaceReplacement;try{record=JSON.parse(readFileSync(file, 'utf8'));}catch{throw Error('Unfinished replacement record is invalid');}
   if (record.version !== 1 || !opaque.test(record.operationNonce) || typeof record.configuration !== 'string' || resolve(record.configuration) !== record.configuration
     || (record.rootCid !== undefined && !/^[a-f0-9]{64}$/i.test(record.rootCid)) || (record.retired !== undefined && typeof record.retired !== 'boolean')
     || (record.cleaned !== undefined && typeof record.cleaned !== 'boolean') || (record.cleaned && !record.retired) || (record.retired && !record.rootCid)) throw Error('Unfinished replacement record is invalid');
@@ -80,11 +82,14 @@ export async function finishWorkspaceReplacement(record: PendingWorkspaceReplace
   unregister?: typeof unregisterWorkspace; cleanup?: () => Promise<void>; enroll?: typeof enrollWorkspace; attach?: AttachDaemonClient;
 } = {}): Promise<{origin: string; hostWorkspaceId: string; rootCid: string}> {
   const current = readWorkspaceBinding();
-  if (!current || (current.workspaceId !== record.previous.workspaceId && !sameWorkspaceBinding(current, record.payload))) throw Error('Workspace binding changed during replacement; review it before continuing');
+  if (!current || (current.workspaceId===record.previous.workspaceId ? (current.appOrigin!==record.previous.appOrigin || current.serverCid.toUpperCase()!==record.previous.serverCid.toUpperCase() || current.hostWorkspaceId!==record.previous.hostWorkspaceId) : !sameWorkspaceBinding(current, record.payload))) throw Error('Workspace binding changed during replacement; review it before continuing');
   if (record.cleaned && sameWorkspaceBinding(current, record.payload)) {
     return {origin: `https://${record.payload.hostname}`, hostWorkspaceId: current.hostWorkspaceId, rootCid: record.rootCid!};
   }
   if (!record.retired) {
+    const manager=new WebServiceManager(),service=manager.readMetadata();
+    if(service?.configuration && resolve(service.configuration)!==record.configuration)throw Error('Installed web service uses another configuration; existing setup preserved');
+    if(!service && existsSync(webControlPath()))throw Error('Stop the foreground Fleet web service before replacing its registration; existing setup preserved');
     record.rootCid = await (effects.unregister ?? unregisterWorkspace)(record.previous, record.payload, record.operationNonce, effects.attach);
     record.retired = true; saveWorkspaceReplacement(record);
   }

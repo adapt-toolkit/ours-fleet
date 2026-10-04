@@ -45,4 +45,17 @@ describe('setup-tunnel positional grant CLI', () => {
       expect(run(encode(grant),[],{THROW_FETCH:grant.code})).toContain('Could not reach');
     } finally { rmSync(root,{recursive:true,force:true}); }
   }, 20000);
+  it('preserves an existing binding and one-use grant without explicit confirmation in a pipe',()=>{
+    const root=mkdtempSync(join(tmpdir(),'tunnel-preserve-')),workspace=join(root,'state','.ours-fleet','workspace');mkdirSync(workspace,{recursive:true});
+    const binding={workspaceId:'w'.repeat(43),hostWorkspaceId:'h'.repeat(43),serverCid:'a'.repeat(64),appOrigin:'https://app.ours-tunnel.com'};
+    writeFileSync(join(workspace,'binding.json'),JSON.stringify(binding),{mode:0o600});writeFileSync(join(workspace,'connector'),'fixture-retained-private-token',{mode:0o600});
+    const preload=join(root,'fetch.mjs'),capture=join(root,'fetch-called');writeFileSync(preload,`import {writeFileSync} from 'node:fs';globalThis.fetch=async()=>{writeFileSync(process.env.FETCH_CAPTURE,'called');throw Error('must not redeem');};`);
+    const grant=encode({version:2,appOrigin:binding.appOrigin,code:'c'.repeat(43),expiresAt:Date.now()+600000});
+    try{
+      const result=spawnSync(process.execPath,['--import',preload,resolve('dist/cli.js'),'setup-tunnel',grant,'--configuration',join(root,'fleet.yaml')],{env:{...process.env,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture},encoding:'utf8',timeout:10000,input:''});
+      expect(result.error).toBeUndefined();expect(result.status).toBe(0);expect(result.stderr).toContain('Existing setup preserved');expect(result.stderr).toContain(binding.workspaceId);expect(result.stderr).not.toContain(grant);expect(result.stderr).not.toContain('fixture-retained-private-token');
+      expect(existsSync(capture)).toBe(false);expect(existsSync(join(root,'fleet.yaml'))).toBe(false);expect(existsSync(join(workspace,'replacement.json'))).toBe(false);expect(readFileSync(join(workspace,'binding.json'),'utf8')).toBe(JSON.stringify(binding));expect(readFileSync(join(workspace,'connector'),'utf8')).toBe('fixture-retained-private-token');
+    }finally{rmSync(root,{recursive:true,force:true});}
+  });
+
 });
