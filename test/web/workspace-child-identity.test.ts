@@ -22,13 +22,14 @@ const tree=():Row[]=>[{name:'alice@home',cid:ROOT,kind:'root',temp:null,session:
 async function host(rows:Row[]=tree()) {
   const dir=mkdtempSync(join(tmpdir(),'fleet-child-')),prior={...process.env};
   const messenger:Array<{path:string;body?:unknown}>=[];const daemon:Array<[string,unknown?]>=[];
-  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase(),releaseFailed:0,preserveProfile:true};
+  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase() as string|undefined,releaseFailed:0,preserveProfile:true};
   const server:Server=createServer(async(req,res)=>{res.setHeader('Content-Type','application/json');const path=new URL(req.url!,'http://host').pathname.replace(/^\/messenger\/api\//,'');
     if(req.method==='GET'){messenger.push({path});
+      if(path==='contacts'){res.end(JSON.stringify({contacts:behaviour.contacts.map(container_id=>({container_id})),pending:[]}));return;}
       // Messenger names the root the daemon describes for the identity it runs as.
       res.end(JSON.stringify({cid:behaviour.messengerCid,rootCid:behaviour.messengerRoot,...(behaviour.preserveProfile?{preserveProfile:true}:{})}));return;}
     const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(chunk);messenger.push({path,body:JSON.parse(Buffer.concat(chunks).toString())});
-    res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:{}));});
+    res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:path==='workspace/unregister'?{submitted:true,rootCid:behaviour.messengerCid}:path==='contacts/add'?{cid:behaviour.peer}:{}));});
   server.listen(0,'127.0.0.1');await once(server,'listening');
   undo.push(async()=>{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));for(const key of Object.keys(process.env))if(!(key in prior))delete process.env[key];Object.assign(process.env,prior);rmSync(dir,{recursive:true,force:true});});
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];process.env.OURS_FLEET_HOME=dir;
@@ -212,6 +213,22 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
 });
 
 describe('signed registration retirement from an existing installation',()=>{
+  it('uses the bound Messenger root without taking a second root lease',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);const installed=await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));h.behaviour.messengerCid=ROOT;h.behaviour.messengerRoot=undefined;
+    h.payload.challenge.workspaceId='r'.repeat(43);h.behaviour.contacts=[];
+    const choices=h.did('chooseIdentity').length,releases=h.did('releaseLease').length;
+    h.behaviour.choose=()=>{throw Error('Root lease held by Messenger');};
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    // The root-held Messenger answers with its ready pinned contact after reconnect.
+    const nativeFetch=globalThis.fetch;const spy=vi.spyOn(globalThis,'fetch').mockImplementation(async(input,init)=>{
+      const response=await nativeFetch(input,init);if(String(input).endsWith('/contacts/add'))h.behaviour.contacts=[SERVER];return response;
+    });undo.push(()=>spy.mockRestore());
+    expect(await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000})).toBe(ROOT);
+    expect(h.did('chooseIdentity')).toHaveLength(choices);expect(h.did('releaseLease')).toHaveLength(releases);
+    expect(h.posted('contacts/add').at(-1)?.body).toEqual({invite:'fixture-invite'});
+    expect(h.posted('workspace/unregister').at(-1)?.body).toEqual({serverCid:SERVER,rootCid:ROOT,type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:installed.hostWorkspaceId,operationNonce:'q'.repeat(43),replacement:{workspaceId:'r'.repeat(43),accountId:'c'.repeat(43),nonce:'n'.repeat(43)}});
+  });
   it('signs an exact same-service replacement challenge and reuses the ready contact for proof',async()=>{
     const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
     const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));

@@ -282,7 +282,8 @@ export async function confirmWorkspaceTarget(payload:Pick<WorkspacePayload,'appO
 /** Retire exactly the original registration using the same signed Human root that bound it. */
 export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number}={}):Promise<string> {
   const appOrigin=validateAccountOrigin(previous.appOrigin);
-  const identity=await messengerIdentity(hostMessenger(),attach);
+  const messenger=hostMessenger();
+  const identity=await messengerIdentity(messenger,attach);
   if(identity.preserveProfile!==true)throw Error('Existing-host replacement requires Messenger profile-preservation support; existing local setup preserved');
   const root=identity.root ?? await humanRoot(attach,identity.cid);
   if(previous.proofRootCid && !same(root.cid,previous.proofRootCid))throw Error('Original workspace proof root differs from this installation; existing local setup preserved');
@@ -301,7 +302,7 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
   let status=await receipt();
   if(status.deleted!==true){
     if(payload.challenge.expiresAt<=Date.now())throw Error('Replacement command expired before retirement; existing setup preserved. Obtain a fresh App command');
-    await asHumanRoot(attach,root,'unregister',async client=>{
+    const retire=async(client:Pick<DaemonClient,'listContacts'|'addContact'|'sendCommand'>)=>{
       const serverCid=previous.serverCid.toUpperCase();
       let contacts=await client.listContacts();
       if(!contacts.contacts.some(contact=>same(contact.container_id,serverCid))){
@@ -318,7 +319,21 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
         ? {workspaceId:payload.challenge.workspaceId,accountId:payload.challenge.accountId,nonce:payload.challenge.nonce}:undefined;
       const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,...(replacement?{replacement}:{})}});
       if(!('sent' in outcome) || !outcome.sent)throw Error('Registration retirement was not sent; local setup preserved');
-    });
+    };
+    if(identity.root)await asHumanRoot(attach,root,'unregister',retire);
+    else {
+      // Messenger already holds the root lease. Its first-party endpoint signs
+      // as that bound root; acquiring a second daemon lease would fail.
+      await retire({
+        listContacts:()=>messenger('contacts'),
+        addContact:args=>messenger('contacts/add',args),
+        sendCommand:async args=>{
+          const answer=await messenger('workspace/unregister',{serverCid:args.contact,rootCid:root.cid,...args.arguments as object});
+          if(answer.submitted!==true || typeof answer.rootCid!=='string' || !same(answer.rootCid,root.cid))throw Error('Registration retirement answered for a different root; local setup preserved');
+          return {sent:true} as Awaited<ReturnType<DaemonClient['sendCommand']>>;
+        },
+      });
+    }
   }
   const deadline=Date.now()+(options.waitMs ?? 30000);
   while(status.deleted!==true || status.retired!==true){
