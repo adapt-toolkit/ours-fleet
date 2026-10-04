@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { completeTunnelSetup } from './tunnel-setup-completion.js';
+import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup } from './tunnel-setup-input.js';
 import { ensureMinimalSetup } from './minimal-setup.js';
 import { confirmWorkspaceTarget } from './workspace-enrollment.js';
 import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
@@ -1383,9 +1385,9 @@ webCommand.command('uninstall').description('stop and uninstall the owner web se
     catch (e) { die(e); }
   });
 
-async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean }, setupTunnel = false): Promise<void> { try {
+async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
     if (setupTunnel && opts.check && opts.resume) throw Error('Use either --check or --resume');
-    if (setupTunnel && (opts.check || opts.resume) && (opts.file || opts.migrateAppOrigin)) throw Error('--check and --resume take no payload file or migration flag');
+    if (setupTunnel && (opts.check || opts.resume) && (argument !== undefined || opts.file || opts.stdin || opts.migrateAppOrigin)) throw Error('--check and --resume take no payload or migration flag');
     if (setupTunnel && opts.check) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
     let pending: PendingTunnelSetup;
     if (setupTunnel && opts.resume) {
@@ -1394,9 +1396,13 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       await setupTunnelPreflight();
     }
     else {
-      if (!opts.file) throw Error('setup-tunnel requires --file <path> (or --resume to finish an interrupted setup)');
-      const payload=readWorkspacePayload(opts.file);
-      if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); await ensureMinimalSetup(opts.configuration ?? defaultConfigPath()); }
+      if (argument === undefined && !opts.file && !opts.stdin) throw Error('setup-tunnel requires an App grant argument, --file <path>, or --stdin (or --resume to finish an interrupted setup)');
+      if (Number(argument !== undefined) + Number(!!opts.file) + Number(!!opts.stdin) > 1) throw Error('Use one payload argument, --file, or --stdin');
+      if (opts.stdin && process.stdin.isTTY) throw Error('--stdin requires a pipe; use an owned private --file instead');
+      const input=setupTunnel ? (argument !== undefined ? readTunnelSetupArgument(argument) : opts.stdin ? await readTunnelSetupStdin() : readTunnelSetupFile(opts.file!)) : undefined;
+      if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); }
+      const payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
+      if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
       const result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
       pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge,configuration:resolvePath(opts.configuration ?? defaultConfigPath())};
       // The proof is one-time: keep what the remaining steps need so they can be finished without a new command.
@@ -1408,11 +1414,18 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       if (!setupTunnel) throw error;
       throw Error(`${error instanceof Error ? error.message : String(error)}\nThis host is already bound to the workspace; do not request a new command. Fix the problem above, then run: ours-fleet setup-tunnel --resume`);
     }
-    clearPendingTunnelSetup();
-    if (setupTunnel) { process.stdout.write('Tunnel setup submitted. Check verified binding and tunnel health in the App, then run ours-fleet link-device and paste its private code. Configure Fleet agents and models in the App after linking.\n'); return; }
-    const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
-    process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
-    process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
+    if (setupTunnel) {
+      await completeTunnelSetup({link:()=>requestWebControl('link-device'),qr:code=>QRCode.toString(code,{type:'terminal',small:true}),write:text=>new Promise<void>((resolve,reject)=>{
+        const onError=(error:Error)=>reject(error);process.stdout.once('error',onError);
+        process.stdout.write(text,error=>{if(error)reject(error);else{process.stdout.removeListener('error',onError);resolve();}});
+      }),clear:clearPendingTunnelSetup});
+    } else {
+      const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
+      process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
+      process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
+      clearPendingTunnelSetup();
+    }
+
   }catch(error){die(error);} }
 
 /** Everything after the root proof: supervised web service, its bound port, and the tunnel target. Safe to repeat. */
@@ -1442,8 +1455,9 @@ async function finishWorkspaceService(pending: PendingTunnelSetup, configuration
     }
     if(requiredPort===undefined){
       // Record the request first: if its answer is lost, a later resume must not assume the default target.
-      if(record){pending={...pending,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
+      if(record){pending={...pending,confirmedPort:undefined,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
       await confirmWorkspaceTarget(pending,pending.hostWorkspaceId,pending.rootCid,bound.port,error=>{process.stderr.write(`The enrollment contact could not be removed from Messenger (${error instanceof Error ? error.message : String(error)}); it can be removed there by hand.\n`);});
+      if(record) savePendingTunnelSetup({...pending,confirmedPort:bound.port});
     } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
     rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
 }
@@ -1454,12 +1468,14 @@ cOpt(program.command('workspace-enroll').description('enroll this host using a p
   .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
   .action(async opts => workspaceEnrollmentCommand(opts));
 
-cOpt(program.command('setup-tunnel').description('connect an installed host using scoped expiring App credentials; preserves identities and agent configuration'))
-  .option('--file <path>', 'owned private App payload file (chmod 600)')
+cOpt(program.command('setup-tunnel').argument('[payload]', 'minimal one-use v2 App grant (appears in shell history and process listings)')
+  .configureOutput({outputError: (_message, write) => write('Invalid setup-tunnel command; run ours-fleet setup-tunnel --help.\n')}).description('connect an installed host using scoped expiring App credentials; preserves identities and agent configuration'))
+  .option('--file <path>', 'owned private App grant or legacy payload file (chmod 600)')
+  .option('--stdin', 'read the private App grant or legacy payload from a pipe')
   .option('--check', 'only verify host prerequisites; changes nothing and needs no payload')
   .option('--resume', 'finish a setup that stopped after this host was bound; needs no new payload')
   .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
-  .action(async opts => workspaceEnrollmentCommand(opts, true));
+  .action(async (payload, opts) => workspaceEnrollmentCommand(opts, true, payload));
 
 program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
   .action(async () => {

@@ -81,3 +81,7 @@ describe('unfinished tunnel setup record', () => {
     expect(() => readPendingTunnelSetup()).toThrow(/No unfinished tunnel setup/);
   });
 });
+
+it('resumes confirmed nondefault target after code issuance failure and expiry',()=>{
+  expect(requiredPortAfterExpiry({appOrigin:'https://app.ours.network',origin:'https://host.ours-tunnel.com',hostWorkspaceId:'host',rootCid:'A'.repeat(64),configuration:'/private/fleet.yaml',challenge:{nonce:'n'.repeat(43),workspaceId:'w'.repeat(43),accountId:'a'.repeat(43),expiresAt:0},requestedPorts:[49272],confirmedPort:49272})).toBe(49272);
+});
