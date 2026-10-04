@@ -1,3 +1,4 @@
+import { retireNotificationTarget } from './notifications/target-cleanup.js';
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, unlinkSync,
 } from 'node:fs';
@@ -314,6 +315,7 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
   rmSync(agentDir(name), { recursive: true, force: true });
   if (generatedSource && existsSync(role.sourceFile)) {
     unlinkSync(role.sourceFile);
+    await retireNotificationTarget(`/fleet/chats?chat=${encodeURIComponent(name)}`).catch(()=>{});
     deps.log(`removed ${role.sourceFile}`);
   }
   deps.log(`removed '${name}' (its ours identity is left intact)`);

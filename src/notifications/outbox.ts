@@ -61,6 +61,7 @@ export class NotificationOutbox {
   cursor?: number;
   checkpoint?: unknown;
   private running?: Promise<void>;
+  private retired=false;
   private timer: ReturnType<typeof setInterval>;
   constructor(private readonly file: string, private readonly config: ProducerConfig,
     private readonly project: (value: unknown, id: string) => Promise<NotificationInput>,
@@ -84,16 +85,19 @@ export class NotificationOutbox {
   advance(cursor: number): void { this.persist(this.entries, cursor); }
   saveCheckpoint(checkpoint: unknown): void { this.persist(this.entries, this.cursor, checkpoint); }
   enqueue(id: string, value: unknown, cursor = this.cursor): boolean {
+    if(this.retired)return false;
     if (this.entries.some(e => e.id === id)) { if (cursor !== this.cursor) this.advance(cursor!); return true; }
     if (this.entries.length >= 2000) return false;
     this.persist([...this.entries, { id, value }], cursor);
     return true;
   }
   drain(): Promise<void> {
+    if(this.retired)return Promise.resolve();
     return this.running ??= this.drainOnce().finally(() => { this.running = undefined; });
   }
   private async drainOnce(): Promise<void> {
     for (const entry of [...this.entries].slice(0, 32)) {
+      if(this.retired)break;
       try {
         const value = entry.payload ?? await this.project(entry.value, entry.id);
         // Freeze the canonical projection before any network attempt. A crash
@@ -112,5 +116,7 @@ export class NotificationOutbox {
       } catch { this.warn('Notification producer delivery pending; retrying from durable outbox'); break; }
     }
   }
+  /** Wait for the current send before clearing queued sends and retiring its target. */
+  async retire():Promise<void>{this.retired=true;clearInterval(this.timer);await this.running;this.persist([]);}
   async close(): Promise<void> { clearInterval(this.timer); await this.running; }
 }

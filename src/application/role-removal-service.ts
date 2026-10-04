@@ -1,3 +1,4 @@
+import { retireNotificationTarget } from '../notifications/target-cleanup.js';
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { loadConfig, ROLE_NAME_RE } from '../config.js';
@@ -90,6 +91,7 @@ export class RoleRemovalService {
     else {
       await this.options.ops.backend.uninstall(preview.role);
       if (existsSync(sourceState)) renameSync(sourceState, join(recoveryPath, 'orphan-state'));
+      await retireNotificationTarget(`/fleet/chats?chat=${encodeURIComponent(preview.role)}`).catch(()=>{});
       this.options.ops.log(`removed orphaned backend/state '${preview.role}'`);
     }
     return { ...preview, removed: true, recoveryPath };

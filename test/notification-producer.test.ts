@@ -79,3 +79,19 @@ it('does not advance over a completion when the durable outbox is full', async (
   producer = new FleetNotificationProducer([root], join(dir, 'outboxes'), config); producer.poll(); await producer.close();
   expect(JSON.parse(readFileSync(queueFile, 'utf8')).entries[0].id).toBe('agent:g:2');
 });
+
+it('retires a deleted target after the in-flight send and clears persisted pending sends before retry',async()=>{
+  const {rmSync}=await import('node:fs');const {retireNotificationTarget}=await import('../src/notifications/target-cleanup.js');
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','deleted-target-')),previous=process.env.OURS_FLEET_HOME;process.env.OURS_FLEET_HOME=dir;
+  cleanup.push(async()=>{if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;});
+  const events:string[]=[];let release!:()=>void,started!:()=>void;const waiting=new Promise<void>(resolve=>{release=resolve;}),sent=new Promise<void>(resolve=>{started=resolve;});
+  const server=createServer(async(req,res)=>{for await(const chunk of req){void chunk;}if(req.url==='/api/v1/send'){events.push('send-start');started();await waiting;events.push('send-end');}else events.push('delete');res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));});
+  const config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'x'.repeat(40)};
+  const root=join(dir,'agents');mkdirSync(root);const state=join(dir,'outboxes');const producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());
+  const roleDir=join(root,'removed-agent');const store=new ConversationEventStore(join(roleDir,'.conversation'),{roleId:'removed-agent'});cleanup.push(async()=>store.close());
+  store.append({kind:'prompt.admitted',promptId:'p',source:'owner_admin_console',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});producer.poll();const draining=producer.drain();await sent;
+  store.close();rmSync(roleDir,{recursive:true,force:true});await retireNotificationTarget('/fleet/chats?chat=removed-agent',config);expect(events).toEqual(['send-start','delete']);
+  producer.poll();release();await draining;await producer.close();expect(events).toEqual(['send-start','delete','send-end','delete']);
+  const saved=JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8'));expect(saved.entries).toEqual([]);
+});

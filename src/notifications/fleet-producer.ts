@@ -1,3 +1,4 @@
+import { drainNotificationTargetCleanup } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -12,6 +13,7 @@ export class FleetNotificationProducer {
   private readonly queues = new Map<string, NotificationOutbox>();
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly existing = new Set<string>();
+  private cleanup?: Promise<void>;
   constructor(private readonly roots: string[], private readonly stateDir: string,
     private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {}) {
     for (const root of roots) for (const name of this.names(root)) this.existing.add(join(root, name));
@@ -23,6 +25,24 @@ export class FleetNotificationProducer {
     catch { return []; }
   }
   poll(): void {
+    this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(url)=>{
+      const name=new URL(url,'https://ours.invalid').searchParams.get('chat');
+      if(!name || !/^[A-Za-z0-9_-]+$/.test(name))return false;
+      // A recreated or retained role still has a valid target. Filesystem errors cannot prove removal.
+      for(const root of this.roots){try{lstatSync(join(root,name));return false;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}
+      for(const root of this.roots){
+        const roleDir=join(root,name),queue=this.queues.get(roleDir);
+        if(queue){await queue.retire();this.queues.delete(roleDir);}
+        else {
+          const file=join(this.stateDir,createHash('sha256').update(roleDir).digest('hex')+'.json');
+          if(existsSync(file)){
+            const queue=new NotificationOutbox(file,this.config,async()=>{throw Error('retired target');});
+            try{await queue.retire();}finally{await queue.close();}
+          }
+        }
+      }
+      return true;
+    }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;});
     for (const root of this.roots) for (const roleId of this.names(root)) {
       const roleDir = join(root, roleId), dir = join(roleDir, '.conversation');
       try {
@@ -86,5 +106,5 @@ export class FleetNotificationProducer {
     }
   }
   async drain(): Promise<void> { await Promise.all([...this.queues.values()].map(q => q.drain())); }
-  async close(): Promise<void> { clearInterval(this.timer); await Promise.all([...this.queues.values()].map(q => q.close())); }
+  async close(): Promise<void> { clearInterval(this.timer); await this.cleanup; await Promise.all([...this.queues.values()].map(q => q.close())); }
 }
