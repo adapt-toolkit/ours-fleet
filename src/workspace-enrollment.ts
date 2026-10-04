@@ -101,11 +101,16 @@ async function asHumanRoot<T>(attach:AttachDaemonClient,root:HumanRoot,purpose:s
   }
 }
 /** The signed workspace binding, sent by the Human root itself: the same command Messenger sends when it runs as the root. */
-async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,payload:WorkspacePayload,hostWorkspaceId:string,contactWaitMs:number):Promise<void> {
+async function proveWithHumanRoot(attach:AttachDaemonClient,root:HumanRoot,payload:WorkspacePayload,hostWorkspaceId:string,contactWaitMs:number,reuseContact=false):Promise<void> {
   const serverCid=payload.serverCid.toUpperCase();
   await asHumanRoot(attach,root,'proof',async client=>{
-    const peer=await client.addContact({invite:payload.invitation});
-    if(peer.cid.toUpperCase()!==serverCid)throw Error('Enrollment server identity mismatch');
+    // Retirement may already have redeemed this one-time invitation. Its exact signed
+    // handoff authorizes the new challenge; do not consume the invitation again.
+    const ready=reuseContact && (await client.listContacts()).contacts.some(contact=>same(contact.container_id,serverCid));
+    if(!ready){
+      const peer=await client.addContact({invite:payload.invitation});
+      if(peer.cid.toUpperCase()!==serverCid)throw Error('Enrollment server identity mismatch');
+    }
     const deadline=Date.now()+contactWaitMs;
     while(!(await client.listContacts()).contacts.some(contact=>contact.container_id.toUpperCase()===serverCid)){
       if(Date.now()>=deadline)throw Error('Enrollment contact is not ready; obtain a fresh setup payload before retrying');
@@ -189,7 +194,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   }
   if(identity.root){
     // The Human root signs the binding; the person's own Messenger identity is the room Owner and issues the Owner invitation.
-    if(!proofAlreadyConfirmed)await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000);
+    if(!proofAlreadyConfirmed)await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000,options.replacingWorkspace!==undefined);
     const invite=await request('invites',{mode:'public'});
     if(typeof invite.blob!=='string' || !invite.blob)throw Error('Malformed workspace enrollment response');
     const after=await request('workspace/enrollment-identity');
@@ -309,7 +314,9 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
           await new Promise(resolve=>setTimeout(resolve,100));
         }
       }
-      const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce}});
+      const replacement=appOrigin===validateAccountOrigin(payload.appOrigin) && same(serverCid,payload.serverCid) && previous.workspaceId!==payload.challenge.workspaceId
+        ? {workspaceId:payload.challenge.workspaceId,accountId:payload.challenge.accountId,nonce:payload.challenge.nonce}:undefined;
+      const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,...(replacement?{replacement}:{})}});
       if(!('sent' in outcome) || !outcome.sent)throw Error('Registration retirement was not sent; local setup preserved');
     });
   }

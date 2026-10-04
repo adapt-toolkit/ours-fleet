@@ -1,4 +1,4 @@
-import {afterEach,describe,expect,it} from 'vitest';
+import {afterEach,describe,expect,it,vi} from 'vitest';
 import {createServer,type Server} from 'node:http';
 import {once} from 'node:events';
 import {existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
@@ -212,6 +212,30 @@ describe('tunnel setup when Messenger runs as the person\'s own identity under t
 });
 
 describe('signed registration retirement from an existing installation',()=>{
+  it('signs an exact same-service replacement challenge and reuses the ready contact for proof',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));
+    h.payload.challenge={...h.payload.challenge,workspaceId:'r'.repeat(43),nonce:'s'.repeat(43)};
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000});
+    expect(h.did('sendCommand').at(-1)?.[1]).toEqual({contact:SERVER,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId:previous.hostWorkspaceId,operationNonce:'q'.repeat(43),replacement:{workspaceId:'r'.repeat(43),accountId:'c'.repeat(43),nonce:'s'.repeat(43)}}});
+    const nativeFetch=globalThis.fetch;
+    const spy=vi.spyOn(globalThis,'fetch').mockImplementation((input,init)=>String(input)===h.payload.appOrigin+'/account-api/workspace-proof'?Promise.resolve(new Response(JSON.stringify({verified:false}))):nativeFetch(input,init));
+    undo.push(()=>spy.mockRestore());
+    const invitationCount=h.did('addContact').length;
+    const attach=(async(options:Parameters<AttachDaemonClient>[0])=>{const client=await h.attach(options);return {...client,async addContact(){throw Error('One-time invitation already consumed');}};}) as AttachDaemonClient;
+    const result=await h.enroll({replacingWorkspace:previous.workspaceId,attach});
+    expect(result.rootCid).toBe(ROOT);expect(h.did('addContact')).toHaveLength(invitationCount);
+    expect(h.did('sendCommand').at(-1)?.[1]).toMatchObject({command:'bind-workspace',arguments:{workspaceId:'r'.repeat(43),nonce:'s'.repeat(43),hostWorkspaceId:previous.hostWorkspaceId}});
+    expect(JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8')).workspaceId).toBe('r'.repeat(43));
+  });
+  it('does not authorize a replacement challenge at a different account service',async()=>{
+    const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));h.payload.appOrigin='https://app.ours.network';h.payload.challenge.workspaceId='r'.repeat(43);
+    let polls=0;const request=(async()=>new Response(JSON.stringify(++polls===1?{deleted:false,retired:false}:{deleted:true,retired:true}))) as typeof fetch;
+    await unregisterWorkspace(previous,h.payload,'q'.repeat(43),h.attach,{request,waitMs:1000});
+    expect((h.did('sendCommand').at(-1)?.[1] as {arguments:object}).arguments).not.toHaveProperty('replacement');
+  });
   it('signs only the original workspace/host, releases the root, and waits for exact retirement',async()=>{
     const {unregisterWorkspace}=await import('../../src/workspace-enrollment.js');const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
     const previous=JSON.parse(readFileSync(join(h.workspace,'binding.json'),'utf8'));const before=readFileSync(join(h.workspace,'binding.json'),'utf8');
