@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { beginWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, sameWorkspaceBinding, refreshWorkspaceReplacement } from './workspace-replacement.js';
+import { beginWorkspaceReplacement, abandonWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
 import { completeTunnelSetup } from './tunnel-setup-completion.js';
-import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup } from './tunnel-setup-input.js';
+import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup, inspectTunnelSetup, verifyTunnelSetupTarget } from './tunnel-setup-input.js';
 import { ensureMinimalSetup } from './minimal-setup.js';
-import { confirmWorkspaceTarget } from './workspace-enrollment.js';
+import { confirmWorkspaceTarget, checkWorkspaceConnector } from './workspace-enrollment.js';
 import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
 import { availableWebPort } from './web/available-port.js';
 import QRCode from 'qrcode';
@@ -1466,7 +1466,11 @@ webCommand.command('uninstall').description('stop and uninstall the owner web se
     catch (e) { die(e); }
   });
 
-async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean; replaceRegistration?: boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
+async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean; replaceRegistration?: boolean; abandonReplacement?:boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
+    if(opts.abandonReplacement){
+      if(!setupTunnel || argument!==undefined || opts.file || opts.stdin || opts.check || opts.resume || opts.migrateAppOrigin || opts.replaceRegistration || opts.configuration)throw Error('--abandon-replacement takes no payload or other setup options');
+      await abandonWorkspaceReplacement();process.stdout.write('Unsent or rejected replacement abandoned; existing local setup preserved. Obtain a fresh App command for another setup.\n');return;
+    }
     if (setupTunnel && opts.check && opts.resume) throw Error('Use either --check or --resume');
     if (setupTunnel && (opts.check || opts.resume) && (argument !== undefined || opts.file || opts.stdin || opts.migrateAppOrigin || opts.replaceRegistration)) throw Error('--check and --resume take no payload or migration flag');
     if (setupTunnel && opts.check) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
@@ -1492,17 +1496,22 @@ async function workspaceEnrollmentCommand(opts: { file?: string; configuration?:
       const input=setupTunnel ? (argument !== undefined ? readTunnelSetupArgument(argument) : opts.stdin ? await readTunnelSetupStdin() : readTunnelSetupFile(opts.file!)) : undefined;
       const previous=setupTunnel ? readWorkspaceBinding() : undefined;
       const replacement=setupTunnel ? readWorkspaceReplacement() : undefined;
-      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, or use a fresh command for the same target with --replace-registration');
+      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, use a fresh command for the same target with --replace-registration, or --abandon-replacement when retirement was never sent or definitively rejected');
       if(replacement && resolvePath(opts.configuration ?? defaultConfigPath())!==replacement.configuration)throw Error('Replacement requires its original configuration');
-      if(previous && !replacement && !(await confirmWorkspaceReplacement(previous,opts.replaceRegistration)))return;
+      const target=previous && !replacement ? await inspectTunnelSetup(input!) : undefined;
+      const different=previous && !replacement && (!target || requiresWorkspaceReplacement(previous,target,opts.migrateAppOrigin));
+      if(different && !(await confirmWorkspaceReplacement(previous!,opts.replaceRegistration))){if(!process.stdin.isTTY)throw Error('Replacement confirmation required; existing setup and grant preserved');return;}
       if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); }
       const payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
+      verifyTunnelSetupTarget(target,payload);
+      const replace=previous && !replacement && requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,serverCid:payload.serverCid,appOrigin:payload.appOrigin},opts.migrateAppOrigin);
+      checkWorkspaceConnector(payload);
       if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
       let result: {origin:string;hostWorkspaceId:string;rootCid:string};
       if(replacement){
         refreshWorkspaceReplacement(replacement,payload,opts.configuration ?? defaultConfigPath());result=await finishWorkspaceReplacement(replacement);
-      }else if(previous && !sameWorkspaceBinding(previous,payload) && !(opts.migrateAppOrigin && previous.workspaceId===payload.challenge.workspaceId && previous.serverCid.toUpperCase()===payload.serverCid.toUpperCase())){
-        const record=beginWorkspaceReplacement(previous,payload,opts.configuration ?? defaultConfigPath());
+      }else if(replace){
+        const record=await beginWorkspaceReplacement(previous!,payload,opts.configuration ?? defaultConfigPath());
         result=await finishWorkspaceReplacement(record);
       }else result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
       pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge,configuration:resolvePath(opts.configuration ?? defaultConfigPath())};
@@ -1575,6 +1584,7 @@ cOpt(program.command('setup-tunnel').argument('[payload]', 'minimal one-use v2 A
   .option('--stdin', 'read the private App grant or legacy payload from a pipe')
   .option('--check', 'only verify host prerequisites; changes nothing and needs no payload')
   .option('--resume', 'finish an interrupted replacement or setup; needs no new payload')
+  .option('--abandon-replacement', 'discard an unsent or definitively rejected replacement after checking its private receipt')
   .option('--replace-registration', 'confirm retirement of the existing account registration when the new one differs')
   .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
   .action(async (payload, opts) => workspaceEnrollmentCommand(opts, true, payload));

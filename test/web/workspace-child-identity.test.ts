@@ -1,7 +1,7 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {createServer,type Server} from 'node:http';
 import {once} from 'node:events';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {chmodSync,existsSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {parse,stringify} from 'yaml';
@@ -289,5 +289,25 @@ describe('signed registration retirement from an existing installation',()=>{
     await expect(unregisterWorkspace({...previous,hostWorkspaceId:'x'.repeat(43)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('host ID differs');
     await expect(unregisterWorkspace({...previous,proofRootCid:'f'.repeat(64)},h.payload,'q'.repeat(43),h.attach,{request})).rejects.toThrow('proof root differs');
     h.behaviour.contacts=[];await expect(unregisterWorkspace(previous,{...h.payload,serverCid:'f'.repeat(64)},'q'.repeat(43),h.attach,{request})).rejects.toThrow('Original enrollment server contact is unavailable');expect(h.did('sendCommand')).toHaveLength(1);expect(existsSync(join(h.workspace,'connector'))).toBe(true);
+  });
+});
+
+
+describe('credential-free same-registration renewal',()=>{
+  it('keeps the existing private connector byte-identical while renewing root proof',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);await h.enroll();
+    const connector=join(h.workspace,'connector'),before=readFileSync(connector,'utf8');
+    delete h.payload.connectorToken;
+    await h.enroll();expect(readFileSync(connector,'utf8')).toBe(before);
+  });
+  it('refuses missing credentials on initial setup, a different target or an unsafe retained file before sends or writes',async()=>{
+    const h=await host();await ensureMinimalSetup(h.config);const token=h.payload.connectorToken;delete h.payload.connectorToken;
+    await expect(h.enroll()).rejects.toThrow('remove and re-create');expect(h.did('sendCommand')).toEqual([]);expect(h.posted('workspace/enroll')).toEqual([]);
+    h.payload.connectorToken=token;await h.enroll();const binding=readFileSync(join(h.workspace,'binding.json'),'utf8'),sent=h.did('sendCommand').length;
+    delete h.payload.connectorToken;h.payload.challenge.workspaceId='r'.repeat(43);
+    await expect(h.enroll({replacingWorkspace:JSON.parse(binding).workspaceId})).rejects.toThrow('remove and re-create');expect(h.did('sendCommand')).toHaveLength(sent);
+    h.payload.challenge.workspaceId=JSON.parse(binding).workspaceId;
+    chmodSync(join(h.workspace,'connector'),0o644);await expect(h.enroll()).rejects.toThrow('remove and re-create');
+    expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(binding);expect(h.did('sendCommand')).toHaveLength(sent);
   });
 });

@@ -11,7 +11,7 @@ import { attachOursClient, type AttachOursClientOptions, type OursClient } from 
 import { preflightInitPaths } from './init-wizard.js';
 import { WebAccessStore } from './web/access.js';
 import { WorkspaceDeviceStore } from './web/workspace-devices.js';
-export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;rootName:string;name:string;surname:string;connectorToken:string;invitation:string;serverCid:string;challenge:{nonce:string;workspaceId:string;accountId:string;expiresAt:number}}
+export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;rootName:string;name:string;surname:string;connectorToken?:string;invitation:string;serverCid:string;challenge:{nonce:string;workspaceId:string;accountId:string;expiresAt:number}}
 export function readWorkspacePayload(file:string):WorkspacePayload {
   const path=resolve(file),stat=lstatSync(path);
   if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>32768)throw Error('Setup payload requires an owned private regular file (chmod 600)');
@@ -20,8 +20,23 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
 export function decodeWorkspacePayload(input:string,options:{allowExpired?:boolean}={}):WorkspacePayload {
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
   if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
-  for(const k of ['connectorToken','invitation','name','surname'] as const)if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');
+  for(const k of ['connectorToken','invitation','name','surname'] as const){if(k==='connectorToken' && p[k]===undefined)continue;if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');}
   return p;
+}
+/** Credential-free renewal is allowed only on the host already holding this private connector. */
+export function checkWorkspaceConnector(payload:WorkspacePayload):void {
+  if(payload.connectorToken!==undefined)return;
+  const reject=()=>{throw Error('This command renews an existing host without a connector credential. Restore its owned private connector file, or remove and re-create the workspace in the App before setting it up again');};
+
+  const dir=join(stateRoot(),'workspace');let previous:any;
+  try{previous=JSON.parse(readFileSync(join(dir,'binding.json'),'utf8'));}catch{reject();}
+  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin??'https://app.ours.network')!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
+  try{
+    const file=join(dir,'connector'),stat=lstatSync(file);
+    if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>8193 || !readFileSync(file,'utf8').trim())reject();
+    const tunnel=JSON.parse(readFileSync(join(dir,'tunnel.json'),'utf8'));
+    if(tunnel.origin!==`https://${payload.hostname}` || tunnel.tokenFile!==file)reject();
+  }catch{reject();}
 }
 const GENERATED_VERSION='ours.network/fleet/v2';
 /** The rooms section tunnel setup writes for the enrolled Human root. */
@@ -158,6 +173,7 @@ export async function checkWorkspaceConfiguration(configuration=defaultConfigPat
     throw Error(`${paths.configPath}: rooms.owner.expected_cid names a different Owner than this host's Messenger identity. Tunnel setup does not replace an existing Owner.`);
 }
 export async function enrollWorkspace(payload:WorkspacePayload,configuration=defaultConfigPath(),options:{migrateAppOrigin?:boolean;preserveProfile?:boolean;replacingWorkspace?:string;attach?:AttachDaemonClient;contactWaitMs?:number;afterInvitation?:()=>void}={}) {
+  checkWorkspaceConnector(payload);
   const attach=options.attach ?? attachOursClient;
   const request=hostMessenger();
   if(new WebAccessStore().read().mode==='none')throw Error('Workspace enrollment requires protected web access; enable pairing or password before setup');
@@ -232,7 +248,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
     const document=parseDocument(readFileSync(configuration,'utf8'));document.setIn(['rooms','owner','expected_cid'],ownerCid);
     replaceFileAtomically(configuration,document.toString(),0o600);
   }
-  replaceFileAtomically(join(dir,'connector'),payload.connectorToken+'\n',0o600);
+  if(payload.connectorToken!==undefined)replaceFileAtomically(join(dir,'connector'),payload.connectorToken+'\n',0o600);
   const origin=`https://${payload.hostname}`;
   replaceFileAtomically(join(dir,'tunnel.json'),JSON.stringify({origin,tokenFile:join(dir,'connector')})+'\n',0o600);
   replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase(),...(identity.root?{proofRootCid:identity.root.cid}:{})})+'\n',0o600);
@@ -280,7 +296,7 @@ export async function confirmWorkspaceTarget(payload:Pick<WorkspacePayload,'appO
 }
 
 /** Retire exactly the original registration using the same signed Human root that bound it. */
-export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number}={}):Promise<string> {
+export async function unregisterWorkspace(previous: {workspaceId:string;hostWorkspaceId:string;appOrigin:string;serverCid:string;proofRootCid?:string}, payload:WorkspacePayload, operationNonce:string, attach:AttachDaemonClient=attachOursClient, options:{request?:typeof fetch;waitMs?:number;checkOnly?:boolean;beforeSend?:()=>void;operationExpiresAt?:number;onReceipt?:(status:{deleted?:boolean;retired?:boolean;absent?:boolean;rejected?:boolean;expired?:boolean;deadlineEnforced?:boolean})=>void}={}):Promise<string> {
   const appOrigin=validateAccountOrigin(previous.appOrigin);
   const messenger=hostMessenger();
   const identity=await messengerIdentity(messenger,attach);
@@ -289,17 +305,31 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
   if(previous.proofRootCid && !same(root.cid,previous.proofRootCid))throw Error('Original workspace proof root differs from this installation; existing local setup preserved');
   const devices=new WorkspaceDeviceStore();const hostWorkspaceId=devices.workspaceId;devices.close();
   if(hostWorkspaceId!==previous.hostWorkspaceId)throw Error('Original workspace host ID differs from this installation; existing local setup preserved');
-  const receiptInput={workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,rootCid:root.cid};
+  const deadlineField:Record<string,number>=options.operationExpiresAt===undefined?{}:{operationExpiresAt:options.operationExpiresAt};
+  const receiptInput={workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,rootCid:root.cid,...deadlineField};
   const request=options.request ?? fetch;
-  const receipt=async():Promise<{deleted?:boolean;retired?:boolean}>=>{
+  const receipt=async():Promise<{deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean}>=>{
     let response:Response;
     try{response=await request(appOrigin+'/account-api/workspace-unregister-receipt',{method:'POST',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000),headers:{Origin:appOrigin,'Content-Type':'application/json'},body:JSON.stringify(receiptInput)});}
     catch{throw Error('Registration retirement could not be confirmed; local setup preserved. Run setup-tunnel --resume to retry');}
     if(response.status===404){await response.body?.cancel();return {};}
     if(!response.ok){await response.body?.cancel();throw Error(`Registration retirement receipt failed (HTTP ${response.status}); local setup preserved`);}
-    try{return await response.json() as {deleted?:boolean;retired?:boolean};}catch{throw Error('Invalid registration retirement receipt; local setup preserved');}
+    try{return await response.json() as {deleted?:boolean;retired?:boolean;rejected?:boolean;absent?:boolean;expired?:boolean;deadlineEnforced?:boolean};}catch{throw Error('Invalid registration retirement receipt; local setup preserved');}
   };
   let status=await receipt();
+  options.onReceipt?.(status);
+  if(options.checkOnly){
+    // No invitation is consumed and no command is sent during preparation.
+    // A different server cannot be reconnected with the successor's invitation.
+    if(status.deleted!==true && status.rejected!==true && !same(previous.serverCid,payload.serverCid)){
+      const check=async(client:Pick<DaemonClient,'listContacts'>)=>{if(!(await client.listContacts()).contacts.some(contact=>same(contact.container_id,previous.serverCid)))throw Error('Original enrollment server contact is unavailable; existing setup preserved');};
+      if(identity.root)await asHumanRoot(attach,root,'retirement-preflight',check);
+      else await check({listContacts:()=>messenger('contacts')});
+    }
+    return root.cid;
+  }
+  const requireRetryable=()=>{if(status.rejected===true)throw Error('The account service definitively rejected this retirement operation. Run setup-tunnel --abandon-replacement, then obtain a fresh App command and start again');};
+  requireRetryable();
   if(status.deleted!==true){
     if(payload.challenge.expiresAt<=Date.now())throw Error('Replacement command expired before retirement; existing setup preserved. Obtain a fresh App command');
     const retire=async(client:Pick<DaemonClient,'listContacts'|'addContact'|'sendCommand'>)=>{
@@ -317,7 +347,10 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
       }
       const replacement=appOrigin===validateAccountOrigin(payload.appOrigin) && same(serverCid,payload.serverCid) && previous.workspaceId!==payload.challenge.workspaceId
         ? {workspaceId:payload.challenge.workspaceId,accountId:payload.challenge.accountId,nonce:payload.challenge.nonce}:undefined;
-      const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,...(replacement?{replacement}:{})}});
+      // Persist uncertainty before invoking the transport: a lost response must
+      // never make an in-flight retirement safe to abandon.
+      options.beforeSend?.();
+      const outcome=await client.sendCommand({contact:serverCid,command:'unregister-workspace',arguments:{type:'ours.app.unregister-workspace.v1',workspaceId:previous.workspaceId,hostWorkspaceId,operationNonce,...deadlineField,...(replacement?{replacement}:{})}});
       if(!('sent' in outcome) || !outcome.sent)throw Error('Registration retirement was not sent; local setup preserved');
     };
     if(identity.root)await asHumanRoot(attach,root,'unregister',retire);
@@ -337,8 +370,10 @@ export async function unregisterWorkspace(previous: {workspaceId:string;hostWork
   }
   const deadline=Date.now()+(options.waitMs ?? 30000);
   while(status.deleted!==true || status.retired!==true){
-    if(Date.now()>=deadline)throw Error('Registration retirement is not complete; local setup preserved. Run setup-tunnel --resume to retry');
+    if(Date.now()>=deadline)throw Error('Registration retirement is not confirmed; local setup preserved. Run setup-tunnel --resume with the same operation, or --abandon-replacement once the server confirms terminal rejection');
     await new Promise(resolve=>setTimeout(resolve,500));status=await receipt();
+    requireRetryable();
   }
+  if((status as {absent?:boolean}).absent)process.stderr.write('The account service has no record of the old registration. No old provider resources were deleted by this service.\n');
   return root.cid;
 }

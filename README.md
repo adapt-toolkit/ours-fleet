@@ -1856,21 +1856,43 @@ pipe with a 32KiB limit and refuses a terminal. Legacy v1 payloads, which contai
 long-lived scoped credentials, are accepted only through file/stdin, never as
 command arguments. Use only one payload transport.
 
-When this host already has a registration, setup describes its workspace/account origin
-and asks `[y/N]` before redeeming the opaque one-use grant. No answer or `no` preserves
-the existing setup and grant. A noninteractive caller must explicitly pass
-`--replace-registration`. The same registration reruns without retirement. For a new
-registration the original Human root signs its unregister command, and setup waits
-for the account's durable tunnel/DNS/invitation cleanup receipt before stopping the
-old local service and revoking its account-linked devices. Installation identities,
+When this host already has a registration, Fleet inspects the one-use grant without
+consuming it. The same workspace reruns without a deletion prompt or retirement.
+An account-origin change for that workspace requires `--migrate-app-origin`; a
+changed server identity is refused. An older App without inspection support falls
+back to asking before redemption. An unavailable inspection service preserves the
+grant and setup. Fleet verifies the redeemed destination against the inspection.
+
+For another workspace, setup describes the existing workspace, tunnel hostname and
+account origin and asks `[y/N]`. No answer or `no` preserves the setup and grant; a
+noninteractive caller must pass `--replace-registration`, otherwise it exits with
+an error. A legacy binding without a server identity must rerun its own workspace
+first. The original Human root signs retirement. Fleet waits for the account's
+durable cleanup receipt before stopping the old service and revoking its linked
+devices. If a migrated database has no old registration, the signed command confirms
+absence; the service has no old provider resources to delete. Installation identities,
 profile, agents, history, stable host ID and local pairing are preserved.
 
-Replacement recovery is stored in an owned private `workspace/replacement.json`;
-`setup-tunnel --resume` retries the same retirement operation and then enrollment.
-If the replacement window expires after retirement, obtain a fresh App command and
-pass `--replace-registration`; completed retirement is retained. The old server CID
-is pinned: if its contact is gone, only an invitation for that same server can
-reconnect it. A different server cannot authorize retirement of the old binding.
+Replacement recovery is saved in an owned private `workspace/replacement.json`
+after root, host, service and server-contact preconditions pass. `setup-tunnel
+--resume` retries its identical nonce and immutable 24-hour operation deadline.
+If the enrollment challenge expires, obtain a fresh App command for the same target
+and pass `--replace-registration`; completed retirement is retained. The old server
+identity is pinned: only its own invitation can reconnect it.
+
+`setup-tunnel --abandon-replacement` removes the private recovery payload only when
+a fresh private receipt confirms no deletion and the operation was never dispatched
+or was terminally rejected. A lost transport response remains uncertain. Expired
+operations require a fresh no-deletion receipt after the deadline plus five minutes
+and an explicit server guarantee that the deadline is enforced;
+older recovery records without that guarantee must be resumed. Abandoning preserves
+the existing binding, connector and installation data. A terminally rejected operation
+requires abandonment and a new App command, rather than reusing its nonce.
+
+Renewal commands contain no existing live connector credential. Fleet keeps the
+current private connector byte for byte, and accepts renewal only for its recorded
+workspace, server, origin and tunnel hostname. Restore a missing or unsafe connector,
+or remove and re-create that workspace in the App before setting it up again.
 
 After service and signed tunnel-target confirmation, setup prints both a QR and
 ordinary private single-use connection code. The App checks readiness automatically
