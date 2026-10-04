@@ -19,7 +19,11 @@ export const CAP_HTTP_COWORK = 'cowork.http-management-v1';
 
 export const CAP_WORKSPACE_PRESERVE_PROFILE = 'workspace.enroll.preserve-profile-v1';
 
+/** `ours-fleet managed-cli setup|status` and the `managed_cli` Agent key (#233). */
+export const CAP_MANAGED_CLI_SETUP = 'managed-cli.setup-v1';
+
 export const CAPABILITIES = [
+  CAP_MANAGED_CLI_SETUP,
   CAP_WORKSPACE_PRESERVE_PROFILE,
   CAP_HTTP_COWORK,
   CAP_MONITOR_INTERRUPT_AFTER_TOOL,

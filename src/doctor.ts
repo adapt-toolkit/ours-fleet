@@ -9,6 +9,7 @@ import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js'
 import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
 import { getAdapter, productionAdapters } from './harness/registry.js';
 import { analyzeFleetPermissions, formatNative } from './permissions.js';
+import { managedCliReport } from './managed-cli.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation, harnessRuntimeDir } from './isolation/policy.js';
@@ -388,6 +389,32 @@ export async function doctor(
           + `${p.unattended === 'deny' ? 'be denied silently' : 'block the turn'}; `
           + `grants only ${analysis.capabilities!.join(', ') || '(nothing)'}`,
     });
+  }
+
+  // Managed CLI policy. Three separate rows on purpose: what Fleet generated
+  // (static), what the running session loaded, and what the supervisor audit
+  // ledger actually recorded. The first two never stand in for the third.
+  if (roles.some(role => role.managed_cli?.length)) {
+    const report = managedCliReport({ roles }, opts.configPath, { write: false, platform });
+    for (const role of report.roles.filter(item => item.setup.state !== 'not-declared')) {
+      checks.push({
+        name: `managed CLI setup: ${role.role}`,
+        ok: ['prepared', 'generated-at-launch', 'not-required'].includes(role.setup.state),
+        detail: `static: ${role.setup.state} — ${role.setup.detail}`
+          + (['missing', 'stale'].includes(role.setup.state) ? '; run: ours-fleet managed-cli setup' : '')
+          + (role.warnings.length ? `; ${role.warnings.join('; ')}` : ''),
+      });
+      if (role.session_policy !== 'not-applicable') checks.push({
+        name: `managed CLI session: ${role.role}`, ok: true,
+        detail: role.session_policy === 'restart-required'
+          ? 'the last launch loaded a different policy — restart this agent to load the current one'
+          : role.session_policy === 'never-launched' ? 'not launched since setup; the policy loads at its next start'
+            : 'the last launch loaded the current policy',
+      });
+      checks.push({
+        name: `managed CLI observed: ${role.role}`, ok: true, detail: role.observed.summary,
+      });
+    }
   }
 
   for (const role of roles.filter(candidate => candidate.auth_proxy !== undefined)) {

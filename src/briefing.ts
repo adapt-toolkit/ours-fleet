@@ -18,6 +18,8 @@ export interface BriefingOpts {
   identityGuarantee?: 'verified' | 'created' | 'unverified';
   /** Temporary spawn whose newly-created identity should share the session lifecycle. */
   temporaryIdentity?: boolean;
+  /** Fleet-prepared invocation guidance (src/managed-cli.ts); empty when none applies. */
+  managedCli?: string[];
 }
 
 const managedSession = (role: ResolvedRole): boolean =>
@@ -215,9 +217,16 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('For omitted settings, the supervisor inherits your canonical Brain and Role selections,');
     L.push('working directory, neutral permissions, coordinator, and fleet monitor policy. Every');
     L.push('explicit option wins; identity/session-local and secret material never inherit.');
-    L.push('All public CLI surfaces are available; hidden worker entry points remain internal.');
+    L.push('All public CLI surfaces are routed this way; hidden worker entry points remain internal.');
+    if (role.permissions && role.permissions.filesystem !== 'unrestricted' && !opts.managedCli?.length) {
+      L.push('Routing is not reachability: every call first connects to the supervisor socket, and a');
+      L.push('harness command sandbox can refuse that connection (`connect EPERM`), even for `--help`.');
+      L.push('No Fleet command is prepared to run outside your sandbox. If one is refused, report it');
+      L.push('as a blocker; the owner enables a workflow with `ours-fleet managed-cli setup --enable`.');
+    }
     L.push('Lifecycle notice delivery failures stay in service diagnostics and never rerun effects.');
     L.push('This proxy is attribution and convenience, not a security boundary for unisolated roles.');
+    L.push(...(opts.managedCli ?? []));
   }
   if (role.coordinator) {
     L.push(`7. ANNOUNCE yourself: call **${v.sendTool}** to contact "${role.coordinator}" with text:`);

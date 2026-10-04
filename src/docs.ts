@@ -266,6 +266,88 @@ the executor inside the role's existing OS sandbox, and ordinary CLI validation 
 the source of truth. Hidden worker entry points remain internal; public lifecycle and
 operator commands are not restricted by the proxy.
 
+### Fleet commands from a command sandbox (\`managed_cli\`)
+
+That supervisor connection is a Unix socket. A harness command sandbox (Codex
+\`workspace-write\`, Claude's OS sandbox) can refuse it with \`connect EPERM\`
+before any command, even \`--help\`, is parsed. Fleet prepares the native
+harness policy for one declared workflow; you never write Codex rules or Claude
+sandbox settings by hand.
+
+Opt an Agent (or Agent Template) in explicitly. It is never inferred from a
+role's name or persona and is not inherited by agents it spawns:
+
+\`\`\`yaml
+# fleet/agents/FleetCoordinator.yaml
+role: { ref: Coordinator }
+brain: { ref: codex-gpt-5-4-medium }
+permissions: { approval: auto, filesystem: workspace, unattended: deny }
+managed_cli: [task-workflow]
+\`\`\`
+
+\`ours-fleet managed-cli setup --enable FleetCoordinator\` adds that one key to
+an existing Agent file and changes nothing else, permissions included.
+\`ours-fleet managed-cli setup\` generates the policy for every declaring agent
+and \`ours-fleet managed-cli status\` compares without writing. Neither starts a
+session or a model. The same preparation runs at every agent start, so spawned
+and task-room agents need no separate step.
+
+\`task-workflow\` prepares: \`task create|start|finish|block|unblock|review\`,
+\`task list|show\`, \`room show|members\`, \`template list|show|validate\`,
+\`config\`, \`docs\` and \`--help\`. \`task start\` and \`task finish\`
+provision and retire rooms and agents: this is real authority. Not prepared, and
+still sandboxed: \`spawn\`, \`ours tools|call\`, \`status|peek|send\`, room
+create/delete/close, task cancel/delete and service administration.
+
+The agent invokes a prepared command through the pinned entry form shown in its
+briefing:
+
+\`\`\`sh
+/abs/node /abs/fleet/dist/cli.js --managed-configuration /abs/fleet.yaml task create --title "..." --backlog --no-room
+\`\`\`
+
+What the native policy does and does not do:
+
+- A rule fixes the Node executable, this Fleet CLI, the configuration and the
+  command. It matches an argv prefix and admits every trailing option and
+  argument. It is not argument validation, target authorization or per-agent
+  isolation.
+- A later \`-c\`/\`--configuration\` naming another file is refused by the
+  Fleet CLI itself, after the process has started outside the sandbox. That is
+  Fleet validation, not a native policy denial.
+- The supervisor audit and ordinary CLI validation are unchanged. The pinned
+  form is refused outside a managed session, where no supervisor would audit it.
+- Compound, piped, redirected, \`$(...)\` and \`VAR=value\`-prefixed command
+  lines do not match and stay sandboxed.
+- Codex: a Fleet-owned \`.codex/rules/ours-fleet-<id>.rules\` in the agent's
+  workspace. It applies to every trusted Codex session in that workspace, and
+  Codex must trust the workspace; Fleet does not change trust. Other files in
+  that directory are never touched.
+- Claude: entries in the agent's own Fleet settings overlay
+  (\`permissions.allow\` and \`sandbox.excludedCommands\`). Your Claude settings
+  are not modified and Fleet never enables or disables Claude's OS sandbox.
+- A Fleet CLI or configuration path containing spaces is spelled in single
+  quotes (Codex >= 0.160.0). The Node executable itself must be at a path that
+  needs no quoting: neither harness matches a quoted executable against a rule.
+  A path containing anything but letters, digits, spaces and \`_@%+=:,./-\`
+  (quotes, backslashes, \`*\` and other pattern characters), or located inside
+  the agent's workspace or a \`harness_options.add_dirs\` directory (also through
+  a symlink), is reported as unsupported; so is a Codex role with
+  \`harness_options.config\` or \`profile\`, whose sandbox Fleet does not inspect.
+- Prepared for: Codex native app-server and bundled ACP, Claude bundled ACP, on
+  Linux and macOS. The generated setup was qualified end to end on Linux
+  (Codex 0.160.0, Claude Code 2.1.289); the macOS run of that matrix is
+  outstanding and \`managed-cli status\` says so there. Custom session
+  commands, other harnesses, roles declaring \`isolation:\` and other
+  platforms are reported as unsupported and left exactly as sandboxed as before.
+
+\`ours-fleet doctor\` reports three separate facts per declaring agent: the
+generated setup (static), whether the last launch loaded the current policy, and
+what the supervisor audit ledger recorded since. A prepared setup is not
+evidence of supervisor access, and a successful \`--help\` proves only its own
+audited path, not the task lifecycle. See
+\`docs/validation/managed-cli-permissions.md\`.
+
 Command invocation, raw argv, read-only work, validation failures, and generic
 outcomes are never forwarded to the Owner-visible channel. Fleet announces only
 confirmed Agent, Task, and Room lifecycle changes. Local diagnostics retain

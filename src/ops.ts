@@ -9,6 +9,7 @@ import { findRole } from './config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
+import { managedCliBriefing } from './managed-cli.js';
 import { resetRestartLedger } from './runner.js';
 import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
 import {
@@ -84,7 +85,7 @@ export function applyRole(
   // brought up from so the supervised process can reload the SAME file instead of
   // silently falling back to the default ~/fleet.yaml. Temp roles snapshot their
   // whole resolved role into role.yaml instead and don't need this.
-  if (!opts.temp) writeFileSync(join(dir, '.config-path'), (opts.configPath ?? '') + '\n');
+  if (!opts.temp || opts.configPath) writeFileSync(join(dir, '.config-path'), (opts.configPath ?? '') + '\n');
   writeFileSync(join(dir, '.identity'), role.identity + '\n');
   if (role.cwd) writeFileSync(join(dir, '.cwd'), role.cwd + '\n');
   if (!existsSync(join(dir, '.session-id'))) writeFileSync(join(dir, '.session-id'), randomUUID() + '\n');
@@ -95,6 +96,7 @@ export function applyRole(
     routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
     identityGuarantee: opts.identityGuarantee,
     temporaryIdentity: opts.temp === true,
+    managedCli: managedCliBriefing(role, opts.configPath, opts.temp === true),
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });
