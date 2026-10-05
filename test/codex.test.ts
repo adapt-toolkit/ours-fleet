@@ -74,6 +74,12 @@ describe('prepareSession', () => {
     expect(session.sessionConfigSelections(role({ effort: 'low' })))
       .toEqual([{ configId: 'reasoning_effort', value: 'low' }]);
     expect(session.sessionConfigSelections(role())).toEqual([]);
+    expect(session.sessionConfigSelections(role({ harness_options: { config: { model_reasoning_effort: 'high' } } })))
+      .toEqual([{ configId: 'reasoning_effort', value: 'high' }]);
+    expect(session.sessionConfigSelections(role({ effort: 'low', harness_options: { config: { model_reasoning_effort: 'high' } } })))
+      .toEqual([{ configId: 'reasoning_effort', value: 'low' }]);
+    for (const invalid of ['unknown', null, 1, ['high']])
+      expect(session.sessionConfigSelections(role({ harness_options: { config: { model_reasoning_effort: invalid } } }))).toEqual([]);
   });
   it('prepares the same ACP environment when ours-codex is installed', async () => {
     const a = makeCodexAdapter(execWith(true));

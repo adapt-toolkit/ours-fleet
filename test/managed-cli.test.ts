@@ -6,7 +6,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { loadConfig, type ResolvedRole } from '../src/config.js';
+import { findRole, loadConfig, type ResolvedRole } from '../src/config.js';
 import { generateBriefing } from '../src/briefing.js';
 import { CAPABILITIES } from '../src/capabilities.js';
 import { erasedArg } from '../src/erased-resources.js';
@@ -14,7 +14,8 @@ import { managedPinMarker, redactFleetArgv } from '../src/fleet-command-audit.js
 import { doctor } from '../src/doctor.js';
 import '../src/harness/claude-code.js';
 import { claudeCodeAdapter, makeClaudeCodeAdapter } from '../src/harness/claude-code.js';
-import '../src/harness/codex.js';
+import { makeCodexAdapter, nativeCodexConfig } from '../src/harness/codex.js';
+import { CODEX_REASONING_EFFORTS } from '../src/harness/codex-reasoning.js';
 import '../src/harness/hermes.js';
 import {
   MANAGED_CLI_RECORD, MANAGED_CLI_WORKFLOWS, acquireCodexRules, analyzeManagedCli,
@@ -287,6 +288,66 @@ describe('which combinations Fleet prepares', () => {
     // Restricted filesystem intents all keep a sandbox and are prepared.
     for (const filesystem of ['workspace', 'read-only'] as const)
       expect(analyze({ permissions: { approval: 'auto', filesystem, unattended: 'deny' } }).state).toBe('supported');
+  });
+});
+
+describe('Codex Brain effort managed CLI regression (#235)', () => {
+  const deps = { paths: { node: PATHS.node, cli: PATHS.cli }, platform: 'linux' as const };
+  const brainAgent = (session: string, effort: string, native = '') =>
+    agent('codex', session, 'managed_cli: [task-workflow]\n')
+      .replace(`session: ${session} }`, `session: ${session}, model: gpt-5.6-sol, effort: ${effort}${native} }`);
+
+  it.each(['codex-app-server', 'acp'] as const)('resolves every supported Brain effort and preserves %s launch settings', async session => {
+    for (const effort of CODEX_REASONING_EFFORTS) {
+      const name = `A-${effort}`;
+      fleet({ [name]: brainAgent(session, effort) });
+      const file = join(root, 'fleet', 'agents', `${name}.yaml`);
+      const before = readFileSync(file, 'utf8');
+      const cfg = loadConfig(config), target = findRole(cfg, name);
+      expect(target).toMatchObject({ effort, model: 'gpt-5.6-sol', identity: name,
+        permissions: { approval: 'auto', filesystem: 'workspace', unattended: 'deny' },
+        harness_options: { config: { model_reasoning_effort: effort } } });
+      for (const platform of ['linux', 'darwin'] as const)
+        expect(analyzeManagedCli(target, config, { ...deps, platform }).state).toBe('supported');
+      const prepared = managedCliReport(cfg, config, { ...deps, write: true }).roles.find(item => item.role === name)!;
+      expect(prepared).toMatchObject({ setup: { state: 'prepared' }, session_policy: 'never-launched' });
+      expect(prepared.observed.summary).toContain('not observed');
+      expect(managedCliReport(cfg, config, { ...deps, write: false }).roles.find(item => item.role === name)!.setup.state).toBe('prepared');
+      const stateDir = agentDir(name); mkdirSync(stateDir, { recursive: true });
+      const adapter = makeCodexAdapter();
+      const adapterPrep = await adapter.prepareSession(target, { stateDir, runCwd: workspace });
+      prepareManagedCliLaunch(target, { stateDir, runCwd: workspace, configPath: config,
+        prep: adapterPrep, deps, log: () => {} });
+      expect(nativeCodexConfig(target)).toEqual({ model_reasoning_effort: effort });
+      expect(adapter.agentSession.sessionConfigSelections(target)).toContainEqual({ configId: 'reasoning_effort', value: effort });
+      expect(target.permissions).toEqual({ approval: 'auto', filesystem: 'workspace', unattended: 'deny' });
+      expect(readFileSync(file, 'utf8')).toBe(before);
+      // The model setting cannot turn replaceable pins into safe native policy.
+      expect(analyzeManagedCli(target, config, { ...deps, paths: { ...PATHS, cli: join(workspace, 'cli.js') } }).state).toBe('unsupported');
+    }
+  });
+
+  it.each(['codex-app-server', 'acp'] as const)('refuses malformed, unknown and authority-bearing config on %s, including effort mixtures', session => {
+    for (const configValue of [false, '', 'medium', 0, [], ['medium'],
+      ...[undefined, null, false, 3, 'MEDIUM', 'medium ', 'unknown', [], { value: 'medium' }]
+        .map(value => ({ model_reasoning_effort: value })),
+      ...['unknown_key', 'approval_policy', 'sandbox_mode', 'sandbox_workspace_write.writable_roots',
+        'permissions.custom.network_access', 'mcp_servers.evil.command']
+        .map(key => ({ model_reasoning_effort: 'medium', [key]: '/opt' }))]) {
+      const result = analyzeManagedCli(role({ session, harness_options: { config: configValue } }), config, deps);
+      expect(result.state, JSON.stringify(configValue)).toBe('unsupported');
+      expect(result.reasons.join('\n')).toContain('only validated model_reasoning_effort');
+    }
+    expect(analyzeManagedCli(role({ session, harness_options: { profile: 'wide', config: { model_reasoning_effort: 'medium' } } }), config, deps).state).toBe('unsupported');
+    // Real Brain translation preserves an extra native key, so it must not be lost before checking.
+    fleet({ A: brainAgent(session, 'medium', ', harness_options: { config: { approval_policy: never } }') });
+    {
+      const cfg = loadConfig(config), target = findRole(cfg, 'A');
+      expect(target.harness_options.config).toEqual({ model_reasoning_effort: 'medium', approval_policy: 'never' });
+      const result = managedCliReport(cfg, config, { ...deps, write: true }).roles[0]!;
+      expect(result.setup.state).toBe('unsupported');
+      expect(existsSync(codexRulesPath(workspace, config))).toBe(false);
+    }
   });
 });
 
