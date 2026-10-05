@@ -314,6 +314,14 @@ export class CodexAppServerSession implements AgentSession {
     }
   }
 
+  readonly liveVoiceSupported = true;
+
+  async interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
+    if (generation !== this.sessionGeneration) throw new Error('session_changed: Agent session changed.');
+    if (this.activeTurn?.promptId !== promptId) return { state: 'settled' };
+    return this.interrupt('local-console');
+  }
+
   async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     const active = this.activeTurn;
     if (!active || !this.threadId) return { state: 'settled' };
@@ -464,6 +472,8 @@ export class CodexAppServerSession implements AgentSession {
     if (existing) return existing;
     if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
       throw new Error('session_changed: Agent session changed. Record a new voice message.');
+    if (command.requireIdle && (this.queueDepth > 0 || this.conversationSnapshot().readiness !== 'idle'))
+      throw new Error('voice_busy: Agent is already working. Wait for the current turn.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },

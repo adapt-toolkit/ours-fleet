@@ -53,6 +53,33 @@ async function startArbiterServer() {
 }
 
 describe('role-control conversation v3', () => {
+  it('live voice binds admission and interrupt atomically through the arbiter/control socket', async () => {
+    const { stateDir } = await startArbiterServer();
+    const page = await controlRequest(stateDir, { command: 'conversation_page', limit: 1 });
+    const generation = (page.result as any).snapshot.sessionGeneration;
+    const snapshot = await controlRequest(stateDir, { command: 'snapshot' });
+    expect((snapshot.result as any).features).toContain('targeted_voice_interrupt');
+    const command = { command: 'submit_voice_prompt' as const, commandId: 'live-one', text: 'block 1200', actor: 'browser', source: 'owner_admin_console' as const, expectedSessionGeneration: generation, requireIdle: true };
+    const first = await controlRequest(stateDir, command); expect(first.ok).toBe(true);
+    await new Promise(r => setTimeout(r, 50));
+    expect((await controlRequest(stateDir, command)).result).toEqual(first.result); // lost receipt retry while running
+    const busy = await controlRequest(stateDir, { ...command, commandId: 'live-two' });
+    expect(busy.ok).toBe(false); expect(busy.error).toContain('voice_busy');
+    const cancel = { command: 'interrupt_voice_v2' as const, commandId: 'cancel-one', promptId: (first.result as any).promptId, expectedSessionGeneration: generation };
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'cancel-stale', expectedSessionGeneration: 'old' })).ok).toBe(false);
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'cancel-other', promptId: 'unrelated' })).ok).toBe(true);
+    let events = ((await controlRequest(stateDir, { command: 'conversation_page', limit: 100 })).result as any).events;
+    expect(events.some((e:any) => e.kind === 'prompt.interrupt_requested')).toBe(false);
+    const stopped = await controlRequest(stateDir, cancel); expect(stopped.ok).toBe(true);
+    expect((await controlRequest(stateDir, cancel)).result).toEqual(stopped.result);
+    expect((await controlRequest(stateDir, { ...cancel, promptId: 'different' })).ok).toBe(false);
+    const next = await controlRequest(stateDir, { ...command, commandId: 'live-new', text: 'block 200' }); expect(next.ok).toBe(true);
+    await new Promise(r => setTimeout(r, 40));
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'late-old-cancel' })).ok).toBe(true);
+    events = ((await controlRequest(stateDir, { command: 'conversation_page', limit: 100 })).result as any).events;
+    expect(events.filter((e:any) => e.kind === 'prompt.interrupt_requested')).toHaveLength(1);
+  });
+
   it('binds voice input to its recorded session and replays the exact admitted receipt', async () => {
     const { stateDir, session } = await startServer();
     const command = { command: 'submit_voice_prompt' as const, commandId: 'voice-once', text: 'Voice message:\n/restart', actor: 'browser', source: 'owner_admin_console' as const };

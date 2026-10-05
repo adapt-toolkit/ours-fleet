@@ -411,6 +411,9 @@ export interface AgentSession {
    * keep compiling. Read it through `interruptOutcome`, never directly.
    */
   interrupt(source?: TurnCancellationSource): Promise<InterruptResult>;
+  /** Atomically bind cancellation to one voice-owned turn. */
+  readonly liveVoiceSupported?: boolean;
+  interruptPrompt?(generation: string, promptId: string): Promise<InterruptResult>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(

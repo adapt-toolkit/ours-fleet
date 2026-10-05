@@ -30,12 +30,14 @@ export interface ControlRequest {
   token: string;
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
-    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'submit_voice_prompt' | 'interrupt_v2'
+    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'submit_voice_prompt' | 'interrupt_v2' | 'interrupt_voice_v2'
     | 'layout_control' | 'agent_contacts' | 'agent_history' | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
   layout?: LayoutControlRequest;
   agentHistory?: AgentHistoryQuery;
   text?: string;
   expectedSessionGeneration?: string;
+  requireIdle?: boolean;
+  promptId?: string;
   permissionId?: string;
   optionId?: string;
   since?: number;
@@ -71,7 +73,7 @@ export interface ControlRequest {
 
 /** Commands that require protocol version 3. */
 const V3_COMMANDS = new Set<ControlRequest['command']>([
-  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'submit_voice_prompt', 'interrupt_v2',
+  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'submit_voice_prompt', 'interrupt_v2', 'interrupt_voice_v2',
   'respond_permission_v2',
 ]);
 
@@ -368,6 +370,7 @@ export class RoleControlServer {
                 ...(this.correspondence ? ['agent_correspondence'] : []),
                 ...(this.session.conversationPage ? ['conversation_v3'] : []),
                 ...(this.session.submitPromptBrowser ? ['generation_bound_prompts'] : []),
+                ...(this.session.liveVoiceSupported ? ['idle_bound_prompts', 'targeted_voice_interrupt'] : []),
                 ...(this.session.capabilities?.steering ? ['steering'] : []),
                 ...(this.session.capabilities?.permissions ? ['permissions'] : []),
                 ...(this.session.capabilities?.messagePhases ? ['message_phases'] : []),
@@ -569,7 +572,7 @@ export class RoleControlServer {
             const receipt = await this.session.submitPromptBrowser({
               commandId: request.commandId, text: request.text,
               source: 'owner_admin_console', actorBrowserSession: request.actor,
-              expectedSessionGeneration: request.expectedSessionGeneration,
+              expectedSessionGeneration: request.expectedSessionGeneration, requireIdle: request.requireIdle === true,
             });
             this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           } catch (error) {
@@ -578,6 +581,25 @@ export class RoleControlServer {
                 'idempotency_conflict: this command id was used with a different prompt body');
             throw error;
           }
+          return;
+        }
+        case 'interrupt_voice_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim() || !request.expectedSessionGeneration?.trim() || !request.promptId?.trim())
+            throw new SessionControlError('rejected', 'commandId, expectedSessionGeneration and promptId are required');
+          if (!this.session.interruptPrompt) throw new SessionControlError('rejected', 'targeted voice interrupt unavailable');
+          const key = 'voice:' + request.commandId;
+          const signature = JSON.stringify([request.expectedSessionGeneration, request.promptId]);
+          const existing = this.interruptCommands.get(key) as { signature: string; receipt: unknown } | undefined;
+          if (existing) {
+            if (existing.signature !== signature) throw new SessionControlError('rejected', 'idempotency_conflict: interrupt target changed');
+            this.write(socket, { version: 1, id: request.id, ok: true, result: existing.receipt }); return;
+          }
+          const outcome = await this.session.interruptPrompt(request.expectedSessionGeneration, request.promptId);
+          const receipt = { accepted: true, commandId: request.commandId, ...outcome };
+          this.interruptCommands.set(key, { signature, receipt });
+          if (this.interruptCommands.size > 200) this.interruptCommands.delete(this.interruptCommands.keys().next().value!);
+          this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           return;
         }
         case 'interrupt_v2': {

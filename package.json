@@ -19,6 +19,7 @@
     "presets",
     "README.md",
     "docs/task-workspaces.md",
+    "docs/live-voice.md",
     "docs/room-layouts.md",
     "docs/validation/managed-cli-permissions.md",
     "LICENSE"

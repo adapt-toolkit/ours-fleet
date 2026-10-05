@@ -106,6 +106,20 @@ async function authenticated(control: unknown = conversationControl()) {
 }
 
 describe('conversation web routes', () => {
+  it('requires authentication, CSRF and generation before Live controller attachment', async () => {
+    let attached = 0;
+    const control = { ...conversationControl(), followConversation: async () => { attached++; return { close() {} }; } };
+    const { server, cookie, csrf } = await authenticated(control);
+    const url = '/api/v1/roles/Alpha/live-presence';
+    const denied = await server.app.inject({ method: 'POST', url, headers: { host: boundary.host, origin: boundary.origin }, payload: { expectedSessionGeneration: 'gen' } });
+    expect(denied.statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie), payload: { expectedSessionGeneration: 'gen' } })).statusCode).toBe(403);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: {} })).statusCode).toBe(400);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: { expectedSessionGeneration: 'old' } })).statusCode).toBe(409);
+    expect(attached).toBe(0);
+    await server.close();
+  });
+
   it('serves conversation history to an authenticated browser only', async () => {
     const { server, cookie } = await authenticated();
     const denied = await server.app.inject({
