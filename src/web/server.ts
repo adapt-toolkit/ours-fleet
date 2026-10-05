@@ -1007,22 +1007,27 @@ export async function buildWebServer(
   // A fetch stream works through the same authenticated workspace transport as
   // ordinary requests, and owns one ACP controller until its browser disconnects.
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/live-presence', async (request, reply) => {
-    auth.authenticate(request, true);
+    const browser = auth.authenticate(request, true);
     const generation = (request.body as { expectedSessionGeneration?: unknown })?.expectedSessionGeneration;
     if (typeof generation !== 'string' || !generation.trim()) throw new FleetError('invalid_request', 'expectedSessionGeneration is required');
     const control = await services.session(request.params.id);
     if (!control.followConversation || !control.conversationPage) throw new FleetError('capability_unavailable', 'Live voice requires a conversation controller');
     const page = await control.conversationPage({ limit: 1 });
     if (page.snapshot.sessionGeneration !== generation) throw new FleetError('stale_state', 'Agent session changed. Start live voice again.');
+    // Session/page discovery can await I/O; recheck revocation before attaching.
+    auth.authenticate(request, true);
+    if (reply.raw.destroyed) return;
     reply.hijack();
     for (const [name, value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name, Array.isArray(value) ? value : String(value));
     reply.raw.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
     let ended = false;
     let follow: { close(): void } | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
-    const close = () => { if (ended) return; ended = true; if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
+    let unbind: (() => void) | undefined;
+    const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
     const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
     reply.raw.once('close', close);
+    unbind = auth.bindTransport(browser.id, close);
     try {
       follow = await control.followConversation({
         after: page.nextCursor,
