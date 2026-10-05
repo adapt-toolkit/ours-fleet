@@ -18,6 +18,18 @@ function supervisor(features: string[], generation = 'g1') {
 const prompt = (expectedSessionGeneration?: string) => ({ commandId: 'c', text: 'See attached file', actorBrowserSession: 'b', source: 'owner_admin_console' as const, expectedSessionGeneration });
 
 describe('generation-bound prompts', () => {
+  it('refuses live admission and targeted cancel on older supervisors without fallback', async () => {
+    const { adapter, commands } = supervisor(['generation_bound_prompts']);
+    await expect(adapter.submitPromptV2({ ...prompt('g1'), requireIdle: true })).rejects.toMatchObject({ code: 'capability_unavailable' });
+    await expect(adapter.interruptPromptV2({ commandId: 'cancel', expectedSessionGeneration: 'g1', promptId: 'p' })).rejects.toMatchObject({ code: 'capability_unavailable' });
+    expect(commands.every(c => c.command === 'snapshot')).toBe(true);
+  });
+  it('passes requireIdle to the atomic admission path', async () => {
+    const { adapter, commands } = supervisor(['generation_bound_prompts','idle_bound_prompts']);
+    await adapter.submitPromptV2({ ...prompt('g1'), requireIdle: true });
+    expect(commands.at(-1)).toMatchObject({command:'submit_voice_prompt',requireIdle:true,expectedSessionGeneration:'g1'});
+  });
+
   it('uses the atomic supervisor command when the supervisor advertises it', async () => {
     const { adapter, commands } = supervisor(['conversation_v3', 'generation_bound_prompts']);
     await adapter.submitPromptV2(prompt('g1'));

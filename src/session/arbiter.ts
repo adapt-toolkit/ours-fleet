@@ -199,6 +199,13 @@ export class RoleTurnArbiter implements AgentSession {
       return Promise.reject(new Error('browser prompt admission is unavailable'));
     return this.exclusive(() => {if(this.retiring) throw new Error('Chat is closing');return this.session.submitPromptBrowser!(command);});
   }
+  get liveVoiceSupported(): boolean { return this.session.liveVoiceSupported === true; }
+  interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
+    return this.exclusive(async () => {
+      if (!this.session.interruptPrompt) throw new Error('targeted voice interrupt is unavailable');
+      return interruptOutcome(await this.session.interruptPrompt(generation, promptId));
+    });
+  }
   interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     return this.exclusive(async () => interruptOutcome(await this.session.interrupt(source)));
   }

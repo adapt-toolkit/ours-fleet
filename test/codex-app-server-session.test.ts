@@ -177,6 +177,25 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('targets live cancellation to generation and prompt without canceling another native turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-live-native-'));
+    let server: FakeAppServer;
+    const session = await start(dir, 'fresh', 'ask', async options => { server = new FakeAppServer(options); return server; });
+    try {
+      const generation = session.conversationSnapshot().sessionGeneration;
+      const command = { commandId: 'live', text: 'permission', source: 'owner_admin_console' as const, actorBrowserSession: 'browser', expectedSessionGeneration: generation, requireIdle: true };
+      const receipt = await session.submitPromptBrowser(command);
+      await waitFor(() => session.snapshot().readiness === 'awaiting_permission');
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      await expect(session.submitPromptBrowser({ ...command, commandId: 'second' })).rejects.toThrow('voice_busy');
+      await expect(session.interruptPrompt('old', receipt.promptId)).rejects.toThrow('session_changed');
+      await session.interruptPrompt(generation, 'unrelated');
+      expect(server!.requests.filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+      await session.interruptPrompt(generation, receipt.promptId);
+      expect(server!.requests.filter(r => r.method === 'turn/interrupt')).toHaveLength(1);
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('rejects stale voice before admission but replays an accepted voice receipt', async () => {
     const dir=mkdtempSync(join(tmpdir(),'ours-voice-session-'));
     let server:FakeAppServer;

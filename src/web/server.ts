@@ -755,6 +755,12 @@ export async function buildWebServer(
     return {...detail, chatIdle: detail.role.lifetime==='temporary' ? readChatIdle(agentDir(request.params.id,true)) ?? null : null};
   });
 
+  app.get<{ Params: { id: string } }>('/api/v1/roles/:id/voice-capabilities', async request => {
+    auth.authenticate(request);
+    const descriptor = await (await services.session(request.params.id)).describe();
+    return { supported: ['generation_bound_prompts', 'idle_bound_prompts', 'targeted_voice_interrupt'].every(f => descriptor.features.includes(f)) };
+  });
+
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/removal-preview', async request => {
     auth.authenticate(request);
     if (!ROLE_NAME_RE.test(request.params.id)) throw new FleetError('invalid_request', 'invalid role name');
@@ -842,9 +848,10 @@ export async function buildWebServer(
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown; attachments?: unknown };
+    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown; requireIdle?: unknown; attachments?: unknown };
     if (body?.expectedSessionGeneration !== undefined && (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim()))
       throw new FleetError('invalid_request', 'expectedSessionGeneration must be a nonempty string');
+    if (body?.requireIdle !== undefined && typeof body.requireIdle !== 'boolean') throw new FleetError('invalid_request', 'requireIdle must be boolean');
     let text = String(body?.text ?? '');
     if (body?.attachments !== undefined) {
       if (typeof body.commandId !== 'string' || !body.commandId.trim()) throw new FleetError('invalid_request', 'commandId is required for attachments');
@@ -868,7 +875,7 @@ export async function buildWebServer(
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
         commandId: admittedCommandId, text, source: 'owner_admin_console',
-        expectedSessionGeneration: body.expectedSessionGeneration as string | undefined,
+        expectedSessionGeneration: body.expectedSessionGeneration as string | undefined, requireIdle: body.requireIdle === true,
         actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
       });
       await audit.record({
@@ -880,7 +887,7 @@ export async function buildWebServer(
       reply.code(202);
       return receipt;
     }
-    if (body.expectedSessionGeneration !== undefined)
+    if (body.expectedSessionGeneration !== undefined || body.requireIdle)
       throw new FleetError('capability_unavailable', 'session-bound voice input is unavailable for this role');
     const receipt = await control.sendText(text);
     await audit.record({
@@ -894,10 +901,18 @@ export async function buildWebServer(
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/interrupt', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { commandId?: unknown } | undefined;
+    const body = request.body as { commandId?: unknown; expectedSessionGeneration?: unknown; promptId?: unknown } | undefined;
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
     const control = await services.session(request.params.id);
+    if (body?.expectedSessionGeneration !== undefined || body?.promptId !== undefined) {
+      if (!commandId || typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim() || typeof body.promptId !== 'string' || !body.promptId.trim())
+        throw new FleetError('invalid_request', 'Targeted interrupt requires commandId, expectedSessionGeneration and promptId');
+      if (!control.interruptPromptV2) throw new FleetError('capability_unavailable', 'Targeted voice interrupt is unavailable');
+      const receipt = await control.interruptPromptV2({ commandId, expectedSessionGeneration: body.expectedSessionGeneration, promptId: body.promptId });
+      await audit.record({ requestId: request.id, browser: session.id, roleId: request.params.id, action: 'session.interrupt_voice', result: 'accepted' });
+      reply.code(202); return receipt;
+    }
     if (commandId && control.interruptV2) {
       const receipt = await control.interruptV2(commandId);
       await audit.record({
@@ -987,6 +1002,42 @@ export async function buildWebServer(
     const action = services.creation.get(request.params.actionId);
     if (!action) throw new FleetError('role_not_found', 'creation action not found');
     return action;
+  });
+
+  // A fetch stream works through the same authenticated workspace transport as
+  // ordinary requests, and owns one ACP controller until its browser disconnects.
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/live-presence', async (request, reply) => {
+    const browser = auth.authenticate(request, true);
+    const generation = (request.body as { expectedSessionGeneration?: unknown })?.expectedSessionGeneration;
+    if (typeof generation !== 'string' || !generation.trim()) throw new FleetError('invalid_request', 'expectedSessionGeneration is required');
+    const control = await services.session(request.params.id);
+    if (!control.followConversation || !control.conversationPage) throw new FleetError('capability_unavailable', 'Live voice requires a conversation controller');
+    const page = await control.conversationPage({ limit: 1 });
+    if (page.snapshot.sessionGeneration !== generation) throw new FleetError('stale_state', 'Agent session changed. Start live voice again.');
+    // Session/page discovery can await I/O; recheck revocation before attaching.
+    auth.authenticate(request, true);
+    if (reply.raw.destroyed) return;
+    reply.hijack();
+    for (const [name, value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name, Array.isArray(value) ? value : String(value));
+    reply.raw.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+    let ended = false;
+    let follow: { close(): void } | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let unbind: (() => void) | undefined;
+    const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
+    const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
+    reply.raw.once('close', close);
+    unbind = auth.bindTransport(browser.id, close);
+    try {
+      follow = await control.followConversation({
+        after: page.nextCursor,
+        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true }); },
+        onEvent: event => { if (event.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } },
+        onClose: () => close(),
+      });
+      if (ended) follow.close();
+      else heartbeat = setInterval(() => { try { auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
+    } catch { write({ error: 'Agent controller connection failed.' }); close(); }
   });
 
   app.post('/api/v1/ws-tickets', async request => {

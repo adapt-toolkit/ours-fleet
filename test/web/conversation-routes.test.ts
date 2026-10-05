@@ -106,6 +106,77 @@ async function authenticated(control: unknown = conversationControl()) {
 }
 
 describe('conversation web routes', () => {
+  it('requires authentication, CSRF and generation before Live controller attachment', async () => {
+    let attached = 0;
+    const control = { ...conversationControl(), followConversation: async () => { attached++; return { close() {} }; } };
+    const { server, cookie, csrf } = await authenticated(control);
+    const url = '/api/v1/roles/Alpha/live-presence';
+    const denied = await server.app.inject({ method: 'POST', url, headers: { host: boundary.host, origin: boundary.origin }, payload: { expectedSessionGeneration: 'gen' } });
+    expect(denied.statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie), payload: { expectedSessionGeneration: 'gen' } })).statusCode).toBe(403);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: {} })).statusCode).toBe(400);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: { expectedSessionGeneration: 'old' } })).statusCode).toBe(409);
+    expect(attached).toBe(0);
+    await server.close();
+  });
+
+  it.each(['logout', 'revoke', 'abort-before-follow-return', 'revoke-before-follow-return', 'changed-during-attach'] as const)('detaches Live presence on %s', async mode => {
+    let attached = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), followConversation: async (request: any) => {
+      attached++;
+      request.onPage({ snapshot: { sessionGeneration: mode === 'changed-during-attach' ? 'replacement' : 'gen' } });
+      if (['abort-before-follow-return','revoke-before-follow-return'].includes(mode)) await gate;
+      let closed = false;
+      return { close() { if (!closed) { closed = true; attached--; request.onClose(); } } };
+    } };
+    const { server, cookie, csrf } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const abort = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/live-presence`, { method: 'POST', headers: headers(cookie, csrf), body: JSON.stringify({ expectedSessionGeneration: 'gen' }), signal: abort.signal });
+      expect(response.status).toBe(200); reader = response.body!.getReader();
+      const first = new TextDecoder().decode((await reader.read()).value);
+      if (mode === 'changed-during-attach') {
+        expect(first).toContain('Agent session changed');
+      } else {
+        expect(first).toContain('"ready":true'); expect(attached).toBe(1);
+        if (mode === 'logout') expect((await server.app.inject({ method: 'POST', url: '/api/v1/auth/logout', headers: headers(cookie, csrf), payload: {} })).statusCode).toBe(200);
+        if (mode === 'revoke') server.auth.clearSessions();
+        if (mode === 'revoke-before-follow-return') { server.auth.clearSessions(); release(); }
+        if (mode === 'abort-before-follow-return') { abort.abort(); await new Promise(r => setTimeout(r, 50)); release(); }
+      }
+      await expect.poll(() => attached, { timeout: 1000 }).toBe(0);
+      if (mode !== 'abort-before-follow-return') expect((await reader.read()).done).toBe(true);
+    } finally { release(); abort.abort(); await reader?.cancel().catch(() => {}); await server.close(); }
+  });
+
+  it.each(['revoked', 'aborted'] as const)('does not attach after discovery is %s', async mode => {
+    let attached = 0;
+    let entered!: () => void, release!: () => void;
+    const seen = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), conversationPage: async () => { entered(); await gate; return { snapshot: { sessionGeneration: 'gen' } }; }, followConversation: async () => { attached++; return { close() { attached--; } }; } };
+    const { server, cookie, csrf } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const abort = new AbortController();
+    try {
+      const pending = fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/live-presence`, { method: 'POST', headers: headers(cookie, csrf), body: JSON.stringify({ expectedSessionGeneration: 'gen' }), signal: abort.signal }).catch(() => undefined);
+      await seen;
+      if (mode === 'revoked') server.auth.clearSessions();
+      else { abort.abort(); await new Promise(r => setTimeout(r, 50)); }
+      release(); const response = await pending;
+      if (mode === 'revoked') expect(response?.status).toBe(401);
+      await new Promise(r => setTimeout(r, 50)); expect(attached).toBe(0);
+    } finally { release(); abort.abort(); await server.close(); }
+  });
+
   it('serves conversation history to an authenticated browser only', async () => {
     const { server, cookie } = await authenticated();
     const denied = await server.app.inject({

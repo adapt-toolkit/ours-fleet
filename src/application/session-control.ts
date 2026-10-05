@@ -49,9 +49,10 @@ export interface RoleSessionControl {
   /** The newest visible events (or those before `before`), read backwards from the ledger. */
   conversationTail?(request: { before?: string; limit?: number }): Promise<ConversationTailPage>;
   submitPromptV2?(request: {
-    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string; requireIdle?: boolean;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
+  interruptPromptV2?(request: { commandId: string; expectedSessionGeneration: string; promptId: string }): Promise<InterruptReceipt>;
   interruptV2?(commandId: string): Promise<InterruptReceipt & { commandId: string }>;
   respondPermissionV2?(request: {
     commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
@@ -168,7 +169,7 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
   }
 
   async submitPromptV2(request: {
-    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string; requireIdle?: boolean;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt> {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
@@ -177,6 +178,9 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     // A prompt bound to a session generation (voice or attachments) is checked atomically by supervisors that
     // support it. Older supervisors do not know that command and never answer, so check the generation here
     // and submit an ordinary prompt; its command id keeps retries idempotent either way.
+    const features = request.requireIdle ? (await this.describe()).features : undefined;
+    if (request.requireIdle && (!request.expectedSessionGeneration || !features?.includes('idle_bound_prompts')))
+      throw new FleetError('capability_unavailable', 'Live voice requires an updated supervisor.');
     let command: 'submit_voice_prompt' | 'submit_prompt_v2' = 'submit_prompt_v2';
     if (request.expectedSessionGeneration) {
       if ((await this.describe()).features.includes('generation_bound_prompts')) command = 'submit_voice_prompt';
@@ -189,16 +193,28 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     try {
       return await this.call(command, {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
-        source: request.source, expectedSessionGeneration: request.expectedSessionGeneration,
+        source: request.source, expectedSessionGeneration: request.expectedSessionGeneration, requireIdle: request.requireIdle,
       }) as PromptReceipt;
     } catch (error) {
       const fleetError = normalizeError(error);
       if (fleetError.message.includes('session_changed:'))
         throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
+      if (fleetError.message.includes('voice_busy:')) throw new FleetError('conflict', 'Agent is already working. Wait for the current turn.');
       if (fleetError.message.includes('idempotency_conflict'))
         throw new FleetError('idempotency_conflict',
           'this command id was already used with a different prompt body');
       throw fleetError;
+    }
+  }
+
+  async interruptPromptV2(request: { commandId: string; expectedSessionGeneration: string; promptId: string }): Promise<InterruptReceipt> {
+    if (!(await this.describe()).features.includes('targeted_voice_interrupt'))
+      throw new FleetError('capability_unavailable', 'Live voice requires an updated supervisor.');
+    try { return await this.call('interrupt_voice_v2', request) as InterruptReceipt; }
+    catch (error) {
+      const failure = normalizeError(error);
+      if (failure.message.includes('session_changed:')) throw new FleetError('stale_state', 'Agent session changed.');
+      throw failure;
     }
   }
 

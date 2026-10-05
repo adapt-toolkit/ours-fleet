@@ -307,6 +307,8 @@ export interface ConversationEventV1 {
 
 export interface SubmitPromptCommand {
   expectedSessionGeneration?: string;
+  /** Live speech must not silently queue behind an unrelated turn. */
+  requireIdle?: boolean;
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */
   commandId: string;
   text: string;
