@@ -253,7 +253,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     const services:ServiceTarget[]=['daemon','cowork','messenger','notifications'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})},
       // The App reports a visible page to the notification service, so an open app is not sent a push.
       ...(name==='notifications'?{deviceSocketPaths:['/api/v1/presence']}:{})}));
-    gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services});
+    gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services,audit});
     const listen = (port:number) => new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(port,bind,()=>{gateway!.server.off('error',reject);resolve();});});
     try { await listen(requestedPort); }
     catch(error) {

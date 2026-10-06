@@ -7,6 +7,10 @@ import { stateRoot } from '../paths.js';
 import { FleetError } from '../application/errors.js';
 const opaque = () => randomBytes(32).toString('base64url');
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+/** Only failure of the enrolled device check may invalidate the App's saved credential. */
+export class WorkspaceDeviceAuthError extends FleetError {
+  constructor(message = 'workspace device is missing, expired, or revoked') { super('unauthorized', message); }
+}
 export interface WorkspaceDevice { id: string; label: string; createdAt: number; lastUsedAt: number; expiresAt: number; revokedAt: number | null }
 export class WorkspaceDeviceStore {
   private readonly db: SQLiteDatabase;
@@ -53,7 +57,7 @@ export class WorkspaceDeviceStore {
     const id=typeof token==='string' ? token.split('.')[0] : '', now=this.now();
     const row=this.db.prepare('SELECT * FROM devices WHERE id=? AND revokedAt IS NULL AND expiresAt>?').get(id,now);
     const supplied=Buffer.from(hash(token || '')),expected=Buffer.from(String(row?.hash || '0'.repeat(64)));
-    if(!row || !timingSafeEqual(supplied,expected)) throw new FleetError('unauthorized','workspace device is missing, expired, or revoked');
+    if(!row || !timingSafeEqual(supplied,expected)) throw new WorkspaceDeviceAuthError();
     this.db.prepare('UPDATE devices SET lastUsedAt=? WHERE id=?').run(now,id);
     return {id,label:String(row.label),createdAt:Number(row.createdAt),lastUsedAt:now,expiresAt:Number(row.expiresAt),revokedAt:null};
   }

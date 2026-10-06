@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import { WorkspaceDeviceAuthError } from './workspace-devices.js';
+import type { AuditSink } from './audit.js';
 import { createServer, request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { Socket } from 'node:net';
@@ -25,6 +28,8 @@ export interface GatewayOptions {
   auth: WebAuth | 'backend';
   fleetOrigin: string;
   services: ServiceTarget[];
+  /** Bounded unauthorized-response diagnostics: fixed service/action enums only. */
+  audit?: Pick<AuditSink, 'record'>;
 }
 /** The App offers exactly these two subprotocols; only the marker is ever answered or forwarded. */
 const DEVICE_SOCKET_PROTOCOL = 'ours.workspace.v1';
@@ -48,6 +53,12 @@ function headersFor(message: IncomingMessage): OutgoingHttpHeaders {
 /** Raw transport deliberately runs outside Fastify's JSON parser and body limits. */
 export function createPrefixGateway(options: GatewayOptions) {
   const auth = options.auth === 'backend' ? undefined : options.auth;
+  let auditWindow = Date.now(), auditCount = 0;
+  const rejected = (requestId: string, prefix: string, result: 'device_rejected' | 'gateway_rejected' | 'upstream_401') => {
+    if (Date.now() - auditWindow >= 60_000) { auditWindow = Date.now(); auditCount = 0; }
+    if (auditCount++ >= 60) return;
+    void options.audit?.record({ requestId, action: 'gateway' + prefix.replaceAll('/', '.'), result, errorCode: 'unauthorized' }).catch(() => {});
+  };
   const services = options.services.map(target => {
     if (!/^\/[a-z][a-z0-9-]*$/.test(target.prefix) || target.prefix === '/fleet') throw new Error('invalid service prefix');
     const origin = new URL(target.origin);
@@ -85,6 +96,8 @@ export function createPrefixGateway(options: GatewayOptions) {
     const headers = headersFor(req);
     // Forward only the explicit browser context, never an attacker-selected forwarding chain.
     for (const key of Object.keys(headers)) if (key.startsWith('x-forwarded-') || key === 'forwarded') delete headers[key];
+    delete headers['x-ours-workspace-auth'];
+    delete headers['x-ours-request-id'];
     if (route.service) {
       if (auth) for (const name of ['cookie', 'authorization', 'x-csrf-token', 'x-ours-api-token']) delete headers[name];
       // The server gateway lets this header choose a producer credential; only machine producers send it directly there.
@@ -113,10 +126,11 @@ export function createPrefixGateway(options: GatewayOptions) {
   const accountCors = (req: IncomingMessage): Record<string, string> => {
     const origin = auth?.accountOrigin(req as unknown as FastifyRequest);
     return origin ? { 'access-control-allow-origin': origin, vary: 'Origin',
-      'access-control-expose-headers': 'Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag' } : {};
+      'access-control-expose-headers': 'Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag, X-Ours-Workspace-Auth, X-Ours-Request-Id' } : {};
   };
   const server = createServer((req, res) => {
     const cors = accountCors(req);
+    const requestId = randomUUID();
     let route: ReturnType<typeof prepare>;
     try {
       if (req.method === 'OPTIONS' && cors.vary && req.headers['access-control-request-method'] && select(req).service) {
@@ -130,7 +144,11 @@ export function createPrefixGateway(options: GatewayOptions) {
     }
     catch (error) {
       const code = (error as { code?: string }).code;
-      res.writeHead(code === 'unauthorized' ? 401 : 403, { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store' });
+      const deviceRejected = error instanceof WorkspaceDeviceAuthError;
+      if (code === 'unauthorized') rejected(requestId, '/auth', deviceRejected ? 'device_rejected' : 'gateway_rejected');
+      res.writeHead(code === 'unauthorized' ? 401 : 403, { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store',
+        ...(code === 'unauthorized' ? { 'x-ours-request-id': requestId } : {}),
+        ...(deviceRejected ? { 'x-ours-workspace-auth': 'rejected' } : {}) });
       res.end(JSON.stringify({ error: { code: code ?? 'forbidden', message: (error as Error).message } }));
       return;
     }
@@ -140,6 +158,14 @@ export function createPrefixGateway(options: GatewayOptions) {
       const headers = headersFor(response);
       if (route.service) {
         delete headers['set-cookie'];
+        // Only Fleet may assert device rejection; never trust a service's marker or correlation id.
+        delete headers['x-ours-workspace-auth'];
+        delete headers['x-ours-request-id'];
+        if (response.statusCode === 401) {
+          headers['x-ours-request-id'] = requestId;
+          headers['x-ours-workspace-auth'] = 'service';
+          rejected(requestId, route.service.prefix, 'upstream_401');
+        }
         for (const key of Object.keys(headers)) if (key.startsWith('access-control-')) delete headers[key];
         Object.assign(headers, cors);
       }
