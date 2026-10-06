@@ -17,6 +17,7 @@ import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast, ho
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
+import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from './codex-reasoning.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -154,6 +155,13 @@ function neutralSandboxMode(role: ResolvedRole): string {
 /** Native config is fail-closed because Codex adds authority-bearing keys over time. */
 function isNativeConfigKeyAllowed(key: string): boolean {
   return NATIVE_CONFIG_ALLOWLIST.has(key);
+}
+
+/** Brain wins; a validated native effort also needs delivery through ACP's selection API. */
+function reasoningEffort(role: ResolvedRole): string | undefined {
+  if (typeof role.effort === 'string') return role.effort;
+  const value = (role.harness_options as CodexOptions | undefined)?.config?.model_reasoning_effort;
+  return isCodexReasoningEffort(value) ? value : undefined;
 }
 
 /** Defense in depth for callers which launch a role after validation was bypassed. */
@@ -339,10 +347,8 @@ export function makeCodexAdapter(
     id: 'codex',
     agentSession: new CodexAgentSessionAdapter({
       resolveBrain(brain) {
-        const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-        if (brain.effort != null
-            && (typeof brain.effort !== 'string' || !levels.includes(brain.effort)))
-          throw new Error(`Codex Brain effort must be one of: ${levels.join(', ')}`);
+        if (brain.effort != null && !isCodexReasoningEffort(brain.effort))
+          throw new Error(`Codex Brain effort must be one of: ${CODEX_REASONING_EFFORTS.join(', ')}`);
         const harnessOptions = { ...(brain.harnessOptions ?? {}) };
         if (brain.effort) harnessOptions.config = {
           ...((harnessOptions.config ?? {}) as Record<string, unknown>),
@@ -363,8 +369,8 @@ export function makeCodexAdapter(
       sessionConfigSelections: role => [
         ...(typeof role.model === 'string'
           ? [{ configId: 'model', value: role.model }] : []),
-        ...(typeof role.effort === 'string'
-          ? [{ configId: 'reasoning_effort', value: role.effort }] : []),
+        ...(reasoningEffort(role)
+          ? [{ configId: 'reasoning_effort', value: reasoningEffort(role)! }] : []),
       ],
       permissionModeId: role => acpAgentMode(role),
       mcpServers: () => undefined,

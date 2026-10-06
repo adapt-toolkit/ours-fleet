@@ -32,10 +32,12 @@ export async function runCodexTurn({ codex, root, role, stateDir, cwd, configPat
   const configHome = join(root, 'codex-home');
   mkdirSync(configHome, { recursive: true });
   let sent = false, result, providerError, sequence = 0, log = '';
+  const reasoningEfforts = [];
   const server = createServer(async (req, res) => {
     try {
       let body = ''; for await (const chunk of req) body += chunk;
       const request = JSON.parse(body);
+      reasoningEfforts.push(request.reasoning?.effort);
       for (const item of request.input ?? []) if (item.type === 'custom_tool_call_output') result = item.output;
       const execution = (Array.isArray(result) ? result : []).map(b => { try { return JSON.parse(b.text); } catch { return undefined; } })
         .find(v => v?.session_id !== undefined || v?.exit_code !== undefined);
@@ -92,7 +94,7 @@ trust_level="trusted"
     const execution = blocks.map(b => { try { return JSON.parse(b.text); } catch { return undefined; } }).find(v => v?.exit_code !== undefined)
       ?? (truncated ? { exit_code: Number(truncated[1]), output: raw } : undefined);
     assert(execution, `No completed real shell execution: ${JSON.stringify(result).slice(0, 2000)}${log}`);
-    return { exitCode: execution.exit_code, output: String(execution.output ?? ''), log };
+    return { exitCode: execution.exit_code, output: String(execution.output ?? ''), log, reasoningEfforts };
   } finally { clearTimeout(timeout); await session?.close(); await close(server); }
 }
 

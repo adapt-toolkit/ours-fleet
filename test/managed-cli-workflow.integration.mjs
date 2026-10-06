@@ -25,6 +25,7 @@ const binary = harness === 'codex' ? process.env.FLEET_CODEX_BIN : process.env.F
 assert(['codex', 'claude'].includes(harness) && binary, 'Set FLEET_TEST_HARNESS=codex|claude and FLEET_CODEX_BIN or FLEET_CLAUDE_BIN');
 const session = harness === 'claude' ? 'acp' : process.env.FLEET_TEST_SESSION ?? 'codex-app-server';
 const quoted = process.env.FLEET_TEST_QUOTED === '1';
+const effort = harness === 'codex' ? process.env.FLEET_TEST_CODEX_EFFORT ?? 'medium' : undefined;
 const claudeSandbox = process.env.FLEET_TEST_CLAUDE_SANDBOX !== '0';
 const sandboxed = harness === 'codex' || claudeSandbox;
 const label = `${process.platform} ${harness}/${session}${quoted ? ' quoted-paths' : ''}${harness === 'claude' && !claudeSandbox ? ' claude-sandbox-off' : ''}`;
@@ -84,7 +85,7 @@ const agentFile = join(configDir, 'fleet', 'agents', 'Coordinator.yaml');
 writeFileSync(agentFile, [
   '# Operator-authored agent; setup adds exactly one key below.',
   'role: { inline: { mission: Coordinate tasks. } }',
-  `brain: { inline: { harness: ${harness === 'codex' ? 'codex' : 'claude-code'}, session: ${session}, model: ${harness === 'codex' ? 'gpt-5.6-sol' : 'claude-sonnet-4-6'} } }`,
+  `brain: { inline: { harness: ${harness === 'codex' ? 'codex' : 'claude-code'}, session: ${session}, model: ${harness === 'codex' ? 'gpt-5.6-sol' : 'claude-sonnet-4-6'}${effort ? `, effort: ${effort}` : ''} } }`,
   'permissions: { approval: auto, filesystem: workspace, unattended: deny }',
   `cwd: ${JSON.stringify(project)}`,
   ...(harness === 'codex' && session === 'acp' ? [`env: { CODEX_PATH: ${JSON.stringify(binary)} }`] : []),
@@ -136,6 +137,10 @@ try {
 
   // --- A supervisor for the role, with the real audit ledger --------------------
   const role = findRole(loadConfig(config), 'Coordinator');
+  if (effort) {
+    assert.equal(role.effort, effort);
+    assert.equal(role.harness_options.config.model_reasoning_effort, effort);
+  }
   const stateDir = agentDir('Coordinator'); mkdirSync(stateDir, { recursive: true });
   const audit = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
   control = new RoleControlServer(stateDir, {}, () => {});
@@ -154,7 +159,11 @@ try {
   async function run(command, note) {
     const result = await turn({ [harness]: binary, root, role, stateDir, cwd: project, configPath: config,
       deps: { paths }, env: baseEnv, command, userSettings });
-    evidence.push({ note, command, exitCode: result.exitCode, output: result.output.slice(0, 600) });
+    if (effort) {
+      assert(result.reasoningEfforts.length > 0, 'no observed model request');
+      assert(result.reasoningEfforts.every(value => value === effort), 'chosen Brain effort lost at launch');
+    }
+    evidence.push({ note, command, effort, reasoningEfforts: result.reasoningEfforts, exitCode: result.exitCode, output: result.output.slice(0, 600) });
     return result;
   }
   const plain = [paths.node, paths.cli].map(token => managedCli.shellSpelling(token)).join(' ');

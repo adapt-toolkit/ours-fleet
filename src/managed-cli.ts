@@ -31,6 +31,7 @@ import {
 } from './config.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { executableOnPath, hostCodex } from './harness/codex-runtime.js';
+import { isManagedCliCodexConfig } from './harness/codex-reasoning.js';
 import { getAdapter } from './harness/registry.js';
 import type { SessionPrep } from './harness/types.js';
 import { agentDir, defaultConfigPath, home, stateRoot } from './paths.js';
@@ -410,8 +411,8 @@ export function analyzeManagedCli(
   // directories the role adds. Native settings Fleet cannot read may add more.
   const native = (role.harness_options ?? {}) as { add_dirs?: unknown; config?: unknown; profile?: unknown };
   const writable = [workspace, ...(Array.isArray(native.add_dirs) ? native.add_dirs.filter((dir): dir is string => typeof dir === 'string').map(dir => resolve(workspace, dir)) : [])];
-  if (role.harness === 'codex' && (native.profile != null || (native.config && typeof native.config === 'object' && Object.keys(native.config).length)))
-    reasons.push('harness_native.config or harness_native.profile changes Codex\'s native sandbox in ways Fleet does not inspect (for example extra writable roots), so it cannot tell whether the agent could replace the pinned files; drop them or keep this role sandboxed');
+  if (role.harness === 'codex' && (native.profile != null || !isManagedCliCodexConfig(native.config)))
+    reasons.push('harness_native.config or harness_native.profile contains invalid or uninspected Codex settings (for example extra writable roots), so Fleet does not inspect enough to tell whether the agent could replace the pinned files; only validated model_reasoning_effort is supported; drop the other settings or keep this role sandboxed');
   if (role.isolation)
     reasons.push('the role declares isolation:, and Fleet\'s outer sandbox is kept as-is; the workflow is not qualified inside it');
   if (!plainExecutable(paths.node))
