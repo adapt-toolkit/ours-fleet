@@ -1,4 +1,4 @@
-import { WorkspaceDeviceStore } from './workspace-devices.js';
+import { WorkspaceDeviceStore, WorkspaceDeviceAuthError } from './workspace-devices.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
@@ -139,7 +139,7 @@ export class WebAuth {
     const authorization = String(request.headers.authorization ?? '');
     if (authorization.startsWith('Bearer ')) {
       this.validateBoundary(request, mutation);
-      if(!this.workspaceDevices)throw new FleetError('unauthorized','workspace bearer credential is invalid');
+      if(!this.workspaceDevices)throw new WorkspaceDeviceAuthError('workspace bearer credential is invalid');
       const device = this.requireWorkspaceDevices().authenticate(authorization.slice(7));
       const id = `workspace:${device.id}`;
       const session = { id, csrf: '', createdAt: device.createdAt, lastSeenAt: this.now(), absoluteExpiresAt: device.expiresAt };

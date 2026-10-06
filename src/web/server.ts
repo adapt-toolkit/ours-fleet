@@ -1,3 +1,4 @@
+import { WorkspaceDeviceAuthError } from './workspace-devices.js';
 import { readFileSync } from 'node:fs';
 import { packagedPresetRoot } from '../preset-bootstrap.js';
 import { validateCatalog, type CatalogModel, type InitAnswers, type Subscription, type WorkKind } from '../init-wizard.js';
@@ -114,6 +115,7 @@ export async function buildWebServer(
     if (request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
       reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
       reply.header('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      reply.header('Access-Control-Expose-Headers','X-Ours-Workspace-Auth, X-Ours-Request-Id');
       reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key');
       if (request.method === 'OPTIONS') {auth.validateBoundary(request,false);return reply.code(204).send();}
     }
@@ -142,6 +144,8 @@ export async function buildWebServer(
       requestId: request.id, action: `${request.method} ${request.routeOptions.url ?? request.url}`,
       result: 'rejected', errorCode: fleetError.code,
     });
+    if (error instanceof WorkspaceDeviceAuthError) reply.header('X-Ours-Workspace-Auth', 'rejected');
+    if (fleetError.code === 'unauthorized') reply.header('X-Ours-Request-Id', request.id);
     reply.code(statusFor(fleetError.code)).send({ error: fleetError.toJSON() });
   });
 
