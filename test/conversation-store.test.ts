@@ -1,7 +1,7 @@
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import type { ConversationEventV1 } from '../src/session/conversation-types.js';
@@ -85,6 +85,43 @@ describe('ConversationEventStore', () => {
     const last = store.page({ after: second.nextCursor, limit: 4 });
     expect(last.events.map(e => e.seq)).toEqual([9, 10]);
     expect(last.hasMore).toBe(false);
+  });
+
+  it('keeps tail and replay-skip paging in memory after more than 1000 events, including recovery', () => {
+    const { dir, store } = open();
+    for (let i = 0; i < 1100; i++) store.append({ kind: 'session.state', sessionGeneration: 'generation', payload: {} });
+    const check = (reader: ConversationEventStore) => {
+      const disk = vi.spyOn(reader as any, 'readSegment');
+      // A session may skip hundreds of replay events one page at a time.
+      for (let after = 101; after < 550; after++) {
+        const page = reader.page({ after: String(after), limit: 1 });
+        expect(page.events[0].seq).toBe(after + 1);
+        expect(page.firstAvailableCursor).toBe('1');
+        expect(page.hasMore).toBe(true);
+      }
+      const empty = reader.page({ after: '1100', limit: 1 });
+      expect(empty.events).toEqual([]);
+      expect(empty.firstAvailableCursor).toBe('1');
+      expect(disk).not.toHaveBeenCalled();
+      disk.mockRestore();
+    };
+    check(store); store.close();
+    const reopened = new ConversationEventStore(join(dir, '.conversation'), { roleId: 'role-a' });
+    check(reopened); reopened.close();
+  });
+
+  it('reports the first readable sequence after an empty/corrupt leading segment and on first append', () => {
+    const { dir, store } = open();
+    expect(store.page().firstAvailableCursor).toBeUndefined();
+    admit(store, 'one'); expect(store.page().firstAvailableCursor).toBe('1'); store.close();
+    const root = join(dir, '.conversation');
+    writeFileSync(join(root, 'events-000001.jsonl'), 'corrupt\n');
+    writeFileSync(join(root, 'events-000002.jsonl'), JSON.stringify({ schemaVersion: 1, seq: 7, kind: 'session.state', payload: {}, sessionGeneration: 'g' }) + '\n');
+    writeFileSync(join(root, 'manifest.json'), 'corrupt');
+    const recovered = new ConversationEventStore(root, { roleId: 'role-a' });
+    expect(recovered.page().firstAvailableCursor).toBe('7');
+    expect(recovered.page().events.map(e => e.seq)).toEqual([7]);
+    expect(recovered.degraded).toBe(true); recovered.close();
   });
 
   it('notifies subscribers of each appended event in order', () => {
