@@ -87,7 +87,11 @@ they belong to the same Unix user. It adds no group/other access, follows no
 artifact symlinks, crosses no mounted device boundary, and never changes the
 owner. Only Git pointer files that the audit must read may gain owner-read;
 hardlinked unreadable pointers are refused to avoid changing an outside alias.
-Permission changes target a verified open inode. On Linux, unreadable entries
+Permission changes target a verified open inode. Readable foreign-UID directories
+may be traversed unchanged; missing owner access is never repaired for another
+UID. On Linux, traversal and Git pointer reads use pinned directory/file
+descriptors, and a detected pathname replacement stops cleanup before descending.
+Unreadable entries
 use an `O_PATH` descriptor through `/proc/self/fd`; other platforms retain the
 error if they cannot open the entry safely. A restricted workspace root is
 temporarily accessible to verify its exact ownership marker; failed marker

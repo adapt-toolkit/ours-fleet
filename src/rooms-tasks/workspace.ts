@@ -61,12 +61,12 @@ function staging(w: OwnedWorkspace, phase: string): string {
  * Linux O_PATH can pin an entry even when a same-owner fixture removed every
  * permission; /proc/self/fd then addresses that inode rather than its old name.
  */
-function withOwnerPermissions<T>(path: string, before: Stats, bits: number, work: () => T, rollback = false): T {
+function withOwnerPermissions<T>(path: string, before: Stats, bits: number, work: (accessPath: string) => T, rollback = false): T {
   if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) fail(`unsafe permission repair ${path}`);
-  if ((before.mode & bits) === bits) return work();
+  const changed = (before.mode & bits) !== bits;
   const uid = process.geteuid?.();
-  if (uid === undefined || before.uid !== uid) fail(`cannot restore owner access to ${path}: owned by uid ${before.uid}`);
-  if (before.isFile() && before.nlink !== 1) fail(`cannot restore owner access to hardlinked Git metadata ${path}`);
+  if (changed && (uid === undefined || before.uid !== uid)) fail(`cannot restore owner access to ${path}: owned by uid ${before.uid}`);
+  if (changed && before.isFile() && before.nlink !== 1) fail(`cannot restore owner access to hardlinked Git metadata ${path}`);
   let descriptor: number, pathDescriptor = false;
   try { descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch (error) {
@@ -83,9 +83,19 @@ function withOwnerPermissions<T>(path: string, before: Stats, bits: number, work
     if (pinned.dev !== before.dev || pinned.ino !== before.ino || pinned.uid !== before.uid
         || pinned.mode !== before.mode || pinned.nlink !== before.nlink)
       fail(`entry changed before permission repair ${path}`);
-    setMode((before.mode & 0o7777) | bits);
-    try { return work(); }
-    catch (error) { if (rollback) setMode(before.mode & 0o7777); throw error; }
+    if (changed) setMode((before.mode & 0o7777) | bits);
+    try {
+      const assertNamedEntry = () => {
+        const named = lstatSync(path);
+        if (named.dev !== before.dev || named.ino !== before.ino || named.uid !== before.uid
+            || named.isSymbolicLink() || named.isDirectory() !== before.isDirectory())
+          fail(`entry changed during permission repair ${path}`);
+      };
+      assertNamedEntry();
+      const result = work(process.platform === 'linux' ? `/proc/self/fd/${descriptor}` : path);
+      assertNamedEntry();
+      return result;
+    } catch (error) { if (rollback && changed) setMode(before.mode & 0o7777); throw error; }
   } finally { closeSync(descriptor); }
 }
 
@@ -102,9 +112,14 @@ export function prepareOwnedDeletionTree(path: string): void {
     const entry = lstatSync(dir);
     if (!entry.isDirectory() || entry.isSymbolicLink()) fail(`unsafe deletion directory ${dir}`);
     if (entry.dev !== device) fail(`foreign mounted directory ${dir}`);
-    withOwnerPermissions(dir, entry, 0o700, () => {
-      for (const child of readdirSync(dir, { withFileTypes: true })) {
-        if (child.isDirectory() && !child.isSymbolicLink()) visit(join(dir, child.name));
+    withOwnerPermissions(dir, entry, 0o700, accessDir => {
+      for (const child of readdirSync(accessDir, { withFileTypes: true })) {
+        if (process.platform !== 'linux') {
+          const named = lstatSync(dir);
+          if (named.dev !== entry.dev || named.ino !== entry.ino || named.isSymbolicLink())
+            fail(`deletion directory changed during traversal ${dir}`);
+        }
+        if (child.isDirectory() && !child.isSymbolicLink()) visit(join(accessDir, child.name));
       }
     });
   };
@@ -157,44 +172,57 @@ function ownedPointer(base: string, from: string, value: string): string {
  * workspace then removes their registries atomically with the owned repositories; never prune.
  */
 export function auditWorkspaceGit(path: string, options: { forDeletion?: boolean } = {}): void {
+  const rootEntry = lstatSync(path);
   if (options.forDeletion) prepareOwnedDeletionTree(path);
   const device = lstatSync(path).dev;
+  if (options.forDeletion && (lstatSync(path).ino !== rootEntry.ino || device !== rootEntry.dev || lstatSync(path).isSymbolicLink()))
+    fail(`workspace changed before Git audit ${path}`);
   const readPointer = (file: string): string => {
     if (!options.forDeletion) return readFileSync(file, 'utf8');
     const before = lstatSync(file);
     if (before.dev !== device) fail(`foreign mounted Git metadata ${file}`);
-    return withOwnerPermissions(file, before, 0o400, () => readFileSync(file, 'utf8'));
+    return withOwnerPermissions(file, before, 0o400, accessFile => readFileSync(accessFile, 'utf8'));
   };
-  const visit = (dir: string, admin = false): void => {
-    admin ||= Boolean(stat(join(dir, 'HEAD')) && (stat(join(dir, 'objects')) || stat(join(dir, 'commondir'))));
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const p = join(dir, entry.name);
-      if (entry.isSymbolicLink()) {
-        if (admin || entry.name === '.git' || entry.name === 'commondir' || entry.name === 'gitdir')
-          fail(`symlink git metadata ${p}`);
-        continue; // rm unlinks ordinary artifact symlinks, never follows them.
+  const visit = (dir: string, accessDir = dir, admin = false): void => {
+    const before = lstatSync(accessDir);
+    const inspect = (pinnedDir: string): void => {
+      admin ||= Boolean(stat(join(pinnedDir, 'HEAD')) && (stat(join(pinnedDir, 'objects')) || stat(join(pinnedDir, 'commondir'))));
+      for (const entry of readdirSync(pinnedDir, { withFileTypes: true })) {
+        if (options.forDeletion && process.platform !== 'linux') {
+          const named = lstatSync(accessDir);
+          if (named.dev !== before.dev || named.ino !== before.ino || named.isSymbolicLink())
+            fail(`directory changed during Git audit ${dir}`);
+        }
+        const p = join(pinnedDir, entry.name);
+        if (entry.isSymbolicLink()) {
+          if (admin || entry.name === '.git' || entry.name === 'commondir' || entry.name === 'gitdir')
+            fail(`symlink git metadata ${p}`);
+          continue; // rm unlinks ordinary artifact symlinks, never follows them.
+        }
+        if (entry.isDirectory()) {
+          if (lstatSync(p).dev !== device) fail(`foreign mounted directory ${p}`);
+          visit(join(dir, entry.name), p, admin || entry.name === '.git'); continue;
+        }
+        if (!entry.isFile()) continue; // sockets/FIFOs in retired runtime state are unlinked, never opened
+        if (entry.name === '.git') {
+          const value = readPointer(p).trim();
+          if (!value.startsWith('gitdir: ')) fail(`invalid git file ${p}`);
+          const gitdir = ownedPointer(path, dir, value.slice(8));
+          if (!stat(gitdir)?.isDirectory()) fail(`missing git directory ${gitdir}`);
+        }
+        // Git admin files, including bare repositories and submodules.
+        if (entry.name === 'commondir' && (admin || stat(join(pinnedDir, 'HEAD')))) {
+          const common = ownedPointer(path, dir, readPointer(p));
+          if (!stat(common)?.isDirectory()) fail(`invalid git common directory ${common}`);
+        }
+        if (entry.name === 'gitdir' && (admin || stat(join(pinnedDir, 'commondir')))) {
+          const target = ownedPointer(path, dir, readPointer(p));
+          if (stat(target) && !stat(target)?.isFile()) fail(`invalid worktree backlink ${target}`);
+        }
       }
-      if (entry.isDirectory()) {
-        if (lstatSync(p).dev !== device) fail(`foreign mounted directory ${p}`);
-        visit(p, admin || entry.name === '.git'); continue;
-      }
-      if (!entry.isFile()) continue; // sockets/FIFOs in retired runtime state are unlinked, never opened
-      if (entry.name === '.git') {
-        const value = readPointer(p).trim();
-        if (!value.startsWith('gitdir: ')) fail(`invalid git file ${p}`);
-        const gitdir = ownedPointer(path, dir, value.slice(8));
-        if (!stat(gitdir)?.isDirectory()) fail(`missing git directory ${gitdir}`);
-      }
-      // Git admin files, including bare repositories and submodules.
-      if (entry.name === 'commondir' && (admin || stat(join(dir, 'HEAD')))) {
-        const common = ownedPointer(path, dir, readPointer(p));
-        if (!stat(common)?.isDirectory()) fail(`invalid git common directory ${common}`);
-      }
-      if (entry.name === 'gitdir' && (admin || stat(join(dir, 'commondir')))) {
-        const target = ownedPointer(path, dir, readPointer(p));
-        if (stat(target) && !stat(target)?.isFile()) fail(`invalid worktree backlink ${target}`);
-      }
-    }
+    };
+    if (options.forDeletion) withOwnerPermissions(accessDir, before, 0o700, inspect);
+    else inspect(accessDir);
   };
   visit(path);
 }
