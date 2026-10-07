@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createServer, connect } from 'node:net';
 import { createInterface } from 'node:readline';
+import { socketPath } from '../dist/socket-path.js';
 import { startMcpEndpoint } from '../dist/agent-ours/mcp-endpoint.js';
 import { prepareManagedHarness } from '../dist/agent-ours/harness.js';
 const mode = process.argv[2] ?? 'codex-native';
@@ -35,8 +36,8 @@ const request = (method, params) =>
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
 try {
-  const socket = join(root, 'real.sock'),
-    relay = join(root, 'relay.sock'),
+  const socket = socketPath(join(root, 'real.sock')),
+    relay = socketPath(join(root, 'relay.sock')),
     descriptor = join(root, 'descriptor.json');
   endpoint = await startMcpEndpoint({
     socket,

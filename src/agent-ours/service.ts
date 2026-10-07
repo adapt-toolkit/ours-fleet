@@ -166,7 +166,8 @@ export async function prepareManagedAgent(
         action: launch?.action ?? prior?.action ?? randomUUID(),
         expectedCid: pin?.cid,
         allowCreate: true,
-        bio: role.bio ?? '',
+        bio: role.bio,
+        persona: role.persona,
       },
       {
         client,

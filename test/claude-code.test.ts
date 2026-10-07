@@ -65,7 +65,9 @@ describe('vocabulary — supervised monitor migration', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('fleet') }));
     expect(p).not.toContain('re-arm');
     expect(p).not.toContain('ours api watch-notifications');
-    expect(p).toContain('choose_identity name "Alice Dev"');
+    expect(p).not.toContain('choose_identity');
+    expect(p).toContain('supervisor has verified assigned identity "Alice Dev"');
+    expect(p).toContain('once for continuity');
   });
 
   it('restartPrompt keeps the re-arm line for a native-monitor role', () => {

@@ -21,7 +21,6 @@ function fixture(options: { temporary?: boolean; releaseFails?: boolean } = {}) 
     lifetime: options.temporary ? ('temporary' as const) : ('permanent' as const),
     action: 'action',
     allowCreate: true,
-    bio: '',
   };
   const client = {
     listIdentities: async () => [],
@@ -257,5 +256,19 @@ it('later room admission preserves serving instance and does not rewrite startup
     await expect(f.runtime.joinAdditionalRoom('private-invite', 'WRONG')).rejects.toThrow('CID_MISMATCH');
     await f.runtime.terminal();
     await expect(f.runtime.joinAdditionalRoom('private-invite', 'ROOM2')).rejects.toThrow('NOT_READY');
+  } finally { f.cleanup(); }
+});
+
+it('identity mismatch fences profile writes before readiness or harness', async () => {
+  const f = fixture(); let writes = 0;
+  try {
+    const runtime = new AgentOursRuntime({ ...f.assignment, persona: 'contract', bio: 'bio' }, f.deps);
+    Object.assign(f.deps.client, {
+      currentIdentity: async () => ({ name: 'Wrong', cid: 'OTHER', temporary: false, isRoot: false }),
+      setBio: async () => { writes++; }, setPersona: async () => { writes++; },
+    });
+    await expect(runtime.prepare()).rejects.toThrow('IDENTITY_PROOF_MISMATCH');
+    expect(writes).toBe(0);
+    await expect(runtime.startHarness(async () => {})).rejects.toThrow('NOT_READY');
   } finally { f.cleanup(); }
 });

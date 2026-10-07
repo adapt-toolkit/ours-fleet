@@ -24,9 +24,8 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('choose_identity');
     expect(b).toContain('Alice Dev');
     expect(b).not.toContain('call **create_identity**');
-    expect(b).toContain('current_identity');
-    expect(b).toContain('set_bio');
-    expect(b).toContain('set_persona');
+    expect(b).not.toMatch(/current_identity|set_bio|set_persona/);
+    expect(b).toContain('application of the configured Role');
     expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('## Charter');
     expect(b).toContain('Own the Alice codebase.');
@@ -37,13 +36,13 @@ describe('generateBriefing', () => {
     expect(b.toLowerCase()).not.toContain('a2adapt');
   });
 
-  it('uses bio verbatim when set, summary phrasing when not', () => {
+  it('preserves configured bio without delegating public profile synthesis', () => {
     const withBio = generateBriefing({ ...base, bio: 'Public card here.' }, vocab, opts);
     expect(withBio).toContain('## Bio');
     expect(withBio).toContain('Public card here.');
-    expect(withBio).toContain('verbatim');
+    expect(withBio).not.toContain('PUBLISH');
     const noBio = generateBriefing(base, vocab, opts);
-    expect(noBio).toContain('summary of your Charter');
+    expect(noBio).not.toContain('summary of your Charter');
   });
 
   it('announces to coordinator when set, owner-driven otherwise', () => {
@@ -72,14 +71,16 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('## Charter');
     expect(b).not.toContain('choose_identity');   // boot steps always appended
     expect(b).toContain('## On restart');
-    expect(b).toContain('did not declare a profile source');
+    expect(b).not.toMatch(/current_identity|set_bio|set_persona/);
+    expect(b).toContain('configured Role');
     expect(b).not.toContain('with the **Charter** section above');
   });
 
-  it('uses Mission as the explicit profile source when no persona exists', () => {
+  it('preserves Mission without inferring a profile source when no persona exists', () => {
     const b = generateBriefing({ ...base, persona: undefined }, vocab, opts);
-    expect(b).toContain('summary of your Mission');
-    expect(b).toContain('with the **Mission** section above');
+    expect(b).toContain('ship v1');
+    expect(b).not.toContain('summary of your Mission');
+    expect(b).not.toContain('with the **Mission** section above');
     expect(b).not.toContain('summary of your Charter');
   });
 
@@ -109,13 +110,15 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('add_contact');
     expect(b).toContain('A'.repeat(64));
     expect(b).toContain('C'.repeat(64));
-    expect(b).toContain('Start the task above');
+    expect(b).toContain('start the task above');
     expect(b).not.toContain('fleet_room_briefing_ack');
     expect(b).not.toContain('briefing_sha256');
     expect(b).not.toContain('list_history');
     expect(b).not.toContain('get_history_item');
+    expect(b).toContain('supervisor delivers initial unread mail');
+    expect(b).toContain('unread messages remain');
     expect(b).not.toContain('LOCAL BOOTSTRAP ONLY');
-    expect(b.indexOf('verified room admission')).toBeLessThan(b.indexOf('Start the task above'));
+    expect(b.indexOf('verified room admission')).toBeLessThan(b.indexOf('start the task above'));
   });
 
   it.each(['LocalCoordinator', 'Developer', 'Critic'])(
@@ -186,7 +189,7 @@ describe('generateBriefing', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('## Routines');
     expect(b).toContain('/s/agents/Alice/ROUTINES.md');
-    expect(b).toContain('re-read it at the START of every wake');
+    expect(b).toContain('read it once in that wake before acting');
     // Mechanical section: sits right after the Durable log section.
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });

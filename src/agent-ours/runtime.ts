@@ -11,7 +11,9 @@ export interface AssignedIdentity {
   action: string;
   expectedCid?: string;
   allowCreate: boolean;
-  bio: string;
+  /** Omitted fields preserve an existing identity's custom profile. */
+  bio?: string;
+  persona?: string;
 }
 export interface RoomAdmission {
   id: string;
@@ -85,7 +87,7 @@ export class AgentOursRuntime {
     this.deps.journal.commit({ ...this.state, ...patch, phase }, this.state.revision);
     this.state = this.deps.journal.read()!;
   }
-  private async verify(): Promise<void> {
+  private async verify() {
     this.deps.assertFence();
     if (this.assignment.expectedCid && this.state.cid !== this.assignment.expectedCid)
       throw Error('PINNED_CID_MISMATCH');
@@ -98,6 +100,7 @@ export class AgentOursRuntime {
     )
       throw Error('IDENTITY_PROOF_MISMATCH');
     this.deps.assertFence();
+    return actual;
   }
   async prepare(room?: RoomAdmission, timeoutMs = 30_000): Promise<void> {
     if (
@@ -132,7 +135,7 @@ export class AgentOursRuntime {
         this.transition('RECOVERING');
         const args = {
           name: this.state.name,
-          bio: this.assignment.bio,
+          bio: this.assignment.bio ?? '',
           exposeLocal: false,
           localAutoAccept: true,
         };
@@ -144,7 +147,18 @@ export class AgentOursRuntime {
         this.transition('OWNED', { cid: created.info.cid });
       }
     }
-    await this.verify();
+    const profile = await this.verify();
+    // The supervisor owns profile setup, just like identity binding. Apply only
+    // explicitly configured fields, under the verified owner, before publishing
+    // readiness or admitting the harness. Repeating a prepare is idempotent.
+    if (this.assignment.bio !== undefined && profile.bio !== this.assignment.bio) {
+      this.deps.assertFence();
+      await this.deps.client.setBio({ bio: this.assignment.bio });
+    }
+    if (this.assignment.persona !== undefined && profile.persona !== this.assignment.persona) {
+      this.deps.assertFence();
+      await this.deps.client.setPersona({ persona: this.assignment.persona });
+    }
     if (!room && (this.state.room || this.state.admissionIntent))
       throw Error('ROOM_DESCRIPTOR_REQUIRED');
     if (room) {
