@@ -6,7 +6,7 @@ import { parse } from 'yaml';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { agentDir, stateRoot } from '../paths.js';
 import { readTempSupervisor, tempSupervisorLiveness, eraseTerminationEvents } from '../temp-lifecycle.js';
-import { assertSafeAncestors, auditWorkspaceGit } from './workspace.js';
+import { assertSafeAncestors, auditWorkspaceGit, prepareOwnedDeletionTree } from './workspace.js';
 import type { RoomMemberSeat } from './types.js';
 
 interface Manifest { launches: Array<{ role: string; launchId: string }>; version: 1; token: string; paths: string[]; stamps: Record<string, { dev: number; ino: number; proof: string }>; phases: Record<string, 'renamed' | 'removed'> }
@@ -80,7 +80,7 @@ export async function eraseMemberArtifacts(
       if (await tempSupervisorLiveness(path) !== 'stopped') throw new Error('Archive writer is not stopped');
       if (creation?.role === supervisor.role && typeof creation.creationActionId === 'string')
         actions.get(supervisor.role)!.add(creation.creationActionId);
-      auditWorkspaceGit(path);
+      auditWorkspaceGit(path, { forDeletion: true });
       launches.push({ role: supervisor.role, launchId: supervisor.launchId });
       paths.push(path);
     }
@@ -106,7 +106,7 @@ export async function eraseMemberArtifacts(
       const state = json(join(path, 'state.json')), instance = json(join(path, 'instance.json'));
       if (state?.lifetime === 'temporary' && actions.get(state.name)?.has(state.action)
           && instance?.role === state.name && instance?.temporary === true && instance?.instance === state.instance) {
-        auditWorkspaceGit(path);
+        auditWorkspaceGit(path, { forDeletion: true });
         paths.push(path);
       }
     }
@@ -134,6 +134,7 @@ export async function eraseMemberArtifacts(
     }
     manifest.phases[path] = 'renamed';
     replaceFileAtomically(manifestPath, JSON.stringify(manifest));
+    if (existsSync(tombstone) && lstatSync(tombstone).isDirectory()) prepareOwnedDeletionTree(tombstone);
     rmSync(tombstone, { recursive: true, force: true });
     manifest.phases[path] = 'removed';
     replaceFileAtomically(manifestPath, JSON.stringify(manifest));

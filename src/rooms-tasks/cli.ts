@@ -290,6 +290,8 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
     records: tasks.map(t =>
       `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
       + ` — List ${markdownCode(t.list_name ?? 'default')}`
+      + (t.deletion?.status === 'pending' ? ' — Deletion pending'
+        + (t.deletion.error ? `: ${markdownProse(t.deletion.error)}` : '') : '')
       + (t.blocked ? ` — 🚧 Blocked: ${markdownProse(t.blocked.reason)}` : '')),
   });
 
@@ -773,15 +775,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--state <state>', 'filter by state (backlog|active|provisioning|review|done|cancelled|failed|all)')
     .option('--list <name>', 'filter by task list')
     .option('--group-by-list', 'group deterministic results by list (JSON)')
+    .option('--include-deleting', 'include tasks whose accepted deletion is still pending')
     .option('--json', 'JSON output')
-    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; includeDeleting?: boolean; json?: boolean }) => {
       try {
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
         const service = taskRoomService(opts.configuration);
-        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}) };
+        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}),
+          ...(opts.includeDeleting ? { includeDeleting: true } : {}) };
         const tasks = service.listTasks(filter);
         if (opts.json) {
           console.log(JSON.stringify(opts.groupByList
@@ -859,7 +863,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const service = taskRoomService(opts.configuration);
         const { task: t, orchestration: room } = service.getTask(id);
-        const readiness = t.state === 'active' ? await service.observeTaskReadiness(id) : undefined;
+        const readiness = t.state === 'active' && t.deletion?.status !== 'pending'
+          ? await service.observeTaskReadiness(id) : undefined;
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
@@ -873,6 +878,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(t.deletion?.status === 'pending' ? [
+              { label: 'Deletion', value: 'Pending — cleanup is not complete' },
+              ...(t.deletion.error ? [{ label: 'Cleanup error', value: t.deletion.error }] : []),
+              { label: 'Retry', value: `ours-fleet task delete ${t.task_id} ${t.task_id}`, kind: 'code' as const },
+            ] : []),
             ...(readiness ? [{ label: 'Readiness', value: readiness.state },
               ...('reason' in readiness ? [{ label: 'Reason', value: readiness.reason }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
