@@ -80,6 +80,33 @@ any remaining original archive and still refuse replacement live member state
 or a recreated identity even after the archive has been consumed. Failed deletion
 remains retryable with its recorded error.
 
+Explicit deletion restores missing owner read/write/traversal bits on real
+directories inside a proven owned workspace or retired archive before the Git
+audit and removal. This handles restrictive artifacts left by tests even when
+they belong to the same Unix user. It adds no group/other access, follows no
+artifact symlinks, crosses no mounted device boundary, and never changes the
+owner. Only Git pointer files that the audit must read may gain owner-read;
+hardlinked unreadable pointers are refused to avoid changing an outside alias.
+Permission changes target a verified open inode. On Linux, unreadable entries
+use an `O_PATH` descriptor through `/proc/self/fd`; other platforms retain the
+error if they cannot open the entry safely. A restricted workspace root is
+temporarily accessible to verify its exact ownership marker; failed marker
+verification restores its original mode. Partial token-derived deletion
+tombstones resume directory cleanup without re-reading already-removed Git
+metadata. List, show, and ordinary Git audit do not repair permissions.
+
+An accepted deletion is hidden from ordinary task lists while cleanup settles.
+Use `ours-fleet task list --include-deleting --json` (or the API's
+`includeDeleting=true`) to include retained cleanup intents, and `task show ID`
+to see pending/error/retry information. Disappearance from the ordinary list is
+not proof of completed deletion; successful deletion removes the task record
+after workspace and member cleanup.
+Cowork HTTP transport failures record the RPC method, failing stage and a
+bounded error category in the cleanup intent. Credential rejection remains an
+explicit `unauthorized` protocol error. Transport diagnostics do not include
+request bodies, credentials, URLs or raw exception text, and failed mutations
+are never automatically replayed.
+
 Deletion rejects traversal, foreign recorded paths, changed markers and symlinked
 workspace ancestors. Ordinary artifact symlinks are unlinked without following
 their targets. Git control symlinks and foreign pointers are refused. As with

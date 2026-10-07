@@ -51,7 +51,7 @@ export function collectWorkspaceArchives(workspace: OwnedWorkspace): void {
     });
     if (!terminated || entry.name.endsWith('.retiring'))
       throw new WorkspaceError('workspace archive retirement is incomplete');
-    auditWorkspaceGit(path);
+    auditWorkspaceGit(path, { forDeletion: true });
     owned.push(path);
   }
   // Preflight the entire set before mutation; task/room record remains until all succeed.

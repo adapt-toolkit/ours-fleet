@@ -99,7 +99,7 @@ vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import {
   createTask, getTask, startTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
-  updateTaskMembers, failTask,
+  updateTaskMembers, failTask, beginTaskDeletionIntent, setTaskDeletionError,
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
@@ -1332,4 +1332,46 @@ it.each(['ready', 'unknown', 'degraded'])('task show exposes %s health separatel
   await run('show', t.task_id);
   expect(out.join('\n')).toContain('Readiness');
   expect(out.join('\n')).toContain(state);
+});
+
+describe('pending task deletion status', () => {
+  it('includes unresolved deletions explicitly in list and grouped JSON', async () => {
+    const t = backlogTask();
+    beginTaskDeletionIntent(t.task_id, { kind: 'local_control', surface: 'cli' });
+    setTaskDeletionError(t.task_id, 'EACCES during cleanup', 'Retry explicit task deletion');
+    const before = getTask(t.task_id);
+    await runLocalTask('list', '--json');
+    expect(JSON.parse(out.join('\n')).tasks).toEqual([]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting', '--json');
+    expect(JSON.parse(out.join('\n')).tasks).toEqual([before]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting', '--group-by-list', '--json');
+    expect(JSON.parse(out.join('\n')).groups.flatMap((group: { tasks: unknown[] }) => group.tasks)).toEqual([before]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting');
+    expect(out.join('\n')).toContain('Deletion pending');
+    expect(out.join('\n')).toContain('EACCES during cleanup');
+    expect(getTask(t.task_id)).toEqual(before);
+    expect(mocks.launchFleetWorker).not.toHaveBeenCalled();
+  });
+
+  it('shows pending cleanup/error/retry without probing the retiring active agent', async () => {
+    const t = backlogTask(); startTask(t.task_id); activateTask(t.task_id);
+    beginTaskDeletionIntent(t.task_id, { kind: 'local_control', surface: 'cli' });
+    setTaskDeletionError(t.task_id, 'EACCES during cleanup', 'Retry explicit task deletion');
+    const before = getTask(t.task_id);
+    await runLocalTask('show', t.task_id, '--json');
+    const shown = JSON.parse(out.join('\n'));
+    expect(shown.task.deletion).toEqual(before.deletion);
+    expect(shown.readiness).toBeUndefined();
+    out.length = 0;
+    await runLocalTask('show', t.task_id);
+    expect(out.join('\n')).toContain('cleanup is not complete');
+    expect(out.join('\n')).toContain('EACCES during cleanup');
+    expect(out.join('\n')).toContain(`ours-fleet task delete ${t.task_id} ${t.task_id}`);
+    expect(mocks.liveReadiness).not.toHaveBeenCalled();
+    expect(mocks.launchFleetWorker).not.toHaveBeenCalled();
+    expect(getTask(t.task_id)).toEqual(before);
+  });
 });

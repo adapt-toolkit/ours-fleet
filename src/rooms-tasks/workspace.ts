@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, type Stats } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { stateRoot } from '../paths.js';
 
@@ -55,6 +55,71 @@ function marked(path: string, w: OwnedWorkspace): void {
 function staging(w: OwnedWorkspace, phase: string): string {
   return join(dirname(w.path), `.${w.id}.${w.token}.${phase}`);
 }
+
+/** Recover only owner access on a pinned, real entry. Never chmod a symlink
+ * target or a hardlinked file through an alias outside the deletion tree.
+ * Linux O_PATH can pin an entry even when a same-owner fixture removed every
+ * permission; /proc/self/fd then addresses that inode rather than its old name.
+ */
+function withOwnerPermissions<T>(path: string, before: Stats, bits: number, work: () => T, rollback = false): T {
+  if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) fail(`unsafe permission repair ${path}`);
+  if ((before.mode & bits) === bits) return work();
+  const uid = process.geteuid?.();
+  if (uid === undefined || before.uid !== uid) fail(`cannot restore owner access to ${path}: owned by uid ${before.uid}`);
+  if (before.isFile() && before.nlink !== 1) fail(`cannot restore owner access to hardlinked Git metadata ${path}`);
+  let descriptor: number, pathDescriptor = false;
+  try { descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) {
+    if (process.platform !== 'linux' || (error as NodeJS.ErrnoException).code !== 'EACCES') throw error;
+    // O_PATH is Linux-specific and is not exposed in Node's fs.constants.
+    descriptor = openSync(path, 0x200000 | constants.O_NOFOLLOW);
+    pathDescriptor = true;
+  }
+  const setMode = (mode: number) => pathDescriptor
+    ? chmodSync(`/proc/self/fd/${descriptor}`, mode)
+    : fchmodSync(descriptor, mode);
+  try {
+    const pinned = fstatSync(descriptor);
+    if (pinned.dev !== before.dev || pinned.ino !== before.ino || pinned.uid !== before.uid
+        || pinned.mode !== before.mode || pinned.nlink !== before.nlink)
+      fail(`entry changed before permission repair ${path}`);
+    setMode((before.mode & 0o7777) | bits);
+    try { return work(); }
+    catch (error) { if (rollback) setMode(before.mode & 0o7777); throw error; }
+  } finally { closeSync(descriptor); }
+}
+
+/** Caller must first prove the exact workspace marker or retired archive
+ * provenance, and hold its lifecycle lock with all managed writers retired.
+ * Directories need owner rwx for recursive removal; ordinary files do not.
+ */
+export function prepareOwnedDeletionTree(path: string): void {
+  assertSafeAncestors(path);
+  const uid = process.geteuid?.();
+  if (uid === undefined || lstatSync(path).uid !== uid) fail(`deletion root is not owned by the current uid: ${path}`);
+  const device = lstatSync(dirname(path)).dev;
+  const visit = (dir: string): void => {
+    const entry = lstatSync(dir);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) fail(`unsafe deletion directory ${dir}`);
+    if (entry.dev !== device) fail(`foreign mounted directory ${dir}`);
+    withOwnerPermissions(dir, entry, 0o700, () => {
+      for (const child of readdirSync(dir, { withFileTypes: true })) {
+        if (child.isDirectory() && !child.isSymbolicLink()) visit(join(dir, child.name));
+      }
+    });
+  };
+  visit(path);
+}
+
+function markedForDeletion(w: OwnedWorkspace): void {
+  assertSafeAncestors(w.path);
+  const before = lstatSync(w.path);
+  if (process.geteuid?.() !== before.uid) fail(`workspace root is not owned by the current uid: ${w.path}`);
+  if (before.dev !== lstatSync(dirname(w.path)).dev) fail(`foreign mounted directory ${w.path}`);
+  // The durable exact path plus current-UID real root permit temporary owner
+  // access to read the marker, but never substitute for the marker itself.
+  withOwnerPermissions(w.path, before, 0o700, () => marked(w.path, w), true);
+}
 /** Atomic directory publication; retry uses the durable token, never adopts another folder. */
 export function ensureWorkspace(w: OwnedWorkspace): string {
   validateWorkspace(w);
@@ -91,8 +156,15 @@ function ownedPointer(base: string, from: string, value: string): string {
  * All registrations and common dirs must be inside this workspace. Removing the complete
  * workspace then removes their registries atomically with the owned repositories; never prune.
  */
-export function auditWorkspaceGit(path: string): void {
+export function auditWorkspaceGit(path: string, options: { forDeletion?: boolean } = {}): void {
+  if (options.forDeletion) prepareOwnedDeletionTree(path);
   const device = lstatSync(path).dev;
+  const readPointer = (file: string): string => {
+    if (!options.forDeletion) return readFileSync(file, 'utf8');
+    const before = lstatSync(file);
+    if (before.dev !== device) fail(`foreign mounted Git metadata ${file}`);
+    return withOwnerPermissions(file, before, 0o400, () => readFileSync(file, 'utf8'));
+  };
   const visit = (dir: string, admin = false): void => {
     admin ||= Boolean(stat(join(dir, 'HEAD')) && (stat(join(dir, 'objects')) || stat(join(dir, 'commondir'))));
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -108,18 +180,18 @@ export function auditWorkspaceGit(path: string): void {
       }
       if (!entry.isFile()) continue; // sockets/FIFOs in retired runtime state are unlinked, never opened
       if (entry.name === '.git') {
-        const value = readFileSync(p, 'utf8').trim();
+        const value = readPointer(p).trim();
         if (!value.startsWith('gitdir: ')) fail(`invalid git file ${p}`);
         const gitdir = ownedPointer(path, dir, value.slice(8));
         if (!stat(gitdir)?.isDirectory()) fail(`missing git directory ${gitdir}`);
       }
       // Git admin files, including bare repositories and submodules.
       if (entry.name === 'commondir' && (admin || stat(join(dir, 'HEAD')))) {
-        const common = ownedPointer(path, dir, readFileSync(p, 'utf8'));
+        const common = ownedPointer(path, dir, readPointer(p));
         if (!stat(common)?.isDirectory()) fail(`invalid git common directory ${common}`);
       }
       if (entry.name === 'gitdir' && (admin || stat(join(dir, 'commondir')))) {
-        const target = ownedPointer(path, dir, readFileSync(p, 'utf8'));
+        const target = ownedPointer(path, dir, readPointer(p));
         if (stat(target) && !stat(target)?.isFile()) fail(`invalid worktree backlink ${target}`);
       }
     }
@@ -134,8 +206,8 @@ export function assertWorkspaceDeletable(w: OwnedWorkspace, owner: OwnedWorkspac
   validateWorkspace(w, owner, id);
   if (stat(w.path)) {
     if (stat(staging(w, 'deleting'))) fail('both live and deleting workspace exist');
-    marked(w.path, w);
-    auditWorkspaceGit(w.path);
+    markedForDeletion(w);
+    auditWorkspaceGit(w.path, { forDeletion: true });
   }
   const pending = staging(w, 'provisioning');
   if (stat(pending)) {
@@ -152,8 +224,8 @@ export function deleteWorkspace(w: OwnedWorkspace, owner: OwnedWorkspace['owner'
   const pending = staging(w, 'provisioning');
   if (stat(w.path)) {
     if (stat(tomb)) fail('both live and deleting workspace exist');
-    marked(w.path, w);
-    auditWorkspaceGit(w.path);
+    markedForDeletion(w);
+    auditWorkspaceGit(w.path, { forDeletion: true });
     renameSync(w.path, tomb);
   }
   if (stat(pending)) {
@@ -162,7 +234,9 @@ export function deleteWorkspace(w: OwnedWorkspace, owner: OwnedWorkspace['owner'
     rmSync(pending, { recursive: true });
   }
   if (stat(tomb)) {
-    assertSafeAncestors(tomb);
+    // This exact token-derived tombstone has already passed the marker and
+    // Git audit; partial removal may have consumed those proofs on disk.
+    prepareOwnedDeletionTree(tomb);
     rmSync(tomb, { recursive: true });
   }
 }

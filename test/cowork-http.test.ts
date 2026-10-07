@@ -62,3 +62,19 @@ test('explicit local socket override cannot bypass malformed gateway profile',as
   expect(()=>createCoworkAdapter({env:f.env,home:f.root,socketPath:join(f.root,'missing.sock')})).toThrow('Local Cowork selectors');
   expect(f.requests).toEqual([]);
 });
+test('failed cleanup preserves its RPC and timeout stage without leaking request or credential', async () => {
+  const f = await fixture({ mode: 'timeout' });
+  const adapter = createCoworkAdapter({ env: f.env, home: f.root, timeoutMs: 1000 });
+  let error: unknown;
+  try { await adapter.deleteRoom('private-room-label'); } catch (value) { error = value; }
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toMatch(/Cowork HTTP room\.delete failed during management (request|response) \(timeout\)/);
+  expect((error as Error).message).not.toMatch(/private-room-label|test-issued|127\.0\.0\.1|credential/);
+  expect(f.requests.filter(path => path.endsWith('/rpc'))).toHaveLength(1);
+});
+test('credential rejection remains an explicit protocol error instead of an inferred transport diagnosis', async () => {
+  const f = await fixture({ badToken: true });
+  const adapter = createCoworkAdapter({ env: f.env, home: f.root });
+  await expect(adapter.deleteRoom('fixture')).rejects.toMatchObject({ name: 'CoworkProtocolError', code: 'unauthorized' });
+  expect(f.requests.filter(path => path.endsWith('/rpc'))).toHaveLength(1);
+});
