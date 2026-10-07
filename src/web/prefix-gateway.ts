@@ -170,6 +170,9 @@ export function createPrefixGateway(options: GatewayOptions) {
         Object.assign(headers, cors);
       }
       res.writeHead(response.statusCode ?? 502, headers);
+      // Streaming headers, including exact-origin CORS and upstream errors,
+      // must reach the client before the first event or body byte arrives.
+      res.flushHeaders();
       response.on('error', () => res.destroy());
       response.on('aborted', () => res.destroy());
       response.on('close', () => { if (!response.complete) res.destroy(); });
