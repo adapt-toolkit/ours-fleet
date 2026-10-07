@@ -208,7 +208,9 @@ try {
 
   const invite=await adapter.generateInvite('monitor-refresh');
   const contact=await sibling.addContact({invite:invite.blob,name:'RecoveryRoot'});
-  await sibling.sendMessage({contact:contact.cid,text:'credential refresh notification'});
+  const notificationText='credential refresh notification';
+  const notification=await sibling.sendMessage({contact:contact.cid,text:notificationText});
+  assert.equal(notification.sent,true,'fixture notification was sent');
   await monitorRun;
   assert.equal(monitorDeliveries.length,1,'built monitor receives a notification after file publication');
   const monitorState=JSON.parse(readFileSync(join(monitorDir,'.monitor-state.json'),'utf8'));
@@ -216,8 +218,20 @@ try {
   assert.equal(monitorState.profileKey,endpoint+'#'+expectedInstanceId);
   assert.match(readFileSync(join(monitorDir,'.monitor-status'),'utf8'),/^armed at /);
   assert(ids.every(id=>id===ownerId),'token update keeps the owner lease ID');
-  assert.equal((await adapter.getMessages(1)).messages.length,1,
-    'same owner channel reads the message after credential replacement');
+  // The live OwnerChannel watch may already have claimed the message while
+  // the monitor retried authentication. Prove exact delivery and intake rather
+  // than requiring the explicit reader to win that race against the watch.
+  await channel.drain();
+  const received=await adapter.getHistoryItem(notification.wireId);
+  assert(received,'same client can read the exact received message after credential replacement');
+  assert.equal(received.wire_id,notification.wireId);
+  assert.equal(received.direction,'in');
+  assert.equal(received.from.id,(await sibling.currentIdentity()).cid);
+  assert.equal(received.text,notificationText);
+  assert.equal(received.inbox_state,'read');
+  const handled=JSON.parse(readFileSync(join(fleetState,'.owner-channel-state.json'),'utf8')).handled;
+  assert(handled.includes(notification.wireId),'live owner channel claimed the exact notification');
+  assert.equal((await adapter.getMessages(1)).messages.length,0,'claimed message is not delivered twice');
   console.log('PASS explicit profile token update: temporary 401 recovered, same owner and cursor retained, notification delivered');
 
   const wrongProfilePath=join(hostState,'wrong-client.json');

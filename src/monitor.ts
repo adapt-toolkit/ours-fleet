@@ -533,7 +533,8 @@ export class Monitor {
           this.recover('connectivity', 'auth');
         } catch (e) {
           if (this.stopped) return;
-          this.degrade('connectivity', 'initial unread check unavailable; retrying');
+          if (e instanceof AuthError) this.degrade('auth', e.message);
+          else this.degrade('connectivity', 'initial unread check unavailable; retrying');
           await this.deps.sleep(BACKOFF_MAX_MS);
           continue;
         }
@@ -717,6 +718,10 @@ export class Monitor {
       };
       client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
       return await client.unread();
+    } catch (error) {
+      if (/(?:HTTP\s*401|unauthori[sz]ed|API token)/i.test(msg(error)))
+        throw new AuthError('daemon rejected the API token (401); initial unread check unavailable; retrying');
+      throw error;
     } finally {
       this.deps.timers.clear(timer);
       this.currentAbort = null;

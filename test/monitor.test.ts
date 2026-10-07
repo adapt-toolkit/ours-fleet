@@ -546,6 +546,40 @@ describe('Monitor.prime', () => {
 });
 
 describe('Monitor initial unread work', () => {
+  it.each(['attach', 'unread'])('reports and recovers an initial %s authentication gap without exposing error bodies', async phase => {
+    const { fetch, calls } = scriptedFetch([{ cursor: 12, events: [] }]);
+    let attempts = 0, retries = 0, deliveries = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      sleep: async () => {
+        retries++;
+        const status = readFileSync(join(dir, '.monitor-status'), 'utf8');
+        expect(status).toMatch(/degraded: auth/);
+        expect(status).not.toContain('private-error-body');
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        expect(calls()).toHaveLength(1);
+      },
+      delivery: { submit: async () => {
+        deliveries++;
+        mon.stop();
+        return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => {
+      const fail = options.requestSignal && ++attempts === 1;
+      if (fail && phase === 'attach') throw new Error('attach: HTTP 401 private-error-body');
+      return { ...await attach(options), unread: async () => {
+        if (fail) throw new Error('unread: HTTP 401 private-error-body');
+        return { identities: [{ name: 'A', count: 1, files: 0 }] };
+      } };
+    };
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(attempts).toBe(2); expect(retries).toBe(1); expect(deliveries).toBe(1);
+    expect(calls()).toHaveLength(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed/);
+  });
+
   it.each([false, true])('delivers a body-free backlog without consuming it (persisted cursor=%s)', async persisted => {
     if (persisted) writeFileSync(join(dir, '.notify-cursor'), '12\n');
     const { fetch } = scriptedFetch([{ cursor: 12, events: [] }]);
