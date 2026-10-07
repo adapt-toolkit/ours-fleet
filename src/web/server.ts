@@ -219,8 +219,11 @@ export async function buildWebServer(
     };
   });
 
-  app.get('/api/v1/onboarding',async request=>{
+  app.get<{ Querystring: { view?: string } }>('/api/v1/onboarding',async request=>{
     auth.authenticate(request);
+    // Opening an existing workspace needs configuration state, not CLI/account discovery.
+    // Keep the full report for the setup screens and older App clients.
+    if(request.query.view==='state')return {configured:onboardingConfigured()};
     const harnesses=await Promise.all((['codex','claude-code'] as const).map(async harness=>{
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));

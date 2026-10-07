@@ -12,6 +12,35 @@ import { buildWebServer } from '../../src/web/server.js';
 import { AuditSink, type AuditEvent } from '../../src/web/audit.js';
 import { FleetError } from '../../src/application/errors.js';
 
+it('makes a gateway connection failure readable only to the configured App, without claiming device rejection', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'workspace-cors-502-'));
+  const store = new WorkspaceDeviceStore(dir), appOrigin = 'https://app.ours.network';
+  const auth = new WebAuth('http://localhost', 'localhost', Date.now, new TrustedDeviceStore(join(dir, 'trusted')), undefined, store, appOrigin);
+  const link = store.mint(), device = store.enroll(link.enrollment, link.workspaceId, 'fixture');
+  const upstream = createServer(); upstream.listen(0, '127.0.0.1'); await once(upstream, 'listening');
+  const upstreamOrigin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
+  await new Promise<void>(resolve => upstream.close(() => resolve()));
+  const gateway = createPrefixGateway({ auth, fleetOrigin: upstreamOrigin, services: [{ prefix: '/notifications', origin: upstreamOrigin }] });
+  gateway.server.listen(0, '127.0.0.1'); await once(gateway.server, 'listening');
+  const origin = `http://127.0.0.1:${(gateway.server.address() as { port: number }).port}`;
+  auth.setBoundary(origin, new URL(origin).host);
+  try {
+    const preflight = await fetch(origin + '/notifications/api/v1/summary', { method: 'OPTIONS', headers: { origin: appOrigin, 'access-control-request-method': 'GET', 'access-control-request-headers': 'authorization' } });
+    expect(preflight.status).toBe(204); expect(preflight.headers.get('access-control-allow-origin')).toBe(appOrigin);
+    const headers = { origin: appOrigin, authorization: 'Bearer ' + device.token, 'sec-fetch-site': 'cross-site' };
+    const failure = await fetch(origin + '/notifications/api/v1/summary', { headers });
+    expect(failure.status).toBe(502); expect(failure.headers.get('access-control-allow-origin')).toBe(appOrigin);
+    expect(failure.headers.get('vary')).toBe('Origin'); expect(failure.headers.get('x-ours-workspace-auth')).toBeNull();
+    expect((await failure.json()).error.code).toBe('upstream_unavailable');
+    expect(store.authenticate(device.token).id).toBe(device.device.id);
+    const foreign = await fetch(origin + '/notifications/api/v1/summary', { headers: { ...headers, origin: 'https://foreign.example' } });
+    expect(foreign.status).toBe(403); expect(foreign.headers.get('access-control-allow-origin')).toBeNull(); await foreign.text();
+    store.revoke(device.device.id);
+    const rejected = await fetch(origin + '/notifications/api/v1/summary', { headers });
+    expect(rejected.status).toBe(401); expect(rejected.headers.get('x-ours-workspace-auth')).toBe('rejected'); await rejected.text();
+  } finally { await gateway.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 it('marks only device validation failure, strips forged service provenance and records bounded safe diagnostics', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'workspace-provenance-'));
   const store = new WorkspaceDeviceStore(dir);
