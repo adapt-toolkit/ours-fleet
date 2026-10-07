@@ -641,12 +641,15 @@ export function makeCodexAdapter(
         'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
         '`[fleet-monitor]` lines — do NOT arm arm_monitor or foreground_monitor. When such a line ' +
         'appears, call **get_messages**, handle the mail, and reply with send_message.',
-      launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
+      launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Announce console readiness before task details.`,
       restartPrompt: (id, worklog, configuredRole) => {
         if (configuredRole?.monitor?.mode === 'fleet')
-          return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true); ` +
-            'your mail wakes are delivered by the fleet supervisor as `[fleet-monitor]` console lines, so do ' +
-            `NOT arm arm_monitor/foreground_monitor. Continue from ${worklog}. Do not re-run whatever crashed you.`;
+          return `Session restarted. The supervisor has verified assigned identity "${id}"; ` +
+            'accept that readiness and continue without rebinding or profile reconciliation. ' +
+            'Mail wakes arrive as `[fleet-monitor]` lines; do NOT arm arm_monitor/foreground_monitor. ' +
+            'Announce console readiness first without tools, then end that readiness turn. ' +
+            `For a separate continuation task, read ${worklog} once for continuity and reuse it in that wake. ` +
+            'Do not re-run whatever crashed you.';
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
           (consented

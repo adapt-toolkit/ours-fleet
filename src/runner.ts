@@ -1,3 +1,5 @@
+import { StartupTelemetry } from './startup-telemetry.js';
+import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
@@ -588,6 +590,8 @@ export async function runOnce(
   partialDeps: Partial<RunnerDeps> = {},
 ): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
+  const startupTelemetry = new StartupTelemetry(deps.now, line => deps.log(`[${name}] ${line}`));
+  startupTelemetry.mark('supervisor_started');
   const temp = opts.temp === true;
   const dir = agentDir(name, temp);
   const configPath = temp ? opts.configPath : resolveConfigPath(dir, opts.configPath);
@@ -690,7 +694,9 @@ export async function runOnce(
     if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
   }
 
+  startupTelemetry.mark('identity_prepare_started');
   const managedService = await deps.prepareAgentOurs(role, dir, opts.identityLifetime ? opts.identityLifetime === 'temporary' : temp);
+  startupTelemetry.mark('identity_ready');
   let layoutRetiring = false;
   try {
   const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
@@ -711,10 +717,9 @@ export async function runOnce(
   }
 
   // Prime the supervisor mail monitor's notification cursor at the
-  // stream tip BEFORE the session launches so no arrival is missed during boot
-  // (backlog before the tip is the SessionStart hook's job). Native-mode roles
-  // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
-  // treated as native (monitor may be undefined on an old role.yaml).
+  // stream tip BEFORE the session launches so no arrival is missed during boot.
+  // Monitor.run checks the body-free initial unread summary after readiness;
+  // managed native hooks do not own backlog delivery.
   let sessionHandle: AgentSession | undefined;
   let modelRecovery: 'advance' | 'hold' | undefined;
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
@@ -786,6 +791,7 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
+    startupTelemetry.mark('harness_starting');
     agentSession = await managedService.runtime.startHarness(() => deps.startAgentSession(adapter.agentSession, {
       managedOurs: managedHarness.ours,
       role, prep,
@@ -793,6 +799,7 @@ export async function runOnce(
       cwd: runCwd, stateDir: dir, mode, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
     }));
+    startupTelemetry.mark('harness_ready');
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
@@ -802,6 +809,7 @@ export async function runOnce(
         event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
+    const unsubscribeTelemetry = agentSession.subscribeConversation?.(event => startupTelemetry.observe(event));
     const unsubscribeStartup = agentSession.subscribeConversation?.(event => {
       if (event.kind !== 'turn.completed' || !('outcome' in event.payload) || event.payload.outcome !== 'completed') return;
       successfulTurnObserved = true;
@@ -810,7 +818,7 @@ export async function runOnce(
         startMonitorAfterStartup();
       }
     });
-    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); };
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
@@ -922,12 +930,11 @@ export async function runOnce(
         };
       },
     };
-    const firstPrompt = mode === 'fresh'
-      ? `Read and follow ${join(dir, 'briefing.md')} now.`
-      : `Your supervisor has verified your assigned identity and room readiness. Read ${join(dir, 'WORKLOG.md')} and ${join(dir, 'briefing.md')}, then continue using the available ours tools.`;
+    const firstPrompt = managedStartupPrompt(dir, mode, booted);
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
-    // up would hide a role that never read its briefing.
+    // up would hide a role that never completed its readiness turn.
+    startupTelemetry.mark('startup_submitted');
     const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
     // Keep the early cursor baseline; do not deliver wakes into the protected
     // first turn. Steering can pre-empt startup just like cancellation.
@@ -950,6 +957,7 @@ export async function runOnce(
       }
     }
     const started = await starting;
+    startupTelemetry.finish();
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
     // only that turn: the already-live agent session and any queued wake remain
@@ -989,6 +997,21 @@ export async function runOnce(
         + 'keeping temporary supervisor alive');
     startupRecoveryAllowed = interruptedForWake;
     sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
+    if (started.succeeded) startupTelemetry.mark('readiness_turn_completed');
+    // Readiness is now complete. Configured work (or retained continuity) is
+    // admitted as a distinct turn; its terminal result must not block console
+    // readiness, mail delivery, or supervisor liveness. Empty fresh agents wait
+    // for authenticated console input or the monitor's unread/arrival wake.
+    if (started.succeeded && !deps.shouldStop?.() && (
+      role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim() || booted
+    )) {
+      const queued = await arbiter.queuePrompt(managedTaskPrompt(dir, mode, booted), {
+        origin: { kind: 'startup' },
+      });
+      void queued.completion.then(result => {
+        deps.log(`[${name}] configured task turn ${result.outcome}`);
+      }, () => deps.log(`[${name}] configured task turn failed`));
+    }
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];

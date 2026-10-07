@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -34,7 +35,18 @@ const instance = randomUUID(),
 writeFileSync(config, JSON.stringify({ stateDir: state, port, apiVisibility: 'owner' }), {
   mode: 0o600,
 });
-writeFileSync(profile, JSON.stringify({ endpoint, expectedInstanceId: instance, credentialPath }), {
+// Exercise the current gateway profile contract through a task-isolated relay.
+const gateway = createHttpServer((req, res) => {
+  if (!req.url.startsWith('/daemon/')) { res.writeHead(404); res.end(); return; }
+  const upstream = httpRequest(endpoint + req.url.slice('/daemon'.length), { method: req.method, headers: req.headers }, reply => {
+    res.writeHead(reply.statusCode, reply.headers); reply.pipe(res);
+  });
+  upstream.on('error', () => { res.writeHead(502); res.end(); });
+  req.pipe(upstream);
+});
+await new Promise(resolve => gateway.listen(0, '127.0.0.1', resolve));
+const serverUrl = `http://127.0.0.1:${gateway.address().port}`;
+writeFileSync(profile, JSON.stringify({ serverUrl, endpoint: serverUrl + '/daemon', expectedInstanceId: instance, credentialPath }), {
   mode: 0o600,
 });
 const env = {
@@ -103,6 +115,8 @@ try {
     identity: 'Agent',
     harness: 'codex',
     sourceFile: 'test',
+    bio: 'Custom public role bio',
+    persona: 'Custom private role persona',
     env: { OURS_CONFIG: profile },
   };
   const dir = join(process.env.OURS_FLEET_HOME, '.ours-fleet', 'tmp', 'Agent');
@@ -125,6 +139,8 @@ try {
     const identity = await mcp.callTool({ name: 'current_identity', arguments: {} });
     assert.equal(identity.isError, false);
     assert(JSON.stringify(identity).includes(cid));
+    assert(JSON.stringify(identity).includes(role.bio));
+    assert(JSON.stringify(identity).includes(role.persona));
   };
   await managed.runtime.startHarness(connect);
   const tools = new SupervisorOursTools();
@@ -133,12 +149,16 @@ try {
   assert.equal((await tools.call('Agent', { tool: 'generate_invite' })).result.isError, false);
   await assert.rejects(() => tools.call('Agent', { tool: 'choose_identity', arguments: { name: 'TestRoot' } }), /not exposed/);
   assert.equal((await tools.list('Agent')).identity.cid, cid);
-  const modern = JSON.parse(readFileSync(managed.descriptor, 'utf8'));
-  const { role: _role, identity: _identity, cid: _cid, ...legacy } = modern;
-  writeFileSync(managed.descriptor, JSON.stringify(legacy));
-  assert.equal((await tools.list('Agent')).identity.cid, cid);
-  assert.equal((await tools.call('Agent', { tool: 'generate_invite' })).result.isError, false);
-  assert.deepEqual(JSON.parse(readFileSync(managed.descriptor, 'utf8')), legacy, 'legacy descriptor remains untouched');
+  // Legacy descriptors predate hashed private socket roots; exercise their exact
+  // logical-path proof only when that compatible transport is selected.
+  if (!process.env.OURS_FLEET_SOCKET_ROOT) {
+    const modern = JSON.parse(readFileSync(managed.descriptor, 'utf8'));
+    const { role: _role, identity: _identity, cid: _cid, ...legacy } = modern;
+    writeFileSync(managed.descriptor, JSON.stringify(legacy));
+    assert.equal((await tools.list('Agent')).identity.cid, cid);
+    assert.equal((await tools.call('Agent', { tool: 'generate_invite' })).result.isError, false);
+    assert.deepEqual(JSON.parse(readFileSync(managed.descriptor, 'utf8')), legacy, 'legacy descriptor remains untouched');
+  }
   await mcp.close();
   mcp = undefined;
   await managed.close(false);
@@ -158,9 +178,14 @@ try {
   writeFileSync(join(permanentDir, '.identity'), 'Permanent');
   managed = await prepareManagedAgent(permanent, permanentDir, false);
   const permanentCid = managed.runtime.snapshot.cid;
-  const permanentDescriptor = JSON.parse(readFileSync(managed.descriptor, 'utf8'));
-  delete permanentDescriptor.role; delete permanentDescriptor.identity; delete permanentDescriptor.cid;
-  writeFileSync(managed.descriptor, JSON.stringify(permanentDescriptor));
+  const permanentProfile = await tools.call('Permanent', { tool: 'current_identity' });
+  assert(JSON.stringify(permanentProfile).includes(permanent.bio));
+  assert(JSON.stringify(permanentProfile).includes(permanent.persona));
+  if (!process.env.OURS_FLEET_SOCKET_ROOT) {
+    const permanentDescriptor = JSON.parse(readFileSync(managed.descriptor, 'utf8'));
+    delete permanentDescriptor.role; delete permanentDescriptor.identity; delete permanentDescriptor.cid;
+    writeFileSync(managed.descriptor, JSON.stringify(permanentDescriptor));
+  }
   assert.equal((await tools.list('Permanent')).identity.cid, permanentCid);
   assert.equal((await tools.call('Permanent', { tool: 'generate_invite' })).result.isError, false);
   await managed.close(true);
@@ -181,6 +206,8 @@ try {
   await exited;
   clearTimeout(timer);
   clearTimeout(watchdog);
+  gateway.closeAllConnections();
+  await new Promise(resolve => gateway.close(resolve));
   if (oldHome === undefined) delete process.env.OURS_FLEET_HOME;
   else process.env.OURS_FLEET_HOME = oldHome;
   rmSync(root, { recursive: true, force: true });

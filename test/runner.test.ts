@@ -1415,6 +1415,59 @@ describe('runOnce ACP startup outcome', () => {
 });
 
 describe('runOnce monitor integration', () => {
+  it.each([false, true])('starts configured work after readiness without waiting for task completion (prior boot=%s)', async priorBoot => {
+    writeCfg({ A: { harness: 'fake', mission: 'Inspect the assigned fixture patch.' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    if (priorBoot) writeFileSync(join(d, '.booted'), 'earlier run\n');
+    const world = fakeWorld();
+    const prompts: string[] = [], logs: string[] = [];
+    let completeReady!: (value: TurnResult) => void;
+    const ready = new Promise<TurnResult>(resolve => { completeReady = resolve; });
+    let admitted!: () => void;
+    const admission = new Promise<void>(resolve => { admitted = resolve; });
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args);
+      session.queuePrompt = async text => {
+        prompts.push(text);
+        if (prompts.length === 1) {
+          admitted(); return { promptId: 'ready', queuedBehind: 0, completion: ready };
+        }
+        return { promptId: 'work', queuedBehind: 0, completion: new Promise<TurnResult>(() => {}) };
+      };
+      return session;
+    };
+    const running = runOnce('A', {}, { ...world.deps, log: line => logs.push(line) });
+    await admission;
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('Fleet readiness check');
+    expect(world.monitor.ranPid).toBeNull();
+    completeReady(turnResult(true, 'completed'));
+    await running; // Task turn remains unsettled; supervisor still ran the monitor.
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('Readiness has already been announced');
+    expect(prompts[1].includes('WORKLOG.md')).toBe(priorBoot);
+    expect(world.monitor.ranPid).toBe(4242);
+    expect(logs.some(line => line.includes('stage=readiness_turn_completed'))).toBe(true);
+    expect(logs.some(line => line.includes('] up;'))).toBe(true);
+  });
+
+  it('leaves a fresh agent with no configured task idle after readiness', async () => {
+    writeCfg({ A: { harness: 'fake', bio: 'Public charter only', persona: 'Preserve the custom charter.' } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const world = fakeWorld(), prompts: string[] = [];
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args), queue = session.queuePrompt;
+      session.queuePrompt = async text => { prompts.push(text); return queue(text); };
+      return session;
+    };
+    await runOnce('A', {}, world.deps);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('Fleet readiness check');
+    expect(world.monitor.ranPid).toBe(4242);
+  });
+
   it.each([false, true, 'after_tool'] as const)('defers %s wakes until startup success while keeping the early baseline', async policy => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet', interrupt: policy } } });
     mkdirSync(agentDir('A'), { recursive: true });
@@ -1430,7 +1483,7 @@ describe('runOnce monitor integration', () => {
       const session = await startSession(...args);
       const queue = session.queuePrompt;
       session.queuePrompt = async text => {
-        if (text.startsWith('Read and follow')) {
+        if (text.startsWith('Fleet readiness check')) {
           arrivals.push('arrived after baseline during startup'); admitted();
           return { promptId:'startup', queuedBehind:0, completion:terminal };
         }

@@ -41,6 +41,8 @@ export type FetchLike = (
 ) => Promise<FetchResponse>;
 
 export interface MonitorPageClient {
+  /** Body-free snapshot; never consumes messages or changes read status. */
+  unread(): Promise<{ identities: Array<Record<string, unknown>> }>;
   readNotificationPage(
     identity: string,
     options?: { since?: number | 'tip'; signal?: AbortSignal; requestTimeoutMs?: number },
@@ -448,6 +450,7 @@ export class Monitor {
   private stopped = false;
   private bootDeadline = 0;
   private currentAbort: AbortController | null = null;
+  private initialBacklogPending = true;
   // Refusal-wedge detector (issue #19): consecutive delivered wakes whose turn
   // ended in an API error with no completed turn in between.
   private apiErrorStreak = 0;
@@ -506,6 +509,36 @@ export class Monitor {
     const pending: NotifyEvent[] = [];
     try { while (!this.stopped) {
       if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
+      // The native SessionStart hook is disabled for managed sessions. Check
+      // existing unread work AFTER the ready turn, without a model inbox ritual
+      // or touching read status. Keep retrying a failed probe/delivery before
+      // committing stream cursors, including on supervisor restarts.
+      if (this.initialBacklogPending) {
+        try {
+          const body = await this.readInitialUnread();
+          if (!Array.isArray(body.identities)) throw new Error('unread summary is malformed');
+          const row = body.identities.find(row => row.name === this.identity);
+          if (row && (!Number.isSafeInteger(row.count) || Number(row.count) < 0
+              || !Number.isSafeInteger(row.files) || Number(row.files) < 0))
+            throw new Error('unread identity summary is malformed');
+          const messages = this.cfg.wake_sources.includes('message_received') ? Number(row?.count ?? 0) : 0;
+          const files = this.cfg.wake_sources.includes('file_received') ? Number(row?.files ?? 0) : 0;
+          if ((messages || files) && !await this.deliverLine(
+            `${PREFIX} unread backlog: ${messages} messages, ${files} files — run get_messages; drain remaining unread batches and authorize files before retrieving them`,
+          )) {
+            await this.deps.sleep(BACKOFF_MAX_MS);
+            continue;
+          }
+          this.initialBacklogPending = false;
+          this.recover('connectivity', 'auth');
+        } catch (e) {
+          if (this.stopped) return;
+          this.degrade('connectivity', 'initial unread check unavailable; retrying');
+          await this.deps.sleep(BACKOFF_MAX_MS);
+          continue;
+        }
+      }
+      if (this.stopped) return;
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
         body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_STALL_MS, 'stall');
@@ -572,7 +605,10 @@ export class Monitor {
   }
 
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
-    const line = formatNotificationLine(batch);
+    return this.deliverLine(formatNotificationLine(batch));
+  }
+
+  private async deliverLine(line: string): Promise<boolean> {
     if (!this.deps.delivery) {
       this.degrade('delivery', 'structured agent-session delivery is unavailable');
       return false;
@@ -665,6 +701,27 @@ export class Monitor {
       });
     }
     return this.profileClientPromise;
+  }
+
+  private async readInitialUnread(): Promise<{ identities: Array<Record<string, unknown>> }> {
+    const ctrl = new AbortController();
+    this.currentAbort = ctrl;
+    const timer = this.deps.timers.set(() => ctrl.abort(), 5_000);
+    let client: MonitorPageClient | undefined;
+    try {
+      const { endpoint, expectedInstanceId, credentialPath } = this.profile;
+      const options: AttachOursClientOptions = {
+        endpoint, expectedInstanceId, credentialPath,
+        sessionMode: 'external', leaseToken: this.monitorLeaseToken, env: {},
+        requestSignal: ctrl.signal,
+      };
+      client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
+      return await client.unread();
+    } finally {
+      this.deps.timers.clear(timer);
+      this.currentAbort = null;
+      await client?.close().catch(() => undefined);
+    }
   }
 
   private async disposeProfileClient(): Promise<void> {

@@ -429,17 +429,17 @@ export function makeClaudeCodeAdapter(
         'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
         '`[fleet-monitor]` lines — do NOT arm an in-session Monitor. When such a line appears, run ' +
         '**get_messages** to drain the mail.',
-      launchNote: name => `You were launched with \`--remote-control ${name}\`. Confirm you are running.`,
-      restartPrompt: (id, worklog, role) =>
-        `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
-        (role?.monitor?.mode === 'fleet'
-          ? 'then continue from '
-          : `then ${armMonitor(id)}, then continue from `) +
-        `${worklog}. Do not re-run whatever crashed you.` +
-        (role?.monitor?.mode === 'fleet'
-          ? ' Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
-            'do NOT arm an in-session Monitor.'
-          : ''),
+      launchNote: name => `You were launched as Fleet role \`${name}\` under a Claude session. Announce console readiness before task details.`,
+      restartPrompt: (id, worklog, role) => role?.monitor?.mode === 'fleet'
+        ? `Session restarted. The supervisor has verified assigned identity "${id}"; ` +
+          'accept that readiness and continue without rebinding or profile reconciliation. ' +
+          'Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
+          'do NOT arm an in-session Monitor. ' +
+          'Announce console readiness first without tools, then end that readiness turn. ' +
+          `For a separate continuation task, read ${worklog} once for continuity and reuse it in that wake. ` +
+          'Do not re-run whatever crashed you.'
+        : `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
+          `then ${armMonitor(id)}, then continue from ${worklog}. Do not re-run whatever crashed you.`,
     },
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },

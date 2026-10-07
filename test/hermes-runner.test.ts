@@ -1,3 +1,4 @@
+import { managedStartupPrompt, managedTaskPrompt } from '../src/startup-prompt.js';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,8 +45,8 @@ function world() {
       async queuePrompt(text, promptOptions) {
         prompts.push({ text, options: promptOptions,
           briefing: readFileSync(join(options.stateDir, 'briefing.md'), 'utf8') });
-        alive = false;
-        return { promptId: 'startup', queuedBehind: 0, completion: Promise.resolve(turnResult(true, 'completed')) };
+        if (!text.startsWith('Fleet readiness check')) alive = false;
+        return { promptId: text.startsWith('Fleet readiness check') ? 'ready' : 'task', queuedBehind: 0, completion: Promise.resolve(turnResult(true, 'completed')) };
       },
       submitPrompt: async () => turnResult(true, 'completed'),
       interrupt: async () => ({ state: 'settled' }), respondPermission: () => false,
@@ -101,7 +102,7 @@ describe('Hermes through the production runner', () => {
     { temporary: false, guarantee: 'created' },
     { temporary: false, guarantee: 'unverified' },
     { temporary: true, guarantee: 'unverified' },
-  ] as const)('uses a full fresh briefing on every restart (%j)', async ({ temporary, guarantee }) => {
+  ] as const)('announces readiness before a separate full task briefing on every restart (%j)', async ({ temporary, guarantee }) => {
     const w = world(); const p = provision(temporary); briefing(w, p, temporary, guarantee);
     const memory = join(p.stateDir, 'harness/hermes/memory.txt'); writeFileSync(memory, 'retained');
     const opts = { temp: temporary, configPath: p.configPath };
@@ -113,9 +114,13 @@ describe('Hermes through the production runner', () => {
     expect(w.runnerStarts.map(start => start.mode)).toEqual(['fresh', 'fresh']);
     expect(w.starts.map(start => start.mode)).toEqual(['fresh', 'fresh']);
     expect(w.prompts.map(prompt => prompt.text)).toEqual([
-      `Read and follow ${join(p.stateDir, 'briefing.md')} now.`,
-      `Read and follow ${join(p.stateDir, 'briefing.md')} now.`,
+      managedStartupPrompt(p.stateDir, 'fresh'),
+      managedTaskPrompt(p.stateDir, 'fresh'),
+      managedStartupPrompt(p.stateDir, 'fresh', true),
+      managedTaskPrompt(p.stateDir, 'fresh', true),
     ]);
+    expect(w.prompts[1].text).not.toContain('WORKLOG.md');
+    expect(w.prompts[3].text).toContain('WORKLOG.md once for continuity');
     expect(w.prompts.every(prompt => prompt.options?.origin?.kind === 'startup')).toBe(true);
     expect(w.prompts[1].briefing).toContain('Complete the distinctive full mission.');
     expect(readFileSync(memory, 'utf8')).toBe('retained');

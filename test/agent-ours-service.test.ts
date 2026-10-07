@@ -22,6 +22,8 @@ const daemon = vi.hoisted(() => ({
   redeems: 0,
   invites: [] as string[],
   member: false,
+  profileWrites: [] as string[],
+  failPersona: false,
 }));
 vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
   ...await importOriginal<typeof import('@ours.network/sdk/client')>(),
@@ -46,6 +48,12 @@ vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
         const row = current();
         if (!row) throw Error('NOT_BOUND');
         return row;
+      },
+      setBio: async ({ bio }: any) => { daemon.profileWrites.push('bio'); current().bio = bio; },
+      setPersona: async ({ persona }: any) => {
+        daemon.profileWrites.push('persona');
+        if (daemon.failPersona) throw Error('persona failed');
+        current().persona = persona;
       },
       listContacts: async () => ({ contacts: daemon.member ? [{ container_id: 'ROOM' }] : [] }),
       addContact: async ({ invite }: { invite: string }) => {
@@ -75,7 +83,7 @@ vi.mock('@ours.network/sdk/client', async (importOriginal) => ({
     function create(args: any, temporary: boolean) {
       daemon.created++;
       if (daemon.failCreate) throw Error('create response lost');
-      const row = { name: args.name, cid: 'CID-' + daemon.created, temporary, isRoot: false };
+      const row = { name: args.name, cid: 'CID-' + daemon.created, temporary, isRoot: false, bio: args.bio, persona: '' };
       daemon.rows.set(args.name, row);
       daemon.owners.set(opts.leaseToken, args.name);
       return { hierarchy: 'role', info: { cid: row.cid } };
@@ -126,6 +134,8 @@ beforeEach(() => {
   daemon.owners.clear();
   daemon.created = daemon.releases = daemon.closed = daemon.redeems = 0;
   daemon.invites = [];
+  daemon.profileWrites = [];
+  daemon.failPersona = false;
   daemon.failCreate = daemon.failRelease = daemon.member = false;
 });
 afterEach(() => {
@@ -248,4 +258,52 @@ it('release failure closes the connection and unlocks for explicit cleanup retry
   daemon.failRelease = false;
   await releaseManagedAgent(role);
   expect(daemon.releases).toBe(2);
+});
+
+it.each([false, true])('provisions custom Role profile before harness, preserves it on reconnect (temporary=%s)', async temporary => {
+  role.bio = 'Public custom role';
+  role.persona = 'Private custom operating contract';
+  if (temporary) storeTemporaryLaunch(role, 'profile-launch');
+  let managed = await prepareManagedAgent(role, stateDir, temporary);
+  const cid = managed.runtime.snapshot.cid;
+  await managed.runtime.startHarness(async () => {
+    expect(daemon.rows.get('Agent')).toMatchObject({ bio: role.bio, persona: role.persona });
+  });
+  expect(daemon.profileWrites).toEqual(['persona']);
+  await managed.close(false);
+  managed = await prepareManagedAgent(role, stateDir, temporary);
+  expect(managed.runtime.snapshot.cid).toBe(cid);
+  expect(daemon.profileWrites).toEqual(['persona']);
+  await managed.close(true);
+});
+it('omitted profile preserves existing custom values, explicit empty values clear them', async () => {
+  role.bio = 'Custom bio'; role.persona = 'Custom persona';
+  let managed = await prepareManagedAgent(role, stateDir, false);
+  await managed.close(false);
+  delete role.bio; delete role.persona;
+  managed = await prepareManagedAgent(role, stateDir, false);
+  expect(daemon.rows.get('Agent')).toMatchObject({ bio: 'Custom bio', persona: 'Custom persona' });
+  expect(daemon.profileWrites).toEqual(['persona']);
+  await managed.close(false);
+  role.bio = ''; role.persona = '';
+  managed = await prepareManagedAgent(role, stateDir, false);
+  expect(daemon.rows.get('Agent')).toMatchObject({ bio: '', persona: '' });
+  expect(daemon.profileWrites).toEqual(['persona', 'bio', 'persona']);
+  await managed.close(true);
+});
+it('profile failure does not publish room readiness or redeem invite; retry preserves identity', async () => {
+  role.persona = 'Required contract';
+  role.roomMemberStartup = { room_id: 'room', room_identity_cid: 'ROOM', identity_name: 'Agent', invite_id: 'seat', invite: 'test-only-invite', role: 'Developer', task: 'test' };
+  storeRoomSecret(role); storeTemporaryLaunch(role, 'profile-launch');
+  daemon.failPersona = true;
+  await expect(prepareManagedAgent(role, stateDir, true)).rejects.toThrow('persona failed');
+  const cid = daemon.rows.get('Agent').cid;
+  expect(daemon.redeems).toBe(0);
+  expect(readdirSync(join(privateRuntimeRoot(), 'room-inputs')).some(x => x.endsWith('.ready.json'))).toBe(false);
+  daemon.failPersona = false;
+  const managed = await prepareManagedAgent(role, stateDir, true);
+  expect(managed.runtime.snapshot.cid).toBe(cid);
+  expect(daemon.created).toBe(1);
+  expect(daemon.redeems).toBe(1);
+  await managed.close(true);
 });

@@ -69,6 +69,7 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
     log: () => {},
     env: gatewayFixture(dir).env,
     attachClient: async options => ({
+      unread: async () => ({ identities: [] }),
       readNotificationPage: async (identity, optionsPage) => {
         const response = await fetch(`${options.endpoint}/identities/${encodeURIComponent(identity)}/notifications?since=${optionsPage.since}`, { signal: optionsPage.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -358,6 +359,7 @@ describe('Monitor.prime', () => {
       attachClient: async () => {
         attachments++;
         return {
+          unread: async () => ({ identities: [] }),
           readNotificationPage: async () => {
             if (++pageCalls === 1) throw new Error('readNotificationPage: HTTP 401');
             mon.stop();
@@ -373,7 +375,7 @@ describe('Monitor.prime', () => {
     await mon.run(1);
 
     expect(pageCalls).toBe(2);
-    expect(attachments).toBe(1);
+    expect(attachments).toBe(2);
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed at /);
   });
 
@@ -398,6 +400,7 @@ describe('Monitor.prime', () => {
       attachClient: async options => {
         attached.push(options);
         return {
+          unread: async () => ({ identities: [] }),
           readNotificationPage: async (identity, options = {}) => {
             const credential = readFileSync(credentialPath, 'utf8').trim();
             const since = options.since ?? 'tip';
@@ -431,6 +434,10 @@ describe('Monitor.prime', () => {
     expect(attached).toEqual([{
       endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
       sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
+    }, {
+      endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
+      requestSignal: expect.any(AbortSignal),
     }]);
     expect(pages).toEqual([
       { identity: 'ProfileIdentity', since: 'tip', credential: 'first-credential' },
@@ -535,6 +542,85 @@ describe('Monitor.prime', () => {
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await expect(mon.prime()).resolves.toBeUndefined();
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded/);
+  });
+});
+
+describe('Monitor initial unread work', () => {
+  it.each([false, true])('delivers a body-free backlog without consuming it (persisted cursor=%s)', async persisted => {
+    if (persisted) writeFileSync(join(dir, '.notify-cursor'), '12\n');
+    const { fetch } = scriptedFetch([{ cursor: 12, events: [] }]);
+    const delivered: string[] = [];
+    let probes = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      delivery: { submit: async text => {
+        delivered.push(text);
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        mon.stop();
+        return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => ({ ...await attach(options), unread: async () => {
+      probes++;
+      return { identities: [
+        { name: 'OtherIdentity', count: 99, files: 99 },
+        { name: 'A', count: 201, files: 2, recent: [{ from: 'private-name', text: 'private-body' }] },
+      ] };
+    } });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    expect(probes).toBe(0); // No pre-read on the protected readiness path.
+    await mon.run(1);
+    expect(probes).toBe(1);
+    expect(delivered).toEqual([
+      '[fleet-monitor] unread backlog: 201 messages, 2 files — run get_messages; drain remaining unread batches and authorize files before retrieving them',
+    ]);
+  });
+
+  it('retries a failed unread probe and a refused wake before polling/committing the stream', async () => {
+    const { fetch, calls } = scriptedFetch([{ cursor: 12, events: [] }]);
+    let probes = 0, deliveries = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      delivery: { submit: async () => {
+        expect(calls()).toHaveLength(1);
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        if (++deliveries === 1) return { succeeded: false, outcome: 'refused' };
+        mon.stop(); return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => ({ ...await attach(options), unread: async () => {
+      if (++probes === 1) throw new Error('private-error');
+      return { identities: [{ name: 'A', count: 1, files: 0 }] };
+    } });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(probes).toBe(3); expect(deliveries).toBe(2);
+    expect(calls()).toHaveLength(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed/);
+  });
+
+  it('leaves empty or other-identity inboxes idle and bounds the read-only probe', async () => {
+    let mon: ReturnType<typeof createMonitor>, signal: AbortSignal | undefined;
+    const { fetch } = scriptedFetch([{ cursor: 12, events: [] }, { cursor: 12, events: [] }], (_, n) => {
+      if (n === 1) mon.stop();
+    });
+    const delivered: string[] = [];
+    const deadlines: number[] = [];
+    const deps = makeDeps(fetch, {
+      timers: { set: (_, ms) => { deadlines.push(ms); return 0 as never; }, clear: () => {} },
+      delivery: { submit: async text => { delivered.push(text); return { succeeded: true, outcome: 'completed' }; } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => {
+      if (options.requestSignal) signal = options.requestSignal;
+      return { ...await attach(options), unread: async () => ({ identities: [{ name: 'Other', count: 1, files: 0 }] }) };
+    };
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(delivered).toEqual([]);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(deadlines).toContain(5_000);
   });
 });
 
