@@ -269,7 +269,7 @@ export async function prepareManagedAgent(
       client,
       identities,
       remoteDaemonFiles: true,
-      ...(exportRoot ? { currentChatFile: (async (input, extra, files) => {
+      ...(exportRoot ? { currentChatFileDirectory: role.file_delivery!.directory, currentChatFile: (async (input, extra, files) => {
         if (!fileSender || !exportRoot) throw Error('CURRENT_CHAT_DELIVERY_UNAVAILABLE');
         exportPath(exportRoot.root, cwd, input.path); // validate before approval/read
         const name = input.filename ?? basename(input.path);

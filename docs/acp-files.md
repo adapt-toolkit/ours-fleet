@@ -32,6 +32,7 @@ file_delivery:
   directory: deliverables
 ```
 
+The tool description advertises this directory and the 20 MiB limit to the Agent.
 The directory is a non-hidden subtree of the Agent's working directory. Both
 routes interpret relative paths from that working directory; absolute paths keep
 their usual meaning. Chat sending additionally enforces the export directory.

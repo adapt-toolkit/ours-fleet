@@ -49,7 +49,7 @@ export class ArtifactStore {
       signal.throwIfAborted(); await file.chmod(0o400); await file.sync(); await file.close(); file = undefined;
       const record: DeliveredFile = { id, name, mimeType, size, sha256: hash.digest('hex'), ...binding };
       renameSync(partial, base + id + '.data');
-      writeFileSync(base + id + '.json', JSON.stringify(record), { flag: 'wx', mode: 0o400 });
+      writeFileSync(base + id + '.json', JSON.stringify(record), { flag: 'wx', mode: 0o400, flush: true });
       // No pending-send record or recovery: a later failure leaves only unreferenced stored bytes.
       await root.sync(); return record;
     } finally {

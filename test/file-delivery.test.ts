@@ -1,4 +1,5 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, renameSync, rmSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -81,4 +82,20 @@ it('injected steering revokes both later sends and publication of a copy already
  await expect(s.sendFileToChat({path:'deliverables/x'},signal(),async()=>{copies++;throw Error('unexpected');},policy)).rejects.toThrow('CURRENT_CHAT_DELIVERY_UNAVAILABLE');
  expect(copies).toBe(1);expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);await s.interrupt();await task;
  const next=await running(s);await s.sendFileToChat({path:'deliverables/x'},signal(),async b=>({id:randomUUID(),name:'x',mimeType:'text/plain',size:1,sha256:'x',...b}),policy);await s.interrupt();await next.task;
+});
+
+it('metadata sync failure returns failure without a receipt, publication or automatic second attempt',async()=>{
+ const {dir,s}=await live();process.env.OURS_FLEET_HOME=dir;mkdirSync(join(dir,'.ours-fleet'));writeFileSync(join(dir,'.session-id'),randomUUID());
+ const store=new ArtifactStore(dir);const {task}=await running(s);let attempts=0,metadataSyncs=0;
+ const original=fs.fsyncSync;const sync=vi.spyOn(fs,'fsyncSync').mockImplementation(fd=>{
+  if(fs.readlinkSync(`/proc/self/fd/${fd}`).endsWith('.json')){metadataSyncs++;throw Error('injected metadata fsync failure');}
+  return original(fd);
+ });
+ try{
+  await expect(s.sendFileToChat({path:'deliverables/x'},signal(),async b=>{
+   attempts++;return store.copy({size:3,body:new Blob(['abc']).stream(),close:async()=>{}},'x','text/plain',b,signal());
+  },policy)).rejects.toThrow('injected metadata fsync failure');
+  expect(metadataSyncs).toBe(1);expect(attempts).toBe(1);
+  expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);
+ }finally{sync.mockRestore();await s.interrupt();await task;}
 });

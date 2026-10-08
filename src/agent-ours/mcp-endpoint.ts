@@ -21,6 +21,7 @@ export interface EndpointOptions {
   client: OursClient;
   identities: ApplicationIdentityStore;
   remoteDaemonFiles: boolean;
+  currentChatFileDirectory?: string;
   currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
 }
 export async function startMcpEndpoint(
@@ -56,7 +57,7 @@ export async function startMcpEndpoint(
     };
     const mcp = createManagedOursMcpServer(options.client, 'managed-v1', options.identities, {
       remoteDaemonFiles: options.remoteDaemonFiles,
-      ...(options.currentChatFile ? { currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
+      ...(options.currentChatFile ? { currentChatFileDirectory: options.currentChatFileDirectory, currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
       fileContext: files,
       admit: async () => {
         if (!authenticated || inFlight >= 32) throw Error('MCP_ADMISSION_LIMIT');
