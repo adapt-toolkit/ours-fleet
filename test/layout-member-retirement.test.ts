@@ -17,6 +17,7 @@ afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: tru
 async function fixture() {
   const runId = 'task-owned', key = 'worker', name = layoutOwnedMemberName(runId, key), cid = 'ab'.repeat(32), action = `${runId}:${key}`;
   const dir = agentDir(name, true); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'role.yaml'), JSON.stringify({ name, identity: name }));
   writeFileSync(join(dir, '.identity'), name); writeFileSync(join(dir, 'creation.json'), JSON.stringify({ role: name, creationActionId: action }));
   const supervisor = prepareTempSupervisor(dir, name);
   writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...supervisor, kind: 'systemd-transient', target: 'isolated-layout.service', phase: 'active' }));

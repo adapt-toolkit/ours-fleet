@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { parse } from 'yaml';
 import { binderKey } from '../agent-ours/state.js';
 import { readClientProfile } from '../client-profile.js';
 import { readProvenance } from '../creation.js';
@@ -51,7 +52,9 @@ export async function retireOwnedLayoutMember(instance: LayoutInstance, runId: s
       || provenance.creationActionId !== action || proof(join(source, '.identity')).trim() !== instance.agent)
     throw Error('LAYOUT_MEMBER_LAUNCH_MISMATCH');
   {
-    const profile = readClientProfile(process.env);
+    const role = parse(proof(join(source, 'role.yaml')));
+    if (role?.name !== instance.agent || role.identity !== instance.agent) throw Error('LAYOUT_MEMBER_ROLE_MISMATCH');
+    const profile = readClientProfile({ ...process.env, ...role.env });
     const privateDir = join(stateRoot(), 'private-ours', binderKey(profile.expectedInstanceId, instance.agent));
     const runtime = JSON.parse(proof(join(privateDir, 'state.json')));
     const runtimeInstance = JSON.parse(proof(join(privateDir, 'instance.json')));

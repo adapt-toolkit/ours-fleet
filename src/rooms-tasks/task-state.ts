@@ -765,6 +765,8 @@ function findCursorForSeat(
     throw new TaskStateError(
       `task ${id} deletion member '${seat.role_name}' identity CID mismatch between cursor and room seat`,
     );
+  if (cursor?.action_id && seat.launch?.action_id && cursor.action_id !== seat.launch.action_id)
+    throw new TaskStateError(`task ${id} deletion member '${seat.role_name}' creation ownership proof changed`);
   return cursor;
 }
 
@@ -787,11 +789,13 @@ export function upsertTaskDeletionMembersFromSeats(
   const now = new Date().toISOString();
   for (const seat of seats) {
     if (!seat.identity_cid) continue;
-    if (!findCursorForSeat(id, stored, seat)) {
+    const cursor = findCursorForSeat(id, stored, seat);
+    if (!cursor) {
       stored.deletion.members.push({
         name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now,
+        ...(seat.launch?.action_id ? { action_id: seat.launch.action_id } : {}),
       });
-    }
+    } else if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
   }
   writeTask(stored);
   return presentTaskLenient(stored);
@@ -857,6 +861,7 @@ export function importTaskDeletionRetirementEvidence(
       cursor = { name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now };
       stored.deletion.members.push(cursor);
     }
+    if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
     if (DELETION_MEMBER_PHASE_ORDER[evidence.phase] < DELETION_MEMBER_PHASE_ORDER[cursor.phase]) continue;
     if (cursor.launch_id !== undefined && cursor.launch_id !== evidence.launch_id)
       throw new TaskStateError(
