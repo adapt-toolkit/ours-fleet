@@ -263,6 +263,7 @@ export interface AcpSessionOptions {
   inheritEnvironment?: boolean;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  requireResume?: boolean;
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
@@ -1270,6 +1271,8 @@ export class AcpSession implements AgentSession {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
+    if (this.options.requireResume && (!persisted || !(this.agentCapabilities?.sessionCapabilities?.resume != null || this.agentCapabilities?.loadSession)))
+      throw new Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
     let advertisedModes: acp.SessionModeState | null | undefined;
     let advertisedModelId: string | undefined;

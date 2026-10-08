@@ -57,7 +57,7 @@ export class CodexAgentSessionAdapter implements AgentSessionAdapter {
     } : original;
     if (role.session === 'codex-app-server') return this.nativeTransport({
       name: role.name, argv: launch.argv, cwd: options.cwd, env: launch.env,
-      stateDir: options.stateDir, mode: options.mode, permissions: options.permissions,
+      stateDir: options.stateDir, mode: options.mode, requireResume: options.requireResume, permissions: options.permissions,
       permissionMode: options.permissionMode,
       model: role.model, effort: role.effort,
       approvalPolicy: this.strategy.approvalPolicy(role),
@@ -69,7 +69,7 @@ export class CodexAgentSessionAdapter implements AgentSessionAdapter {
     return this.transport({
       name: role.name, harness: role.harness,
       argv: launch.argv, cwd: options.cwd, env: launch.env,
-      stateDir: options.stateDir, mode: options.mode, permissions: options.permissions,
+      stateDir: options.stateDir, mode: options.mode, requireResume: options.requireResume, permissions: options.permissions,
       modeId: this.strategy.permissionModeId(role),
       mcpServers: options.managedOurs ? [...(this.strategy.mcpServers(role) ?? []).filter(s => s.name !== 'ours'), options.managedOurs.server] : this.strategy.mcpServers(role),
       inheritEnvironment: options.managedOurs ? false : undefined,

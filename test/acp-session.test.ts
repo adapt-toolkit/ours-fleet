@@ -70,6 +70,16 @@ async function waitForRunning(session: AcpSession): Promise<void> {
 }
 
 describe('AcpSession', () => {
+  it('refuses a fresh fallback when durable task context requires resume', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-resume-')); dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'retained-session\n');
+    await expect(AcpSession.start({ name: 'Task', argv: [process.execPath, fixture], cwd: stateDir,
+      env: {}, stateDir, mode: 'resume', requireResume: true,
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, log: () => {},
+    })).rejects.toThrow('TASK_CONTEXT_RESUME_UNAVAILABLE');
+    expect(readFileSync(join(stateDir, '.acp-session-id'), 'utf8')).toBe('retained-session\n');
+  });
+
   it('initializes ACP v1, streams typed events, and completes a prompt', async () => {
     const session = await start();
     const result = await session.submitPrompt('hello');

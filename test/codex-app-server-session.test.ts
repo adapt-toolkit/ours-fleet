@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -177,6 +177,21 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it('rejects a changed native thread during durable task resume without overwriting context', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-native-durable-'));
+    writeFileSync(join(stateDir, '.session-id'), 'retained-thread');
+    const transport: CodexAppServerTransportFactory = async options => {
+      const server = new FakeAppServer(options), request = server.request.bind(server);
+      server.request = async <T = unknown>(method: string, params: Record<string, unknown> = {}) =>
+        method === 'thread/resume' ? { thread: { id: 'replacement-thread' } } as T : request<T>(method, params);
+      return server;
+    };
+    try {
+      await expect(start(stateDir, 'resume', 'allow', transport, { requireResume: true })).rejects.toThrow('TASK_CONTEXT_RESUME_MISMATCH');
+      expect(readFileSync(join(stateDir, '.session-id'), 'utf8')).toBe('retained-thread');
+    } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+
   it('targets live cancellation to generation and prompt without canceling another native turn', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-live-native-'));
     let server: FakeAppServer;

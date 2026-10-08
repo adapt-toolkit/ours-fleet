@@ -52,6 +52,11 @@ function marked(path: string, w: OwnedWorkspace): void {
   const actual = JSON.parse(readFileSync(marker, 'utf8')) as OwnedWorkspace;
   if (JSON.stringify(actual) !== JSON.stringify(w)) fail('ownership marker mismatch');
 }
+/** Read-only recovery proof; never allocate a replacement for a missing workspace. */
+export function assertWorkspacePresent(w: OwnedWorkspace, owner: OwnedWorkspace['owner'], id: string): void {
+  validateWorkspace(w, owner, id);
+  marked(w.path, w);
+}
 function staging(w: OwnedWorkspace, phase: string): string {
   return join(dirname(w.path), `.${w.id}.${w.token}.${phase}`);
 }

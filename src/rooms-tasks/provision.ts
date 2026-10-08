@@ -17,7 +17,8 @@ import type {
   TemplateSnapshot, TemplateMemberSlot,
 } from './types.js';
 import { storedRoomLaunchPolicy } from './types.js';
-import { spawnTemp } from '../spawn.js';
+import { spawnTemp, resumeTaskSupervisor } from '../spawn.js';
+import { adoptLegacyTaskMember } from './legacy-task-member.js';
 import type { SpawnOpts } from '../spawn.js';
 import { type FleetConfig, type RoomMemberStartup } from '../config.js';
 import type { AgentDefinition, ResolvedRole } from '../config.js';
@@ -335,6 +336,21 @@ async function retainRunningLaunch(input: {
       } });
       return true;
     }
+    if (supervisor.taskOwner) {
+      await resumeTaskSupervisor(member.name, provision.binPath);
+      updateMemberStartup(provision.roomId, member.name, { launch: {
+        ...retainedLaunch, state: 'launched', launch_id: supervisor.launchId,
+        presentation: retainedLaunch.presentation ?? presentationFromStatePath(dir, settings, member.coworkRole),
+        updated_at: new Date().toISOString(),
+      } });
+      return true;
+    }
+    if (provision.taskId) {
+      const adopted = await adoptLegacyTaskMember({ taskId: provision.taskId, roomId: provision.roomId,
+        roomIdentityCid, creationActionId: retainedLaunch.action_id! }, member.name);
+      if (adopted !== 'running-legacy') await resumeTaskSupervisor(member.name, provision.binPath);
+      return true;
+    }
     await secureStoppedTempArchive(member.name, supervisor.launchId);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       ...retainedLaunch, state: 'stopped', launch_id: supervisor.launchId,
@@ -344,6 +360,7 @@ async function retainRunningLaunch(input: {
   }
 
   if (seat.launch?.state === 'launched' && !existsSync(dir)) {
+    if (provision.taskId) throw Error(`retained task member ${member.name} is missing; explicit reconciliation required`);
     if (!seat.launch.launch_id || !seat.launch.action_id)
       throw new Error(`missing durable launch identity for disappeared ${member.name}`);
     const archive = await secureStoppedTempArchive(member.name, seat.launch.launch_id);
@@ -664,6 +681,7 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
           member,
           settings: settings.get(member.name)!,
           startup: {
+            ...(taskId ? { task_id: taskId } : {}),
             workspace: existing.workspace,
             room_id: roomId,
             room_identity_cid: roomIdentityCid,

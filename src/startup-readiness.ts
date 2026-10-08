@@ -1,6 +1,6 @@
 import { agentDir } from './paths.js';
 import { findRole, loadConfig } from './config.js';
-import { resolveConfigPath } from './runner.js';
+import { resolveConfigPath, loadTempRole } from './runner.js';
 import { probeDaemonGeneration, type DaemonGenerationProbe } from './daemon-recovery.js';
 import type { FetchLike } from './monitor.js';
 
@@ -16,7 +16,7 @@ interface ReadinessDeps {
 
 /** Read-only preflight: never binds identities, starts a harness or edits its ledger. */
 export async function waitForRoleDaemon(
-  name: string, configPath?: string, partial: Partial<ReadinessDeps> = {},
+  name: string, configPath?: string, partial: Partial<ReadinessDeps> = {}, temp = false,
 ): Promise<void> {
   const deps: ReadinessDeps = {
     probe: env => probeDaemonGeneration(
@@ -30,7 +30,7 @@ export async function waitForRoleDaemon(
     ...partial,
   };
   const path = resolveConfigPath(agentDir(name), configPath);
-  const role = findRole(loadConfig(path), name);
+  const role = temp ? loadTempRole(name) : findRole(loadConfig(path), name);
   const env = { ...deps.env, ...role.env };
   const deadline = deps.now() + STARTUP_WAIT_MS;
   let lastReason = '';

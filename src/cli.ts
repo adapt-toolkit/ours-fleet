@@ -1654,6 +1654,11 @@ program.command('_wait-daemon <name>', { hidden: true }).description('internal: 
     try { await waitForRoleDaemon(name, opts.configuration); } catch (e) { die(e); }
   });
 
+program.command('_wait-temp-daemon <name>', { hidden: true })
+  .action(async name => {
+    try { await waitForRoleDaemon(name, undefined, {}, true); } catch (error) { die(error); }
+  });
+
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {

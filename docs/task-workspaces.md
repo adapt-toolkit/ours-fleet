@@ -159,3 +159,27 @@ claiming complete erasure. An identity with no recoverable authenticated binding
 requires restoring its actual ownership evidence; a name-only force removal is
 not supported. Room deletion removes the linked Task's dead room/member links and preserves its workspace; use explicit
 Task deletion when the request includes the associated Task and its artifacts.
+
+
+## Retained task supervisors
+
+Task-created members use separate persistent systemd user units on Linux or
+LaunchAgents on macOS. The resolved role, task cwd, supervisor launch ID, daemon
+identity ownership, room admission and harness conversation stay with the task;
+service restart or the next boot resumes them in place. Task agents remain outside
+the configured standalone roster. Explicit supervisor mode `none` has no boot
+service; use the recovery command after starting the required daemon manually.
+
+`ours-fleet task recover-members <task-id>` checks retained ownership and room
+admission before resuming stopped members or resetting their held restart circuit.
+It never creates identities or issues/redeems another invitation. Active legacy
+transient members remain unchanged and report `migration_pending`; proven stopped
+single-room members can be adopted into durable supervision without changing their
+identity, launch ID or saved conversation. Legacy layout members with no durable
+ownership marker require explicit reconciliation.
+
+Missing private runtime ownership, saved conversation, workspace marker or exact
+room evidence fails closed. Restore the original evidence before retrying. A
+backend that cannot resume the saved conversation cannot silently open a fresh
+session. Task deletion disables/removes the owned boot service before retiring
+and erasing its resources; service-manager failures retain retryable cleanup state.

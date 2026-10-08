@@ -32,6 +32,8 @@ export interface AgentSessionStartOptions {
   cwd: string;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  /** Durable task context must never silently fall back to a fresh session. */
+  requireResume?: boolean;
   permissions: CommonPermissions;
   permissionMode: { fleetMode: FleetPermissionMode; nativeMode: string };
   log(line: string): void;

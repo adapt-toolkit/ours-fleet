@@ -2,6 +2,7 @@ import { StartupTelemetry } from './startup-telemetry.js';
 import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
+import { taskSupervisorMayRun } from './task-supervision.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { prepareManagedCliLaunch } from './managed-cli.js';
@@ -62,7 +63,7 @@ import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
 import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
 import {
-  archiveTempState, markTempSupervisorActive, requestedTempStopReason,
+  archiveTempState, markTempSupervisorActive, requestedTempStopReason, readTempSupervisor,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
 import { FleetCommandAuditStore } from './fleet-command-audit.js';
@@ -636,7 +637,10 @@ export async function runOnce(
   const bootedFile = join(dir, '.booted');
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
+  const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
+  if (durableTask && !adapter.supportsResume) throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
+  const requireResume = durableTask && booted && existsSync(join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id'));
   // Stamp EVERY attempt, not just the first. `.booted` used to be written only
   // on the fresh path, so after a restart — including one the supervisor never
   // saw, like an OOM-kill — its mtime still read the original boot and any
@@ -796,7 +800,7 @@ export async function runOnce(
       managedOurs: managedHarness.ours,
       role, prep,
       launch: { ...launch, argv: wrappedArgv, env: managedHarness.env },
-      cwd: runCwd, stateDir: dir, mode, permissions: perms,
+      cwd: runCwd, stateDir: dir, mode, requireResume, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
     }));
     managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
@@ -1090,7 +1094,7 @@ export async function runOnce(
   });
 
   let chatIdle: TemporaryChatIdle | undefined;
-  try { if(temp && !role.roomMemberStartup) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
+  try { if(temp && !role.roomMemberStartup && !readTempSupervisor(dir)?.taskOwner) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
   catch { deps.log(`[${name}] automatic idle closure disabled: activity state is unreadable`); }
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
@@ -1212,8 +1216,8 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (!temp && deps.shouldStop?.())
-    deps.log(`[${name}] supervisor stop requested -> next start RESUMES context`);
+  if (readTempSupervisor(dir)?.taskOwner || (!temp && deps.shouldStop?.()))
+    deps.log(`[${name}] supervisor/context retained -> next start RESUMES context`);
   else if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
@@ -1261,18 +1265,20 @@ export async function runOnce(
  */
 export async function runSupervised(
   name: string,
-  opts: { configPath?: string } = {},
+  opts: { configPath?: string; temp?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
   attempt: (
-    n: string, o: { configPath?: string; allowResumeRotation?: boolean }, d: Partial<RunnerDeps>,
+    n: string, o: { configPath?: string; allowResumeRotation?: boolean; temp?: boolean }, d: Partial<RunnerDeps>,
   ) => Promise<AttemptResult> = runOnce,
 ): Promise<RestartLedger> {
   const deps = { ...defaultDeps(), ...partialDeps };
-  const dir = agentDir(name);
+  const taskMember = opts.temp === true;
+  const dir = agentDir(name, taskMember);
   mkdirSync(dir, { recursive: true });
   let stopping = false;
   const requestStop = () => { stopping = true; };
-  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false);
+  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false)
+    || (taskMember && requestedTempStopReason(dir) === 'operator-stop');
   deps.shouldStop = shouldStop;
   const stamp = () => new Date(deps.now()).toISOString();
 
@@ -1302,10 +1308,11 @@ export async function runSupervised(
   process.on('SIGINT', requestStop);
   try {
   while (!shouldStop()) {
+    if (taskMember && !taskSupervisorMayRun(name)) break;
     let ledger = readRestartLedger(dir);
     try {
       const configPath = resolveConfigPath(dir, opts.configPath);
-      const role = findRole(loadConfig(configPath), name);
+      const role = taskMember ? loadTempRole(name) : findRole(loadConfig(configPath), name);
       reconcileModelRecovery(dir, role, stamp());
       if (modelRecoveryHeld(dir)) {
         await deps.sleep(HELD_DOWN_POLL_MS);
@@ -1322,19 +1329,26 @@ export async function runSupervised(
       continue;
     }
 
+    if (attempt === runOnce && taskMember) {
+      // Boot-time daemon unavailability must not consume the harness crash budget.
+      const { waitForRoleDaemon } = await import('./startup-readiness.js');
+      await waitForRoleDaemon(name, undefined, {}, true);
+    }
+    if (taskMember && (shouldStop() || !taskSupervisorMayRun(name))) break;
     let result: AttemptResult;
     try {
       // Service-manager boot and automatic retry bypass the operator-facing
       // up/restart commands. Reconcile again immediately before every real
       // permanent harness attempt; the operation is idempotent and releases its
       // provisioning lease before the agent or owner channel binds.
-      if (attempt === runOnce) {
+      if (attempt === runOnce && !taskMember) {
         const configPath = resolveConfigPath(dir, opts.configPath);
         const role = findRole(loadConfig(configPath), name);
         await reconcilePermanentRoleIdentities(role, undefined, deps.log);
       }
       result = await attempt(
-        name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
+        name, { configPath: opts.configPath, ...(taskMember ? { temp: true } : {}),
+          allowResumeRotation: taskMember ? false : !ledger.resumeDiscarded }, deps);
     } catch (e) {
       if (e instanceof SupervisorRecycleRequiredError) {
         writeRestartLedger(dir, {
@@ -1356,7 +1370,7 @@ export async function runSupervised(
       };
     }
 
-    if (stopping) break;
+    if (stopping || (taskMember && (shouldStop() || result.retirementReason))) break;
 
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
@@ -1374,7 +1388,8 @@ export async function runSupervised(
       await deps.sleep(HELD_DOWN_POLL_MS);
       continue;
     }
-    const fastFailSecs = fastFailSecsFor(name, opts.configPath);
+    const fastFailSecs = taskMember ? getAdapter(loadTempRole(name).harness).exitPolicy.fastFailSecs
+      : fastFailSecsFor(name, opts.configPath);
     // The fast-fail boundary starts a recovery episode; it must not also be
     // the boundary that declares recovery successful. Otherwise alternating
     // 19s and 20s deaths erase one another forever. Require the configured
@@ -1413,7 +1428,7 @@ export async function runSupervised(
       next.nextDelayMs = 0;
       writeRestartLedger(dir, next);
       deps.log(`[${name}] HELD DOWN after ${failures} immediate failures at ${next.openedAt} — ` +
-        `${reason}; the agent will not be restarted until: ours-fleet restart ${name}`);
+        `${reason}; recover with: ${taskMember ? `ours-fleet task recover-members ${readTempSupervisor(dir)!.taskOwner!.taskId}` : `ours-fleet restart ${name}`}`);
       continue;
     }
     writeRestartLedger(dir, next);
@@ -1427,7 +1442,7 @@ export async function runSupervised(
     process.off('SIGINT', requestStop);
     // An orderly shutdown clears the marker; an unhandled signal or OOM-kill
     // leaves it so the successor can identify an abrupt termination.
-    if (shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
+    if (!taskMember && shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
     releaseSupervisorRun(dir);
   }
 }
@@ -1450,6 +1465,16 @@ export async function runTemp(
   attempt: typeof runOnce = runOnce,
 ): Promise<void> {
   const dir = agentDir(name, true);
+  if (readTempSupervisor(dir)?.taskOwner) {
+    // Serialize the entire process lifetime before metadata/session writes.
+    const lease = await acquireOwnerBinderLease(join(dir, '.task-supervisor'), 'task-supervisor', name);
+    try {
+      if (!taskSupervisorMayRun(name)) return;
+      await markTempSupervisorActive(dir);
+      await runSupervised(name, { temp: true }, deps, attempt);
+    } finally { lease.release(); }
+    return;
+  }
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
   const onTerm = () => { signal = 'SIGTERM'; };

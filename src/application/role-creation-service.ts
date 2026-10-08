@@ -186,7 +186,8 @@ export class RoleCreationService {
   async createManaged(caller: ResolvedRole, requested: SpawnOpts): Promise<ManagedFleetSpawnResult> {
     const plan = this.previewSpawn({ origin: 'managed', caller, options: requested }) as
       Extract<CreationPlan, { origin: 'managed' }>;
-    const creationActionId = randomUUID();
+    const creationActionId = requested.roomMemberStartup?.task_id
+      ? requested.creationActionId ?? randomUUID() : randomUUID();
     plan.options.creationActionId = creationActionId;
     const statePath = await this.launchSync(plan.options);
     const selectionSummary = (kind: 'brain' | 'role'): string => {

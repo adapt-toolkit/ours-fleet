@@ -636,6 +636,23 @@ describe('runOnce', () => {
     expect(existsSync(join(d, '.booted'))).toBe(false);
   });
 
+  it.each(['0', '1'])('retains a durable task conversation after exit %s', async exitCode => {
+    const name = 'TaskMember', d = agentDir(name, true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', roomId: 'room', roomIdentityCid: 'cid', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'stable-runner-id\n');
+    writeFileSync(join(d, '.acp-session-id'), 'stable-acp-id\n');
+    writeFileSync(join(d, '.booted'), 'previous-start');
+    const { deps, starts } = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') });
+    const result = await runOnce(name, { temp: true }, deps);
+    expect(result).toMatchObject({ mode: 'resume', rotated: false });
+    expect(starts[0].mode).toBe('resume');
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('stable-runner-id\n');
+    expect(readFileSync(join(d, '.acp-session-id'), 'utf8')).toBe('stable-acp-id\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
   it('fast-failing resume self-heals to fresh', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });

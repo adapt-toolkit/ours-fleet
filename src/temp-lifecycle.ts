@@ -1,10 +1,12 @@
 import {
   appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 } from 'node:fs';
+import { parse } from 'yaml';
 import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
+import { installTaskSupervisorService, taskSystemdUnit, taskLaunchdLabel, uninstallTaskSupervisorService } from './task-supervisor-service.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
@@ -14,7 +16,7 @@ const TEMP_GLOBAL_TERMINATION_MARKER = '.termination-globally-recorded';
 export const TEMP_RECLAIM_BATCH = 32;
 export const TEMP_LAUNCH_GRACE_MS = 60_000;
 
-export type TempSupervisorKind = 'systemd-transient' | 'launchd-transient' | 'detached';
+export type TempSupervisorKind = 'systemd-transient' | 'launchd-transient' | 'systemd-persistent' | 'launchd-persistent' | 'detached';
 export type TempTerminationReason =
   | 'idle-timeout'
   | 'identity-closed'
@@ -25,6 +27,13 @@ export type TempTerminationReason =
   | 'startup-failure'
   | 'stale-supervisor';
 
+export interface TaskSupervisorOwner {
+  taskId: string;
+  roomId?: string;
+  roomIdentityCid?: string;
+  layout?: { runId: string; participant: string };
+  creationActionId: string;
+}
 export interface TempSupervisorRecord {
   version: 1;
   role: string;
@@ -35,6 +44,7 @@ export interface TempSupervisorRecord {
   target?: string;
   pid?: number;
   binPath?: string;
+  taskOwner?: TaskSupervisorOwner;
 }
 
 export interface TempTerminationRecord {
@@ -55,9 +65,9 @@ const metadataPath = (dir: string) => join(dir, TEMP_SUPERVISOR_FILE);
 export const tempSystemdUnit = (name: string) => `ours-fleet-temp-${name}.service`;
 export const tempLaunchdLabel = (name: string) => `network.ours.fleet.temp.${name}`;
 
-export function prepareTempSupervisor(dir: string, role: string): TempSupervisorRecord {
+export function prepareTempSupervisor(dir: string, role: string, taskOwner?: TaskSupervisorOwner): TempSupervisorRecord {
   const record: TempSupervisorRecord = {
-    version: 1, role, launchId: randomUUID(), createdAt: new Date().toISOString(), phase: 'launching',
+    version: 1, role, launchId: randomUUID(), createdAt: new Date().toISOString(), phase: 'launching', ...(taskOwner ? { taskOwner } : {}),
   };
   replaceFileAtomically(metadataPath(dir), JSON.stringify(record, null, 2) + '\n');
   return record;
@@ -121,6 +131,14 @@ export function makeTempSupervisorLauncher(options: {
     const role = args.at(-1);
     if (!role) throw new Error('temporary supervisor launch requires a role name');
     const log = join(dir, 'supervisor.log');
+    if (readTempSupervisor(dir)?.taskOwner && supervisor !== 'none') {
+      const kind = platform === 'linux' ? 'systemd-persistent' : 'launchd-persistent';
+      const target = platform === 'linux' ? taskSystemdUnit(role) : taskLaunchdLabel(role);
+      await updateTempSupervisor(dir, { phase: 'launching', kind, target, binPath });
+      await installTaskSupervisorService(role, binPath, dir, platform, exec);
+      await updateTempSupervisor(dir, { phase: 'active' });
+      return;
+    }
     if (supervisor !== 'none' && platform === 'linux') {
       const target = tempSystemdUnit(role);
       await updateTempSupervisor(dir, { phase: 'launching', kind: 'systemd-transient', target, binPath });
@@ -460,13 +478,13 @@ export async function tempSupervisorLiveness(
   // A concurrent spawn writes the target before systemd-run/launchctl has
   // registered it. A not-yet-created unit looks exactly like an inactive one,
   // so launch phase plus its bounded grace is not cleanup authority.
-  if (record.phase === 'launching'
+  if (record.phase === 'launching' && !requestedTempStopReason(dir)
       && (!Number.isFinite(age) || age < TEMP_LAUNCH_GRACE_MS)) return 'unknown';
   // Older writers could lose `kind` in an unlocked metadata RMW while retaining
   // the supervisor pid. Exact argv ownership is stronger than the missing tag.
   if (record.pid && (!record.kind || record.kind === 'detached'))
     return detachedProcessLiveness(record, deps);
-  if (record.kind === 'systemd-transient' && record.target) {
+  if ((record.kind === 'systemd-transient' || record.kind === 'systemd-persistent') && record.target) {
     const result = await exec('systemctl', [
       '--user', 'show', '-p', 'ActiveState', '--value', record.target,
     ]);
@@ -476,7 +494,7 @@ export async function tempSupervisorLiveness(
         || /not (?:be )?(?:found|loaded)|could not be found/i.test(result.stderr)) return 'stopped';
     return 'unknown';
   }
-  if (record.kind === 'launchd-transient' && record.target) {
+  if ((record.kind === 'launchd-transient' || record.kind === 'launchd-persistent') && record.target) {
     const result = await exec('launchctl', ['print', `gui/${process.getuid?.() ?? 501}/${record.target}`]);
     if (result.code === 0) return 'running';
     return /could not find service|no such process/i.test(`${result.stdout}\n${result.stderr}`)
@@ -524,6 +542,11 @@ export async function stopTempSupervisor(
   replaceFileAtomically(join(dir, TEMP_STOP_REQUEST_FILE), JSON.stringify({
     version: 1, role, reason: 'operator-stop', requestedAt: new Date().toISOString(),
   }) + '\n');
+  if (record.taskOwner && (record.kind === 'systemd-persistent' || record.kind === 'launchd-persistent')) {
+    if (!record.target) throw Error('TASK_SERVICE_TARGET_MISSING');
+    await uninstallTaskSupervisorService(role, record.kind, record.target, exec);
+    return 'stopped';
+  }
   if (record.kind === 'systemd-transient' && record.target) {
     const result = await exec('systemctl', ['--user', 'stop', record.target]);
     if (result.code !== 0
@@ -574,6 +597,22 @@ export async function stopTempSupervisor(
   return 'stopped';
 }
 
+/** Legacy task snapshots remain recovery evidence even before explicit migration. */
+function hasRetainedTaskReference(dir: string): boolean {
+  try {
+    const startup = (parse(readFileSync(join(dir, 'role.yaml'), 'utf8')) as {
+      roomMemberStartup?: { room_id?: string; identity_name?: string };
+    })?.roomMemberStartup;
+    if (!startup?.room_id || !/^[A-Za-z0-9_-]{1,120}$/.test(startup.room_id)) return false;
+    const room = JSON.parse(readFileSync(join(stateRoot(), 'rooms', `${startup.room_id}.json`), 'utf8'));
+    return typeof room.task_id === 'string'
+      && room.member_seats.some((seat: { role_name: string }) => seat.role_name === basename(dir));
+  } catch (error) {
+    // An unreadable role/room is uncertain ownership, never permission to reclaim.
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
+
 /**
  * Move a bounded batch of definitely-dead temp state into the evidence archive.
  * Unknown/legacy/live entries are preserved; absence of proof is never cleanup authority.
@@ -592,6 +631,7 @@ export async function reclaimStaleTempState(deps: TempLifecycleDeps = {}): Promi
   const archived: string[] = [...recovered];
   for (const entry of entries) {
     const dir = join(tmpRoot(), entry.name);
+    if (readTempSupervisor(dir)?.taskOwner || hasRetainedTaskReference(dir)) continue; // task state is retained until explicit retirement
     if (!readTempSupervisor(dir)) continue; // legacy evidence has no safe ownership proof
     if (await tempSupervisorLiveness(dir, deps) !== 'stopped') continue;
     const target = archiveTempState(

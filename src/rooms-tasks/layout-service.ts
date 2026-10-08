@@ -38,7 +38,12 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     const definition = this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
     const name = `layout-${createHash('sha256').update(this.runId + ':' + key).digest('hex').slice(0, 16)}`;
+    const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
+    const task = taskId ? (await import('./task-state.js')).getTask(taskId) : undefined;
+    if (task && task.layout?.run_id !== this.runId) throw Error('TASK_LAYOUT_OWNER_MISMATCH');
     await spawnTemp({ name, temp: true, configPath: this.configPath, agentDefinition: definition,
+      ...(task ? { taskOwner: { taskId: task.task_id, layout: { runId: this.runId, participant: key },
+        creationActionId: `${this.runId}:${key}` } } : {}),
       creationActionId: `${this.runId}:${key}`, surface: 'cli' }, fileURLToPath(new URL('../cli.js', import.meta.url)));
     const deadline = Date.now() + 120_000; let last: unknown;
     while (Date.now() < deadline) {
