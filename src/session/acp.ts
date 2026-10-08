@@ -720,6 +720,10 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
+    // A tool-boundary wait may outlive its original turn. Recheck the current
+    // typed source at delivery, since an Owner turn can begin during the wait.
+    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.origin?.kind === 'owner-admin-console')
+      return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);

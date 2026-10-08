@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import { CodexAppServerSession } from '../src/session/codex-app-server.js';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
+import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import { CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED, SessionControlError } from '../src/session/types.js';
 import type {
   CodexAppServerConnection, CodexAppServerTransportFactory, CodexAppServerTransportOptions,
@@ -190,6 +191,32 @@ describe('CodexAppServerSession', () => {
       await expect(start(stateDir, 'resume', 'allow', transport, { requireResume: true })).rejects.toThrow('TASK_CONTEXT_RESUME_MISMATCH');
       expect(readFileSync(join(stateDir, '.session-id'), 'utf8')).toBe('retained-thread');
     } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+
+  it('queues monitor mail behind native Owner voice and preserves explicit cancellation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'native-owner-monitor-'));
+    let server: FakeAppServer;
+    const session = await start(dir, 'fresh', 'ask', async options => { server = new FakeAppServer(options); return server; });
+    const arbiter = new RoleTurnArbiter(session);
+    try {
+      const generation = session.conversationSnapshot().sessionGeneration;
+      const receipt = await arbiter.submitPromptBrowser({ commandId: 'voice', text: 'permission', source: 'owner_admin_console',
+        actorBrowserSession: 'browser', expectedSessionGeneration: generation, requireIdle: true });
+      await waitFor(() => session.snapshot().readiness === 'awaiting_permission');
+      const wake = await arbiter.queuePrompt('mail', { origin: { kind: 'fleet-monitor' }, interrupt: true, steer: true,
+        interruptSource: 'fleet-monitor' });
+      expect(wake.queuedBehind).toBe(1);
+      expect(server!.requests.filter(request => ['turn/interrupt', 'turn/steer'].includes(request.method))).toEqual([]);
+      expect(session.respondPermission(session.snapshot().pendingPermissionId!, 'allow_once')).toBe(true);
+      expect((await wake.completion).succeeded).toBe(true);
+      const completed = session.conversationPage({ limit: 100 }).events.filter(event => event.kind === 'turn.completed');
+      expect(completed.map(event => event.promptId)).toEqual([receipt.promptId, wake.promptId]);
+      const next = await arbiter.submitPromptBrowser({ commandId: 'next', text: 'permission', source: 'owner_admin_console',
+        actorBrowserSession: 'browser', expectedSessionGeneration: generation, requireIdle: true });
+      await waitFor(() => session.snapshot().readiness === 'awaiting_permission');
+      await arbiter.interruptPrompt(generation, next.promptId);
+      expect(server!.requests.filter(request => request.method === 'turn/interrupt')).toHaveLength(1);
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('targets live cancellation to generation and prompt without canceling another native turn', async () => {
