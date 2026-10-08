@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -88,6 +88,36 @@ function makeNoRoomTask(): TaskRecord {
 }
 
 describe('settleTaskDeletion — no-room tasks', () => {
+  it('blocks a missing-room legacy cursor that collides with permanent state before any cleanup', async () => {
+    const t = makeNoRoomTask();
+    updateTaskMembers(t.task_id, [{ name: 'PersonalAssistant', identity_cid: CID, slot: 'dev', cowork_role: 'Developer' }]);
+    const permanent = join(stateRoot(), 'agents', 'PersonalAssistant');
+    mkdirSync(permanent, { recursive: true });
+    writeFileSync(join(permanent, '.identity'), 'PersonalAssistant');
+    writeFileSync(join(permanent, '.session-id'), 'retained-context');
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    const events: string[] = [];
+    await expect(settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached,
+      deps: chainDeps(events) })).rejects.toThrow(/permanent agent/);
+    expect(events).toEqual([]);
+    expect(getDeletingTask(t.task_id).deletion).toMatchObject({ status: 'pending', error: expect.stringMatching(/permanent agent/) });
+    expect(readFileSync(join(permanent, '.session-id'), 'utf8')).toBe('retained-context');
+  });
+
+  it('deletes an owned task while preserving an unrelated permanent agent byte-for-byte', async () => {
+    const t = makeNoRoomTask();
+    updateTaskMembers(t.task_id, [{ name: 'owned-worker', identity_cid: CID, slot: 'dev', cowork_role: 'Developer' }]);
+    const permanent = join(stateRoot(), 'agents', 'PersonalAssistant');
+    mkdirSync(permanent, { recursive: true });
+    writeFileSync(join(permanent, '.identity'), 'PersonalAssistant');
+    writeFileSync(join(permanent, '.session-id'), 'retained-context');
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached, deps: chainDeps([]) });
+    expect(existsSync(taskFile(t.task_id))).toBe(false);
+    expect(readFileSync(join(permanent, '.identity'), 'utf8')).toBe('PersonalAssistant');
+    expect(readFileSync(join(permanent, '.session-id'), 'utf8')).toBe('retained-context');
+  });
+
   it('settles without constructing Cowork or loading rooms config', async () => {
     const t = makeNoRoomTask();
     beginTaskDeletionIntent(t.task_id, CLI_ACTOR);

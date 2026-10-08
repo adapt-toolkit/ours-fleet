@@ -1,4 +1,5 @@
 import { eraseMemberArtifacts } from './erasure.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
 import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
@@ -115,6 +116,7 @@ function cursorSeat(cursor: TaskDeletionMemberCursor): RoomMemberSeat {
 async function retireCursorMember(
   taskId: string, cursor: TaskDeletionMemberCursor, deps: TaskDeletionSettleDeps,
 ): Promise<void> {
+  assertMemberNotPermanent(cursor.name);
   let phase = cursor.phase;
   let launchId = cursor.launch_id;
   if (phase === 'identity_absent') {

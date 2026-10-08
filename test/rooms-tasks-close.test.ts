@@ -1,6 +1,6 @@
 vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ serverUrl: 'http://gateway.test', endpoint: 'http://gateway.test/daemon', expectedInstanceId: '11111111-2222-3333-4444-555555555555', credentialPath: '/fixture/credential' }) }));
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -72,6 +72,20 @@ function fixture() {
 }
 
 describe('deterministic managed room close', () => {
+  it.each(['same-role', 'shared-identity'])('preserves a permanent agent despite a legacy room seat: %s', async mode => {
+    const permanent = join(root, '.ours-fleet', 'agents', mode === 'same-role' ? 'member-1' : 'PersonalAssistant');
+    mkdirSync(permanent, { recursive: true });
+    writeFileSync(join(permanent, '.identity'), 'member-1\n');
+    writeFileSync(join(permanent, '.session-id'), 'permanent-conversation\n');
+    sdk.listIdentities.mockResolvedValue([{ name: 'member-1', cid: CID }]);
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork })).rejects.toThrow(/permanent agent/);
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+    expect(cowork.closeRoom).not.toHaveBeenCalled();
+    expect(readFileSync(join(permanent, '.session-id'), 'utf8')).toBe('permanent-conversation\n');
+    expect(getRoomRecord(ROOM_ID)!.member_seats[0].retirement).toBeUndefined();
+  });
+
   it('retires appended members alongside the original roster',async()=>{
     const original=getRoomRecord(ROOM_ID)!.member_seats[0];
     updateMemberSeats(ROOM_ID,[original,{...original,role_name:'added-2',identity_cid:'cd'.repeat(32),slot:'extra'}],

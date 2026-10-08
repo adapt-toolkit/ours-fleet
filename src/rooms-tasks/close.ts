@@ -1,5 +1,6 @@
 import { detachDeletedRoom } from './task-state.js';
 import { binderKey } from '../agent-ours/state.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
 import { eraseMemberArtifacts } from './erasure.js';
 import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
 import { collectWorkspaceArchives } from './workspace-artifacts.js';
@@ -68,6 +69,7 @@ function exactMemberIdentity(seat: RoomMemberSeat): void {
 }
 
 export async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
+  assertMemberNotPermanent(seat.role_name);
   exactMemberIdentity(seat);
   const supervisor = readTempSupervisor(agentDir(seat.role_name, true));
   if (!supervisor || supervisor.role !== seat.role_name
@@ -127,6 +129,7 @@ export async function identityCidPresent(cid: string): Promise<boolean> {
 }
 
 export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
+  assertMemberNotPermanent(seat.role_name);
   await withIdentityClient(async client => {
     const rows = await client.listIdentities();
     const before = listedIdentity(rows, seat.role_name);
@@ -147,6 +150,7 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
       );
     }
     try {
+      assertMemberNotPermanent(seat.role_name);
       await client.removeIdentity({ name: seat.role_name });
     } catch (error) {
       const code = error instanceof Error && error.name === 'OursError'
@@ -177,6 +181,7 @@ export async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<
 async function retireMember(
   roomId: string, seat: RoomMemberSeat, deps: RoomCloseDeps,
 ): Promise<void> {
+  assertMemberNotPermanent(seat.role_name);
   let room = getRoomRecord(roomId)!;
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
   let retirement = current.retirement;

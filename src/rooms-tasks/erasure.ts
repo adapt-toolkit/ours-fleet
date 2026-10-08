@@ -1,4 +1,5 @@
 import { eraseResourcePresentations } from '../erased-resources.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join, relative } from 'node:path';
@@ -48,6 +49,7 @@ export async function eraseMemberArtifacts(
   const names = new Set(seats.map(s => s.role_name));
   for (const name of names) {
     if (!/^[a-zA-Z0-9_-]{1,120}$/.test(name)) throw new Error('Invalid erasure member');
+    assertMemberNotPermanent(name);
     if (existsSync(agentDir(name, true))) throw new Error(`Member '${name}' still has live state during erasure`);
   }
   if (!manifest) {
