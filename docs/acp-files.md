@@ -89,10 +89,10 @@ saving after a workspace change.
 ## Release prerequisite and qualification
 
 This source requires the companion MCP implementation's
-`MANAGED_FILE_DELIVERY_VERSION = 1`. Fleet's current published MCP pin does not
-include it: opt-in fails closed on that package. Publish a qualifying MCP build
-and repin Fleet's manifest and lock exactly before shipping the feature. Local
-integration tests use the task-owned built MCP package only.
+`MANAGED_FILE_DELIVERY_VERSION = 1`. Fleet pins published
+`@ours.network/mcp@1.2.0-nightly.13`, which includes it. Older MCP packages without
+this capability fail closed when file delivery is enabled. Changes to the MCP
+pin require clean installed-package qualification without a built MCP overlay.
 
 The deterministic native fixture uses real ACP adapters, the real managed
 connector and an isolated daemon. A local scripted provider supplies only tool
