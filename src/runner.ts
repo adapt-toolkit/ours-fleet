@@ -799,6 +799,7 @@ export async function runOnce(
       cwd: runCwd, stateDir: dir, mode, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
     }));
+    managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
     startupTelemetry.mark('harness_ready');
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);

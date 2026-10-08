@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { openExportFile } from '../file-delivery/reader.js';
 import { createHash } from 'node:crypto';
 import { connect } from 'node:net';
 import { access, mkdir, open, readFile, type FileHandle } from 'node:fs/promises';
@@ -24,7 +25,7 @@ export async function runBridge(descriptorPath: string): Promise<void> {
       throw Error('SUPERVISOR_SELECTION_CHANGED');
   }
   const wire = new Wire(connect(descriptor.socket));
-  const handles = new Map<string, { file: FileHandle; call: string; write: boolean }>();
+  const handles = new Map<string, { file: FileHandle; call: string; write: boolean; original?: { size: number; mtimeMs: number; ctimeMs: number } }>();
   const cleanup = async () => {
     for (const row of handles.values()) await row.file.close().catch(() => {});
     handles.clear();
@@ -68,7 +69,7 @@ export async function runBridge(descriptorPath: string): Promise<void> {
             } catch {
               value = false;
             }
-          } else if (op === 'read-open' || op === 'write-open') {
+          } else if (op === 'read-open' || op === 'write-open' || op === 'export-open') {
             if (
               handles.size >= 32 ||
               typeof args.handle !== 'string' ||
@@ -78,8 +79,9 @@ export async function runBridge(descriptorPath: string): Promise<void> {
               throw Error('FILE_LIMIT');
             const path = resolve(args.path);
             if (op === 'write-open') await mkdir(dirname(path), { recursive: true });
-            const file = await open(path, op === 'write-open' ? 'w' : 'r');
-            handles.set(args.handle, { file, call, write: op === 'write-open' });
+            const file = op === 'export-open' ? await openExportFile(args.root, process.cwd(), args.path) : await open(path, op === 'write-open' ? 'w' : 'r');
+            const stat = await file.stat();
+            handles.set(args.handle, { file, call, write: op === 'write-open', ...(op === 'export-open' ? { original: { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } } : {}) });
             value =
               op === 'write-open'
                 ? path
@@ -97,6 +99,10 @@ export async function runBridge(descriptorPath: string): Promise<void> {
                 await row.file.close();
                 value = null;
               } else if (op === 'read' && !row.write) {
+                if (row.original) {
+                  const stat = await row.file.stat();
+                  if (!stat.isFile() || stat.nlink !== 1 || stat.size !== row.original.size || stat.mtimeMs !== row.original.mtimeMs || stat.ctimeMs !== row.original.ctimeMs) throw Error('EXPORT_SOURCE_CHANGED');
+                }
                 const buffer = Buffer.alloc(MAX_CHUNK_BYTES);
                 const { bytesRead } = await row.file.read(buffer);
                 value = bytesRead ? buffer.subarray(0, bytesRead).toString('base64') : null;

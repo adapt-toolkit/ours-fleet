@@ -1,3 +1,7 @@
+import type { AgentSession } from '../session/types.js';
+import { pinExportRoot, exportPath, ensureExportDirectory } from '../file-delivery/reader.js';
+import { ArtifactStore } from '../file-delivery/store.js';
+import { resolve, basename, extname } from 'node:path';
 import { socketPath as privateSocketPath } from '../socket-path.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -18,6 +22,7 @@ export interface ManagedAgentService {
   runtime: AgentOursRuntime;
   descriptor: string;
   privatePaths: string[];
+  setFileDelivery?(sender: AgentSession['sendFileToChat']): void;
   close(terminal: boolean): Promise<void>;
 }
 function roomSecretPath(role: ResolvedRole): string {
@@ -113,6 +118,8 @@ export async function prepareManagedAgent(
     instance,
   );
   let closeClient: (() => Promise<void>) | undefined;
+  let exportRoot: Awaited<ReturnType<typeof pinExportRoot>> | undefined;
+  let fileSender: AgentSession['sendFileToChat'];
   let partialEndpoint: { close(): Promise<void> } | undefined;
   try {
     let prior = controller.journal.read();
@@ -243,6 +250,17 @@ export async function prepareManagedAgent(
     mkdirSync(bridgeDir, { recursive: true, mode: 0o700 });
     const capability = randomBytes(32).toString('hex'),
       socket = privateSocketPath(join(bridgeDir, `g${generation}.sock`));
+    const cwd = role.cwd && existsSync(role.cwd) ? resolve(role.cwd) : resolve(stateDir);
+    if (role.file_delivery?.enabled) {
+      if (role.session !== 'acp' || !['codex', 'claude-code'].includes(role.harness)) throw Error('FILE_DELIVERY_REQUIRES_CODEX_OR_CLAUDE_ACP');
+      const rootPath = resolve(cwd, role.file_delivery.directory);
+      const forbidden = [privateRuntimeRoot(), join(stateRoot(), 'private-file-delivery'), profile.configPath, profile.credentialPath];
+      if (forbidden.some(p => rootPath === resolve(p) || rootPath.startsWith(resolve(p) + '/') || resolve(p).startsWith(rootPath + '/')))
+        throw Error('PRIVATE_STATE_CANNOT_BE_EXPORTED');
+      await ensureExportDirectory(cwd, role.file_delivery.directory);
+      exportRoot = await pinExportRoot(rootPath);
+    }
+    const artifactStore = new ArtifactStore(stateDir);
     const endpoint = await startMcpEndpoint({
       socket,
       capability,
@@ -251,6 +269,19 @@ export async function prepareManagedAgent(
       client,
       identities,
       remoteDaemonFiles: true,
+      ...(exportRoot ? { currentChatFile: (async (input, extra, files) => {
+        if (!fileSender || !exportRoot) throw Error('CURRENT_CHAT_DELIVERY_UNAVAILABLE');
+        exportPath(exportRoot.root, cwd, input.path); // validate before approval/read
+        const name = input.filename ?? basename(input.path);
+        if (!name || Buffer.byteLength(name) > 240 || /[\/\\\x00-\x1f]/.test(name) || name === '.' || name === '..') throw Error('INVALID_FILENAME');
+        const mime = input.mime ?? ({ '.txt': 'text/plain', '.md': 'text/markdown', '.pdf': 'application/pdf', '.json': 'application/json', '.html': 'text/html', '.png': 'image/png' } as Record<string, string>)[extname(name).toLowerCase()] ?? 'application/octet-stream';
+        if (mime.length > 200 || !/^[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+$/.test(mime)) throw Error('INVALID_MIME');
+        return fileSender(input, extra.signal, async binding => {
+          const source = await files.readExport(input.path, exportRoot!.root, extra);
+          try { return await artifactStore.copy(source, name, mime, binding, extra.signal); }
+          finally { await source.close(); }
+        }, role.permissions);
+      }) satisfies NonNullable<Parameters<typeof startMcpEndpoint>[0]['currentChatFile']> } : {}),
     });
     partialEndpoint = endpoint;
     const descriptor = join(bridgeDir, 'descriptor.json');
@@ -258,10 +289,13 @@ export async function prepareManagedAgent(
     return {
       runtime,
       descriptor,
-      privatePaths: [root, profile.configPath, profile.credentialPath],
+      privatePaths: [root, profile.configPath, profile.credentialPath, join(stateRoot(), 'private-file-delivery')],
+      setFileDelivery: sender => { fileSender = sender; },
       close: async (terminal) => {
         try {
+          fileSender = undefined;
           await endpoint.close();
+          await exportRoot?.handle.close();
           if (terminal) await runtime.terminal();
           else await runtime.suspend();
         } finally {
@@ -276,6 +310,7 @@ export async function prepareManagedAgent(
   } catch (error) {
     try {
       await partialEndpoint?.close();
+      await exportRoot?.handle.close();
     } finally {
       try {
         await closeClient?.();

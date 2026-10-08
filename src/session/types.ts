@@ -378,6 +378,7 @@ export interface ConversationHandlePage {
  * on any concrete transport which implements it.
  */
 export interface AgentSession {
+  sendFileToChat?: (input: import('../file-delivery/types.js').FileDeliveryInput, signal: AbortSignal, copy: import('../file-delivery/types.js').CopyChatFile, policy: import('../config.js').CommonPermissions) => Promise<import('../file-delivery/types.js').DeliveredFile>;
   readonly backend: SessionBackendId;
   readonly pid: number;
   /** Live capabilities; optional only for source compatibility with external adapters. */

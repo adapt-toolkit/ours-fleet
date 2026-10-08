@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
+import { socketPath } from '../src/socket-path.js';
 import { Wire } from '../src/agent-ours/wire.js';
 import { binderKey } from '../src/agent-ours/state.js';
 import { RoleControlServer } from '../src/session/control.js';
@@ -30,7 +31,7 @@ async function fixture(temporary = false) {
   let releases = 0;
   const mutations: unknown[] = [];
   const endpoint = await startMcpEndpoint({
-    socket: join(dir, '.ours-bridge', 'g7.sock'), capability: 'test-private-capability', generation: 7,
+    socket: socketPath(join(dir, '.ours-bridge', 'g7.sock')), capability: 'test-private-capability', generation: 7,
     runtime: { admit: async () => () => {} } as never,
     client: {
       currentIdentity: async () => { identityReads++; return liveIdentity; },
@@ -43,7 +44,7 @@ async function fixture(temporary = false) {
   });
   cleanups.push(() => endpoint.close());
   const descriptor = join(dir, '.ours-bridge', 'descriptor.json');
-  const metadata = { socket: join(dir, '.ours-bridge', 'g7.sock'), capability: 'test-private-capability', generation: 7,
+  const metadata = { socket: socketPath(join(dir, '.ours-bridge', 'g7.sock')), capability: 'test-private-capability', generation: 7,
     role: 'Alpha', identity: 'AlphaIdentity', cid };
   writeFileSync(descriptor, JSON.stringify(metadata));
   const cliEnv: NodeJS.ProcessEnv = {};

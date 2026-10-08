@@ -1920,3 +1920,5 @@ Prerelease rollout requires this Fleet capability to be published first, then th
 installer's normal generated version/integrity lock updated, then installer and
 App released. The currently pinned Fleet nightly.41 does not support v2 grants.
 These source changes do not publish, merge, or deploy any component.
+
+See [ACP file sending](docs/acp-files.md) for the opt-in same-chat `send_file` flow and supported configurations.

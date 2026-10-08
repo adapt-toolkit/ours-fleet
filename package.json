@@ -22,7 +22,8 @@
     "docs/live-voice.md",
     "docs/room-layouts.md",
     "docs/validation/managed-cli-permissions.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/acp-files.md"
   ],
   "engines": {
     "node": ">=22.13.0"

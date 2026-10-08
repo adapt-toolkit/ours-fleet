@@ -1,3 +1,4 @@
+import { socketPath } from '../socket-path.js';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -40,7 +41,8 @@ export class SupervisorOursTools {
     const identity = legacy
       ? legacySupervisorIdentity(role, identityName, selected.temporary, descriptor.generation)
       : { name: identityName, cid: descriptor.cid as string, generation: descriptor.generation as number };
-    if (legacy && descriptor.socket !== join(selected.dir, '.ours-bridge', `g${descriptor.generation}.sock`))
+    const legacySocket = join(selected.dir, '.ours-bridge', `g${descriptor.generation}.sock`);
+    if (legacy && descriptor.socket !== legacySocket && descriptor.socket !== socketPath(legacySocket))
       throw new FleetError('capability_unavailable', 'legacy supervisor socket does not match the selected agent');
     if ((!legacy && (descriptor.role !== role || descriptor.identity !== identityName))
         || !/^[a-f0-9]{64}$/i.test(identity.cid ?? '') || !Number.isSafeInteger(descriptor.generation) || descriptor.generation < 1)

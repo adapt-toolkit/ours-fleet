@@ -70,6 +70,17 @@ export type MonitorInterrupt = boolean | 'after_tool';
 export const MANAGED_CLI_WORKFLOW_IDS = ['task-workflow'] as const;
 export type ManagedCliWorkflowId = (typeof MANAGED_CLI_WORKFLOW_IDS)[number];
 
+export interface FileDeliveryConfig { enabled: boolean; directory: string }
+
+export function validateFileDelivery(value: unknown): FileDeliveryConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value) || Object.keys(value).some(k => !['enabled', 'directory'].includes(k))
+      || typeof value.enabled !== 'boolean' || typeof value.directory !== 'string'
+      || !value.directory || value.directory.split('/').some(p => !p || p.startsWith('.') || /[\\\x00-\x1f]/.test(p)))
+    throw new ConfigError('file_delivery requires enabled:boolean and a relative non-hidden directory');
+  return value as unknown as FileDeliveryConfig;
+}
+
 export interface CommonPermissions {
   approval: ApprovalMode;
   filesystem: FilesystemMode;
@@ -254,6 +265,8 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
   /** Fleet-prepared CLI workflows this role may run outside its command sandbox. */
   managed_cli?: ManagedCliWorkflowId[];
+  /** Explicit per-Agent export opt-in; not inherited from manifest defaults. */
+  file_delivery?: FileDeliveryConfig;
 }
 
 export type AgentSelection<T extends Record<string, unknown> = Record<string, unknown>> =
@@ -277,6 +290,8 @@ export interface AgentDefinition {
   auth_proxy?: Partial<AuthProxyConfig>;
   /** Fleet-prepared CLI workflows this Agent may run outside its command sandbox. */
   managed_cli?: ManagedCliWorkflowId[];
+  /** Explicit per-Agent export opt-in; not inherited from manifest defaults. */
+  file_delivery?: FileDeliveryConfig;
   /** Scheduled turns scoped only to temporary launches; persistent Agents reject this field. */
   loops?: AgentLoopsConfig;
 }
@@ -427,7 +442,7 @@ export const ROLE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'effort', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'managed_cli',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'managed_cli', 'file_delivery',
 ];
 
 export const ROLE_PRESET_KEYS = ['mission', 'persona', 'bio', 'briefing_file'];
@@ -437,7 +452,7 @@ export const BRAIN_PRESET_KEYS = [
 ];
 export const AGENT_KEYS = [
   'role', 'brain', 'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops', 'managed_cli',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops', 'managed_cli', 'file_delivery',
 ];
 const AGENT_INSTANCE_KEYS = ['template', 'overrides'];
 const TEMPLATE_FORBIDDEN_KEYS = ['identity'];
@@ -489,6 +504,7 @@ export function validateBrainValue(value: BarePreset, file: string, pointer: str
 export function validateEffectiveAgentTemplate(
   definition: AgentTemplateDefinition, id = 'room-member',
 ): AgentTemplateDefinition {
+  validateFileDelivery(definition.file_delivery);
   const value = structuredClone(definition) as unknown as Record<string, unknown>;
   const bad = Object.keys(value).filter(key => !AGENT_KEYS.includes(key));
   if (bad.length) throw new ConfigError(`member '${id}' has unknown Agent key(s) ${bad.join(', ')}`);
@@ -960,6 +976,7 @@ export function loadConfig(
       if (bad.length)
         throw new ConfigError(
           `${file}: role '${name}' has unknown key(s) ${bad.join(', ')}; allowed: ${ROLE_KEYS.join(', ')}`);
+      validateFileDelivery(r.file_delivery);
       const isolation = r.isolation ?? (defaults.isolation as IsolationConfig | undefined);
       const session = resolveSession(r.session ?? defaults.session, file, name);
       const sessionOptions = resolveSessionOptions(

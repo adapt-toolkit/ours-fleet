@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, findRole, validateMonitorConfig, resolveSnapshotMonitor, ConfigError } from '../src/config.js';
+import { loadConfig, findRole, validateFileDelivery, validateMonitorConfig, resolveSnapshotMonitor, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import '../src/harness/hermes.js';
@@ -838,4 +838,11 @@ describe('rooms-tasks split-config backward compat', () => {
     ].join('\n'));
     expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
+});
+
+it('file delivery is explicit per Agent, default off, and rejects unsafe/unknown configuration',()=>{
+ base('roles:\n  A: {session: acp, file_delivery: {enabled: true, directory: deliverables}}\n  B: {session: acp}\n');
+ expect(findRole(loadConfig(),'A').file_delivery).toEqual({enabled:true,directory:'deliverables'});expect(findRole(loadConfig(),'B').file_delivery).toBeUndefined();
+ for(const value of [null,{}, {enabled:true,directory:'/absolute'}, {enabled:true,directory:'../parent'}, {enabled:true,directory:'a/.hidden'}, {enabled:true,directory:'a//b'}, {enabled:true,directory:'a',retry:true}, {enabled:'true',directory:'a'}])expect(()=>validateFileDelivery(value)).toThrow();
+ expect(validateFileDelivery({enabled:false,directory:'deliverables'})).toEqual({enabled:false,directory:'deliverables'});
 });
