@@ -1099,6 +1099,32 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('queues a delayed monitor boundary delivery behind the Owner turn that replaced its original turn', async () => {
+    const session = await start('allow', { afterToolBoundaryTimeoutMs: 2_000 });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const boundary = vi.spyOn(session as any, 'waitForToolBoundary').mockImplementation(async () => { await gate; return true; });
+    try {
+      const original = session.submitPrompt('late');
+      await expect.poll(() => session.eventsSince(0).some(event => event.kind === 'tool_call' && event.status === 'in_progress')).toBe(true);
+      const wake = session.submitPromptAfterTool('delayed mail', { origin: { kind: 'fleet-monitor' }, steer: true });
+      await expect.poll(() => boundary.mock.calls.length).toBe(1);
+      await session.interrupt('local-console');
+      expect((await original).outcome).toBe('cancelled');
+      const voice = await session.queuePrompt('block 400', { origin: { kind: 'owner-admin-console' } });
+      await expect.poll(() => session.snapshot().activePromptSource).toBe('owner-admin-console');
+      release();
+      expect((await voice.completion).succeeded).toBe(true);
+      expect((await wake).succeeded).toBe(true);
+      const events = session.conversationPage({ limit: 100 }).events;
+      const voiceFinished = events.findIndex(event => event.kind === 'turn.completed' && event.promptId === voice.promptId);
+      const mailStarted = events.findIndex(event => event.kind === 'prompt.started' && event.source === 'fleet_monitor');
+      expect(voiceFinished).toBeGreaterThan(-1);
+      expect(mailStarted).toBeGreaterThan(voiceFinished);
+      expect(session.eventsSince(0).filter(event => event.kind === 'turn_stop' && event.cancellationSource === 'fleet-monitor')).toHaveLength(0);
+    } finally { release(); boundary.mockRestore(); await session.close(); }
+  });
+
   it('lets an explicit human interrupt bypass an after_tool wait immediately', async () => {
     const session = await start('allow', { afterToolBoundaryTimeoutMs: 2_000 });
     const active = session.submitPrompt('late');
