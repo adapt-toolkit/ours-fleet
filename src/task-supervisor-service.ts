@@ -141,3 +141,15 @@ export function assertTaskServicesAbsent(taskId: string): void {
     if (owner.taskOwner.taskId === taskId) throw Error('TASK_SERVICES_REMAIN');
   }
 }
+
+/** Presence-only compatibility query; incomplete/symlink evidence is still not absence. */
+export function hasRetainedTaskService(role: string): boolean {
+  if (!/^[A-Za-z0-9_-]+$/.test(role)) throw Error('TASK_SERVICE_INVALID_INPUT');
+  return [ownerPath(role), unitPath(role), plistPath(role)].some(path => {
+    try { lstatSync(path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      throw error;
+    }
+    readProof(path); return true;
+  });
+}
