@@ -505,5 +505,7 @@ export async function resumeTaskSupervisor(name: string, binPath: string): Promi
   if (!taskSupervisorMayRun(name)) throw Error('TASK_SUPERVISOR_RETIRED');
   const dir = agentDir(name, true);
   if (requestedTempStopReason(dir)) throw Error('TASK_SUPERVISOR_STOP_REQUESTED');
-  await independentSupervisor(binPath, ['_run-temp', name], dir);
+  const launcher = readTempSupervisor(dir)?.kind === 'detached'
+    ? makeTempSupervisorLauncher({ spawnDetached, supervisor: 'none' }) : independentSupervisor;
+  await launcher(binPath, ['_run-temp', name], dir);
 }
