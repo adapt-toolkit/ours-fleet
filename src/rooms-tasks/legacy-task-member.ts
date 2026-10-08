@@ -28,8 +28,8 @@ function bounded(path: string): string {
     throw Error('LEGACY_TASK_MEMBER_UNSAFE_PROOF');
   return readFileSync(path, 'utf8');
 }
-async function verifyIdentity(name: string, cid: string): Promise<void> {
-  const profile = readClientProfile(process.env);
+async function verifyIdentity(name: string, cid: string, env: NodeJS.ProcessEnv): Promise<void> {
+  const profile = readClientProfile(env);
   const client = await attachOursClient({ endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
     credentialPath: profile.credentialPath, sessionMode: 'external', env: {}, leaseToken: `task-migration-${randomUUID()}` });
   try {
@@ -78,7 +78,8 @@ export async function adoptLegacyTaskMember(
     const live = await (deps.liveness ?? tempSupervisorLiveness)(dir);
     if (live === 'running') return 'running-legacy';
     if (live !== 'stopped') throw Error('LEGACY_TASK_MEMBER_LIVENESS_UNKNOWN');
-    const profile = readClientProfile(process.env);
+    const env = { ...process.env, ...role.env };
+    const profile = readClientProfile(env);
     const privateDir = join(stateRoot(), 'private-ours', binderKey(profile.expectedInstanceId, name));
     const state = JSON.parse(bounded(join(privateDir, 'state.json'))) as RuntimeState;
     const instance = JSON.parse(bounded(join(privateDir, 'instance.json')));
@@ -96,7 +97,8 @@ export async function adoptLegacyTaskMember(
       throw Error('LEGACY_TASK_MEMBER_RUNTIME_NOT_RESUMABLE');
     const sessionPath = join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id');
     if (!bounded(sessionPath).trim()) throw Error('LEGACY_TASK_MEMBER_CONVERSATION_MISSING');
-    await (deps.verifyIdentity ?? verifyIdentity)(name, seat.identity_cid);
+    if (deps.verifyIdentity) await deps.verifyIdentity(name, seat.identity_cid);
+    else await verifyIdentity(name, seat.identity_cid, env);
     assertMemberNotPermanent(name);
     if (bounded(rolePath) !== roleBytes || JSON.stringify(readTempSupervisor(dir)) !== JSON.stringify(supervisor))
       throw Error('LEGACY_TASK_MEMBER_STATE_CHANGED');
