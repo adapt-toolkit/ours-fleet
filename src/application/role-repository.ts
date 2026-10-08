@@ -12,6 +12,18 @@ import { readSpawnLineage } from '../web/topology.js';
 
 const MAX_SNAPSHOT_BYTES = 256 * 1024;
 
+function retainedTaskId(dir: string, name: string): string | undefined {
+  try {
+    const path = join(dir, '.temp-supervisor.json');
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16 * 1024) return undefined;
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    const id = record?.taskOwner?.taskId;
+    return record?.version === 1 && record?.role === name && typeof id === 'string'
+      && /^[0-9a-z]{9}[0-9a-f]{8}$/.test(id) ? id : undefined;
+  } catch { return undefined; }
+}
+
 export interface RoleRepositoryOptions {
   configPath?: string;
   permanentRoot?: string;
@@ -143,10 +155,12 @@ export class RoleRepository {
       const stateRef = inTemporary ? { lifetime: 'temporary' as const }
         : inPermanent ? { lifetime: 'permanent' as const } : undefined;
       const tempStateDir = inTemporary ? join(temporaryRoot, name) : undefined;
+      const taskId = !config && tempStateDir ? retainedTaskId(tempStateDir, name) : undefined;
       return {
         id: name,
         lifetime: config ? 'permanent' : inTemporary ? 'temporary' : 'orphan',
         configured: Boolean(config),
+        ...(taskId ? { taskId } : {}),
         config: config ? view(config) : tempRole ? view(tempRole) : undefined,
         stateRef,
         stateHealth,

@@ -1,5 +1,5 @@
 import { preparePermanentAssignment } from '../../src/agent-ours/service.js';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -68,7 +68,7 @@ describe('application services', () => {
     writeFileSync(join(dir, 'role.yaml'), 'harness: codex\nsession: acp\nidentity: task-worker\n');
     writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: 'task-worker',
       launchId: 'retained-launch', kind: 'systemd-persistent', taskOwner: {
-        taskId: 'task1234567890', roomId: 'room1234567890', roomIdentityCid: 'ab'.repeat(32), creationActionId: 'retained-action',
+        taskId: '0mv03vs1e34acae5c', layout: { runId: 'task-0mv03vs1e34acae5c', participant: 'developer' }, creationActionId: 'retained-action',
       } }));
     for (let restart = 0; restart < 2; restart++) {
       const repository = new RoleRepository({ configPath });
@@ -76,11 +76,18 @@ describe('application services', () => {
         control: async () => ({ ok: true, result: { backend: 'acp', alive: true, readiness: 'idle' } }) });
       const listed = await query.list();
       expect(listed.map(item => item.role.id)).toEqual(['PersonalAssistant']);
+      expect(listed[0].role.taskId).toBeUndefined();
       expect(deriveTopology(loadConfig(configPath), listed).nodes.filter(node => node.kind === 'agent').map(node => node.label))
         .toEqual(['PersonalAssistant']);
-      expect((await query.detail('task-worker')).role).toMatchObject({ configured: false, lifetime: 'temporary' });
+      const detail = (await query.detail('task-worker')).role;
+      expect(detail).toMatchObject({ configured: false, lifetime: 'temporary', taskId: '0mv03vs1e34acae5c' });
+      expect(JSON.stringify(detail)).not.toContain('retained-action');
+      expect(JSON.stringify(detail)).not.toContain('participant');
       expect((await query.list(true)).map(item => item.role.id)).toEqual(['PersonalAssistant', 'task-worker']);
     }
+    const metadata = join(dir, '.temp-supervisor.json'), target = join(root, 'untrusted-metadata');
+    writeFileSync(target, readFileSync(metadata)); unlinkSync(metadata); symlinkSync(target, metadata);
+    expect((await new RoleRepository({ configPath }).get('task-worker'))?.taskId).toBeUndefined();
   });
 
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
