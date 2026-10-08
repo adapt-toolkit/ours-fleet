@@ -39,11 +39,45 @@ function fixture() {
     getSeats: vi.fn(async (id: string) => rooms.get(id).seats),
     getRoom: vi.fn(async (id: string) => rooms.has(id) ? { identity_cid: id, state: rooms.get(id).closed ? 'closed' : 'active', seats: rooms.get(id).seats } : undefined),
     closeRoom: vi.fn(async (id: string) => { rooms.get(id).closed = true; }),
+    deleteRoom: vi.fn(async (id: string) => { rooms.delete(id); }),
   } as unknown as CoworkAdapter;
   const file = join(root, 'run.json');
   const layout = new RoomLayout(file, cowork, supervisor);
   return { file, layout, supervisor, cowork, running, rooms, reload: () => new RoomLayout(file, cowork, supervisor) };
 }
+
+describe('explicit layout deletion', () => {
+  it('retains rooms on close, deletes them on explicit deletion, and preserves borrowed instances', async () => {
+    const f = fixture(), borrowed = instance('PersonalAssistant'); f.running.set(borrowed.launch, borrowed);
+    await f.layout.create(scopedDefinition(), 'operator', { doctor: borrowed });
+    await f.layout.activate('operator', 'design');
+    await f.layout.close('operator');
+    expect(f.cowork.deleteRoom).not.toHaveBeenCalled();
+    expect(f.rooms.size).toBe(1);
+    await f.reload().delete('operator'); await f.reload().delete('operator');
+    expect(f.rooms.size).toBe(0);
+    expect(f.cowork.deleteRoom).toHaveBeenCalledTimes(1);
+    expect(f.running.get(borrowed.launch)).toEqual(borrowed);
+    expect(f.supervisor.retire).not.toHaveBeenCalledWith(borrowed);
+  });
+  it('resumes after partial remote deletion without replaying completed rooms or member retirement', async () => {
+    const f = fixture();
+    await f.layout.create(scopedDefinition(), 'operator');
+    await f.layout.activate('operator', 'design'); await f.layout.activate('operator', 'discovery');
+    let calls = 0;
+    vi.mocked(f.cowork.deleteRoom).mockImplementation(async id => {
+      if (++calls === 2) throw Error('transport down');
+      f.rooms.delete(id);
+    });
+    await expect(f.layout.delete('operator')).rejects.toThrow('transport down');
+    expect(Object.values(f.layout.snapshot().rooms).filter(room => room.deleted)).toHaveLength(1);
+    const retirements = f.supervisor.retire.mock.calls.length;
+    await f.reload().delete('operator');
+    expect(f.rooms.size).toBe(0);
+    expect(calls).toBe(3);
+    expect(f.supervisor.retire).toHaveBeenCalledTimes(retirements);
+  });
+});
 function scopedDefinition(): LayoutDefinition {
   return { participants: {
     doctor: { agent_template: 'Doctor', instance_scope: 'layout' },

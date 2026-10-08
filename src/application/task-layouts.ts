@@ -18,6 +18,8 @@ import { layoutRunPath, RoomLayoutService } from '../rooms-tasks/layout-service.
 import type { RoomLayoutState } from '../rooms-tasks/layout.js';
 import { FleetError } from './errors.js';
 import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
+import { ownedLayoutRetirementSeats } from '../rooms-tasks/layout-member-retirement.js';
+import { eraseMemberArtifacts } from '../rooms-tasks/erasure.js';
 
 export type TaskLayoutOperation = 'open' | 'close-room' | 'close';
 export interface TaskLayoutOperationRecord {
@@ -246,7 +248,13 @@ export class TaskLayouts {
   async closeAndForget(task: Pick<TaskRecord, 'task_id' | 'layout'>): Promise<void> {
     const link = task.layout;
     if (!link) return;
-    if (this.runExists(link)) await this.service().open(link.run_id, true).close(layoutSupervisorId());
+    if (this.runExists(link)) {
+      const engine = this.service().open(link.run_id, true);
+      await engine.delete(layoutSupervisorId());
+      const state = engine.snapshot();
+      const rooms = Object.values(state.rooms).flatMap(room => room.native ? [room.native.room_id] : []);
+      await eraseMemberArtifacts('task', task.task_id, ownedLayoutRetirementSeats(state, link.run_id), rooms);
+    }
     await this.withTaskLock(link.run_id, async () => {
       for (const path of [layoutRunPath(link.run_id), this.provenancePath(link.run_id), taskBriefPath(task)])
         rmSync(path, { force: true });
