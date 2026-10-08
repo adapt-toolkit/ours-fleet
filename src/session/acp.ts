@@ -605,6 +605,7 @@ export class AcpSession implements AgentSession {
       readiness: this.readiness === 'idle' && this.steeringOccupied
         ? 'running' : this.readiness,
       sessionId: this.sessionId,
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,

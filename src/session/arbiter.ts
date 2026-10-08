@@ -112,7 +112,20 @@ export class RoleTurnArbiter implements AgentSession {
   }
 
   queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
-    return this.exclusive(async () => { if(this.retiring) throw new Error('Chat is closing'); return this.track(await this.session.queuePrompt(text, options)); });
+    return this.exclusive(async () => {
+      if (this.retiring) throw new Error('Chat is closing');
+      return this.track(await this.session.queuePrompt(text, this.monitorAdmissionOptions(options)));
+    });
+  }
+
+  /** Inbox traffic must not cancel or steer an active human console/voice turn.
+   * Queue it once; the monitor commits its cursor after that turn succeeds.
+   * Other origins retain their configured monitor policy.
+   */
+  private monitorAdmissionOptions(options: SubmitPromptOptions): SubmitPromptOptions {
+    return options.origin?.kind === 'fleet-monitor'
+      && this.session.snapshot().activePromptSource === 'owner-admin-console'
+      ? { ...options, interrupt: false, steer: false } : options;
   }
 
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
@@ -125,6 +138,8 @@ export class RoleTurnArbiter implements AgentSession {
    */
   submitPromptAfterTool(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
     if(this.retiring) return Promise.reject(new Error('Chat is closing'));
+    if (this.monitorAdmissionOptions(options) !== options)
+      return this.submitPrompt(text, options);
     return this.session.submitPromptAfterTool?.(text, options)
       ?? this.session.submitPrompt(text, { ...options, interrupt: false, steer: false });
   }

@@ -254,6 +254,7 @@ export class CodexAppServerSession implements AgentSession {
       alive: this.isAlive(),
       readiness: this.readiness,
       sessionId: this.threadId,
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
