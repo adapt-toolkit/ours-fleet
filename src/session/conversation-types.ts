@@ -17,6 +17,7 @@ export type ConversationEventKind =
   | 'plan.replace'
   | 'tool.upsert' | 'tool.content_chunk'
   | 'permission.requested' | 'permission.resolved'
+  | 'file.attached'
   | 'fleet.task_created'
   | 'monitor.delivery'
   | 'usage.updated'
@@ -262,6 +263,7 @@ export interface BoundedJson {
 }
 
 export type ConversationPayload =
+  | { attachment: import('../file-delivery/types.js').DeliveredFile }
   | MessageChunkPayload | ThoughtChunkPayload | PlanReplacePayload | ToolUpsertPayload
   | UsageUpdatedPayload | SessionStatePayload | SessionInfoPayload
   | CapabilitiesUpdatedPayload | UnsupportedPayload | PromptAdmittedPayload

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { CodexFileInventory } from './codex-file-inventory.js';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
@@ -472,6 +473,7 @@ export function runCodexAppServerProxy(): void {
       });
     }
   };
+  const inventory = process.env.FLEET_CURRENT_CHAT_FILES === '1' ? new CodexFileInventory(writeToChild, writeToClient) : undefined;
   const recovery = new CodexTerminalRecovery({
     sendToCodex: writeToChild,
     emitToClient: writeToClient,
@@ -481,6 +483,7 @@ export function runCodexAppServerProxy(): void {
     if (finished) return;
     finished = true;
     recovery.close();
+    inventory?.close();
     input.close();
     process.stdin.destroy();
     // stdout/stderr are often pipes under Fleet and tests. Setting exitCode
@@ -514,10 +517,10 @@ export function runCodexAppServerProxy(): void {
     const rewritten = rewriteCodexAppServerRequest(
       line, approval, expectedSandbox, disableInheritedMcp, managedOursTools);
     recovery.observeClientLine(rewritten);
-    writeToChild(rewritten);
+    if (!inventory || inventory.observeClientLine(rewritten)) writeToChild(rewritten);
   });
   output.on('line', line => {
-    if (!finished && recovery.observeServerLine(line)) writeToClient(line);
+    if (!finished && (!inventory || inventory.observeServerLine(line)) && recovery.observeServerLine(line)) writeToClient(line);
   });
   input.once('close', () => {
     if (!child.stdin.destroyed) child.stdin.end();

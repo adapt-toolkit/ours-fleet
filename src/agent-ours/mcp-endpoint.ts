@@ -1,3 +1,6 @@
+import * as managedMcp from '@ours.network/mcp/server';
+import type { FileDeliveryInput, DeliveredFile } from '../file-delivery/types.js';
+import type { ToolRequestExtra } from '@ours.network/mcp/dist/types/mcp/tool.js';
 import { createServer, type Server } from 'node:net';
 import { chmod, unlink } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
@@ -18,10 +21,13 @@ export interface EndpointOptions {
   client: OursClient;
   identities: ApplicationIdentityStore;
   remoteDaemonFiles: boolean;
+  currentChatFileDirectory?: string;
+  currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
 }
 export async function startMcpEndpoint(
   options: EndpointOptions,
 ): Promise<{ close(): Promise<void> }> {
+  if (options.currentChatFile && (managedMcp as typeof managedMcp & { MANAGED_FILE_DELIVERY_VERSION?: number }).MANAGED_FILE_DELIVERY_VERSION !== 1) throw Error('INCOMPATIBLE_MANAGED_FILE_DELIVERY');
   const sockets = new Set<Wire>();
   const server: Server = createServer((socket) => {
     if (sockets.size >= 4) {
@@ -51,6 +57,7 @@ export async function startMcpEndpoint(
     };
     const mcp = createManagedOursMcpServer(options.client, 'managed-v1', options.identities, {
       remoteDaemonFiles: options.remoteDaemonFiles,
+      ...(options.currentChatFile ? { currentChatFileDirectory: options.currentChatFileDirectory, currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
       fileContext: files,
       admit: async () => {
         if (!authenticated || inFlight >= 32) throw Error('MCP_ADMISSION_LIMIT');

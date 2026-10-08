@@ -1,3 +1,5 @@
+import { conversationHasAttachment } from '../application/conversation-history.js';
+import { readDeliveredFile } from '../file-delivery/store.js';
 import { WorkspaceDeviceAuthError } from './workspace-devices.js';
 import { readFileSync } from 'node:fs';
 import { packagedPresetRoot } from '../preset-bootstrap.js';
@@ -819,6 +821,23 @@ export async function buildWebServer(
       const page = await control.conversationPage({ after: request.query.after, limit });
       return { ...page, events: page.events.map(present) };
     });
+
+  app.get<{ Params: { id: string; artifactId: string } }>('/api/v1/roles/:id/artifacts/:artifactId', async (request, reply) => {
+    auth.authenticate(request);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('resource_not_found', 'Agent file not found');
+    try {
+      const { record, bytes } = await readDeliveredFile(stateDir, request.params.artifactId);
+      if (!await conversationHasAttachment(stateDir, record)) throw Error('ARTIFACT_NOT_PUBLISHED');
+      reply.header('Cache-Control', 'private, no-store');
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+      reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(record.name).replace(/'/g, '%27')}`);
+      return reply.type('application/octet-stream').send(bytes);
+    } catch { throw new FleetError('resource_not_found', 'Agent file unavailable'); }
+  });
 
   app.get<{ Params: { id: string; attachmentId: string } }>('/api/v1/roles/:id/attachments/:attachmentId', async (request, reply) => {
     auth.authenticate(request);

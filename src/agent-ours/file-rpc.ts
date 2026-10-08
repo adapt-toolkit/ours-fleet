@@ -1,3 +1,4 @@
+import type { ExportRoot } from '../file-delivery/reader.js';
 import { randomUUID } from 'node:crypto';
 import type { FileExecutionContext } from '@ours.network/mcp/server';
 import type { ToolRequestExtra } from '@ours.network/mcp/dist/types/mcp/tool.js';
@@ -57,9 +58,15 @@ export class FileCallbacks implements FileExecutionContext {
     return (await this.rpc(String(extra.requestId), 'probe', { path }, extra.signal)) === true;
   }
   async read(path: string, extra: ToolRequestExtra) {
+    return this.openRead(path, extra);
+  }
+  async readExport(path: string, root: ExportRoot, extra: ToolRequestExtra) {
+    return this.openRead(path, extra, root);
+  }
+  private async openRead(path: string, extra: ToolRequestExtra, root?: ExportRoot) {
     const call = String(extra.requestId),
       handle = randomUUID();
-    const meta = await this.rpc(call, 'read-open', { path, handle }, extra.signal);
+    const meta = await this.rpc(call, root ? 'export-open' : 'read-open', { path, handle, ...(root ? { root } : {}) }, extra.signal);
     if (
       !meta ||
       typeof meta.filename !== 'string' ||
@@ -67,7 +74,9 @@ export class FileCallbacks implements FileExecutionContext {
       meta.size < 0
     )
       throw Error('INVALID_FILE_METADATA');
+    let closed = false;
     const close = async () => {
+      if (closed) return; closed = true;
       await this.rpc(call, 'close', { handle }, new AbortController().signal).catch(() => {});
     };
     const body = new ReadableStream<Uint8Array>({

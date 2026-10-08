@@ -1,3 +1,4 @@
+import { controlSocketPath } from '../src/session/control.js';
 import { gatewayFixture } from './gateway-fixture.js';
 import { createServer } from 'node:http';
 import { attachOursClient } from '@ours.network/sdk/client';
@@ -287,7 +288,7 @@ describe('doctor scheduled-loop checkpoint', () => {
     ].join('\n'), { mode: 0o600 });   // loop delivery refuses a group/world-writable config
     const agent = join(dir, '.ours-fleet', 'agents', 'Coordinator');
     mkdirSync(agent, { recursive: true });
-    if (opts.running) writeFileSync(join(agent, '.control.sock'), '');
+    if (opts.running) writeFileSync(controlSocketPath(agent), '');
     if (opts.lastWallMs !== undefined) writeFileSync(join(agent, '.scheduled-loops.json'),
       JSON.stringify({
         version: 1, role: 'Coordinator', generation: 'g',

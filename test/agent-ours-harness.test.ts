@@ -77,3 +77,13 @@ it('does not add Codex policy to other harnesses', () => {
   expect((prepared.ours.native.mcp_servers as any).ours).not.toHaveProperty('tools');
   expect(prepared.env.CODEX_CONFIG).toBe('{"model":"preserved"}');
 });
+
+it('opt-in refuses explicit MCP disabling, custom adapters and ambiguous Claude inventories; off keeps them unchanged',()=>{
+ const role={harness:'codex',session:'acp',file_delivery:{enabled:true,directory:'deliverables'}} as ResolvedRole;
+ expect(()=>prepareManagedHarness(role,'/state','/work','/descriptor',{OURS_FLEET_CODEX_ACP_MANIFEST:'/manifest',CODEX_HOME:'/nonexistent-clean-home',CODEX_CONFIG:'{"mcp_servers":{"ours":{"enabled":false}}}'})).toThrow('disabled');
+ expect(()=>prepareManagedHarness({...role,session_options:{acp:{command:['custom']}}},'/state','/work','/descriptor',{})).toThrow('stock ACP');
+ expect(()=>prepareManagedHarness({...role,harness:'claude-code'},'/state','/work','/descriptor',{})).toThrow('single ours');
+ const c={...role,harness:'claude-code',harness_options:{mcp_servers_only:true,mcp_servers:{ours:{command:'ours-mcp',args:['proxy']}}}} as ResolvedRole;
+ expect(prepareManagedHarness(c,'/state','/work','/descriptor',{}).ours.server.name).toBe('ours');
+ expect(()=>prepareManagedHarness({...c,harness_options:{...c.harness_options,mcp_servers:{ours:{command:'ours-mcp'},alias:{command:'ours-mcp'}}}},'/state','/work','/descriptor',{})).toThrow('single ours');
+});

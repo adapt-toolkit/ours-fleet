@@ -5,7 +5,7 @@ import {createInterface} from 'node:readline';
 import type {ConversationEventV1} from '../session/conversation-types.js';
 import type {ConversationPageView} from './session-control.js';
 
-const HISTORICAL_KINDS=['fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'];
+const HISTORICAL_KINDS=['file.attached','fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'];
 
 /** Whether a ledger event belongs in the conversation: the live generation, or history of the resumed ACP session. */
 export function conversationEventVisible(event:ConversationEventV1,sessionGeneration:string,resumedSessionId?:string):boolean {
@@ -117,7 +117,7 @@ export async function resumedConversationPage(stateDir:string, request:{after?:s
         let event:ConversationEventV1;try{event=JSON.parse(line);}catch{continue;}
         const cursor=Number(event.seq);
         if(!Number.isSafeInteger(cursor)||cursor<=after)continue;
-        const historical=['fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'].includes(event.kind);
+        const historical=['file.attached','fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'].includes(event.kind);
         const visible=event.source!=='agent_replay' && (event.sessionGeneration===live.snapshot.sessionGeneration || (historical&&event.acpSessionId===sessionId));
         if(!visible){next=String(cursor);continue;}
         if(events.length===limit){hasMore=true;break scan;}
@@ -128,4 +128,25 @@ export async function resumedConversationPage(stateDir:string, request:{after?:s
   // If a fresh/resumed session changed during the read, use the live page only.
   if((await readFile(join(stateDir,'.acp-session-id'),'utf8')).trim()!==sessionId)return live;
   return {...live,events,firstAvailableCursor:first,nextCursor:next,hasMore};
+}
+
+/** Download authorization requires an actual published attachment, never an orphan copy. */
+export async function conversationHasAttachment(stateDir: string, attachment: import('../file-delivery/types.js').DeliveredFile): Promise<boolean> {
+  const dir = join(stateDir, '.conversation');
+  const names = (await readdir(dir)).filter(n => /^events-\d+\.jsonl$/.test(n)).sort().reverse();
+  let found = false;
+  for (const name of names) {
+    await readLinesBackward(join(dir, name), line => {
+      try {
+        const e = JSON.parse(line) as ConversationEventV1;
+        const a = (e.payload as { attachment?: import('../file-delivery/types.js').DeliveredFile }).attachment;
+        if (e.kind === 'file.attached' && e.source === 'agent' && a?.id === attachment.id
+            && e.sessionGeneration === attachment.sessionGeneration && e.acpSessionId === attachment.acpSessionId
+            && e.turnId === attachment.turnId && JSON.stringify(a) === JSON.stringify(attachment)) found = true;
+      } catch { /* unreadable lines cannot authorize a download */ }
+      return !found;
+    });
+    if (found) break;
+  }
+  return found;
 }

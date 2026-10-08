@@ -280,6 +280,7 @@ function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string,
   const source = compiledProxyModule();
   if (!source) throw new Error('Codex app-server proxy is missing; rebuild ours-fleet');
   writeFileSync(proxyModule, readFileSync(source, 'utf8'), { mode: 0o600 });
+  writeFileSync(join(runtimeDir, 'codex-file-inventory.js'), readFileSync(join(dirname(source), 'codex-file-inventory.js'), 'utf8'), { mode: 0o600 });
   const windows = process.platform === 'win32';
   const command = join(runtimeDir, windows ? 'codex-app-server-proxy.cmd' : 'codex-app-server-proxy');
   const script = windows
@@ -496,7 +497,7 @@ export function makeCodexAdapter(
           catch (error) {
             throw new Error(`Codex ACP runtime check failed: ${(error as Error).message}; check CODEX_PATH or reinstall Fleet with optional dependencies`);
           }
-          const minimum = role.model === 'gpt-6-astra' || resolution.version === '1.10.0'
+          const minimum = role.file_delivery?.enabled ? '0.159.0' : role.model === 'gpt-6-astra' || resolution.version === '1.10.0'
             ? '0.153.3' : '0.145.0';
           if (!codexVersionAtLeast(runtime.version, minimum))
             throw new Error(`${role.model ?? 'Codex ACP'} requires a newer Codex (>=${minimum}): ACP selects ${runtime.executable} (${runtime.version}); upgrade Fleet or set CODEX_PATH to a supported executable in the agent/service environment`);

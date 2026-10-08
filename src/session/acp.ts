@@ -1,3 +1,4 @@
+import type { FileDeliveryInput, CopyChatFile, DeliveredFile } from '../file-delivery/types.js';
 import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -399,7 +400,9 @@ export class AcpSession implements AgentSession {
     recoveryStartedAt?: number; resumed: boolean; blocked: boolean;
   };
   private readonly toolBoundaryWaiters = new Set<() => void>();
+  private fileExportBusy = false;
   private activeTurn?: {
+    fileDeliveryRevoked?: boolean;
     toolEvidence: Map<string, string>; planEvidence?: string;
     startedAt: number; toolIds: Set<string>; lastProgressAt: number; progressCount: number; transportFailures: number; boundaryUnknown: boolean;
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
@@ -969,6 +972,7 @@ export class AcpSession implements AgentSession {
       this.stallAttempt.superseded = true;
     if (!this.sessionId) return;
     const active = this.activeTurn;
+    if (active) active.fileDeliveryRevoked = true;
     const previousSource = active?.cancellationSource;
     if (active && (source === 'owner' || source === 'local-console' || !previousSource))
       active.cancellationSource = source;
@@ -1176,6 +1180,41 @@ export class AcpSession implements AgentSession {
 
   exitResult(): ExitRecord | null {
     return this.exit;
+  }
+
+  /** One attempt, tied to the managed live turn captured before any approval/read. */
+  async sendFileToChat(input: FileDeliveryInput, signal: AbortSignal, copy: CopyChatFile, policy: CommonPermissions): Promise<DeliveredFile> {
+    const active = this.activeTurn, sessionId = this.sessionId;
+    const check = () => {
+      signal.throwIfAborted();
+      if (!active || !sessionId || this.activeTurn !== active || this.sessionId !== sessionId || active.fileDeliveryRevoked
+          || active.cancellationSource || this.closing || !this.isAlive() || this.replaying || this.steeringOccupied
+          || active.origin?.kind === 'scheduled-loop' || policy.approval === 'deny') throw Error('CURRENT_CHAT_DELIVERY_UNAVAILABLE');
+    };
+    check(); if (this.fileExportBusy) throw Error('FILE_DELIVERY_BUSY');
+    this.fileExportBusy = true;
+    const toolCallId = 'fleet-file-export-' + randomUUID();
+    try {
+      const onAbort = () => { for (const [id, pending] of this.pendingPermissions) if (pending.toolCallId === toolCallId)
+        this.settlePendingAutomatically(id, pending, 'cancelled', undefined, 'File send cancelled'); };
+      signal.addEventListener('abort', onAbort, { once: true });
+      let answer: acp.RequestPermissionResponse;
+      try {
+        answer = await this.requestPermission({ sessionId: sessionId!, toolCall: {
+          toolCallId, title: 'Send file to this ACP chat: ' + (input.filename ?? input.path), kind: 'read', status: 'pending',
+          locations: [{ path: resolve(this.options.cwd, input.path) }],
+        }, options: [ { optionId: 'send', name: 'Send file', kind: 'allow_once' }, { optionId: 'deny', name: 'Do not send', kind: 'reject_once' } ] }, policy);
+      } finally { signal.removeEventListener('abort', onAbort); }
+      check();
+      if (answer.outcome.outcome !== 'selected' || answer.outcome.optionId !== 'send') throw Error('FILE_SEND_DENIED');
+      const attachment = await copy({ sessionGeneration: this.sessionGeneration, acpSessionId: sessionId!, turnId: active!.id });
+      // Synchronous check + durable append establishes order with cancellation/stop.
+      // No await, pending-send journal, replay or recovery exists after this point.
+      check();
+      this.conversation.append({ kind: 'file.attached', source: 'agent', sessionGeneration: this.sessionGeneration,
+        acpSessionId: sessionId, promptId: active!.id, turnId: active!.id, payload: { attachment } });
+      return attachment;
+    } finally { this.releaseTool(toolCallId); this.fileExportBusy = false; }
   }
 
   async close(): Promise<void> {
@@ -1559,6 +1598,7 @@ export class AcpSession implements AgentSession {
 
   private async steerPrompt(text: string): Promise<TurnResult> {
     this.steeringWasUsed = true;
+    if (this.activeTurn) this.activeTurn.fileDeliveryRevoked = true;
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.steeringRequests++;
@@ -1589,7 +1629,7 @@ export class AcpSession implements AgentSession {
     } finally { this.steeringRequests--; }
   }
 
-  private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+  private requestPermission(params: acp.RequestPermissionRequest, neutralPolicy?: CommonPermissions): Promise<acp.RequestPermissionResponse> {
     // `kinds` is a PRIORITY order. Scanning the agent's option array instead
     // (`options.find(o => kinds.includes(o.kind))`) hands the choice to whatever
     // order the agent happened to list, which is exactly how an automatic denial
@@ -1606,7 +1646,7 @@ export class AcpSession implements AgentSession {
     // Permission is part of the tool lifecycle. Reserve before any policy or
     // human decision so a monitor wake cannot slip between request and answer.
     this.reservePermission(toolCallId, permissionId);
-    if (this.isEffectiveCodexProtectedMcpApproval(params)) {
+    if (!neutralPolicy && this.isEffectiveCodexProtectedMcpApproval(params)) {
       // Protected MCP approval is already the tool's narrow gate. Never turn
       // this one decision into an adapter-wide standing grant.
       const option = choose(['allow_once']);
@@ -1617,11 +1657,11 @@ export class AcpSession implements AgentSession {
       else this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
     }
-    if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
+    if ((neutralPolicy ?? this.options.permissions).approval === 'allow' && this.withinAutomaticBoundary(params, neutralPolicy)) {
       const option = choose(['allow_always', 'allow_once']);
       const response = this.settleAutomatically(params, option, 'allowed',
         'permissions.approval=allow',
-        `the request is inside the ${this.options.permissions.filesystem} boundary`);
+        `the request is inside the ${(neutralPolicy ?? this.options.permissions).filesystem} boundary`);
       if (option) this.allowPermission(toolCallId, permissionId);
       else this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
@@ -1629,8 +1669,8 @@ export class AcpSession implements AgentSession {
     // A live grace window still counts as attended: the controller may be
     // mid-reconnect, and denying instantly is exactly what the grace prevents.
     const unattended = this.controllerCount === 0 && !this.controllerGrace
-      && this.options.permissions.unattended === 'deny';
-    if (this.options.permissions.approval === 'deny' || unattended) {
+      && (neutralPolicy ?? this.options.permissions).unattended === 'deny';
+    if ((neutralPolicy ?? this.options.permissions).approval === 'deny' || unattended) {
       // reject_once FIRST: `reject_always` teaches the agent a standing rule from
       // a decision no human made, so one unattended denial would silently disable
       // the tool for the rest of the session.
@@ -1743,8 +1783,8 @@ export class AcpSession implements AgentSession {
       : { outcome: { outcome: 'cancelled' } };
   }
 
-  private withinAutomaticBoundary(params: acp.RequestPermissionRequest): boolean {
-    const filesystem = this.options.permissions.filesystem;
+  private withinAutomaticBoundary(params: acp.RequestPermissionRequest, policy?: CommonPermissions): boolean {
+    const filesystem = (policy ?? this.options.permissions).filesystem;
     if (filesystem === 'unrestricted') return true;
     if (filesystem === 'read-only' && params.toolCall.kind !== 'read') return false;
     const locations = params.toolCall.locations ?? [];
