@@ -51,7 +51,14 @@ export class ArtifactStore {
       renameSync(partial, base + id + '.data');
       writeFileSync(base + id + '.json', JSON.stringify(record), { flag: 'wx', mode: 0o400, flush: true });
       // No pending-send record or recovery: a later failure leaves only unreferenced stored bytes.
-      await root.sync(); return record;
+      await root.sync();
+      // The newly created incarnation directory and store root must also survive
+      // a crash before a durable conversation event can reference this file.
+      for (const parent of [join(stateRoot(), 'private-file-delivery'), stateRoot()]) {
+        const handle = await openDirectory(parent);
+        try { await handle.sync(); } finally { await handle.close(); }
+      }
+      return record;
     } finally {
       await file?.close(); await reader.cancel().catch(() => {}); await source.close();
       await unlink(partial).catch(() => {}); await root.close();

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, renameSync, rmSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { pinExportRoot, openExportFile, MAX_FILE_BYTES } from '../src/file-delivery/reader.js';
+import { pinExportRoot, openExportFile, openDirectory, MAX_FILE_BYTES } from '../src/file-delivery/reader.js';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { conversationEventVisible, conversationHasAttachment } from '../src/application/conversation-history.js';
 import { ArtifactStore, readDeliveredFile } from '../src/file-delivery/store.js';
@@ -96,6 +96,24 @@ it('metadata sync failure returns failure without a receipt, publication or auto
    attempts++;return store.copy({size:3,body:new Blob(['abc']).stream(),close:async()=>{}},'x','text/plain',b,signal());
   },policy)).rejects.toThrow('injected metadata fsync failure');
   expect(metadataSyncs).toBe(1);expect(attempts).toBe(1);
+  expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);
+ }finally{sync.mockRestore();await s.interrupt();await task;}
+});
+
+it.each(['private-file-delivery','state root'])('%s directory sync failure prevents first attachment publication',async level=>{
+ const {dir,s}=await live();process.env.OURS_FLEET_HOME=dir;const stateRoot=join(dir,'.ours-fleet');mkdirSync(stateRoot,{mode:0o700});writeFileSync(join(dir,'.session-id'),randomUUID());
+ const store=new ArtifactStore(dir);const {task}=await running(s);let attempts=0,parentSyncs=0;
+ const probe=await openDirectory(dir);const prototype=Object.getPrototypeOf(probe);const original=prototype.sync;await probe.close();
+ const target=level==='state root'?stateRoot:join(stateRoot,'private-file-delivery');
+ const sync=vi.spyOn(prototype,'sync').mockImplementation(function(this:any){
+  if(fs.readlinkSync(`/proc/self/fd/${this.fd}`)===target){parentSyncs++;return Promise.reject(Error('injected parent directory fsync failure'));}
+  return original.call(this);
+ });
+ try{
+  await expect(s.sendFileToChat({path:'deliverables/x'},signal(),async b=>{
+   attempts++;return store.copy({size:3,body:new Blob(['abc']).stream(),close:async()=>{}},'x','text/plain',b,signal());
+  },policy)).rejects.toThrow('injected parent directory fsync failure');
+  expect(parentSyncs).toBe(1);expect(attempts).toBe(1);
   expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);
  }finally{sync.mockRestore();await s.interrupt();await task;}
 });
