@@ -919,7 +919,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           cowork: task.layout ? undefined : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config }) });
         if (opts.json) console.log(JSON.stringify({ schema_version: 1, task_id: id, members }, null, 2));
         else for (const member of members) console.log(`${member.name}: ${member.status}`);
-      } catch (error) { if (opts.json) die(error); dieTaskRoom(error); }
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('start <id>'))

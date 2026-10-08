@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
-import { installTaskSupervisorService, taskSystemdUnit, taskLaunchdLabel, uninstallTaskSupervisorService } from './task-supervisor-service.js';
+import { installTaskSupervisorService, taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService } from './task-supervisor-service.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
@@ -135,7 +135,7 @@ export function makeTempSupervisorLauncher(options: {
       const kind = platform === 'linux' ? 'systemd-persistent' : 'launchd-persistent';
       const target = platform === 'linux' ? taskSystemdUnit(role) : taskLaunchdLabel(role);
       await updateTempSupervisor(dir, { phase: 'launching', kind, target, binPath });
-      await installTaskSupervisorService(role, binPath, dir, platform, exec);
+      await installTaskSupervisorService(role, binPath, dir, platform, exec, readTempSupervisor(dir)!.taskOwner!, readTempSupervisor(dir)!.launchId);
       await updateTempSupervisor(dir, { phase: 'active' });
       return;
     }
@@ -544,7 +544,7 @@ export async function stopTempSupervisor(
   }) + '\n');
   if (record.taskOwner && (record.kind === 'systemd-persistent' || record.kind === 'launchd-persistent')) {
     if (!record.target) throw Error('TASK_SERVICE_TARGET_MISSING');
-    await uninstallTaskSupervisorService(role, record.kind, record.target, exec);
+    await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
     return 'stopped';
   }
   if (record.kind === 'systemd-transient' && record.target) {
@@ -600,6 +600,11 @@ export async function stopTempSupervisor(
 /** Legacy task snapshots remain recovery evidence even before explicit migration. */
 function hasRetainedTaskReference(dir: string): boolean {
   try {
+    if (existsSync(join(stateRoot(), 'task-supervisors', basename(dir) + '.json'))) return true;
+    if (basename(dir).startsWith('layout-')) {
+      const provenance = JSON.parse(readFileSync(join(dir, 'creation.json'), 'utf8'));
+      if (typeof provenance.creationActionId === 'string' && provenance.creationActionId.startsWith('task-')) return true;
+    }
     const startup = (parse(readFileSync(join(dir, 'role.yaml'), 'utf8')) as {
       roomMemberStartup?: { room_id?: string; identity_name?: string };
     })?.roomMemberStartup;

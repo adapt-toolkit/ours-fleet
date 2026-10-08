@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -11,7 +11,7 @@ import { createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-sta
 import { agentDir, stateRoot } from '../src/paths.js';
 import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor } from '../src/temp-lifecycle.js';
 import { taskSupervisorMayRun } from '../src/task-supervision.js';
-import { taskSystemdUnit, taskLaunchdLabel } from '../src/task-supervisor-service.js';
+import { taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
 import { runTemp, readRestartLedger, writeRestartLedger } from '../src/runner.js';
 import { recoverTaskMembers } from '../src/rooms-tasks/recovery.js';
 import { adoptLegacyTaskMember } from '../src/rooms-tasks/legacy-task-member.js';
@@ -260,4 +260,65 @@ it('uses explicit layout ownership and excludes borrowed participants from recov
   const resume = vi.fn(async () => {}), liveness = vi.fn(async () => 'stopped' as const);
   expect(await recoverTaskMembers({ taskId: task.task_id, binPath: '/fixture/fleet', deps: { resume, liveness } })).toEqual([]);
   expect(resume).not.toHaveBeenCalled(); expect(liveness).not.toHaveBeenCalled();
+});
+
+it('removes the exact retained service after losing live task member state', async () => {
+  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })(
+    '/fixture/fleet', ['_run-temp', f.name], f.dir);
+  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
+  const service = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
+  rmSync(f.dir, { recursive: true });
+  await expect(uninstallRetainedTaskService(f.name, { taskId: 'other-task', creationActionId: 'task-action' }, exec))
+    .rejects.toThrow('TASK_SERVICE_OWNER_MISMATCH');
+  expect(existsSync(service)).toBe(true); expect(existsSync(proof)).toBe(true);
+  await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec);
+  expect(existsSync(service)).toBe(false); expect(existsSync(proof)).toBe(false);
+  await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, async () => ({ code: 0, stdout: 'not-found', stderr: '' })); // retry
+});
+
+it('preserves a replaced service file and its cleanup proof', async () => {
+  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })(
+    '/fixture/fleet', ['_run-temp', f.name], f.dir);
+  const service = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
+  writeFileSync(service, 'replacement service'); exec.mockClear();
+  await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_FILE_MISMATCH');
+  expect(exec).not.toHaveBeenCalled();
+  expect(readFileSync(service, 'utf8')).toBe('replacement service');
+  expect(existsSync(join(stateRoot(), 'task-supervisors', f.name + '.json'))).toBe(true);
+});
+
+it('refuses corrupt task supervisor metadata instead of entering standalone temporary retirement', async () => {
+  const f = fixture(), attempt = vi.fn();
+  writeFileSync(join(f.dir, '.temp-supervisor.json'), '{}');
+  await expect(runTemp(f.name, {}, attempt)).rejects.toThrow('TASK_SUPERVISOR_OWNER_MISSING');
+  expect(attempt).not.toHaveBeenCalled(); expect(existsSync(f.dir)).toBe(true);
+});
+
+it.each(['permanent', 'symlink'])('refuses retained task startup with %s ownership evidence', mode => {
+  const f = admittedFixture();
+  if (mode === 'permanent') mkdirSync(agentDir(f.name), { recursive: true });
+  else { const path = join(f.privateDir, 'identity-pin.json'), copy = join(root, 'other-pin');
+    writeFileSync(copy, readFileSync(path)); rmSync(path); symlinkSync(copy, path); }
+  expect(() => taskSupervisorMayRun(f.name)).toThrow();
+});
+
+it('refuses service removal through a symlinked ownership marker', async () => {
+  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
+  const path = join(stateRoot(), 'task-supervisors', f.name + '.json'), copy = join(root, 'foreign-service-owner');
+  writeFileSync(copy, readFileSync(path)); rmSync(path); symlinkSync(copy, path); exec.mockClear();
+  await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_UNSAFE_PROOF');
+  expect(exec).not.toHaveBeenCalled(); expect(existsSync(copy)).toBe(true);
+});
+
+it('blocks task erasure while a surviving service proof references a lost layout or room', async () => {
+  const f = fixture(), exec = async () => ({ code: 0, stdout: '', stderr: '' });
+  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
+  expect(() => assertTaskServicesAbsent('another-task')).not.toThrow();
+  rmSync(f.dir, { recursive: true });
+  expect(() => assertTaskServicesAbsent(f.task.task_id)).toThrow('TASK_SERVICES_REMAIN');
+  await uninstallRetainedTaskService(f.name, { taskId: f.task.task_id, launchId: f.metadata.launchId }, exec);
+  expect(() => assertTaskServicesAbsent(f.task.task_id)).not.toThrow();
 });

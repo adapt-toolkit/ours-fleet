@@ -63,6 +63,8 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           }, null, 2));
           return;
         }",
+  "if (opts.json) console.log(JSON.stringify({ schema_version: 1, task_id: id, members }, null, 2));
+        else for (const member of members) console.log(\`\${member.name}: \${member.status}\`);",
   "if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t, provisioning }, null, 2)); return;
         }",

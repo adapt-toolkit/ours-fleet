@@ -1,10 +1,9 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
-import { agentDir } from './paths.js';
+import { agentDir, stateRoot } from './paths.js';
 import { readTempSupervisor } from './temp-lifecycle.js';
 import { createHash } from 'node:crypto';
-import { stateRoot } from './paths.js';
 import { readProvenance } from './creation.js';
 import type { ResolvedRole } from './config.js';
 import { getTask } from './rooms-tasks/task-state.js';
@@ -12,21 +11,29 @@ import { getRoomRecord } from './rooms-tasks/room-state.js';
 import { assertWorkspacePresent } from './rooms-tasks/workspace.js';
 import { privateRuntimeRoot } from './agent-ours/service.js';
 import { binderKey, RuntimeJournal } from './agent-ours/state.js';
+import { assertMemberNotPermanent } from './rooms-tasks/member-ownership.js';
 import { readClientProfile } from './client-profile.js';
+
+function readProof(path: string): string {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 256 * 1024) throw Error('TASK_SUPERVISOR_UNSAFE_PROOF');
+  return readFileSync(path, 'utf8');
+}
 
 /** An admitted task member must resume its retained instance, never allocate a successor. */
 function assertRetainedRuntime(role: ResolvedRole, action: string, cid: string, launch?: string, session?: string): void {
   const profile = readClientProfile({ ...process.env, ...role.env });
   if (!profile) throw Error('TASK_RUNTIME_PROFILE_MISSING');
   const dir = join(privateRuntimeRoot(), binderKey(profile.expectedInstanceId, role.identity));
-  const instance = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'));
-  const owner = JSON.parse(readFileSync(join(dir, 'owner.json'), 'utf8'));
-  const pin = JSON.parse(readFileSync(join(dir, 'identity-pin.json'), 'utf8'));
+  const instance = JSON.parse(readProof(join(dir, 'instance.json')));
+  const owner = JSON.parse(readProof(join(dir, 'owner.json')));
+  const pin = JSON.parse(readProof(join(dir, 'identity-pin.json')));
+  readProof(join(dir, 'state.json'));
   const state = new RuntimeJournal(dir).read();
-  const creation = JSON.parse(readFileSync(join(privateRuntimeRoot(), 'launches', binderKey('temporary', role.name) + '.json'), 'utf8'));
+  const creation = JSON.parse(readProof(join(privateRuntimeRoot(), 'launches', binderKey('temporary', role.name) + '.json')));
   const sessionDir = agentDir(role.name, true);
-  const retainedSession = readFileSync(join(sessionDir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id'), 'utf8').trim();
-  readFileSync(join(sessionDir, '.booted'), 'utf8'); // presence is the runner's resume marker, including legacy empty files
+  const retainedSession = readProof(join(sessionDir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id')).trim();
+  readProof(join(sessionDir, '.booted')); // presence is the runner's resume marker, including legacy empty files
   if (creation.role !== role.name || creation.identity !== role.identity || creation.action !== action
       || !state || instance.role !== role.name || instance.temporary !== true || !instance.instance
       || owner.instance !== instance.instance || typeof owner.token !== 'string' || !owner.token
@@ -40,10 +47,14 @@ function assertRetainedRuntime(role: ResolvedRole, action: string, cid: string, 
 
 /** Read-only ownership fence: absence/mismatch never permits a new identity or launch. */
 export function taskSupervisorMayRun(name: string): boolean {
-  const dir = agentDir(name, true), supervisor = readTempSupervisor(dir), owner = supervisor?.taskOwner;
+  assertMemberNotPermanent(name);
+  const dir = agentDir(name, true);
+  readProof(join(dir, '.temp-supervisor.json'));
+  readProof(join(dir, 'creation.json'));
+  const supervisor = readTempSupervisor(dir), owner = supervisor?.taskOwner;
   if (!owner || supervisor.role !== name || !owner.taskId || !owner.creationActionId)
     throw Error('TASK_SUPERVISOR_OWNER_MISSING');
-  const role = parse(readFileSync(join(dir, 'role.yaml'), 'utf8')) as ResolvedRole;
+  const role = parse(readProof(join(dir, 'role.yaml'))) as ResolvedRole;
   const startup = role.roomMemberStartup, provenance = readProvenance(dir);
   const task = getTask(owner.taskId);
   if (role.name !== name || role.identity !== name || provenance?.role !== name
@@ -58,7 +69,7 @@ export function taskSupervisorMayRun(name: string): boolean {
     if (!task.layout || task.layout.run_id !== runId || runId !== `task-${owner.taskId}`
         || !/^[A-Za-z0-9_-]+$/.test(runId) || expectedName !== name
         || owner.creationActionId !== `${runId}:${participant}`) throw Error('TASK_LAYOUT_OWNER_MISMATCH');
-    const state = JSON.parse(readFileSync(join(stateRoot(), 'layouts', `${runId}.json`), 'utf8'));
+    const state = JSON.parse(readProof(join(stateRoot(), 'layouts', `${runId}.json`)));
     const member = state.participants[participant];
     if (!member?.owned || member.instance?.remote || (member.instance?.agent && member.instance.agent !== name)
         || (member.instance && member.instance.temporary !== true)) throw Error('TASK_LAYOUT_PARTICIPANT_MISMATCH');

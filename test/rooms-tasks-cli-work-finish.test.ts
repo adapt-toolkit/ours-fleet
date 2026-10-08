@@ -549,7 +549,8 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(out.join('\n')).toContain("unknown command 'recover'");
     expect(mocks.provisionMembers).not.toHaveBeenCalled();
     const task = makeProgram().commands.find(command => command.name() === 'task');
-    expect(task?.helpInformation()).not.toContain('recover');
+    expect(task?.commands.some(command => command.name() === 'recover')).toBe(false);
+    expect(task?.commands.some(command => command.name() === 'recover-members')).toBe(true);
   });
 
   it('rejects the removed task await subcommand before any provisioning effect', async () => {

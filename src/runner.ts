@@ -1,3 +1,4 @@
+import { readProvenance } from './creation.js';
 import { StartupTelemetry } from './startup-telemetry.js';
 import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
@@ -1465,7 +1466,15 @@ export async function runTemp(
   attempt: typeof runOnce = runOnce,
 ): Promise<void> {
   const dir = agentDir(name, true);
-  if (readTempSupervisor(dir)?.taskOwner) {
+  const metadata = readTempSupervisor(dir);
+  if (!metadata?.taskOwner) {
+    const role = loadTempRole(name);
+    const provenance = readProvenance(dir);
+    if (role.roomMemberStartup?.task_id || existsSync(join(stateRoot(), 'task-supervisors', name + '.json'))
+        || (name.startsWith('layout-') && provenance?.creationActionId?.startsWith('task-')))
+      throw Error('TASK_SUPERVISOR_OWNER_MISSING');
+  }
+  if (metadata?.taskOwner) {
     // Serialize the entire process lifetime before metadata/session writes.
     const lease = await acquireOwnerBinderLease(join(dir, '.task-supervisor'), 'task-supervisor', name);
     try {
