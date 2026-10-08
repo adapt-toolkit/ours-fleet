@@ -46,13 +46,49 @@ async function startArbiterServer() {
     permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     log: () => {},
   });
-  const server = new RoleControlServer(stateDir, new RoleTurnArbiter(session), () => {});
+  const arbiter = new RoleTurnArbiter(session);
+  const server = new RoleControlServer(stateDir, arbiter, () => {});
   await server.start();
   cleanups.push(async () => { await server.close(); await session.close(); });
-  return { stateDir };
+  return { stateDir, session, server, arbiter };
 }
 
 describe('role-control conversation v3', () => {
+  it.each(['interrupt', 'after-tool'])('queues a monitor wake during active voice despite a timed-out member spawn: %s', async policy => {
+    const { stateDir, session, server, arbiter } = await startArbiterServer();
+    const generation = session.conversationSnapshot().sessionGeneration;
+    const voice = await controlRequest(stateDir, { command: 'submit_voice_prompt', commandId: 'voice-task-start',
+      text: 'block 600', actor: 'browser', source: 'owner_admin_console', expectedSessionGeneration: generation, requireIdle: true });
+    expect(voice.ok).toBe(true);
+    await expect.poll(() => session.snapshot().activePromptSource).toBe('owner-admin-console');
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    server.setFleetSpawner(async () => { await pending; return {
+      caller: 'A', role: 'TaskWorker', lifetime: 'temporary', statePath: '/fixture/task-worker',
+      creationActionId: 'task-action', inherited: [], harness: 'codex', session: 'acp',
+      monitor: { mode: 'fleet', interrupt: true }, brainSummary: 'fixture', roleSummary: 'worker',
+    }; });
+    try {
+      const spawn = controlRequest(stateDir, { command: 'fleet_spawn', spawn: { name: 'TaskWorker' } }, 30)
+        .catch(error => error);
+      const options = { interrupt: true, steer: true, interruptSource: 'fleet-monitor' as const, origin: { kind: 'fleet-monitor' as const } };
+      const wake = policy === 'after-tool' ? arbiter.submitPromptAfterTool('mail after voice', options) : arbiter.submitPrompt('mail after voice', options);
+      expect((await controlRequest(stateDir, { command: 'snapshot' })).result).toMatchObject({
+        alive: true, readiness: 'running', activePromptSource: 'owner-admin-console',
+      });
+      expect((await spawn).kind).toBe('timeout');
+      expect((await wake).succeeded).toBe(true);
+      const events = session.conversationPage({ limit: 100 }).events;
+      expect(events.filter(event => event.kind === 'prompt.interrupt_requested')).toEqual([]);
+      const voiceId = (voice.result as { promptId: string }).promptId;
+      const stopped = events.findIndex(event => event.kind === 'turn.completed' && event.promptId === voiceId);
+      const mailStarted = events.findIndex(event => event.kind === 'prompt.started' && event.source === 'fleet_monitor');
+      expect(stopped).toBeGreaterThan(-1);
+      expect(mailStarted).toBeGreaterThan(stopped);
+      expect(session.conversationSnapshot().sessionGeneration).toBe(generation);
+    } finally { release(); }
+  });
+
   it('live voice binds admission and interrupt atomically through the arbiter/control socket', async () => {
     const { stateDir } = await startArbiterServer();
     const page = await controlRequest(stateDir, { command: 'conversation_page', limit: 1 });

@@ -240,6 +240,8 @@ export interface SessionSnapshot {
   backend: SessionBackendId;
   alive: boolean;
   readiness: SessionReadiness;
+  /** Typed source of the active prompt; excludes prompt bodies and command IDs. */
+  activePromptSource?: PromptOrigin['kind'];
   sessionId?: string;
   lastError?: string;
   pendingPermissionId?: string;
