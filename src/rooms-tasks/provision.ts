@@ -410,6 +410,7 @@ async function launchMember(input: {
   const actionId = randomUUID();
   let effectiveActionId: string = actionId;
   const attempt = (seat.launch?.attempt ?? 0) + 1;
+  const taskSupervised = Boolean(provision.taskId) && process.env.OURS_FLEET_SUPERVISOR !== 'none';
   const taskSha = sha256Text(startup.task);
   const effectiveAgentDefinition = structuredClone(settings.definition);
   const { projection: agentDefinition, fingerprint: agentFingerprint } =
@@ -418,6 +419,7 @@ async function launchMember(input: {
     ? process.env[FLEET_PROXY_CALLER_ENV] : undefined;
   updateMemberStartup(provision.roomId, member.name, { launch: {
     state: 'intent', attempt, action_id: actionId, mission_sha256: taskSha,
+    ...(taskSupervised ? { task_supervised: true } : {}),
     agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
     agent_template: settings.template, agent_template_hash: settings.templateHash,
     ...(proxyCaller ? { caller_role: proxyCaller } : {}),
@@ -442,6 +444,7 @@ async function launchMember(input: {
     if (launched.creationActionId !== actionId) {
       updateMemberStartup(provision.roomId, member.name, { launch: {
         state: 'intent', attempt, action_id: launched.creationActionId,
+        ...(taskSupervised ? { task_supervised: true } : {}),
         mission_sha256: taskSha, agent_definition: agentDefinition,
         agent_fingerprint: agentFingerprint,
         agent_template: settings.template, agent_template_hash: settings.templateHash,
@@ -462,6 +465,7 @@ async function launchMember(input: {
       : presentationFromStatePath(launchedDir, settings, member.coworkRole);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
+      ...(taskSupervised ? { task_supervised: true } : {}),
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
       presentation,
@@ -471,6 +475,7 @@ async function launchMember(input: {
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
+      ...(taskSupervised ? { task_supervised: true } : {}),
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
       ...(proxyCaller ? { caller_role: proxyCaller } : {}),

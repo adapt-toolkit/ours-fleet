@@ -9,6 +9,7 @@ import { agentDir, stateRoot } from '../paths.js';
 import { readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempArchiveForCreationAction, type TempLifecycleDeps } from '../temp-lifecycle.js';
 import { assertMemberIdentityAbsent, removeExactMemberIdentity, waitForLivenessAbsent } from './close.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
+import { retireTaskMemberService } from './task-service-retirement.js';
 import type { LayoutInstance, RoomLayoutState } from './layout.js';
 import type { RoomMemberSeat } from './types.js';
 function proof(path: string): string {
@@ -35,11 +36,13 @@ function seatFor(instance: LayoutInstance & { agent: string }, key: string, acti
  * instance and CID fence replacement supervisors even when already stopped.
  */
 export async function retireOwnedLayoutMember(instance: LayoutInstance, runId: string, key: string,
-  lifecycle: TempLifecycleDeps = {}): Promise<void> {
+  lifecycle: TempLifecycleDeps = {}, taskSupervised = false): Promise<void> {
   assertOwned(instance, runId, key);
   const action = `${runId}:${key}`, dir = agentDir(instance.agent, true);
   const archived = tempArchiveForCreationAction(instance.agent, action);
   if (!existsSync(dir) && !archived) {
+    if (runId.startsWith('task-')) await retireTaskMemberService(instance.agent,
+      { taskId: runId.slice(5), creationActionId: action, taskSupervised }, lifecycle.exec);
     // A prior erasure may already have consumed its archive. No live state plus
     // authoritative identity absence is required before accepting completion.
     await assertMemberIdentityAbsent({ role_name: instance.agent, identity_cid: instance.cid,
@@ -64,6 +67,8 @@ export async function retireOwnedLayoutMember(instance: LayoutInstance, runId: s
         || runtime.lifetime !== 'temporary' || runtime.action !== action
         || runtime.cid?.toLowerCase() !== instance.cid.toLowerCase())
       throw Error('LAYOUT_MEMBER_INSTANCE_MISMATCH');
+    if (runId.startsWith('task-')) await retireTaskMemberService(instance.agent,
+      { taskId: runId.slice(5), creationActionId: action, launchId: supervisor.launchId, taskSupervised }, lifecycle.exec);
     if (existsSync(dir)) {
       await stopTempSupervisor(instance.agent, lifecycle);
       await waitForLivenessAbsent(instance.agent, supervisor.launchId, lifecycle);

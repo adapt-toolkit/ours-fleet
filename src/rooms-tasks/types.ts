@@ -84,6 +84,7 @@ export interface TaskDeletionMemberCursor {
   name: string;
   identity_cid: string;
   action_id?: string;
+  task_supervised?: boolean;
   phase: TaskDeletionMemberPhase;
   launch_id?: string;
   archive_path?: string;
@@ -222,6 +223,7 @@ export interface RoomRoleBriefingDefinition {
 }
 
 export interface RoomMemberLaunchState {
+  task_supervised?: boolean;
   state: 'pending' | 'intent' | 'launched' | 'stopped' | 'failed';
   attempt: number;
   action_id?: string;

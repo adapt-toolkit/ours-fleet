@@ -1,6 +1,7 @@
 import { detachDeletedRoom } from './task-state.js';
 import { binderKey } from '../agent-ours/state.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
+import { retireTaskMemberService } from './task-service-retirement.js';
 import { eraseMemberArtifacts } from './erasure.js';
 import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
 import { collectWorkspaceArchives } from './workspace-artifacts.js';
@@ -32,6 +33,7 @@ export function roomCloseLockPath(roomId: string): string {
 }
 
 export interface RoomCloseDeps {
+  retireTaskService?: typeof retireTaskMemberService;
   inspectMember?(seat: RoomMemberSeat): Promise<{ launchId: string }>;
   requestStop?(role: string): Promise<void>;
   waitForLivenessAbsent?(role: string, launchId: string): Promise<void>;
@@ -184,6 +186,11 @@ async function retireMember(
   assertMemberNotPermanent(seat.role_name);
   let room = getRoomRecord(roomId)!;
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
+  if (room.task_id) await (deps.retireTaskService ?? retireTaskMemberService)(current.role_name, {
+    taskId: room.task_id, creationActionId: current.launch?.action_id,
+    taskSupervised: current.launch?.task_supervised,
+    ...(current.launch?.launch_id ? { launchId: current.launch.launch_id } : {}),
+  });
   let retirement = current.retirement;
   if (retirement?.phase === 'identity_absent') {
     if (!deps.inspectMember) {

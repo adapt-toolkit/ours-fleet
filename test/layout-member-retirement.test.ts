@@ -29,7 +29,7 @@ async function fixture() {
   writeFileSync(join(permanent, '.session-id'), 'permanent-conversation');
   let rows = [{ name, cid }]; sdk.listIdentities.mockImplementation(async () => rows);
   sdk.removeIdentity.mockImplementation(async ({ name: removing }) => { rows = rows.filter(row => row.name !== removing); });
-  const exec = vi.fn(async (cmd: string, args: string[]) => ({ code: 0, stdout: args.includes('show') ? 'inactive\n' : '', stderr: '' }));
+  const exec = vi.fn(async (cmd: string, args: string[]) => ({ code: 0, stdout: args.includes('LoadState') ? 'not-found\n' : args.includes('show') ? 'inactive\n' : '', stderr: '' }));
   const instance = { supervisor: stateRoot(), agent: name, temporary: true, launch: runtime.instance, cid, session: 'original-conversation' };
   return { runId, key, name, cid, dir, privateDir, runtime, permanent, exec, instance };
 }

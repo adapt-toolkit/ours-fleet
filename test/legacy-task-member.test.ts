@@ -7,7 +7,7 @@ import { gatewayFixture } from './gateway-fixture.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { binderKey } from '../src/agent-ours/state.js';
 import { createTask, startTask, updateTaskRoom, beginTaskDeletionIntent } from '../src/rooms-tasks/task-state.js';
-import { createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
+import { createRoomRecord, updateMemberSeats, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { adoptLegacyTaskMember } from '../src/rooms-tasks/legacy-task-member.js';
 import { prepareTempSupervisor, readTempSupervisor } from '../src/temp-lifecycle.js';
 import { readClientProfile } from '../src/client-profile.js';
@@ -55,6 +55,7 @@ it('adopts only metadata and preserves original launch, conversation, identity a
   expect(readFileSync(join(f.dir, '.acp-session-id'), 'utf8')).toBe('same-conversation');
   expect(readFileSync(join(f.privateDir, 'state.json'))).toEqual(runtime);
   expect(parse(readFileSync(join(f.dir, 'role.yaml'), 'utf8')).roomMemberStartup.task_id).toBe(f.task.task_id);
+  expect(getRoomRecord(f.owner.roomId)?.member_seats[0].launch?.task_supervised).toBe(true);
   expect(await adoptLegacyTaskMember(f.owner, f.name, f.deps)).toBe('already-durable');
   expect(f.deps.verifyIdentity).toHaveBeenCalledTimes(1);
 });

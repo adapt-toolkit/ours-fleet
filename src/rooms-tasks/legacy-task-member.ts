@@ -10,7 +10,7 @@ import { readProvenance } from '../creation.js';
 import { agentDir, stateRoot } from '../paths.js';
 import { readTempSupervisor, tempSupervisorLiveness, TEMP_SUPERVISOR_FILE } from '../temp-lifecycle.js';
 import { getTask } from './task-state.js';
-import { getRoomRecord } from './room-state.js';
+import { getRoomRecord, updateMemberStartup } from './room-state.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
 
 export interface LegacyTaskOwner {
@@ -73,6 +73,8 @@ export async function adoptLegacyTaskMember(
       if (Object.entries(owner).some(([key, value]) => supervisor.taskOwner![key as keyof LegacyTaskOwner] !== value)
           || startup.task_id !== owner.taskId)
         throw Error('LEGACY_TASK_MEMBER_OWNER_MISMATCH');
+      if (supervisor.kind !== 'detached' && process.env.OURS_FLEET_SUPERVISOR !== 'none')
+        updateMemberStartup(owner.roomId, name, { launch: { ...seat.launch, task_supervised: true } });
       return 'already-durable';
     }
     const live = await (deps.liveness ?? tempSupervisorLiveness)(dir);
@@ -105,6 +107,8 @@ export async function adoptLegacyTaskMember(
     // Crash after this write is healed by retrying the same stopped adoption.
     startup.task_id = owner.taskId;
     replaceFileAtomically(rolePath, stringify(role));
+    if (supervisor.kind !== 'detached' && process.env.OURS_FLEET_SUPERVISOR !== 'none')
+      updateMemberStartup(owner.roomId, name, { launch: { ...seat.launch, task_supervised: true } });
     deps.beforeOwnerCommit?.();
     replaceFileAtomically(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...supervisor, taskOwner: owner }, null, 2) + '\n');
     return 'adopted';

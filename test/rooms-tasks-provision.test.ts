@@ -362,6 +362,12 @@ describe('simple Cowork room member startup', () => {
     });
     const h = coworkHarness();
     beginFleetAuditCollection();
+    const spawn = mocks.spawnTemp.getMockImplementation()!;
+    mocks.spawnTemp.mockImplementation(async (options: Record<string, any>, ...rest: any[]) => {
+      const seat = getRoomRecord('room-1')!.member_seats.find(seat => seat.role_name === options.name);
+      expect(seat?.launch?.task_supervised).toBe(true);
+      return spawn(options, ...rest);
+    });
     const result = await provisionMembers({
       cfg: cfg(), cowork: h.cowork, roomId: 'room-1', taskId: task.task_id,
       template: template(2), binPath: '/usr/bin/ours-fleet', configPath: '/custom/fleet.yaml',

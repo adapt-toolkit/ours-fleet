@@ -752,7 +752,7 @@ export function advanceTaskDeletionMember(
 interface SeatEvidence {
   role_name: string;
   identity_cid?: string;
-  launch?: { launch_id?: string; action_id?: string };
+  launch?: { launch_id?: string; action_id?: string; task_supervised?: boolean };
   retirement?: { absence_verified?: boolean; phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
 }
 
@@ -794,8 +794,12 @@ export function upsertTaskDeletionMembersFromSeats(
       stored.deletion.members.push({
         name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now,
         ...(seat.launch?.action_id ? { action_id: seat.launch.action_id } : {}),
+        ...(seat.launch?.task_supervised ? { task_supervised: true } : {}),
       });
-    } else if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
+    } else {
+      if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
+      if (seat.launch?.task_supervised) cursor.task_supervised = true;
+    }
   }
   writeTask(stored);
   return presentTaskLenient(stored);
@@ -862,6 +866,7 @@ export function importTaskDeletionRetirementEvidence(
       stored.deletion.members.push(cursor);
     }
     if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
+    if (seat.launch?.task_supervised) cursor.task_supervised = true;
     if (DELETION_MEMBER_PHASE_ORDER[evidence.phase] < DELETION_MEMBER_PHASE_ORDER[cursor.phase]) continue;
     if (cursor.launch_id !== undefined && cursor.launch_id !== evidence.launch_id)
       throw new TaskStateError(

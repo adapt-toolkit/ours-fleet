@@ -28,6 +28,7 @@ export interface LayoutAssignment {
   participant: string; room_role?: string; contract?: string;
 }
 export interface LayoutSupervisor {
+  readonly taskSupervised?: boolean;
   id: string;
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
@@ -37,7 +38,7 @@ export interface LayoutSupervisor {
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
   retire(instance: LayoutInstance): Promise<void>;
 }
-type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean; participant?: string; room?: string };
+type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean; participant?: string; room?: string; task_supervised?: boolean };
 type RoomState = {
   spec: LayoutRoom; native?: CoworkRoomCreateResult; ready: string[];
   state: 'provisioning' | 'active' | 'closed'; owner_ready?: boolean;
@@ -150,6 +151,7 @@ export class RoomLayout {
       if (!p.instance) {
         const template = s.definition.participants[member]?.agent_template;
         need(template, `no factory for ${member}`);
+        if (this.supervisor.taskSupervised) p.task_supervised = true;
         await this.mutation(s, `spawn:${resolvedKey}`, () => this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
         await this.verify(p.instance!);
       }

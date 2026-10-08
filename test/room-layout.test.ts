@@ -47,6 +47,17 @@ function fixture() {
 }
 
 describe('explicit layout deletion', () => {
+  it('persists boot-service intent before a spawn with an unknown outcome', async () => {
+    const f = fixture();
+    Object.assign(f.supervisor, { taskSupervised: true });
+    await f.layout.create(scopedDefinition(), 'operator');
+    f.supervisor.spawn.mockImplementationOnce(async key => {
+      expect(f.reload().snapshot().participants[key].task_supervised).toBe(true);
+      throw Error('spawn response lost');
+    });
+    await expect(f.layout.activate('operator', 'design')).rejects.toThrow('spawn response lost');
+    expect(f.reload().snapshot().participants.doctor.task_supervised).toBe(true);
+  });
   it('retains rooms on close, deletes them on explicit deletion, and preserves borrowed instances', async () => {
     const f = fixture(), borrowed = instance('PersonalAssistant'); f.running.set(borrowed.launch, borrowed);
     await f.layout.create(scopedDefinition(), 'operator', { doctor: borrowed });

@@ -16,10 +16,12 @@ import { tempSupervisorLiveness } from '../temp-lifecycle.js';
 import { layoutOwnedMemberName, retireOwnedLayoutMember } from './layout-member-retirement.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
+  readonly taskSupervised: boolean;
   readonly id: string;
   constructor(private configPath: string | undefined,
     private runId: string, private templates: Record<string, AgentTemplateDefinition>) {
     mkdirSync(stateRoot(), { recursive: true, mode: 0o700 }); this.id = layoutSupervisorId();
+    this.taskSupervised = runId.startsWith('task-') && process.env.OURS_FLEET_SUPERVISOR !== 'none';
   }
   private async request(agent: string, temporary: boolean, request: LayoutControlRequest): Promise<unknown> {
     if (!/^[A-Za-z0-9_-]+$/.test(agent)) throw Error('invalid agent name');
@@ -88,7 +90,7 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     const owned = Object.entries(snapshot.participants).filter(([, participant]) => participant.owned
       && participant.instance?.agent === i.agent && JSON.stringify(participant.instance) === JSON.stringify(i));
     if (owned.length !== 1) throw Error('LAYOUT_MEMBER_NOT_OWNED');
-    await retireOwnedLayoutMember(i, this.runId, owned[0][0]);
+    await retireOwnedLayoutMember(i, this.runId, owned[0][0], {}, owned[0][1].task_supervised);
   }
 }
 export const layoutRunPath = (id: string): string => {
