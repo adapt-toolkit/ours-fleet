@@ -4,10 +4,11 @@ import { ArtifactStore } from '../file-delivery/store.js';
 import { resolve, basename, extname } from 'node:path';
 import { socketPath as privateSocketPath } from '../socket-path.js';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { attachOursClient } from '@ours.network/sdk/client';
 import { ApplicationIdentityStore } from '@ours.network/mcp/application-identities';
+import { assertSafeAncestors } from '../rooms-tasks/workspace.js';
 import { readClientProfile } from '../client-profile.js';
 import { stateRoot } from '../paths.js';
 import { createCoworkAdapter } from '../rooms-tasks/cowork-adapter.js';
@@ -383,13 +384,26 @@ export function readRoomReadiness(
 }
 
 /** Explicit logical-instance termination, independent of harness/bridge transport. */
-export async function releaseManagedAgent(role: ResolvedRole): Promise<void> {
+export async function releaseManagedAgent(role: ResolvedRole, expected?: { cid: string; action: string }): Promise<void> {
   const profile = readClientProfile({ ...process.env, ...role.env });
   if (!profile) throw Error('MANAGED_OURS_REQUIRES_EXPLICIT_DAEMON_PROFILE');
   const root = privateRuntimeRoot(),
     dir = join(root, binderKey(profile.expectedInstanceId, role.identity));
-  if (!existsSync(join(dir, 'instance.json'))) return;
-  const instance = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'));
+  if (!existsSync(join(dir, 'instance.json'))) {
+    if (expected) throw Error('MEMBER_RUNTIME_RETIREMENT_MISSING');
+    return;
+  }
+  const read = (file: string) => {
+    const path = join(dir, file);
+    if (expected) {
+      assertSafeAncestors(dir);
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 256 * 1024) throw Error('MEMBER_RUNTIME_UNSAFE_PROOF');
+    }
+    return JSON.parse(readFileSync(path, 'utf8'));
+  };
+  const instance = read('instance.json');
+  if (expected) { read('state.json'); read('owner.json'); }
   if (instance.role !== role.name) throw Error('IDENTITY_ASSIGNED_TO_OTHER_ROLE');
   const controller = await RuntimeController.acquire(
     root,
@@ -399,9 +413,14 @@ export async function releaseManagedAgent(role: ResolvedRole): Promise<void> {
   );
   try {
     const state = controller.journal.read();
-    if (!state || state.phase === 'RELEASED') return;
-    const owner = JSON.parse(readFileSync(join(dir, 'owner.json'), 'utf8'));
-    if (owner.instance !== state.instance) throw Error('OWNER_RECORD_MISMATCH');
+    if (expected && (!state || state.name !== role.identity || state.daemon !== profile.expectedInstanceId
+        || state.instance !== instance.instance || state.lifetime !== 'temporary' || instance.temporary !== true
+        || state.cid !== expected.cid || state.action !== expected.action))
+      throw Error('MEMBER_RUNTIME_RETIREMENT_MISMATCH');
+    if (!state) return;
+    const owner = read('owner.json');
+    if (owner.instance !== state.instance || typeof owner.token !== 'string' || !owner.token) throw Error('OWNER_RECORD_MISMATCH');
+    if (state.phase === 'RELEASED') return;
     const client = await attachOursClient({
       endpoint: profile.endpoint,
       expectedInstanceId: profile.expectedInstanceId,

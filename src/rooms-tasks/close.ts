@@ -5,9 +5,12 @@ import { retireTaskMemberService } from './task-service-retirement.js';
 import { eraseMemberArtifacts } from './erasure.js';
 import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
 import { collectWorkspaceArchives } from './workspace-artifacts.js';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parse } from 'yaml';
+import type { ResolvedRole } from '../config.js';
+import { privateRuntimeRoot, releaseManagedAgent } from '../agent-ours/service.js';
 import { attachOursClient, type OursClient } from '@ours.network/sdk/client';
 
 import { withFileLock } from '../atomic-file.js';
@@ -130,6 +133,38 @@ export async function identityCidPresent(cid: string): Promise<boolean> {
   });
 }
 
+/** A managed temporary identity belongs to its durable external lease even
+ * after worker exit. Retire that exact logical owner before generic removal. */
+async function releaseRetainedMemberRuntime(seat: RoomMemberSeat): Promise<void> {
+  const live = agentDir(seat.role_name, true);
+  const source = existsSync(live) ? live
+    : (seat.launch?.launch_id ? tempArchiveForLaunch(seat.role_name, seat.launch.launch_id) : undefined);
+  if (!source) return;
+  const path = join(source, 'role.yaml');
+  if (!existsSync(path)) return; // pre-managed compatibility evidence has no runtime
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 256 * 1024) throw Error('MEMBER_RUNTIME_UNSAFE_PROOF');
+  const role = parse(readFileSync(path, 'utf8')) as ResolvedRole;
+  const profile = readClientProfile({ ...process.env, ...role.env });
+  const runtime = join(privateRuntimeRoot(), binderKey(profile.expectedInstanceId, seat.role_name));
+  const metadata = readTempSupervisor(source);
+  if (!existsSync(join(runtime, 'instance.json'))) {
+    if (metadata?.kind === 'fleet-managed') throw Error('MEMBER_RUNTIME_RETIREMENT_MISSING');
+    return;
+  }
+  const creationPath = join(source, 'creation.json'), creationStat = lstatSync(creationPath);
+  if (!creationStat.isFile() || creationStat.isSymbolicLink() || creationStat.size > 256 * 1024)
+    throw Error('MEMBER_RUNTIME_UNSAFE_PROOF');
+  const creation = JSON.parse(readFileSync(creationPath, 'utf8'));
+  if (role.name !== seat.role_name || role.identity !== seat.role_name || !seat.identity_cid
+      || !seat.launch?.action_id || !seat.launch.launch_id || creation.role !== seat.role_name
+      || creation.creationActionId !== seat.launch.action_id || metadata?.role !== seat.role_name
+      || metadata.launchId !== seat.launch.launch_id
+      || (metadata.taskOwner && metadata.taskOwner.creationActionId !== seat.launch.action_id))
+    throw Error('MEMBER_RUNTIME_RETIREMENT_MISMATCH');
+  await releaseManagedAgent(role, { cid: seat.identity_cid, action: seat.launch.action_id });
+}
+
 export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
   assertMemberNotPermanent(seat.role_name);
   await withIdentityClient(async client => {
@@ -151,6 +186,7 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
         `room member '${seat.role_name}' identity absence is not proven: CID mismatch: recorded ${seat.identity_cid}, found ${before.cid ?? 'none'}`,
       );
     }
+    await releaseRetainedMemberRuntime(seat);
     try {
       assertMemberNotPermanent(seat.role_name);
       await client.removeIdentity({ name: seat.role_name });

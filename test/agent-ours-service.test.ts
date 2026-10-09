@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ResolvedRole } from '../src/config.js';
@@ -306,4 +306,37 @@ it('profile failure does not publish room readiness or redeem invite; retry pres
   expect(daemon.created).toBe(1);
   expect(daemon.redeems).toBe(1);
   await managed.close(true);
+});
+
+it.each(['cid', 'action', 'instance', 'owner', 'unsafe-owner'])('fences suspended task retirement before releasing the durable owner: %s', async mismatch => {
+  storeTemporaryLaunch(role, 'owned-task-action');
+  const service = await prepareManagedAgent(role, stateDir, true), cid = service.runtime.snapshot.cid!;
+  await service.close(false);
+  const dir = join(privateRuntimeRoot(), binderKey('11111111-1111-1111-1111-111111111111', role.identity));
+  const expected = { cid, action: 'owned-task-action' };
+  if (mismatch === 'cid') expected.cid = 'foreign-cid';
+  if (mismatch === 'action') expected.action = 'foreign-action';
+  if (mismatch === 'instance') {
+    const value = JSON.parse(readFileSync(join(dir, 'instance.json'), 'utf8'));
+    writeFileSync(join(dir, 'instance.json'), JSON.stringify({ ...value, instance: 'replacement' }));
+  }
+  if (mismatch === 'owner') rmSync(join(dir, 'owner.json'));
+  if (mismatch === 'unsafe-owner') {
+    const value = readFileSync(join(dir, 'owner.json'));
+    writeFileSync(join(root, 'foreign-owner'), value); rmSync(join(dir, 'owner.json'));
+    symlinkSync(join(root, 'foreign-owner'), join(dir, 'owner.json'));
+  }
+  await expect(releaseManagedAgent(role, expected)).rejects.toThrow();
+  expect(daemon.releases).toBe(0); expect(daemon.rows.get(role.identity)?.cid).toBe(cid);
+});
+it('retries exact retirement after owner release before saga erasure without touching a sibling', async () => {
+  storeTemporaryLaunch(role, 'owned-task-action');
+  const service = await prepareManagedAgent(role, stateDir, true), cid = service.runtime.snapshot.cid!;
+  await service.close(false);
+  daemon.rows.set('PersonalAssistant', { name: 'PersonalAssistant', cid: 'permanent-cid', temporary: false });
+  const sibling = structuredClone(daemon.rows.get('PersonalAssistant'));
+  const expected = { cid, action: 'owned-task-action' };
+  await releaseManagedAgent(role, expected); await releaseManagedAgent(role, expected);
+  expect(daemon.releases).toBe(1); expect(daemon.rows.has(role.identity)).toBe(false);
+  expect(daemon.rows.get('PersonalAssistant')).toEqual(sibling);
 });

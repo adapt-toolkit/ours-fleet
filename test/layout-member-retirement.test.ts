@@ -2,6 +2,10 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+const releaseOwned = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/agent-ours/service.js')>(), releaseManagedAgent: releaseOwned,
+}));
 const sdk = vi.hoisted(() => ({ listIdentities: vi.fn(), removeIdentity: vi.fn(), releaseLease: vi.fn(async () => {}), close: vi.fn(async () => {}) }));
 vi.mock('@ours.network/sdk/client', () => ({ attachOursClient: vi.fn(async () => sdk) }));
 vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ endpoint: 'http://isolated.test', expectedInstanceId: 'fixture-daemon', credentialPath: '/fixture' }) }));
@@ -37,6 +41,7 @@ it('stops and archives the exact owned factory launch before removing identity a
   const f = await fixture();
   await retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec });
   expect(f.exec).toHaveBeenCalledWith('systemctl', ['--user', 'stop', 'isolated-layout.service']);
+  expect(releaseOwned).toHaveBeenCalledWith(expect.objectContaining({ name: f.name, identity: f.name }), { cid: f.cid, action: `${f.runId}:${f.key}` });
   expect(existsSync(f.dir)).toBe(false); expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: f.name });
   const archive = tempArchiveForCreationAction(f.name, `${f.runId}:${f.key}`)!;
   const state = { participants: { worker: { owned: true, retired: true, instance: f.instance },
@@ -65,4 +70,12 @@ it('retries an identity-removal failure from the exact archive without restoppin
   expect(existsSync(f.dir)).toBe(false);
   await retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec });
   expect(f.exec.mock.calls.filter(([, args]) => args.includes('stop'))).toHaveLength(1);
+});
+
+it('holds archived layout deletion when durable owner release is unavailable, then retries', async () => {
+  const f = await fixture(); releaseOwned.mockRejectedValueOnce(Error('OWNER_RECORD_MISSING'));
+  await expect(retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec })).rejects.toThrow('OWNER_RECORD_MISSING');
+  expect(sdk.removeIdentity).not.toHaveBeenCalled(); expect(existsSync(f.privateDir)).toBe(true);
+  await retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec });
+  expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: f.name });
 });
