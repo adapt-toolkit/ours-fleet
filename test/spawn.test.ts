@@ -288,6 +288,13 @@ describe('spawn Codex options', () => {
 });
 
 describe('spawnTemp', () => {
+  it('refuses non-resumable task harnesses before launch or state reservation', async () => {
+    const launch = vi.fn();
+    await expect(spawnTemp({ name: 'HermesTask', harness: 'hermes', model: 'fixture-model', taskOwner: { taskId: 'task', creationActionId: 'action' } }, '/fixture/fleet', launch))
+      .rejects.toThrow('TASK_HARNESS_RESUME_UNSUPPORTED');
+    expect(launch).not.toHaveBeenCalled(); expect(existsSync(agentDir('HermesTask', true))).toBe(false);
+  });
+
   it('snapshots the role and launches the supervisor detached', async () => {
     const launched: { binPath: string; args: string[]; dir: string }[] = [];
     const d = await spawnTemp(

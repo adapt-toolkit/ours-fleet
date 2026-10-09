@@ -13,6 +13,7 @@ import { privateRuntimeRoot } from './agent-ours/service.js';
 import { binderKey, RuntimeJournal } from './agent-ours/state.js';
 import { assertMemberNotPermanent } from './rooms-tasks/member-ownership.js';
 import { readClientProfile } from './client-profile.js';
+import { firstManagedSessionMayStart } from './managed-recovery.js';
 
 function readProof(path: string): string {
   const stat = lstatSync(path);
@@ -32,7 +33,9 @@ function assertRetainedRuntime(role: ResolvedRole, action: string, cid: string, 
   const state = new RuntimeJournal(dir).read();
   const creation = JSON.parse(readProof(join(privateRuntimeRoot(), 'launches', binderKey('temporary', role.name) + '.json')));
   const sessionDir = agentDir(role.name, true);
-  const retainedSession = readProof(join(sessionDir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id')).trim();
+  let retainedSession = '';
+  try { retainedSession = readProof(join(sessionDir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id')).trim(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || session || !firstManagedSessionMayStart(sessionDir)) throw error; }
   readProof(join(sessionDir, '.booted')); // presence is the runner's resume marker, including legacy empty files
   if (creation.role !== role.name || creation.identity !== role.identity || creation.action !== action
       || !state || instance.role !== role.name || instance.temporary !== true || !instance.instance
@@ -41,7 +44,7 @@ function assertRetainedRuntime(role: ResolvedRole, action: string, cid: string, 
       || state.daemon !== profile.expectedInstanceId || state.name !== role.identity || state.cid !== cid
       || state.instance !== instance.instance || state.lifetime !== 'temporary' || state.action !== action
       || ['QUIESCING', 'TERMINAL_INTENT', 'RELEASED', 'CLEANUP_PENDING', 'FAILED'].includes(state.phase)
-      || !retainedSession || (launch && launch !== instance.instance) || (session && session !== retainedSession))
+      || (!retainedSession && !firstManagedSessionMayStart(sessionDir)) || (launch && launch !== instance.instance) || (session && session !== retainedSession))
     throw Error('TASK_RETAINED_RUNTIME_MISMATCH');
 }
 

@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { preparePermanentAssignment } from '../src/agent-ours/service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
@@ -252,9 +253,10 @@ describe('up / down / restart', () => {
     const tempDir = agentDir('Temp', true);
     mkdirSync(tempDir, { recursive: true });
     prepareTempSupervisor(tempDir, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
     const { calls, backend } = fakeBackend();
     const commands: string[][] = [];
@@ -639,9 +641,10 @@ describe('rmRole', () => {
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(join(tempDir, 'WORKLOG.md'), 'keep this\n');
     prepareTempSupervisor(tempDir, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
     const { calls, backend } = fakeBackend();
     const { d, logs } = deps(backend);

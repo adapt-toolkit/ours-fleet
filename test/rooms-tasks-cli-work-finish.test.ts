@@ -1,3 +1,4 @@
+import { ensureFleetParent } from '../src/supervisor/fleet.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -467,6 +468,27 @@ describe('canonical proxied Task/Room audit metadata', () => {
     await expect(run('create', '--title', 'No room', '--no-room', '--anonymous', '--json'))
       .rejects.toThrow(ExitError);
     expect(out.join('\n')).toContain('--anonymous/--no-anonymous cannot be combined with --no-room');
+  });
+
+  it.each([false, true])('surfaces the actionable missing Fleet initialization at task start (json=%s)', async json => {
+    writeCustomTemplate();
+    await run('create', '--title', 'Before initialization', '--backlog', '--template', 'durable', '--json');
+    const id = JSON.parse(out.join('\n')).task.task_id; out = [];
+    const native = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      try { await ensureFleetParent(native, 'linux'); }
+      catch (error) {
+        setSagaError(roomId, (error as Error).message, 'Run ours-fleet init, then retry task start.', 'member_failed');
+        throw error;
+      }
+    });
+    await run('start', id, ...(json ? ['--json'] : []));
+    expect(native).not.toHaveBeenCalled();
+    const text = out.join('\n');
+    expect(text.replaceAll('\\_', '_')).toContain('FLEET_SERVICE_NOT_INSTALLED'); expect(text).toContain('run ours-fleet init');
+    if (json) expect(JSON.parse(text).provisioning).toMatchObject({
+      blocker: 'FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init', next_action: expect.stringContaining('ours-fleet init'),
+    });
   });
 
   it.each([false, true])('captures real task create/start transitions (json=%s)', async json => {

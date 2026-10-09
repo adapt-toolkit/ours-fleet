@@ -1,3 +1,4 @@
+import { writeManagedRecovery, readManagedRecovery } from '../src/managed-recovery.js';
 import { gatewayFixture } from './gateway-fixture.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
@@ -20,7 +21,7 @@ import {
   ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus, turnResult,
   type ExitRecord, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
-import { registerAdapter } from '../src/harness/registry.js';
+import { registerAdapter, getAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
@@ -646,6 +647,7 @@ describe('runOnce', () => {
     writeFileSync(join(d, '.session-id'), 'stable-runner-id\n');
     writeFileSync(join(d, '.acp-session-id'), 'stable-acp-id\n');
     writeFileSync(join(d, '.booted'), 'previous-start');
+    writeManagedRecovery(d, { version: 1, session: 'established', readiness: true, initial: 'completed', active: false });
     const { deps, starts, submittedPrompts } = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') });
     const result = await runOnce(name, { temp: true }, deps);
     expect(result).toMatchObject({ mode: 'resume', rotated: false });
@@ -654,6 +656,42 @@ describe('runOnce', () => {
     expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('stable-runner-id\n');
     expect(readFileSync(join(d, '.acp-session-id'), 'utf8')).toBe('stable-acp-id\n');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it.each([
+    ['pending', false, 'Read and follow'],
+    ['dispatching', true, 'Fleet supervisor restarted.'],
+    ['completed', true, 'Fleet supervisor restarted.'],
+    ['completed', false, undefined],
+  ] as const)('recovers %s task work (active=%s) without replaying a delivered assignment', async (initial, active, expected) => {
+    const name = 'ResumeWork', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp', mission: 'Do the work' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'runner'); writeFileSync(join(d, '.acp-session-id'), 'backend'); writeFileSync(join(d, '.booted'), 'previous');
+    writeManagedRecovery(d, { version: 1, session: 'established', readiness: true, initial, active });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, deps);
+    expect(starts[0].mode).toBe('resume');
+    expect(submittedPrompts.length).toBe(expected ? 1 : 0);
+    if (expected) expect(submittedPrompts[0]).toContain(expected);
+    expect(submittedPrompts.every(prompt => !prompt.includes('Fleet readiness check.'))).toBe(true);
+    expect(readManagedRecovery(d)).toMatchObject({ initial: 'completed', active: false });
+  });
+
+  it('retries the first session before any task delivery, retaining its logical identity', async () => {
+    const name = 'FirstSessionRetry', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp', mission: 'Do the work' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'unchanged-runner'); writeFileSync(join(d, '.booted'), 'failed-before-session');
+    writeManagedRecovery(d, { version: 1, session: 'pending', readiness: false, initial: 'pending', active: false });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, deps);
+    expect(starts[0].mode).toBe('fresh');
+    expect(submittedPrompts).toHaveLength(2);
+    expect(submittedPrompts[0]).toContain('Fleet readiness check.');
+    expect(submittedPrompts[1]).toContain('Read and follow');
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('unchanged-runner');
+    expect(readManagedRecovery(d)).toMatchObject({ session: 'established', initial: 'completed' });
   });
 
   it('refuses a lost retained task backend id before starting a fresh harness', async () => {
@@ -1848,6 +1886,24 @@ describe('runOnce config-path fallback', () => {
 });
 
 describe('runTemp', () => {
+  it('starts a non-resumable Hermes temporary and archives it on parent stop', async () => {
+    const original = getAdapter('fake');
+    registerAdapter({ ...original, id: 'hermes-finite-fixture', supportsResume: false });
+    const name = 'HermesFinite', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'hermes-finite-fixture', session: 'acp' }));
+    prepareTempSupervisor(d, name);
+    let stop = false;
+    const world = fakeWorld({ lifeChecks: 30, exitFile: join(d, '.exit-status') });
+    const attempt = async (...args: Parameters<typeof runOnce>) => {
+      const result = await runOnce(...args); stop = true; return result;
+    };
+    const release = vi.fn();
+    await runTemp(name, { ...world.deps, shouldStop: () => stop, suspendOnStop: true, releaseAgentOurs: release }, attempt);
+    expect(world.starts[0].mode).toBe('fresh');
+    expect(world.submittedPrompts[0]).toContain('Fleet readiness check.');
+    expect(release).toHaveBeenCalledTimes(1); expect(existsSync(d)).toBe(false);
+  });
+
   it('runs from the tmp snapshot and archives evidence outside the live roster afterwards', async () => {
     const d = agentDir('T', true);
     mkdirSync(d, { recursive: true });

@@ -9,19 +9,19 @@ import { readMember, memberKey, unregisterMember, registerMember } from './catal
 import { migrateLegacyPermanentMembers } from './legacy.js';
 import { ensureFleetParent } from './fleet.js';
 
-export async function adoptConfiguredFleet(binPath: string, exec: Exec, platform: NodeJS.Platform, configPath?: string): Promise<void> {
+export async function adoptConfiguredFleet(binPath: string, exec: Exec, platform: NodeJS.Platform, configPath?: string, selectedRole?: string): Promise<void> {
   const path = configPath || defaultConfigPath();
   if (existsSync(path)) {
     const config = loadConfig(path);
     await migrateLegacyPermanentMembers({
-      roles: config.roles, binPath, configPath: path, exec, platform,
+      roles: selectedRole ? [findRole(config, selectedRole)] : config.roles, binPath, configPath: path, exec, platform,
       prepareParent: () => ensureFleetParent(exec, platform),
       register: async (name, desired, selectedConfig) => {
         await registerMember({ name, kind: 'permanent', dir: agentDir(name), configPath: selectedConfig }, { initialDesired: desired, preserveExisting: true });
       },
     });
   } else await ensureFleetParent(exec, platform);
-  await migrateLegacyTaskMembers(exec);
+  if (!selectedRole) await migrateLegacyTaskMembers(exec);
 }
 
 /** Boot resumes recorded transfers only. It does not rediscover removed agents

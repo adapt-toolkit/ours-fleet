@@ -198,19 +198,34 @@ The private member catalog (directory 0700, records 0600) retains the creator's
 client profile path and explicit runtime/profile overrides. It is not part of the
 App agent roster or status output. Where an explicit legacy API token override is
 needed, it stays in private member state and is erased on unregister. Prefer the
-client profile's credential reference. Managed resume requires the saved backend
-session and submits no readiness or task-start prompt again.
+client profile's credential reference. Task recovery preserves its original creator
+selection even when invoked from another shell; changing that selection requires
+explicit retirement and a new launch. Unregister also erases temporary member state.
 
-First-start interruptions are distinct from a completed conversation restart:
-before identity/runtime allocation, the same provisioning intent can retry;
-after allocation but before the backend saved its session ID, retained ownership
-alone cannot prove a resumable conversation. Missing/mismatched admission journals,
-`.booted`, or backend session IDs remain held and recovery reports the proof error.
-Restore original evidence if it exists. If no backend conversation was ever saved,
-inspect and preserve the task artifacts, then use the explicit destructive recovery
-`ours-fleet task delete <task-id> <task-id>` and create a new task from the accepted
-brief. This retires the partial launch; it cannot preserve a conversation that was
-never persisted, and Fleet never silently substitutes one.
+Managed task/resumable temporary recovery uses a private, body-free delivery cursor.
+A never-dispatched assignment is delivered once after readiness. An assignment whose
+dispatch or terminal result is uncertain receives a short continuation notice asking
+the agent to continue pending work without redoing completed steps. A completed idle
+conversation receives neither readiness nor assignment again. Other console/mail
+turns are tracked too, so a suspended active turn receives continuation. Older saved
+sessions without the cursor receive one conservative continuation notice. Delivery
+and cursor persistence cannot be atomic with a remote backend: an uncertain dispatch
+is treated as potentially delivered and receives continuation, never assignment replay.
+
+A first-attempt crash before the backend session is established can retry using the
+same identity/admission when the cursor proves no readiness/work was submitted. Once
+established, a lost backend ID remains held: restore its original evidence rather
+than silently replacing a conversation. Older partial launches without this proof
+remain held. Inspect and preserve artifacts before any explicit destructive recovery
+`ours-fleet task delete <task-id> <task-id>` and replacement task creation.
+Missing/mismatched identity, workspace or room journals always require reconciliation.
+
+Task agents require a resumable harness; unsupported harnesses fail before their
+identity/launch reservation with `TASK_HARNESS_RESUME_UNSUPPORTED`. Plain temporary
+Hermes agents remain supported. Since Hermes cannot resume a conversation, parent
+shutdown retires and archives these finite temporary agents; an abrupt worker failure
+also retires their evidence rather than promising durable recovery. Permanent agents
+retain their existing readiness/continuity prompt sequence on restart.
 
 One parent failure can temporarily suspend all managed members. SIGTERM/SIGKILL
 recovery must preserve each member's intent and private conversation while preventing

@@ -7,7 +7,7 @@ import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
 import { installTaskSupervisorService, uninstallRetainedTaskService } from './task-supervisor-service.js';
-import { captureMemberEnvironment, catalogLiveness, memberKey, readMember, registerMember, stopMember } from './supervisor/catalog.js';
+import { captureMemberEnvironment, catalogLiveness, memberKey, readMember, registerMember, unregisterMember } from './supervisor/catalog.js';
 import { ensureFleetParent } from './supervisor/fleet.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
@@ -510,7 +510,7 @@ export async function stopTempSupervisor(
   }) + '\n');
   if (record.kind === 'fleet-managed') {
     if (record.taskOwner) await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
-    else await stopMember(record.target ?? memberKey(role, 'temporary'), { exec, sleep: deps.sleep });
+    else await unregisterMember(record.target ?? memberKey(role, 'temporary'), { exec, sleep: deps.sleep });
     return 'stopped';
   }
   if (record.taskOwner && (record.kind === 'systemd-persistent' || record.kind === 'launchd-persistent')) {

@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../../src/supervisor/fleet.js';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -94,9 +95,10 @@ describe('safe web role removal', () => {
     writeFileSync(join(state, 'role.yaml'), 'name: Temp\nharness: codex\nsession: acp\n');
     writeFileSync(join(state, 'WORKLOG.md'), 'temporary evidence');
     prepareTempSupervisor(state, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], state);
     (service as any).options.ops.exec = async (_command: string, args: string[]) => ({
       stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,

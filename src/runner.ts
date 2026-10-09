@@ -1,4 +1,5 @@
 import { readProvenance } from './creation.js';
+import { firstManagedSessionMayStart, managedRecoveryPath, readManagedRecovery, writeManagedRecovery, type ManagedRecovery } from './managed-recovery.js';
 import { StartupTelemetry } from './startup-telemetry.js';
 import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
@@ -635,19 +636,35 @@ export async function runOnce(
     deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
 
   const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
-  const retainedManaged = durableTask || Boolean(deps.suspendOnStop);
+  const retainedManaged = durableTask || Boolean(deps.suspendOnStop && adapter.supportsResume);
   const sidFile = join(dir, '.session-id');
+  const backendSidFile = join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id');
+  let recovery = retainedManaged ? readManagedRecovery(dir) : undefined;
+  const firstSessionRetry = retainedManaged && existsSync(join(dir, '.booted')) && !existsSync(backendSidFile)
+    && firstManagedSessionMayStart(dir);
   if (retainedManaged && existsSync(join(dir, '.booted'))
-      && (!existsSync(sidFile) || !existsSync(join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id'))))
+      && (!existsSync(sidFile) || !existsSync(backendSidFile)) && !firstSessionRetry)
     throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
   const sessionId = readFileSync(sidFile, 'utf8').trim();
   const bootedFile = join(dir, '.booted');
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
-  if (retainedManaged && !adapter.supportsResume) throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
-  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
-  const requireResume = retainedManaged && booted;
+  if (durableTask && !adapter.supportsResume) throw Error('TASK_HARNESS_RESUME_UNSUPPORTED');
+  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume && !firstSessionRetry ? 'resume' : 'fresh';
+  const requireResume = retainedManaged && mode === 'resume';
+  if (retainedManaged && !recovery) {
+    // Older admitted sessions have no cursor. Continue once, without replaying
+    // their assignment; fresh sessions record intent before the first attempt.
+    recovery = { version: 1, session: booted ? 'established' : 'pending', readiness: booted,
+      initial: booted ? 'dispatching' : 'pending', active: booted };
+    writeManagedRecovery(dir, recovery);
+  }
+  const recoveryBefore = recovery ? { ...recovery } : undefined;
+  const saveRecovery = (update: Partial<ManagedRecovery>) => {
+    if (!recovery) return;
+    recovery = { ...recovery, ...update }; writeManagedRecovery(dir, recovery);
+  };
   // Stamp EVERY attempt, not just the first. `.booted` used to be written only
   // on the fresh path, so after a restart — including one the supervisor never
   // saw, like an OOM-kill — its mtime still read the original boot and any
@@ -812,6 +829,7 @@ export async function runOnce(
     }));
     managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
     startupTelemetry.mark('harness_ready');
+    saveRecovery({ session: 'established' });
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
@@ -830,7 +848,20 @@ export async function runOnce(
         startMonitorAfterStartup();
       }
     });
-    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); };
+    const activePrompts = new Set<string>();
+    const unsubscribeContinuity = agentSession.subscribeConversation?.(event => {
+      if (!recovery?.readiness) return;
+      if (event.kind === 'prompt.started') {
+        if (event.promptId) activePrompts.add(event.promptId);
+        saveRecovery({ active: true });
+      } else if (event.kind === 'turn.completed' && 'outcome' in event.payload) {
+        if (event.promptId) activePrompts.delete(event.promptId);
+        // A shutdown/failed turn needs continuation; a successful terminal turn
+        // proves it may stay idle. Never store prompt bodies in this cursor.
+        if (event.payload.outcome === 'completed') saveRecovery({ active: activePrompts.size > 0 });
+      }
+    });
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); unsubscribeContinuity?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
@@ -946,7 +977,7 @@ export async function runOnce(
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never completed its readiness turn.
-    const retainedResume = retainedManaged && mode === 'resume';
+    const retainedResume = retainedManaged && mode === 'resume' && recoveryBefore?.readiness === true;
     if (!retainedResume) startupTelemetry.mark('startup_submitted');
     // The backend already verified the saved conversation. Resuming a managed
     // member admits new wakes/console input without replaying startup or work.
@@ -1015,20 +1046,28 @@ export async function runOnce(
     startupRecoveryAllowed = interruptedForWake;
     sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
     if (started.succeeded && !retainedResume) startupTelemetry.mark('readiness_turn_completed');
+    if (started.succeeded) saveRecovery({ readiness: true });
     // Readiness is now complete. Configured work (or retained continuity) is
     // admitted as a distinct turn; its terminal result must not block console
     // readiness, mail delivery, or supervisor liveness. Empty fresh agents wait
     // for authenticated console input or the monitor's unread/arrival wake.
-    if (!retainedResume && started.succeeded && !deps.shouldStop?.() && (
-      role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim() || booted
-    )) {
-      const queued = await arbiter.queuePrompt(managedTaskPrompt(dir, mode, booted), {
+    const configuredWork = Boolean(role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim());
+    const initialPending = retainedManaged && recoveryBefore?.initial === 'pending';
+    const interruptedWork = retainedManaged && (recoveryBefore?.active || recoveryBefore?.initial === 'dispatching');
+    const workPrompt = retainedManaged
+      ? initialPending && configuredWork ? managedTaskPrompt(dir, 'fresh', false)
+        : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
+      : configuredWork || booted ? managedTaskPrompt(dir, mode, booted) : undefined;
+    if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
+      saveRecovery({ initial: 'dispatching', active: true });
+      const queued = await arbiter.queuePrompt(workPrompt, {
         origin: { kind: 'startup' },
       });
       void queued.completion.then(result => {
+        if (result.succeeded) saveRecovery({ initial: 'completed', active: activePrompts.size > 0 });
         deps.log(`[${name}] configured task turn ${result.outcome}`);
       }, () => deps.log(`[${name}] configured task turn failed`));
-    }
+    } else if (started.succeeded && initialPending && !configuredWork) saveRecovery({ initial: 'completed' });
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -1225,6 +1264,7 @@ export async function runOnce(
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
+    rmSync(managedRecoveryPath(dir), { force: true });
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
@@ -1486,6 +1526,10 @@ export async function runTemp(
 ): Promise<void> {
   const dir = agentDir(name, true);
   const metadata = readTempSupervisor(dir);
+  // Non-resumable standalone temporaries retain their prior finite lifecycle:
+  // a parent stop retires them rather than promising retained conversation.
+  if (!metadata?.taskOwner && deps.suspendOnStop && !getAdapter(loadTempRole(name).harness).supportsResume)
+    deps = { ...deps, suspendOnStop: false };
   if (!metadata?.taskOwner) {
     const role = loadTempRole(name);
     const provenance = readProvenance(dir);

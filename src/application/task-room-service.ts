@@ -487,7 +487,9 @@ export class TaskRoomApplicationService {
     const ready = task.state === 'active' && room?.state === 'active'
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
-    const nextAction = task.terminal_intent
+    const nextAction = blocker === 'FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init'
+      ? `Run ours-fleet init, then retry ours-fleet task start ${task.task_id}.`
+      : task.terminal_intent
       ? `Complete the accepted ${task.terminal_intent.kind} operation; do not restart provisioning.`
       : room?.state === 'closing' || room?.state === 'closed'
         ? `Complete room cleanup; do not restart provisioning.`

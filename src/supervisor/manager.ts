@@ -48,6 +48,10 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
         if (owned && !owned.stoppingAt) { owned.stoppingAt = Date.now(); owned.child.kill('SIGTERM'); }
         return;
       }
+      // Our ChildProcess supplies exit notification for steady owned members.
+      // Probe argv only for predecessor discovery or before an actual stop;
+      // macOS otherwise spawned one ps process per member every 250ms.
+      if (owned && owned.generation === member.generation && member.desired === 'running' && !stopping && !owned.stoppingAt) return;
       const live = await memberProcess(member, exec);
       if (member.desired === 'stopped' || stopping) {
         if (live.state === 'running' && live.pid) {
@@ -89,7 +93,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
         void withMemberLock(key, async () => {
           const current = readMember(key);
           if (!current || current.generation !== generation) return;
-          if (current.kind === 'temporary' && !existsSync(current.dir) && !stopping && !childState.stoppingAt) {
+          if (current.kind === 'temporary' && !existsSync(current.dir)) {
             rmSync(memberPath(key)); return;
           }
           let taskCompleted = false;

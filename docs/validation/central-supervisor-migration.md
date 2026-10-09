@@ -61,6 +61,44 @@ Readiness commands are generic operator-owned paths; migration does not read or
 execute their scripts. Once registered, later operator edits to parent drop-ins
 and readiness scripts do not invalidate completed adoption.
 
+## Upgrade and migration trigger
+
+This release requires a deliberate host transition. Package installation has no
+postinstall service mutation, and Fleet has no automatic upgrade/self-update
+command that runs init. Merely replacing the package leaves legacy roles running
+on their installed entry points; task and temporary creation through the new CLI
+is unavailable until `ours-fleet init` succeeds. It returns
+`FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init`, including the task-start
+provisioning blocker/action in CLI and JSON output. Treat this as a deployment
+precondition: schedule the package upgrade and explicit init together, preserve
+operator parent drop-ins first, then verify the installed parent before accepting
+new task/temp work. An uninitialised new CLI does not rewrite/install the parent
+as a side effect of member creation.
+
+`ours-fleet init` explicitly preflights and adopts all configured permanent roles
+and retained task-service transfers. It can restart those agents as the native
+owners retire. `up X` inspects/adopts only X and does not migrate unrelated
+permanents or sweep legacy task services. A newly created catalog membership
+never restarts an already running parent. Pending recorded transfers can finish
+at parent boot; boot does not rediscover deliberately removed members.
+
+Managed OS supervision currently uses the OS user's home only. A custom
+`OURS_FLEET_HOME` with the real OS backend refuses `FLEET_SERVICE_HOME_CONFLICT`;
+use explicit `OURS_FLEET_SUPERVISOR=none` for isolated/manual fleets. Do not
+attempt to share one global native service among different managed Fleet homes.
+
+One parent restart affects all members. Permanent agents preserve their shipped
+restart behaviour: same identity CID/backend conversation and readiness plus
+continuity prompts; an orderly shutdown releases their private runtime and the
+next start creates its successor instance. A killed parent disconnects IPC and
+requests orderly worker shutdown, so this path may also release the permanent
+runtime. Directly killing a legacy runner is a different shutdown path. Task
+members retain their original runtime instance, owner, admission and session;
+completed idle tasks get no repeated assignment, and interrupted work gets a
+short continuation notice. Plain non-resumable temporaries retire on shutdown.
+These differences are explicit lifecycle behaviour, not a physical-reboot or
+live-host migration qualification.
+
 ## Failure and retry
 
 Before deployment, inspect the requested roles, package paths, service overrides

@@ -410,6 +410,8 @@ export async function spawnTemp(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
+  if ((o.taskOwner || o.roomMemberStartup?.task_id) && !getAdapter(prepared.role.harness).supportsResume)
+    throw Error('TASK_HARNESS_RESUME_UNSUPPORTED: task agents require a resumable harness');
   if (o.roomMemberStartup?.workspace) {
     const workspace = o.roomMemberStartup.workspace;
     if (prepared.role.cwd !== workspace.path)

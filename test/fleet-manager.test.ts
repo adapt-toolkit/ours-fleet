@@ -110,6 +110,9 @@ describe('Fleet parent lifecycle', () => {
       await makeFleetBackend(exec, 'linux').install('Second', '/task/dev/cli.js');
       const tempDir = agentDir('Transient', true); mkdirSync(tempDir, { recursive: true }); prepareTempSupervisor(tempDir, 'Transient');
       await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/another/dev/cli.js', ['_run-temp', 'Transient'], tempDir);
+      await makeFleetBackend(exec, 'linux').stop('Second');
+      await makeFleetBackend(exec, 'linux').uninstall('Second');
+      expect(await catalogLiveness(original.key)).toMatchObject({ state: 'running' });
       const taskDir = agentDir('NewTask', true); mkdirSync(taskDir, { recursive: true });
       await installTaskSupervisorService('NewTask', '/third/dev/cli.js', taskDir, 'linux', exec, { taskId: 'task2', creationActionId: 'action2' }, 'launch2');
       await until(async () => (await catalogLiveness('task-NewTask')).state === 'running');
@@ -130,7 +133,9 @@ describe('Fleet parent lifecycle', () => {
     const environment = await captureMemberEnvironment({ OURS_CONFIG: '/creator/profile.json', OURS_PORT: '43118', OURS_STATE_DIR: '/creator/state', OURS_API_TOKEN: 'fixture-secret-value' });
     writeMember({ ...member, environment });
     expect(managedMemberEnvironment(readMember(member.key)!, { OURS_CONFIG: '/other/profile', OURS_API_TOKEN: 'other', PATH: '/parent' })).toMatchObject({ OURS_CONFIG: '/creator/profile.json', OURS_PORT: '43118', OURS_STATE_DIR: '/creator/state', OURS_API_TOKEN: 'fixture-secret-value' });
-    expect(statSync(memberPath(member.key)).mode & 0o777).toBe(0o600); expect(statSync(catalogRoot()).mode & 0o777).toBe(0o700);
+    expect(statSync(memberPath(member.key)).mode & 0o777).toBe(0o600);
+    await registerMember({ ...readMember(member.key)!, environment: { OURS_CONFIG: '/other-recovery/profile.json' } });
+    expect(readMember(member.key)?.environment).toEqual(environment); expect(statSync(catalogRoot()).mode & 0o777).toBe(0o700);
     expect(JSON.stringify(await catalogLiveness(member.key))).not.toContain('fixture-secret-value');
     await unregisterTaskMember(member.name, { taskId: 'task1', launchId: 'launch' });
     expect(existsSync(memberPath(member.key))).toBe(false);

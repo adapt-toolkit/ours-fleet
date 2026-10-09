@@ -70,6 +70,15 @@ describe('Fleet-managed temporary process ownership', () => {
     expect(calls.some(call => call[0] === 'systemd-run' || call.includes('stop') || call.includes('restart') || call.includes('disable'))).toBe(false);
     expect(calls.some(call => call.includes('daemon-reload') || call[0] === 'loginctl' || call.includes('enable'))).toBe(false);
   });
+  it('operator retirement removes the temporary catalog and private selection without stopping the parent', async () => {
+    const dir = temp('Retired'), calls: string[][] = [];
+    const exec: Exec = async (cmd, args) => { calls.push([cmd, ...args]); return { stdout: 'active', stderr: '', code: 0 }; };
+    await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/fixture/fleet', ['_run-temp', 'Retired'], dir);
+    await stopTempSupervisor('Retired', { exec });
+    expect(readMember('temporary-Retired')).toBeUndefined();
+    expect(existsSync(join(home, '.config/systemd/user/ours-fleet.service'))).toBe(true);
+    expect(calls.some(call => call.includes('stop') || call.includes('disable'))).toBe(false);
+  });
   it('retains exact launch state when the Fleet service cannot be started', async () => {
     const dir = temp('Broken'), launchId = readTempSupervisor(dir)!.launchId;
     await expect(makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'managed',

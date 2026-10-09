@@ -117,7 +117,8 @@ export async function registerMember(input: MemberRegistration, options: { initi
     if (previous?.retiring) throw Error('FLEET_MEMBER_RETIRING');
     const desired = options.initialDesired ?? 'running';
     const member: FleetMember = previous
-      ? { ...previous, desired, configPath: input.configPath ?? previous.configPath, environment: input.environment ?? previous.environment, retryAt: 0 }
+      ? { ...previous, desired, configPath: input.configPath ?? previous.configPath,
+          environment: previous.kind === 'task' ? previous.environment : input.environment ?? previous.environment, retryAt: 0 }
       : { ...input, version: 1, key, desired, incarnation: randomUUID() };
     writeMember(member);
     return { created: !previous, member };

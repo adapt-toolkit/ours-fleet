@@ -40,7 +40,7 @@ export function makeFleetBackend(exec: Exec = realExec, platform: NodeJS.Platfor
       let configPath: string | undefined;
       try { configPath = readFileSync(join(agentDir(name), '.config-path'), 'utf8').trim() || undefined; }
       catch { /* a new state directory may not carry a config marker yet */ }
-      await adoptConfiguredFleet(binPath, exec, platform, configPath);
+      await adoptConfiguredFleet(binPath, exec, platform, configPath, name);
       const result = await registerMember({ name, kind: 'permanent', dir: agentDir(name) });
       try {
         await waitMember(result.member.key, 'running', { exec });
