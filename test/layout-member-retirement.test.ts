@@ -14,6 +14,7 @@ import { binderKey } from '../src/agent-ours/state.js';
 import { prepareTempSupervisor, TEMP_SUPERVISOR_FILE, tempArchiveForCreationAction } from '../src/temp-lifecycle.js';
 import { layoutOwnedMemberName, retireOwnedLayoutMember, ownedLayoutRetirementSeats } from '../src/rooms-tasks/layout-member-retirement.js';
 import { eraseMemberArtifacts } from '../src/rooms-tasks/erasure.js';
+import { removeExactMemberIdentity } from '../src/rooms-tasks/close.js';
 import type { RoomLayoutState } from '../src/rooms-tasks/layout.js';
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'task-layout-retire-')); vi.stubEnv('OURS_FLEET_HOME', root); vi.clearAllMocks(); });
@@ -78,4 +79,26 @@ it('holds archived layout deletion when durable owner release is unavailable, th
   expect(sdk.removeIdentity).not.toHaveBeenCalled(); expect(existsSync(f.privateDir)).toBe(true);
   await retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec });
   expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: f.name });
+});
+
+it('finishes the saved owner release journal after a lost reply removed the identity', async () => {
+  const f = await fixture();
+  releaseOwned.mockImplementationOnce(async () => {
+    sdk.listIdentities.mockResolvedValue([]);
+    throw Error('release reply lost');
+  });
+  await expect(retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec })).rejects.toThrow('release reply lost');
+  expect(sdk.removeIdentity).not.toHaveBeenCalled();
+  await retireOwnedLayoutMember(f.instance, f.runId, f.key, { exec: f.exec });
+  expect(releaseOwned).toHaveBeenCalledTimes(2);
+  expect(releaseOwned).toHaveBeenLastCalledWith(expect.objectContaining({ name: f.name }), { cid: f.cid, action: `${f.runId}:${f.key}` });
+  expect(sdk.removeIdentity).not.toHaveBeenCalled();
+});
+
+it('names missing retained launch evidence and preserves the owned identity', async () => {
+  const f = await fixture(); rmSync(f.dir, { recursive: true });
+  await expect(removeExactMemberIdentity({ role_name: f.name, identity_cid: f.cid, slot: 'worker', cowork_role: 'Developer', seat_state: 'active',
+    launch: { state: 'stopped', action_id: `${f.runId}:${f.key}`, launch_id: 'missing-launch', task_supervised: true, attempt: 1, updated_at: '' },
+  })).rejects.toThrow('MEMBER_RUNTIME_RETIREMENT_SOURCE_MISSING');
+  expect(releaseOwned).not.toHaveBeenCalled(); expect(sdk.removeIdentity).not.toHaveBeenCalled();
 });

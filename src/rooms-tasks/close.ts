@@ -139,7 +139,10 @@ async function releaseRetainedMemberRuntime(seat: RoomMemberSeat): Promise<void>
   const live = agentDir(seat.role_name, true);
   const source = existsSync(live) ? live
     : (seat.launch?.launch_id ? tempArchiveForLaunch(seat.role_name, seat.launch.launch_id) : undefined);
-  if (!source) return;
+  if (!source) {
+    if (seat.launch?.task_supervised) throw Error('MEMBER_RUNTIME_RETIREMENT_SOURCE_MISSING');
+    return;
+  }
   const path = join(source, 'role.yaml');
   if (!existsSync(path)) return; // pre-managed compatibility evidence has no runtime
   const stat = lstatSync(path);
@@ -174,6 +177,11 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
       if (rows.some(row => row.name === seat.role_name || (seat.identity_cid && 'cid' in row
           && row.cid.toLowerCase() === seat.identity_cid.toLowerCase())))
         throw new Error(`room member '${seat.role_name}' identity absence is not proven`);
+      // A terminal release can remove the SDK identity before its response is
+      // recorded. Finish the exact retained launch's release journal on retry.
+      if (existsSync(agentDir(seat.role_name, true)) || (seat.launch?.launch_id
+          && tempArchiveForLaunch(seat.role_name, seat.launch.launch_id)))
+        await releaseRetainedMemberRuntime(seat);
       return;
     }
     if (!seat.identity_cid) {
