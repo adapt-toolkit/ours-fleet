@@ -45,6 +45,19 @@ restored, reconcile ownership explicitly; do not fabricate evidence, create a
 replacement identity, redeem the original invite again or erase the private
 runtime to force completion.
 
+The only production writer of `.temp-stop-request.json` is
+`stopTempSupervisor`, which writes `reason: operator-stop`. Its callers are
+standalone removal (`ops.ts`), task launch rollback (`spawn.ts`), owned layout
+retirement, task deletion, and managed room closure. Each requests deliberate
+retirement. `requestedTempStopReason` accepts only `operator-stop`; other reason
+values are ignored. Parent TERM/KILL/IPC shutdown does not write this file. The
+gate suspends and then explicitly retires the same task member to prove both
+branches. Failed launches without a published CID stay held rather than guessing
+ownership; the gate reattaches the same production runtime/seat/action without
+creating a second identity, then exercises the real room saga's original CID
+recovery and exact retirement. This runtime-layer retry does not qualify an
+automatic `task start` handover of a lost or archived launch.
+
 Native Linux readiness, linger and boot ordering, physical reboot, macOS
 launchd, migration of the live host, and real provider sessions remain outside
 this gate. The migration/deployment preconditions and running legacy-member

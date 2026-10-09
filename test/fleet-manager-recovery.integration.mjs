@@ -19,7 +19,7 @@ import { loadConfig, findRole, splitRootFor } from '../dist/config.js';
 import '../dist/harness/codex.js';
 import { createTask, startTask, updateTaskRoom } from '../dist/rooms-tasks/task-state.js';
 import { createRoomRecord, updateMemberSeats, getRoomRecord } from '../dist/rooms-tasks/room-state.js';
-import { prepareTempSupervisor, updateTempSupervisor, stopTempSupervisor } from '../dist/temp-lifecycle.js';
+import { prepareTempSupervisor, updateTempSupervisor, stopTempSupervisor, archiveTempState, tempArchiveForLaunch, TEMP_STOP_REQUEST_FILE } from '../dist/temp-lifecycle.js';
 import { controlRequest } from '../dist/session/control.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../dist/rooms-tasks/deletion.js';
 import { createCoworkAdapter } from '../dist/rooms-tasks/cowork-adapter.js';
@@ -63,7 +63,7 @@ if (process.argv[2] === 'parent') {
   const configPath = join(fleetHome, 'fleet.yaml'), members = new Map(), observed = new Map();
   let daemon, parent, control, daemonExit, parentExit, daemonOutput = '', cowork;
   const children = new Set(), messages = [], rooms = new Map();
-  let releaseFaultToken, releaseFaultHits = 0, removeFaultName, scanFault = false, scanFaultHits = 0, roomDeleteFault = false;
+  let releaseFaultToken, releaseFaultHits = 0, removeFaultName, scanFault = false, scanFaultHits = 0, roomDeleteFault = false, identityCreates = 0, admissionCalls = 0;
   const options = { endpoint, expectedInstanceId: daemonId, credentialPath: credential, sessionMode: 'external', env: {} };
   const watchdog = setTimeout(() => { parent?.kill('SIGKILL'); daemon?.kill('SIGKILL'); for (const pid of children) { try { process.kill(-pid, 'SIGKILL'); } catch {} } process.exit(124); }, 240000);
   const runtimeRoot = join(stateRoot(), 'private-ours');
@@ -176,6 +176,8 @@ if (process.argv[2] === 'parent') {
     cowork = createServer(async (req, res) => {
       try {
         if (req.url?.startsWith('/daemon/')) {
+          if (/\/create(?:Temporary)?Identity$/.test(req.url)) identityCreates++;
+          if (req.url.endsWith('/addContact')) admissionCalls++;
           if (req.url.endsWith('/listIdentities') && scanFault) {
             scanFault = false; scanFaultHits++; req.resume(); res.writeHead(503); res.end('fixture lost CID verification'); return;
           }
@@ -260,8 +262,12 @@ if (process.argv[2] === 'parent') {
         rmSync(join(dir, '.acp-session-id')); f.session = 'fixture-session';
       }
       save(join(dir, '.managed-recovery.json'), cursor);
-      updateMemberSeats(roomId, [{ role_name: name, identity_cid: runtime(name).cid, slot: 'developer', cowork_role: 'Developer', seat_state: 'active', invite_id: 'original-seat',
-        launch: { state: 'launched', action_id: action, launch_id: metadata.launchId, task_supervised: variant !== 'finite', attempt: 1, updated_at: '' } }]);
+      updateMemberSeats(roomId, [{ role_name: name, identity_cid: variant === 'failed' ? undefined : runtime(name).cid, slot: 'developer', cowork_role: 'Developer', seat_state: 'active', invite_id: 'original-seat',
+        launch: { state: variant === 'failed' ? 'failed' : 'launched', action_id: action, launch_id: metadata.launchId, task_supervised: variant !== 'finite', attempt: 1, updated_at: '' } }]);
+      if (variant === 'failed') {
+        f.archive = archiveTempState(name, 'startup-failure', 'failed', 'fixture launch failed after runtime admission before CID publication');
+        assert(f.archive); return f;
+      }
       await registerMember({ name, kind, dir, ...(variant !== 'finite' ? { taskOwner: owner } : {}), launchId: metadata.launchId, environment: await captureMemberEnvironment() });
       return f;
     };
@@ -339,11 +345,36 @@ if (process.argv[2] === 'parent') {
     await until(() => runtime(finite.name).phase === 'RELEASED' && !existsSync(finite.dir), 'normal terminal worker release/archive');
     assert(existsSync(join(runtimeRoot, binderKey(daemonId, finite.name), 'owner.json')));
     await deleteTaskMember(finite, permanent);
-    const taskStop = await addTask('TaskOperatorStop'); await ready(taskStop);
+    const taskStop = await addTask('TaskOperatorStop'); const taskBeforeStop = await ready(taskStop);
+    assert.equal(existsSync(join(taskStop.dir, TEMP_STOP_REQUEST_FILE)), false);
+    await stopParent();
+    assert.notEqual(runtime(taskStop.name).phase, 'RELEASED');
+    assert.equal(existsSync(taskStop.dir), true); assert.equal(tempArchiveForLaunch(taskStop.name, taskStop.launchId), undefined);
+    await startParent(); const taskAfterParent = await ready(taskStop); await ready(permanent);
+    for (const field of ['cid', 'daemon', 'instance', 'session']) assert.equal(taskAfterParent[field], taskBeforeStop[field]);
     console.log('delete: live task worker completed terminal operator stop'); await stopTempSupervisor(taskStop.name);
     await until(() => runtime(taskStop.name).phase === 'RELEASED' && !existsSync(taskStop.dir), 'task operator terminal release/archive');
     assert(existsSync(join(runtimeRoot, binderKey(daemonId, taskStop.name), 'owner.json')));
     await deleteTaskMember(taskStop, permanent);
+    const failed = await addTask('FailedTaskLaunch', 'failed');
+    const creationsBeforeRetry = identityCreates, admissionsBeforeRetry = admissionCalls;
+    assert(creationsBeforeRetry > 0, 'gateway observes real SDK identity creation');
+    assert.equal(getRoomRecord(failed.roomId).member_seats[0].identity_cid, undefined);
+    const failedOwner = readFileSync(join(runtimeRoot, binderKey(daemonId, failed.name), 'owner.json'));
+    console.log('retry: same failed-launch runtime/seat binding before full retirement');
+    // Reattach the production runtime with the SAME action and seat from its
+    // exact archived launch. This is a runtime-layer retry, not automatic
+    // orchestration of a lost/archived launch by task start.
+    await seedRuntime({ ...failed, dir: failed.archive }, failed.role, true);
+    assert.equal(identityCreates, creationsBeforeRetry); assert.equal(admissionCalls, admissionsBeforeRetry);
+    for (const field of ['cid', 'daemon', 'instance', 'action']) assert.equal(runtime(failed.name)[field], failed.originalRuntime[field]);
+    assert.deepEqual(runtime(failed.name).room, failed.originalRuntime.room);
+    assert.deepEqual(readFileSync(join(runtimeRoot, binderKey(daemonId, failed.name), 'owner.json')), failedOwner);
+    assert.equal((await control.listIdentities()).filter(row => row.name === failed.name).length, 1);
+    // The real close saga recovers the unpublished CID from the original
+    // runtime/Cowork binding, then releases and erases that exact owner.
+    await deleteTaskMember(failed, permanent);
+    assert.equal(identityCreates, creationsBeforeRetry);
     const second = await addTask('TaskDeleteDown'); await ready(second);
     console.log('delete: parent down'); await stopParent(); await deleteTaskMember(second, permanent);
     await startParent(); await ready(permanent); await pause(400);
@@ -366,7 +397,7 @@ if (process.argv[2] === 'parent') {
     assert.equal(runtime(permanent.name).cid, originalPermanent.cid);
     const baselineRestartExit = once(baselineRestart, 'exit'); baselineRestart.kill('SIGTERM'); await baselineRestartExit;
     assert.equal(runtime(permanent.name).phase, 'RELEASED');
-    console.log('PASS: default-spawn production runManagedMember/runOnce SIGTERM/SIGKILL; same real SDK CID/instance/contact admission and ACP session ID; one worker/member, exact observed generations; real control responsiveness; initial/interrupted/completed-idle ACP delivery cursor, first-session missing backend ID, uncertain dispatch briefing pointer, saved-owner release acknowledgement retry, SDK-remove-before-CID-verify retry and post-verification retry, normal live finite/task operator terminal release, actual layout-owned retirement; parent-up/down full task/room/workspace/artifact deletion preserves permanent record. Parent TERM/KILL gracefully releases permanent instances; task instance/admission remain retained. Direct permanent supervisor SIGKILL retains its instance, explicitly differing from parent IPC quiescence. Native services/reboot and authenticated model harness remain unqualified.');
+    console.log('PASS: default-spawn production runManagedMember/runOnce SIGTERM/SIGKILL; same real SDK CID/instance/contact admission and ACP session ID; one worker/member, exact observed generations; real control responsiveness; initial/interrupted/completed-idle ACP delivery cursor, first-session missing backend ID, uncertain dispatch briefing pointer, saved-owner release acknowledgement retry, SDK-remove-before-CID-verify retry and post-verification retry, same-member parent suspension versus explicit task terminal stop, failed-launch runtime binding reuse and seat retirement without another identity, normal live finite/task operator terminal release, actual layout-owned retirement; parent-up/down full task/room/workspace/artifact deletion preserves permanent record. Parent TERM/KILL gracefully releases permanent instances; task instance/admission remain retained. Direct permanent supervisor SIGKILL retains its instance, explicitly differing from parent IPC quiescence. Native services/reboot and authenticated model harness remain unqualified.');
   } catch (error) {
     console.error('parent diagnostics:', messages.join('').slice(-2000));
     for (const key of members.keys()) { const m = readMember(key); console.error('worker state:', key, m?.desired, m?.generation, m?.pid, m?.retryAt); }
