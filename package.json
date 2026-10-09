@@ -23,6 +23,7 @@
     "docs/room-layouts.md",
     "docs/validation/managed-cli-permissions.md",
     "docs/validation/central-supervisor-migration.md",
+    "docs/validation/central-supervisor-recovery.md",
     "LICENSE",
     "docs/acp-files.md"
   ],
@@ -40,6 +41,7 @@
     "prepack": "npm run build",
     "prepublishOnly": "npm run build && npm test",
     "test:task-recovery": "node test/task-runtime-recovery.integration.mjs",
+    "test:fleet-recovery": "node test/fleet-manager-recovery.integration.mjs",
     "test:v1-recovery": "node test/fleet-v1-recovery.integration.mjs retry && node test/fleet-v1-recovery.integration.mjs terminal-after-failure && node test/fleet-v1-recovery.integration.mjs terminal-release-failure"
   },
   "dependencies": {
