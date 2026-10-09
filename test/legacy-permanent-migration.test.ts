@@ -18,14 +18,16 @@ function fixture(platform: 'linux' | 'darwin' = 'linux') {
   mkdirSync(join(nativePath, '..'), { recursive: true });
   writeFileSync(nativePath, platform === 'linux' ? `[Service]\nExecStart="${process.execPath}" "${binPath}" _run %i\nRestart=on-failure\n`
     : `<plist><dict><key>Label</key><string>network.ours.fleet.${name}</string><key>ProgramArguments</key><array><string>${binPath}</string><string>_run</string><string>${name}</string></array><key>RunAtLoad</key><true/></dict></plist>`);
-  const state = { enabled: true, live: true, loaded: true, fragment: nativePath, dropIns: '', probeCode: 0 };
+  const effective = (args: string[]) => `{ path=${args[0]} ; argv[]=${args.join(' ')} ; ignore_errors=no ; start_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
+  const state = { enabled: true, live: true, loaded: true, fragment: nativePath, dropIns: '', probeCode: 0,
+    start: effective([process.execPath, binPath, '_run', name]), pre: '', active: '', environment: '', mainPid: '' };
   const events: string[] = [], catalog = new Map<string, 'running' | 'stopped'>();
   const exec = vi.fn(async (command: string, args: string[]) => {
     if (command === 'ps') return { code: 0, stdout: '', stderr: '' };
     if (command === 'systemctl' && args.includes('show')) return { code: state.probeCode,
-      stdout: `LoadState=loaded\nFragmentPath=${state.fragment}\nDropInPaths=${state.dropIns}\nUnitFileState=${state.enabled ? 'enabled' : 'disabled'}\nActiveState=${state.live ? 'active' : 'inactive'}\n`, stderr: '' };
+      stdout: `LoadState=loaded\nFragmentPath=${state.fragment}\nDropInPaths=${state.dropIns}\nUnitFileState=${state.enabled ? 'enabled' : 'disabled'}\nActiveState=${state.active || (state.live ? 'active' : 'inactive')}\nExecStart=${state.start}\nExecStartPre=${state.pre}\nExecStartPost=\nExecStop=\nExecStopPost=\nExecReload=\nExecCondition=\nEnvironment=${state.environment}\nMainPID=${state.mainPid || (state.live ? '123' : '0')}\nControlGroup=\nTimeoutStartUSec=4min 30s\nRestartUSec=15s\n`, stderr: '' };
     if (command === 'systemctl' && args.includes('disable')) {
-      events.push('disable-old'); state.enabled = false; state.live = false;
+      events.push('disable-old'); state.enabled = false; state.live = false; state.active = '';
       return { code: 0, stdout: '', stderr: '' };
     }
     if (command === 'launchctl' && args[0] === 'print') return state.loaded ? { code: state.probeCode,
@@ -41,9 +43,9 @@ function fixture(platform: 'linux' | 'darwin' = 'linux') {
     expect(state.live).toBe(false); expect(platform === 'linux' ? state.enabled : state.loaded).toBe(false);
     events.push('register-central'); if (!catalog.has(role)) catalog.set(role, desired);
   });
-  const input = { roles: [{ name, identity }], binPath, platform, configPath: '/fixture/fleet.yaml', exec, register };
+  const input = { roles: [{ name, identity }], binPath, platform, configPath: '/fixture/fleet.yaml', exec, register, prepareParent: async () => {} };
   const receiptPath = join(stateRoot(), 'supervisor/legacy-permanent', `${name}.json`);
-  return { name, identity, dir, nativePath, receiptPath, state, events, catalog, input, register, exec };
+  return { name, identity, dir, nativePath, receiptPath, state, events, catalog, input, register, exec, effective };
 }
 it.each(['linux', 'darwin'] as const)('transfers an exact live legacy %s registration after quiescence without changing identity or conversation', async platform => {
   const f = fixture(platform), before = ['.identity', '.session-id', '.booted'].map(file => readFileSync(join(f.dir, file)));
@@ -56,10 +58,10 @@ it.each(['linux', 'darwin'] as const)('transfers an exact live legacy %s registr
   expect(await migrateLegacyPermanentMembers(f.input)).toEqual([{ name: f.name, status: 'already-migrated' }]);
   expect(f.register).toHaveBeenCalledTimes(1); expect(f.catalog.get(f.name)).toBe('stopped');
 });
-it.each(['linux', 'darwin'] as const)('preserves stopped intent during %s migration', async platform => {
+it.each(['linux', 'darwin'] as const)('maps native boot intent during %s migration', async platform => {
   const f = fixture(platform); f.state.live = false;
   await migrateLegacyPermanentMembers(f.input);
-  expect(f.catalog.get(f.name)).toBe('stopped');
+  expect(f.catalog.get(f.name)).toBe(platform === 'linux' ? 'running' : 'stopped');
 });
 it('does not discover unconfigured roles or mutate a disabled legacy unit', async () => {
   const f = fixture(); f.state.enabled = false; f.state.live = false;
@@ -75,8 +77,6 @@ it('migrates a stopped, unloaded launchd plist without starting the role', async
 });
 it.each(['prepared', 'native-retired'] as const)('resumes a %s receipt after interrupted native removal/registration', async phase => {
   const f = fixture();
-  if (phase === 'prepared') f.exec.mockImplementationOnce(async () => ({ code: 0,
-    stdout: `LoadState=loaded\nFragmentPath=${f.nativePath}\nDropInPaths=\nUnitFileState=enabled\nActiveState=active\n`, stderr: '' }));
   if (phase === 'prepared') {
     const original = f.exec.getMockImplementation()!;
     f.exec.mockImplementation(async (command, args) => {
@@ -105,7 +105,7 @@ it('preserves later stopped catalog intent after a crash between register and re
 it.each(['identity', 'foreign-command', 'fragment', 'drop-in', 'bus', 'config', 'unsafe', 'disabled-running'])('fails closed before native mutation for %s proof', async mode => {
   const f = fixture();
   if (mode === 'identity') writeFileSync(join(f.dir, '.identity'), 'ForeignIdentity');
-  if (mode === 'foreign-command') writeFileSync(f.nativePath, '[Service]\nExecStart=/foreign/daemon\n');
+  if (mode === 'foreign-command') f.state.start = f.effective(['/foreign/daemon']);
   if (mode === 'fragment') f.state.fragment = '/foreign/unit';
   if (mode === 'drop-in') f.state.dropIns = '/foreign/override.conf';
   if (mode === 'bus') f.state.probeCode = 1;
@@ -124,8 +124,80 @@ it('does not register the central member while an old runner still survives nati
   const f = fixture(), original = f.exec.getMockImplementation()!;
   f.exec.mockImplementation(async (command, args) => command === 'ps'
     ? { code: 0, stdout: `1234 /fixture/fleet _run ${f.name}\n`, stderr: '' } : original(command, args));
-  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('LEGACY_PERMANENT_PROCESS_STILL_RUNNING');
+  await expect(migrateLegacyPermanentMembers({ ...f.input, processHome: () => root })).rejects.toThrow('LEGACY_PERMANENT_PROCESS_STILL_RUNNING');
   expect(f.register).not.toHaveBeenCalled(); expect(JSON.parse(readFileSync(f.receiptPath, 'utf8')).phase).toBe('native-retired');
   f.exec.mockImplementation(original);
   await migrateLegacyPermanentMembers(f.input); expect(f.catalog.get(f.name)).toBe('running');
+});
+function hostOverrides(f: ReturnType<typeof fixture>) {
+  const oldCli = join(root, '.local/share/old-fleet/node_modules/@ours.network/fleet/dist/cli.js');
+  mkdirSync(dirnameOf(oldCli), { recursive: true });
+  writeFileSync(oldCli, '// installed old release');
+  writeFileSync(join(oldCli, '../..', 'package.json'), JSON.stringify({ name: '@ours.network/fleet', bin: { 'ours-fleet': 'dist/cli.js' } }));
+  const shared = `${f.nativePath}.d/60-dependency-readiness.conf`;
+  const override = join(root, `.config/systemd/user/ours-fleet-agent@${f.name}.service.d/70-current-fleet.conf`);
+  mkdirSync(dirnameOf(shared), { recursive: true }); mkdirSync(dirnameOf(override), { recursive: true });
+  const gate = join(root, 'bin/ours-fleet-wait-ready'); mkdirSync(dirnameOf(gate), { recursive: true });
+  writeFileSync(gate, '# fixture: wait for daemon, cowork and gateway health');
+  const settings = `[Service]\nExecStartPre=\nExecStartPre=${gate}\nTimeoutStartSec=270\nRestartSec=15\nEnvironment=ROLE_FEATURE=enabled\n`;
+  writeFileSync(shared, settings);
+  writeFileSync(override, `[Service]\nExecStart=\nExecStart=${process.execPath} ${oldCli} _run ${f.name}\n`);
+  f.state.dropIns = `${shared} ${override}`;
+  f.state.start = f.effective([process.execPath, oldCli, '_run', f.name]);
+  f.state.pre = f.effective([gate]);
+  f.state.environment = 'ROLE_FEATURE=enabled';
+  const parent = join(root, '.config/systemd/user/ours-fleet.service.d/60-operator-readiness.conf');
+  return { parent, settings, oldCli, shared, override, gate };
+}
+const dirnameOf = (path: string) => join(path, '..');
+it('fails host-shaped drop-ins before mutation, then adopts only after operator parent settings and readiness acknowledgement', async () => {
+  const f = fixture(), host = hostOverrides(f);
+  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('OPERATOR_DROPIN_REQUIRED');
+  expect(f.events).toEqual([]); expect(existsSync(f.receiptPath)).toBe(false);
+  mkdirSync(dirnameOf(host.parent), { recursive: true }); writeFileSync(host.parent, host.settings);
+  await expect(migrateLegacyPermanentMembers({ ...f.input, prepareParent: undefined as any })).rejects.toThrow('PARENT_PREPARATION_REQUIRED');
+  const before = readFileSync(host.parent), prepareParent = vi.fn(async gates => {
+    expect(gates).toEqual([expect.objectContaining({ path: host.gate, timeoutStartSec: 270, restartSec: 15 })]);
+    f.events.push('parent-ready');
+  });
+  await migrateLegacyPermanentMembers({ ...f.input, prepareParent });
+  expect(f.events).toEqual(['parent-ready', 'disable-old', 'register-central']);
+  const receipt = JSON.parse(readFileSync(f.receiptPath, 'utf8'));
+  expect(receipt.legacyBinPath).toBe(host.oldCli); expect(receipt.files).toHaveLength(3);
+  expect(readFileSync(host.parent)).toEqual(before);
+  await migrateLegacyPermanentMembers({ ...f.input, prepareParent });
+  expect(readFileSync(host.parent)).toEqual(before); expect(f.register).toHaveBeenCalledTimes(1);
+  expect(existsSync(f.nativePath)).toBe(true); expect(existsSync(host.shared)).toBe(true);
+});
+it('validates every configured role before writing receipts or disabling the first', async () => {
+  const f = fixture();
+  await expect(migrateLegacyPermanentMembers({ ...f.input, roles: [
+    ...f.input.roles, { name: 'FleetCoordinator', identity: 'MissingContext' },
+  ] })).rejects.toThrow();
+  expect(f.events).toEqual([]); expect(existsSync(f.receiptPath)).toBe(false);
+});
+it('keeps parent-before-retirement ordering even when registration fails and retry completes after a CLI upgrade', async () => {
+  const f = fixture(), prepareParent = vi.fn(async () => { f.events.push('parent-ready'); });
+  f.register.mockRejectedValueOnce(Error('register failed'));
+  await expect(migrateLegacyPermanentMembers({ ...f.input, prepareParent })).rejects.toThrow('register failed');
+  expect(f.events).toEqual(['parent-ready', 'disable-old']);
+  await migrateLegacyPermanentMembers({ ...f.input, prepareParent, binPath: '/fixture/new-cli-release' });
+  expect(f.catalog.get(f.name)).toBe('running');
+  expect(f.events).toEqual(['parent-ready', 'disable-old', 'parent-ready', 'register-central']);
+});
+it('preserves enabled failed-unit boot intent instead of silently stopping it', async () => {
+  const f = fixture(); f.state.live = false; f.state.active = 'failed';
+  await migrateLegacyPermanentMembers(f.input); expect(f.catalog.get(f.name)).toBe('running');
+});
+it('does not treat same-name runners from another Fleet home as this native member', async () => {
+  const f = fixture(), original = f.exec.getMockImplementation()!;
+  f.exec.mockImplementation(async (command, args) => command === 'ps'
+    ? { code: 0, stdout: `2345 /fixture/fleet _run ${f.name}\n`, stderr: '' } : original(command, args));
+  await migrateLegacyPermanentMembers({ ...f.input, processHome: () => '/another/fleet' });
+  expect(f.catalog.get(f.name)).toBe('running');
+});
+it('rejects a lingering native MainPID without registering a replacement', async () => {
+  const f = fixture(); f.state.mainPid = '123';
+  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('NATIVE_STOP_UNPROVEN');
+  expect(f.register).not.toHaveBeenCalled();
 });
