@@ -1,3 +1,4 @@
+import { assertNativeFleetScope } from './scope.js';
 import { clientConfigPath } from '../client-profile.js';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -117,6 +118,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
 
   /** Read `launchctl print` once; both callers classify it for their own question. */
   const printJob = async (name: string): Promise<LaunchdJob> => {
+    assertNativeFleetScope(exec);
     const r = await exec('launchctl', ['print', `${domain}/${labelFor(name)}`]);
     const out = `${r.stdout}\n${r.stderr}`;
     if (r.code !== 0) return {
@@ -135,9 +137,11 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
   return {
     id: 'launchd',
 
-    async init() {
+    async init(binPath) {
+      assertNativeFleetScope(exec);
       mkdirSync(agentsDir(), { recursive: true });
       mkdirSync(logsRoot(), { recursive: true });
+      writeFileSync(plistPath('fleet'), plist('fleet', binPath));
       return [
         `LaunchAgents dir ready: ${agentsDir()}`,
         'note: launchd agents start at login (macOS has no linger equivalent)',
@@ -145,11 +149,9 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
     },
 
     async install(name, binPath) {
-      mkdirSync(agentsDir(), { recursive: true });
-      mkdirSync(logsRoot(), { recursive: true });
-      // The plist's prior existence is the record of whether we created this.
-      const existed = existsSync(plistPath(name));
-      writeFileSync(plistPath(name), plist(name, binPath));
+      assertNativeFleetScope(exec);
+      if (!existsSync(plistPath(name))) throw Error('FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init');
+      const existed = true;
       const loaded = await printJob(name);
       if (loaded.loaded) return { created: !existed, detail: 'Fleet service already loaded' };
       if (!loaded.notFound) throw new Error('Fleet launchd liveness unknown');
@@ -196,14 +198,17 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
         : { created: true, detail: `installed ${labelFor(name)} (${start.detail})` };
     },
     async start(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['bootstrap', domain, plistPath(name)]);
       if (r.code !== 0) await exec('launchctl', ['kickstart', `${domain}/${labelFor(name)}`]);
     },
     async stop(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
       if (r.code !== 0) throw new Error(`launchctl bootout ${labelFor(name)} failed: ${r.stderr.trim()}`);
     },
     async restart(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['kickstart', '-k', `${domain}/${labelFor(name)}`]);
       if (r.code !== 0) throw new Error(`launchctl kickstart ${labelFor(name)} failed: ${r.stderr.trim()}`);
     },
@@ -238,6 +243,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       };
     },
     async uninstall(name) {
+      assertNativeFleetScope(exec);
       const existed = existsSync(plistPath(name));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);   // idempotent
       rmSync(plistPath(name), { force: true });

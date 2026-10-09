@@ -6,11 +6,12 @@ import { acquireOwnerBinderLease } from '../owner-channel/binder.js';
 import { stateRoot } from '../paths.js';
 import { readRestartLedger, writeRestartLedger, backoffFor, RESTART_FAIL_THRESHOLD } from '../runner.js';
 import { realExec, type Exec } from '../exec.js';
-import { listMemberKeys, memberPath, memberProcess, readMember, withMemberLock, writeMember, type FleetMember } from './catalog.js';
+import { listMemberKeys, managedMemberEnvironment, memberPath, memberProcess, readMember, withMemberLock, writeMember, type FleetMember } from './catalog.js';
 
-interface ChildState { child: ChildProcess; generation: string; stoppingAt?: number }
+interface ChildState { child: ChildProcess; generation: string; startedAt: number; stoppingAt?: number }
 export interface ManagerDeps {
   exec?: Exec;
+  now?(): number;
   sleep?(ms: number): Promise<void>;
   shouldStop?(): boolean;
   log?(message: string): void;
@@ -20,6 +21,7 @@ export interface ManagerDeps {
 export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}): Promise<void> {
   const lease = await acquireOwnerBinderLease(join(stateRoot(), 'supervisor'), 'fleet-manager', 'fleet-manager');
   const children = new Map<string, ChildState>();
+  const now = deps.now ?? Date.now;
   const log = deps.log ?? (message => console.error(message));
   const exec = deps.exec ?? realExec;
   const sleep = deps.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
@@ -34,7 +36,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
       return spawn(process.execPath, [entrypoint, '_run-managed', member.key, generation], {
         // A process group permits bounded cleanup of a hung runner and its harness.
         // IPC couples its lifetime to this parent even if the parent is SIGKILLed.
-        detached: true, stdio: ['ignore', fd, fd, 'ipc'], env: process.env,
+        detached: true, stdio: ['ignore', fd, fd, 'ipc'], env: managedMemberEnvironment(member),
       });
     } finally { closeSync(fd); }
   });
@@ -76,7 +78,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
         writeMember({ ...member, generation: undefined, pid: undefined, retryAt: Date.now() + backoffFor(failures) });
         return;
       }
-      const childState: ChildState = { child, generation };
+      const childState: ChildState = { child, generation, startedAt: now() };
       children.set(key, childState);
       writeMember({ ...member, generation, pid: child.pid });
       let finished = false;
@@ -84,14 +86,25 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
         if (finished) return;
         finished = true;
         if (children.get(key) === childState) children.delete(key);
-        void withMemberLock(key, () => {
+        void withMemberLock(key, async () => {
           const current = readMember(key);
           if (!current || current.generation !== generation) return;
           if (current.kind === 'temporary' && !existsSync(current.dir) && !stopping && !childState.stoppingAt) {
             rmSync(memberPath(key)); return;
           }
+          let taskCompleted = false;
+          if (!failed && !stopping && !childState.stoppingAt && current.kind === 'task') {
+            try { taskCompleted = !(await import('../task-supervision.js')).taskSupervisorMayRun(current.name); }
+            catch { failed = true; } // uncertainty consumes the existing bounded failure budget
+          }
           const ledger = readRestartLedger(current.dir);
-          const failures = failed && !stopping && !childState.stoppingAt ? ledger.consecutiveImmediateFailures + 1 : ledger.consecutiveImmediateFailures;
+          let previousFailures = ledger.consecutiveImmediateFailures;
+          if (failed && !stopping && !childState.stoppingAt) {
+            const { stableSupervisorWindow } = await import('../runner.js');
+            if (now() - childState.startedAt >= stableSupervisorWindow(current.name, current.kind !== 'permanent', current.configPath) * 1000)
+              previousFailures = 0;
+          }
+          const failures = failed && !stopping && !childState.stoppingAt ? previousFailures + 1 : ledger.consecutiveImmediateFailures;
           if (failed && !stopping && !childState.stoppingAt && existsSync(current.dir)) writeRestartLedger(current.dir, {
             ...ledger, consecutiveImmediateFailures: failures, lastReason: 'Fleet member runner exited unexpectedly',
             circuit: failures >= RESTART_FAIL_THRESHOLD ? 'open' : 'closed', nextDelayMs: backoffFor(failures),
@@ -100,7 +113,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
           writeMember({ ...current, pid: undefined, generation: undefined,
             retryAt: Date.now() + backoffFor(failures),
             // A completed task/transient worker must not become an endless launch loop.
-            desired: !failed && !stopping && !childState.stoppingAt && current.kind !== 'permanent' && current.kind !== 'watchdogs' ? 'stopped' : current.desired });
+            desired: !failed && !stopping && !childState.stoppingAt && (current.kind === 'temporary' || taskCompleted) ? 'stopped' : current.desired });
         }).catch(() => log(`[fleet] child completion record unavailable: ${key}`));
       };
       child.once('error', () => finish(true));
@@ -113,6 +126,14 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
     });
   }
   try {
+    try {
+      const { resumeFleetTransfers } = await import('./adoption.js');
+      await resumeFleetTransfers(entrypoint, exec);
+    } catch (error) {
+      // Existing catalog members continue; uncertain transfers remain held with
+      // their receipts. Operator init/up reports the same actionable failure.
+      log(`[fleet] transfer pending: ${error instanceof Error ? error.message : 'proof unavailable'}`);
+    }
     while (!stopping && !deps.shouldStop?.()) {
       for (const key of listMemberKeys()) {
         try { await reconcile(key); }

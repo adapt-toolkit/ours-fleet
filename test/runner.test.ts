@@ -92,6 +92,7 @@ function monitorRecorder(sessionCreated: () => boolean) {
 function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean; recoveryGate?: Promise<void> } = {}) {
   const paneCommands: string[] = [];
   const recoveryPrompts: string[] = [];
+  const submittedPrompts: string[] = [];
   const managedRecoveries: string[] = [];
   const starts: Array<{ mode: 'fresh' | 'resume'; argv: string[]; env: Record<string, string> }> = [];
   let clock = 0;
@@ -154,6 +155,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
         },
         snapshot: () => ({ backend: 'acp' as const, alive: !closed, readiness: 'idle' as const }),
         queuePrompt: async (text: string) => {
+          submittedPrompts.push(text);
           const promptId = text.includes('[fleet-recovery]') ? `recovery-${seq}` : 'fake-prompt';
           if (text.includes('[fleet-recovery]')) {
             recoveryPrompts.push(text);
@@ -175,7 +177,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
             completion: Promise.resolve(turnResult(true, 'completed')),
           };
         },
-        submitPrompt: async () => turnResult(true, 'completed'),
+        submitPrompt: async (text: string) => { submittedPrompts.push(text); return turnResult(true, 'completed'); },
         interrupt: async () => ({ state: 'settled' as const }),
         respondPermission: () => true,
         eventsSince: () => [],
@@ -197,7 +199,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       };
     },
   };
-  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts, managedRecoveries };
+  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts, managedRecoveries, submittedPrompts };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
@@ -644,13 +646,25 @@ describe('runOnce', () => {
     writeFileSync(join(d, '.session-id'), 'stable-runner-id\n');
     writeFileSync(join(d, '.acp-session-id'), 'stable-acp-id\n');
     writeFileSync(join(d, '.booted'), 'previous-start');
-    const { deps, starts } = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') });
     const result = await runOnce(name, { temp: true }, deps);
     expect(result).toMatchObject({ mode: 'resume', rotated: false });
     expect(starts[0].mode).toBe('resume');
+    expect(submittedPrompts).toEqual([]);
     expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('stable-runner-id\n');
     expect(readFileSync(join(d, '.acp-session-id'), 'utf8')).toBe('stable-acp-id\n');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('refuses a lost retained task backend id before starting a fresh harness', async () => {
+    const name = 'TaskLostSession', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'unchanged-runner-id'); writeFileSync(join(d, '.booted'), 'retained');
+    const { deps, starts, submittedPrompts } = fakeWorld();
+    await expect(runOnce(name, { temp: true }, deps)).rejects.toThrow('TASK_CONTEXT_RESUME_UNAVAILABLE');
+    expect(starts).toEqual([]); expect(submittedPrompts).toEqual([]);
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('unchanged-runner-id');
   });
 
   it('fast-failing resume self-heals to fresh', async () => {

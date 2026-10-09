@@ -1,10 +1,11 @@
-import { lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { agentDir, stateRoot, watchdogsRoot } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { TaskSupervisorOwner } from '../temp-lifecycle.js';
+import { assertSafeAncestors } from '../rooms-tasks/workspace.js';
 import type { Liveness } from './types.js';
 
 export interface FleetMember {
@@ -19,9 +20,25 @@ export interface FleetMember {
   taskOwner?: TaskSupervisorOwner;
   launchId?: string;
   configPath?: string;
+  environment?: Record<string, string>;
   generation?: string;
   pid?: number;
   retryAt?: number;
+}
+const MEMBER_ENV_KEYS = ['HOME', 'PATH', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'CODEX_PATH', 'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN', 'OURS_CONFIG'];
+/** Private 0600 member state retains exactly the creator's profile selection.
+ * Pin the resolved profile path even when the caller relied on HOME defaults. */
+export async function captureMemberEnvironment(env: NodeJS.ProcessEnv = process.env): Promise<Record<string, string>> {
+  const { clientConfigPath } = await import('../client-profile.js');
+  return Object.fromEntries([...MEMBER_ENV_KEYS.flatMap(key => env[key] === undefined ? [] : [[key, env[key]!]]), ['OURS_CONFIG', clientConfigPath(env)]]);
+}
+export function managedMemberEnvironment(member: FleetMember, parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...parent };
+  if (member.environment) {
+    for (const key of MEMBER_ENV_KEYS) delete env[key];
+    Object.assign(env, member.environment);
+  }
+  return env;
 }
 export const catalogRoot = () => join(stateRoot(), 'supervisor', 'members');
 export function memberKey(name: string, kind: FleetMember['kind']): string {
@@ -40,6 +57,7 @@ function memberKeyFromValidatedKey(key: string): string { memberPath(key); retur
 
 export function readMember(key: string): FleetMember | undefined {
   const path = memberPath(key);
+  assertSafeAncestors(catalogRoot());
   let stat;
   try { stat = lstatSync(path); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
@@ -57,6 +75,8 @@ function validateMember(record: FleetMember, key: string): void {
       || !['running', 'stopped'].includes(record.desired)
       || !/^[a-f0-9-]{36}$/.test(record.incarnation)
       || record.dir !== resolve(record.dir) || record.dir !== expectedDir
+      || (record.environment !== undefined && (typeof record.environment !== 'object' || record.environment === null
+          || Object.entries(record.environment).some(([key, value]) => !MEMBER_ENV_KEYS.includes(key) || typeof value !== 'string' || value.includes('\0'))))
       || (record.pid !== undefined && (!Number.isSafeInteger(record.pid) || record.pid <= 0))
       || (record.retryAt !== undefined && (!Number.isFinite(record.retryAt) || record.retryAt < 0))
       || (record.kind === 'task' && (!record.taskOwner?.taskId || !record.taskOwner.creationActionId || !record.launchId)))
@@ -64,6 +84,9 @@ function validateMember(record: FleetMember, key: string): void {
 }
 export function writeMember(record: FleetMember): void {
   validateMember(record, record.key);
+  assertSafeAncestors(catalogRoot());
+  mkdirSync(catalogRoot(), { recursive: true, mode: 0o700 });
+  chmodSync(catalogRoot(), 0o700);
   replaceFileAtomically(memberPath(record.key), JSON.stringify(record) + '\n');
 }
 export function listMemberKeys(): string[] {
@@ -81,7 +104,7 @@ export function listMembers(): FleetMember[] {
   });
 }
 
-export type MemberRegistration = Pick<FleetMember, 'name' | 'kind' | 'dir' | 'taskOwner' | 'launchId' | 'configPath'>;
+export type MemberRegistration = Pick<FleetMember, 'name' | 'kind' | 'dir' | 'taskOwner' | 'launchId' | 'configPath' | 'environment'>;
 /** Persist intent before starting anything. The parent never discovers members from tmp directories. */
 export async function registerMember(input: MemberRegistration, options: { initialDesired?: FleetMember['desired']; preserveExisting?: boolean } = {}): Promise<{ created: boolean; member: FleetMember }> {
   const key = memberKey(input.name, input.kind);
@@ -94,7 +117,7 @@ export async function registerMember(input: MemberRegistration, options: { initi
     if (previous?.retiring) throw Error('FLEET_MEMBER_RETIRING');
     const desired = options.initialDesired ?? 'running';
     const member: FleetMember = previous
-      ? { ...previous, desired, configPath: input.configPath ?? previous.configPath, retryAt: 0 }
+      ? { ...previous, desired, configPath: input.configPath ?? previous.configPath, environment: input.environment ?? previous.environment, retryAt: 0 }
       : { ...input, version: 1, key, desired, incarnation: randomUUID() };
     writeMember(member);
     return { created: !previous, member };

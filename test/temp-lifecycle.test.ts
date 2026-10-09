@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
@@ -16,9 +17,12 @@ import { memberKey, readMember, registerMember } from '../src/supervisor/catalog
 import type { Exec } from '../src/exec.js';
 
 let home: string;
-beforeEach(() => {
+beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), 'ours-fleet-temp-life-'));
   process.env.OURS_FLEET_HOME = home;
+  const setup = async () => ({ code: 0, stdout: '', stderr: '' });
+  await fleetHostBackend(setup, 'linux').init('/fixture/fleet');
+  await fleetHostBackend(setup, 'darwin').init('/fixture/fleet');
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -39,6 +43,7 @@ describe('Fleet-managed temporary process ownership', () => {
     for (const value of ['/fixture/native codex', '', undefined]) {
       vi.stubEnv('CODEX_PATH', value);
       vi.stubEnv('OURS_CONFIG', '/profile/client.json');
+      await fleetHostBackend(async () => ({ code: 0, stdout: '', stderr: '' }), platform).init('/fixture/fleet');
       const dir = temp('Runtime');
       let bootstrapped = false;
       await makeTempSupervisorLauncher({ platform, supervisor: 'managed', exec: async (cmd, args) => {
@@ -63,13 +68,13 @@ describe('Fleet-managed temporary process ownership', () => {
     await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/fixture/fleet', ['_run-temp', 'Worker'], dir);
     expect(readTempSupervisor(dir)).toMatchObject({ kind: 'fleet-managed', target: 'temporary-Worker', phase: 'active' });
     expect(calls.some(call => call[0] === 'systemd-run' || call.includes('stop') || call.includes('restart') || call.includes('disable'))).toBe(false);
-    expect(calls).toContainEqual(['systemctl', '--user', 'enable', '--now', 'ours-fleet.service']);
+    expect(calls.some(call => call.includes('daemon-reload') || call[0] === 'loginctl' || call.includes('enable'))).toBe(false);
   });
   it('retains exact launch state when the Fleet service cannot be started', async () => {
     const dir = temp('Broken'), launchId = readTempSupervisor(dir)!.launchId;
     await expect(makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'managed',
       exec: async () => ({ stdout: '', stderr: 'user bus unavailable', code: 1 }),
-    })('/fixture/fleet', ['_run-temp', 'Broken'], dir)).rejects.toThrow(/user bus unavailable/);
+    })('/fixture/fleet', ['_run-temp', 'Broken'], dir)).rejects.toThrow('FLEET_SERVICE_LIVENESS_UNKNOWN');
     expect(readTempSupervisor(dir)?.launchId).toBe(launchId);
   });
   it('reclamation preserves stopped children with retained running Fleet intent', async () => {

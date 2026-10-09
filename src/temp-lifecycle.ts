@@ -7,8 +7,8 @@ import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
 import { installTaskSupervisorService, uninstallRetainedTaskService } from './task-supervisor-service.js';
-import { catalogLiveness, memberKey, readMember, registerMember, stopMember } from './supervisor/catalog.js';
-import { fleetHostBackend } from './supervisor/fleet.js';
+import { captureMemberEnvironment, catalogLiveness, memberKey, readMember, registerMember, stopMember } from './supervisor/catalog.js';
+import { ensureFleetParent } from './supervisor/fleet.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
@@ -88,7 +88,7 @@ const metadataLockPath = (dir: string) => join(
   stateRoot(), 'locks', 'temp-supervisors', encodeURIComponent(basename(dir)),
 );
 
-async function updateTempSupervisor(
+export async function updateTempSupervisor(
   dir: string, update: Partial<Omit<TempSupervisorRecord, 'version' | 'role' | 'launchId' | 'createdAt'>>,
 ): Promise<TempSupervisorRecord | undefined> {
   // The launcher and the just-started supervisor are separate processes. Lock
@@ -105,11 +105,7 @@ async function updateTempSupervisor(
   });
 }
 
-/**
- * Launch a temp supervisor outside the caller's service-manager ownership
- * boundary. `detached: true` creates a new process group but does not escape a
- * systemd cgroup; a transient unit does, and is not enabled across reboot.
- */
+/** Register managed members under Fleet; explicit manual mode uses a detached child. */
 export function makeTempSupervisorLauncher(options: {
   exec?: Exec;
   platform?: NodeJS.Platform;
@@ -129,11 +125,9 @@ export function makeTempSupervisorLauncher(options: {
       return;
     }
     if (supervisor !== 'none') {
-      const result = await registerMember({ name: role, kind: 'temporary', dir });
+      await ensureFleetParent(exec, platform);
+      const result = await registerMember({ name: role, kind: 'temporary', dir, environment: await captureMemberEnvironment() });
       await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: result.member.key, binPath });
-      const host = fleetHostBackend(exec, platform);
-      await host.init(binPath);
-      await host.install('fleet', binPath);
       await updateTempSupervisor(dir, { phase: 'active' });
       return;
     }

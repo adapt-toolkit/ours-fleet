@@ -634,16 +634,20 @@ export async function runOnce(
   else if (rotation.rotated)
     deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
 
+  const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
+  const retainedManaged = durableTask || Boolean(deps.suspendOnStop);
   const sidFile = join(dir, '.session-id');
+  if (retainedManaged && existsSync(join(dir, '.booted'))
+      && (!existsSync(sidFile) || !existsSync(join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id'))))
+    throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
   const sessionId = readFileSync(sidFile, 'utf8').trim();
   const bootedFile = join(dir, '.booted');
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
-  const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
-  if (durableTask && !adapter.supportsResume) throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
+  if (retainedManaged && !adapter.supportsResume) throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
-  const requireResume = durableTask && booted && existsSync(join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id'));
+  const requireResume = retainedManaged && booted;
   // Stamp EVERY attempt, not just the first. `.booted` used to be written only
   // on the fresh path, so after a restart — including one the supervisor never
   // saw, like an OOM-kill — its mtime still read the original boot and any
@@ -942,8 +946,13 @@ export async function runOnce(
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never completed its readiness turn.
-    startupTelemetry.mark('startup_submitted');
-    const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
+    const retainedResume = retainedManaged && mode === 'resume';
+    if (!retainedResume) startupTelemetry.mark('startup_submitted');
+    // The backend already verified the saved conversation. Resuming a managed
+    // member admits new wakes/console input without replaying startup or work.
+    const starting: Promise<TurnResult> = retainedResume
+      ? Promise.resolve({ accepted: false, succeeded: true, outcome: 'completed', detail: 'retained backend resumed; no readiness prompt submitted' })
+      : arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
     // Keep the early cursor baseline; do not deliver wakes into the protected
     // first turn. Steering can pre-empt startup just like cancellation.
     // Owner traffic and agent replies must be observed during a long first
@@ -1005,12 +1014,12 @@ export async function runOnce(
         + 'keeping temporary supervisor alive');
     startupRecoveryAllowed = interruptedForWake;
     sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
-    if (started.succeeded) startupTelemetry.mark('readiness_turn_completed');
+    if (started.succeeded && !retainedResume) startupTelemetry.mark('readiness_turn_completed');
     // Readiness is now complete. Configured work (or retained continuity) is
     // admitted as a distinct turn; its terminal result must not block console
     // readiness, mail delivery, or supervisor liveness. Empty fresh agents wait
     // for authenticated console input or the monitor's unread/arrival wake.
-    if (started.succeeded && !deps.shouldStop?.() && (
+    if (!retainedResume && started.succeeded && !deps.shouldStop?.() && (
       role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim() || booted
     )) {
       const queued = await arbiter.queuePrompt(managedTaskPrompt(dir, mode, booted), {
@@ -1463,6 +1472,14 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
+/** The parent uses the same adapter-relative sustained-uptime reset boundary. */
+export function stableSupervisorWindow(name: string, temp: boolean, configPath?: string): number {
+  try {
+    const role = temp ? loadTempRole(name) : findRole(loadConfig(configPath), name);
+    return getAdapter(role.harness).exitPolicy.fastFailSecs * RESTART_FAIL_THRESHOLD;
+  } catch { return 20 * RESTART_FAIL_THRESHOLD; }
+}
+
 export async function runTemp(
   name: string, deps: Partial<RunnerDeps> = {},
   attempt: typeof runOnce = runOnce,

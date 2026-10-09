@@ -1,11 +1,17 @@
+import { retirePermanentRegistration, resumeFleetTransfers } from '../src/supervisor/adoption.js';
+import { ensureFleetParent, fleetHostBackend, makeFleetBackend } from '../src/supervisor/fleet.js';
+import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
+import { installTaskSupervisorService } from '../src/task-supervisor-service.js';
+import { assertNativeFleetScope } from '../src/supervisor/scope.js';
+import { realExec } from '../src/exec.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { agentDir } from '../src/paths.js';
-import { catalogLiveness, hasTaskMemberRegistration, memberKey, memberPath, memberProcess, readMember, registerMember, unregisterMember, unregisterTaskMember, writeMember, type FleetMember } from '../src/supervisor/catalog.js';
+import { captureMemberEnvironment, catalogRoot, managedMemberEnvironment, catalogLiveness, hasTaskMemberRegistration, memberKey, memberPath, memberProcess, readMember, registerMember, unregisterMember, unregisterTaskMember, writeMember, type FleetMember } from '../src/supervisor/catalog.js';
 import { runFleetManager } from '../src/supervisor/manager.js';
 import { readRestartLedger, resetRestartLedger, writeRestartLedger } from '../src/runner.js';
 
@@ -89,6 +95,69 @@ describe('Fleet parent lifecycle', () => {
       finally { stop = true; await successor; }
     } finally { stop = true; await parent; }
   }, 15000);
+  it('registering permanent, temporary and task members keeps the installed unit and existing process unchanged', async () => {
+    const calls: string[][] = [];
+    const exec = async (cmd: string, args: string[]) => { calls.push([cmd, ...args]); return { code: 0, stdout: 'active\nrunning\n', stderr: '' }; };
+    await fleetHostBackend(exec, 'linux').init('/installed/release/cli.js');
+    const path = join(root, '.config/systemd/user/ours-fleet.service');
+    const bytes = readFileSync(path), mtime = statSync(path).mtimeMs; calls.length = 0;
+    const original = await permanent(); let stop = false;
+    const parent = runFleetManager('/unused', { shouldStop: () => stop, spawnChild: worker });
+    try {
+      await until(async () => (await catalogLiveness(original.key)).state === 'running');
+      const pid = readMember(original.key)?.pid;
+      mkdirSync(agentDir('Second'), { recursive: true });
+      await makeFleetBackend(exec, 'linux').install('Second', '/task/dev/cli.js');
+      const tempDir = agentDir('Transient', true); mkdirSync(tempDir, { recursive: true }); prepareTempSupervisor(tempDir, 'Transient');
+      await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/another/dev/cli.js', ['_run-temp', 'Transient'], tempDir);
+      const taskDir = agentDir('NewTask', true); mkdirSync(taskDir, { recursive: true });
+      await installTaskSupervisorService('NewTask', '/third/dev/cli.js', taskDir, 'linux', exec, { taskId: 'task2', creationActionId: 'action2' }, 'launch2');
+      await until(async () => (await catalogLiveness('task-NewTask')).state === 'running');
+      expect(readMember(original.key)?.pid).toBe(pid);
+      expect(readFileSync(path)).toEqual(bytes); expect(statSync(path).mtimeMs).toBe(mtime);
+      expect(calls.every(call => call[0] === 'systemctl' && call[2] === 'show')).toBe(true);
+    } finally { stop = true; await parent; }
+  });
+  it('requires explicit initialization and refuses isolated real OS supervision without issuing OS calls', async () => {
+    await expect(ensureFleetParent(async () => ({ code: 0, stdout: 'active', stderr: '' }), 'linux')).rejects.toThrow('FLEET_SERVICE_NOT_INSTALLED');
+    expect(() => assertNativeFleetScope(realExec)).toThrow('FLEET_SERVICE_HOME_CONFLICT');
+    process.env.OURS_FLEET_HOME = join(root, 'another');
+    expect(() => assertNativeFleetScope(realExec)).toThrow('FLEET_SERVICE_HOME_CONFLICT');
+    expect(existsSync(join(root, '.config/systemd/user/ours-fleet.service'))).toBe(false);
+  });
+  it('keeps creator profile selection private across parent environment changes and redacts status', async () => {
+    const member = await task();
+    const environment = await captureMemberEnvironment({ OURS_CONFIG: '/creator/profile.json', OURS_PORT: '43118', OURS_STATE_DIR: '/creator/state', OURS_API_TOKEN: 'fixture-secret-value' });
+    writeMember({ ...member, environment });
+    expect(managedMemberEnvironment(readMember(member.key)!, { OURS_CONFIG: '/other/profile', OURS_API_TOKEN: 'other', PATH: '/parent' })).toMatchObject({ OURS_CONFIG: '/creator/profile.json', OURS_PORT: '43118', OURS_STATE_DIR: '/creator/state', OURS_API_TOKEN: 'fixture-secret-value' });
+    expect(statSync(memberPath(member.key)).mode & 0o777).toBe(0o600); expect(statSync(catalogRoot()).mode & 0o777).toBe(0o700);
+    expect(JSON.stringify(await catalogLiveness(member.key))).not.toContain('fixture-secret-value');
+    await unregisterTaskMember(member.name, { taskId: 'task1', launchId: 'launch' });
+    expect(existsSync(memberPath(member.key))).toBe(false);
+  });
+  it('an explicit removal closes a pending migration cursor before boot can recover it', async () => {
+    const member = await permanent();
+    const receipt = join(root, '.ours-fleet/supervisor/legacy-permanent', member.name + '.json');
+    mkdirSync(join(receipt, '..'), { recursive: true });
+    writeFileSync(receipt, JSON.stringify({ version: 1, name: member.name, phase: 'native-retired' }));
+    const exec = async () => { throw Error('must not inspect native services for a removed member'); };
+    await retirePermanentRegistration(member.name, exec);
+    await resumeFleetTransfers('/fixture/fleet', exec, 'linux');
+    expect(readMember(member.key)).toBeUndefined();
+    expect(JSON.parse(readFileSync(receipt, 'utf8')).phase).toBe('registered');
+  });
+  it('a sustained worker uptime resets the parent-added failure streak before another crash', async () => {
+    const member = await permanent();
+    writeRestartLedger(member.dir, { ...readRestartLedger(member.dir), circuit: 'closed', consecutiveImmediateFailures: 4 });
+    let stop = false, clock = 0;
+    const parent = runFleetManager('/unused', { shouldStop: () => stop, now: () => clock, spawnChild: worker });
+    try {
+      await until(async () => (await catalogLiveness(member.key)).state === 'running');
+      clock = 100_001; process.kill(readMember(member.key)!.pid!, 'SIGKILL');
+      await until(() => readRestartLedger(member.dir).lastReason === 'Fleet member runner exited unexpectedly');
+      expect(readRestartLedger(member.dir)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 1 });
+    } finally { stop = true; await parent; }
+  });
   it('honors the existing runner circuit across parent restart and operator reset', async () => {
     const member = await permanent();
     writeRestartLedger(member.dir, { ...readRestartLedger(member.dir), circuit: 'open', consecutiveImmediateFailures: 5, lastReason: 'fixture failure' });

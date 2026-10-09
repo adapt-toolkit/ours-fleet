@@ -1,3 +1,4 @@
+import { assertNativeFleetScope } from './scope.js';
 import { clientConfigPath } from '../client-profile.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
@@ -63,11 +64,12 @@ async function probeLiveness(
 }
 
 export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
-  const ctl = (...args: string[]) => exec('systemctl', ['--user', ...args]);
+  const ctl = (...args: string[]) => { assertNativeFleetScope(exec); return exec('systemctl', ['--user', ...args]); };
   return {
     id: 'systemd',
 
     async init(binPath: string) {
+      assertNativeFleetScope(exec);
       const msgs: string[] = [];
       const unitDir = join(home(), '.config', 'systemd', 'user');
       // Lingering user units often start before a login shell imports its PATH.

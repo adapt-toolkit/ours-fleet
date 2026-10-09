@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
@@ -12,7 +13,7 @@ import { agentDir, stateRoot } from '../src/paths.js';
 import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor } from '../src/temp-lifecycle.js';
 import { memberKey, memberPath, readMember } from '../src/supervisor/catalog.js';
 import { taskSupervisorMayRun } from '../src/task-supervision.js';
-import { taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
+import { migrateLegacyTaskMembers, taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
 import { runTemp, readRestartLedger, writeRestartLedger } from '../src/runner.js';
 import { recoverTaskMembers } from '../src/rooms-tasks/recovery.js';
 import { adoptLegacyTaskMember } from '../src/rooms-tasks/legacy-task-member.js';
@@ -22,10 +23,13 @@ import { parse } from 'yaml';
 import { gatewayFixture } from './gateway-fixture.js';
 
 let root: string;
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'fleet-task-durable-'));
   vi.stubEnv('OURS_FLEET_HOME', root);
   vi.stubEnv('OURS_CONFIG', gatewayFixture(root).env.OURS_CONFIG);
+  const setup = async () => ({ code: 0, stdout: '', stderr: '' });
+  await fleetHostBackend(setup, 'linux').init('/fixture/fleet');
+  await fleetHostBackend(setup, 'darwin').init('/fixture/fleet');
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
@@ -49,7 +53,7 @@ function fixture() {
 
 function seedLegacyService(f: ReturnType<typeof fixture>) {
   const target = taskSystemdUnit(f.name), path = join(root, '.config/systemd/user', target);
-  const contents = 'saved legacy unit';
+  const contents = `[Service]\nEnvironment="OURS_CONFIG=${process.env.OURS_CONFIG}"\nExecStart=/fixture/fleet _run-temp ${f.name}\n`;
   mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, contents);
   const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
   mkdirSync(join(proof, '..'), { recursive: true });
@@ -254,7 +258,7 @@ it.each(['unknown', 'session', 'owner', 'workspace', 'retirement', 'remote'])('f
 it('does not bootstrap an existing macOS service when liveness cannot be read', async () => {
   const f = fixture(), exec = vi.fn(async () => ({ code: 1, stdout: '', stderr: 'permission denied' }));
   await expect(makeTempSupervisorLauncher({ platform: 'darwin', supervisor: 'launchd', exec })(
-    '/fixture/fleet', ['_run-temp', f.name], f.dir)).rejects.toThrow('Fleet launchd liveness unknown');
+    '/fixture/fleet', ['_run-temp', f.name], f.dir)).rejects.toThrow('FLEET_SERVICE_LIVENESS_UNKNOWN');
   expect(exec.mock.calls).toHaveLength(1);
 });
 
@@ -278,7 +282,7 @@ it('uses explicit layout ownership and excludes borrowed participants from recov
 });
 
 it('removes the exact retained service after losing live task member state', async () => {
-  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: 'active', stderr: '' }));
   await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })(
     '/fixture/fleet', ['_run-temp', f.name], f.dir);
   const proof = memberPath(memberKey(f.name, 'task'));
@@ -328,11 +332,59 @@ it('refuses service removal through a symlinked ownership marker', async () => {
 });
 
 it('blocks task erasure while a surviving service proof references a lost layout or room', async () => {
-  const f = fixture(), exec = async () => ({ code: 0, stdout: '', stderr: '' });
+  const f = fixture(), exec = async () => ({ code: 0, stdout: 'active', stderr: '' });
   await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
   expect(() => assertTaskServicesAbsent('another-task')).not.toThrow();
   rmSync(f.dir, { recursive: true });
   expect(() => assertTaskServicesAbsent(f.task.task_id)).toThrow('TASK_SERVICES_REMAIN');
   await uninstallRetainedTaskService(f.name, { taskId: f.task.task_id, launchId: f.metadata.launchId }, exec);
   expect(() => assertTaskServicesAbsent(f.task.task_id)).not.toThrow();
+});
+
+it('resumes the same legacy task transfer after native removal before central publication', async () => {
+  const f = fixture(); seedLegacyService(f);
+  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
+  let fail = true;
+  const exec = async (_cmd: string, args: string[]) => {
+    if (args.includes('daemon-reload') && fail) { fail = false; return { code: 1, stdout: '', stderr: 'interrupted reload' }; }
+    return { code: 0, stdout: args.includes('is-enabled') ? 'enabled' : '', stderr: '' };
+  };
+  await expect(migrateLegacyTaskMembers(exec)).rejects.toThrow('systemctl --user failed');
+  expect(existsSync(proof)).toBe(true); expect(readMember('task-' + f.name)).toBeUndefined();
+  expect(existsSync(join(root, '.config/systemd/user', taskSystemdUnit(f.name)))).toBe(false);
+  await migrateLegacyTaskMembers(exec);
+  expect(existsSync(proof)).toBe(false);
+  expect(readMember('task-' + f.name)).toMatchObject({ desired: 'running', taskOwner: f.metadata.taskOwner, launchId: f.metadata.launchId });
+  expect(readTempSupervisor(f.dir)).toMatchObject({ kind: 'fleet-managed', launchId: f.metadata.launchId });
+});
+it('serializes task transfer and deletion so a retained crash receipt cannot resurrect a retired member', async () => {
+  const f = fixture(); seedLegacyService(f);
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const migration = migrateLegacyTaskMembers(async (_cmd, args) => {
+    if (args.includes('disable')) { entered(); await gate; }
+    return { code: 0, stdout: args.includes('is-enabled') ? 'enabled' : '', stderr: '' };
+  });
+  await started;
+  beginTaskDeletionIntent(f.task.task_id, { kind: 'local_control', surface: 'cli' });
+  const deletion = uninstallRetainedTaskService(f.name, { ...f.metadata.taskOwner!, launchId: f.metadata.launchId }, async () => ({ code: 0, stdout: 'not-found', stderr: '' }));
+  release(); await migration; await deletion;
+  expect(readMember('task-' + f.name)).toBeUndefined();
+  await migrateLegacyTaskMembers(async () => ({ code: 0, stdout: '', stderr: '' }));
+  expect(readMember('task-' + f.name)).toBeUndefined(); expect(existsSync(f.dir)).toBe(true);
+});
+
+it('rejects an unproven legacy profile before any native retirement', async () => {
+  const f = fixture(); seedLegacyService(f);
+  const file = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
+  const contents = '[Service]\nExecStart=/fixture/fleet _run-temp TaskDeveloper\n';
+  writeFileSync(file, contents);
+  const path = join(stateRoot(), 'task-supervisors', f.name + '.json');
+  const owner = JSON.parse(readFileSync(path, 'utf8'));
+  writeFileSync(path, JSON.stringify({ ...owner, fileHash: createHash('sha256').update(contents).digest('hex') }));
+  const exec = vi.fn(async () => ({ code: 0, stdout: 'enabled', stderr: '' }));
+  await expect(migrateLegacyTaskMembers(exec)).rejects.toThrow('TASK_SERVICE_PROFILE_UNPROVEN');
+  expect(exec.mock.calls.some(call => call[1].includes('disable'))).toBe(false);
+  expect(readFileSync(file, 'utf8')).toBe(contents); expect(readMember('task-' + f.name)).toBeUndefined();
 });

@@ -7,9 +7,10 @@ import { classifyStart } from '../src/supervisor/launchd.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 
 let dir: string;
-beforeEach(() => {
+beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-sup-'));
   process.env.OURS_FLEET_HOME = dir;
+  await makeLaunchdBackend(async () => ({ code: 0, stdout: '', stderr: '' })).init('/usr/local/bin/ours-fleet');
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
@@ -113,17 +114,17 @@ describe('launchd backend', () => {
     expect(labelFor('A')).toBe('network.ours.fleet');
   });
 
-  it('install persists an XML-safe prepared profile selection only when supplied', async () => {
+  it('explicit init persists an XML-safe prepared profile selection only when supplied', async () => {
     const { exec } = recorder();
     const selected = join(dir, 'profile & <private> "client".json');
     process.env.OURS_CONFIG = selected;
     try {
-      await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
+      await makeLaunchdBackend(exec, 501).init('/usr/local/bin/ours-fleet');
       const configured = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
       expect(configured).toContain('<key>EnvironmentVariables</key>');
       expect(configured).toContain(`<key>OURS_CONFIG</key><string>${selected.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}</string>`);
       delete process.env.OURS_CONFIG;
-      await makeLaunchdBackend(exec, 501).install('B', '/usr/local/bin/ours-fleet');
+      await makeLaunchdBackend(exec, 501).init('/usr/local/bin/ours-fleet');
       const defaulted = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
       expect(defaulted).toContain('OURS_CONFIG');
       expect(defaulted).toContain('.ours-client/profile.json');
@@ -337,10 +338,10 @@ describe('install/uninstall outcomes are explicit and idempotent', () => {
     expect(await makeSystemdBackend(absent).uninstall('A')).toMatchObject({ removed: false });
   });
 
-  it('launchd reports creation from the plist it had to write', async () => {
+  it('launchd starts an explicitly installed shared plist idempotently', async () => {
     const { exec } = recorder();
     const first = await makeLaunchdBackend(exec, 501).install('A', '/b');
-    expect(first).toMatchObject({ created: true });
+    expect(first).toMatchObject({ created: false });
     const second = await makeLaunchdBackend(exec, 501).install('A', '/b');
     expect(second).toMatchObject({ created: false });          // idempotent
     expect(await makeLaunchdBackend(exec, 501).uninstall('A')).toMatchObject({ removed: true });
@@ -380,14 +381,14 @@ describe('a failed registration leaves no artifact', () => {
     return { calls, exec };
   };
 
-  it('launchd removes the plist it just wrote when bootstrap fails', async () => {
+  it('launchd preserves the explicitly installed shared plist when bootstrap fails', async () => {
     const { calls, exec } = bootstrapFails();
     await expect(makeLaunchdBackend(exec, 501).install('A', '/b')).rejects.toThrow(/bootstrap/);
     // The plist carries RunAtLoad: leaving it is leaving a service that starts
     // at the next login, for a role whose spawn failed.
-    expect(existsSync(launchAgent())).toBe(false);
+    expect(existsSync(launchAgent())).toBe(true);
     // and it was booted out of the domain, not merely deleted from disk.
-    expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);
+    expect(calls.filter(c => c[1] === 'bootout').length).toBe(0);
   });
 
   it('launchd does NOT delete a plist that was already there', async () => {
@@ -542,8 +543,8 @@ describe('a failed registration leaves no artifact', () => {
       expect(err!.message).toContain('last exit = 1');
       // and it entered the SAME rollback path as a failed bootstrap: nothing
       // is left behind, on disk or in the domain.
-      expect(existsSync(launchAgent())).toBe(false);
-      expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);
+      expect(existsSync(launchAgent())).toBe(true);
+      expect(calls.filter(c => c[1] === 'bootout').length).toBe(0);
     });
 
     it('a job that bootstrap loaded but the domain does not have is a failed install', async () => {
@@ -552,13 +553,13 @@ describe('a failed registration leaves no artifact', () => {
       });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
         .rejects.toThrow(/not running.*not loaded in the domain/s);
-      expect(existsSync(launchAgent())).toBe(false);
+      expect(existsSync(launchAgent())).toBe(true);
     });
 
     it('a job that really started installs normally, and says what state it is in', async () => {
       const { calls, exec } = launchctl(0, { stdout: '\tstate = running\n\tpid = 4242\n' });
       expect(await makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .toMatchObject({ created: true, detail: 'installed network.ours.fleet (state = running)' });
+        .toMatchObject({ created: false, detail: 'network.ours.fleet was already installed (state = running)' });
       expect(existsSync(launchAgent())).toBe(true);
       expect(calls.filter(c => c[1] === 'bootout').length).toBe(0);
     });
@@ -567,7 +568,7 @@ describe('a failed registration leaves no artifact', () => {
       // launchd is still working on it — the launchd analogue of `activating`.
       const { exec } = launchctl(0, { stdout: '\tstate = waiting\n\tlast exit code = 1\n' });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .resolves.toMatchObject({ created: true });
+        .resolves.toMatchObject({ created: false });
     });
 
     it('not running with NOTHING exited yet is not a failed start — RunAtLoad is async', async () => {
@@ -575,14 +576,14 @@ describe('a failed registration leaves no artifact', () => {
       // roll back healthy roles on a slow host, which is the asynchrony trap.
       const { exec } = launchctl(0, { stdout: '\tstate = not running\n' });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .resolves.toMatchObject({ created: true });
+        .resolves.toMatchObject({ created: false });
     });
 
     it('an UNANSWERABLE probe is never read as a failed start', async () => {
       // launchd may be perfectly fine and launchctl merely unable to answer.
       const { exec } = launchctl(0, { stderr: 'Bootstrap failed: 5: Input/output error', code: 5 });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .resolves.toMatchObject({ created: true });
+        .resolves.toMatchObject({ created: false });
       expect(existsSync(launchAgent())).toBe(true);
     });
 
@@ -597,7 +598,7 @@ describe('a failed registration leaves no artifact', () => {
       for (const line of ['last exit code = 1', 'last exit status = 256', 'last exit reason = Killed']) {
         const { exec } = launchctl(0, { stdout: `\tstate = not running\n\t${line}\n` });
         await expect(makeLaunchdBackend(exec, 501).install('A', '/b'), line).rejects.toThrow(/not running/);
-        expect(existsSync(launchAgent()), line).toBe(false);   // rolled back each time
+        expect(existsSync(launchAgent()), line).toBe(true);   // rolled back each time
       }
     });
 
@@ -606,7 +607,7 @@ describe('a failed registration leaves no artifact', () => {
       // from here, so a line this does not recognise must not fail the install.
       const { exec } = launchctl(0, { stdout: '\tstate = not running\n\tlast termination = 9\n' });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .resolves.toMatchObject({ created: true });
+        .resolves.toMatchObject({ created: false });
     });
 
     it('classifyStart keeps liveness distinct: a loaded dead job is still LIVE for 1.1', async () => {

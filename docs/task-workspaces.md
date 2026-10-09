@@ -163,8 +163,9 @@ Task deletion when the request includes the associated Task and its artifacts.
 
 ## Retained task supervisors
 
-Task-created members use separate persistent systemd user units on Linux or
-LaunchAgents on macOS. The resolved role, task cwd, supervisor launch ID, daemon
+Permanent and task-created members share one Fleet systemd user service on Linux
+or one Fleet LaunchAgent on macOS. Fleet stores members and desired running state
+internally and invokes the existing agent runner for each member. The resolved role, task cwd, supervisor launch ID, daemon
 identity ownership, room admission and harness conversation stay with the task;
 service restart or the next boot resumes them in place. Task agents remain outside
 the configured standalone roster. Explicit supervisor mode `none` has no boot
@@ -181,5 +182,37 @@ ownership marker require explicit reconciliation.
 Missing private runtime ownership, saved conversation, workspace marker or exact
 room evidence fails closed. Restore the original evidence before retrying. A
 backend that cannot resume the saved conversation cannot silently open a fresh
-session. Task deletion disables/removes the owned boot service before retiring
-and erasing its resources; service-manager failures retain retryable cleanup state.
+session. Task deletion removes its exact member registration before retiring and erasing
+its resources; failed process quiescence retains retryable cleanup state. The shared
+Fleet service and permanent members stay registered.
+
+Install or upgrade the shared service explicitly with `ours-fleet init`. Creating
+members or running `up` does not rewrite the installed service, change its Node/CLI
+path, reload the OS manager, or change linger. A missing parent reports
+`FLEET_SERVICE_NOT_INSTALLED`. Managed OS supervision currently requires the OS
+user's home: custom `OURS_FLEET_HOME` reports `FLEET_SERVICE_HOME_CONFLICT`; isolated
+fleets can use explicit `OURS_FLEET_SUPERVISOR=none`. This restriction prevents an
+isolated fleet from taking over the OS user's shared service.
+
+The private member catalog (directory 0700, records 0600) retains the creator's
+client profile path and explicit runtime/profile overrides. It is not part of the
+App agent roster or status output. Where an explicit legacy API token override is
+needed, it stays in private member state and is erased on unregister. Prefer the
+client profile's credential reference. Managed resume requires the saved backend
+session and submits no readiness or task-start prompt again.
+
+First-start interruptions are distinct from a completed conversation restart:
+before identity/runtime allocation, the same provisioning intent can retry;
+after allocation but before the backend saved its session ID, retained ownership
+alone cannot prove a resumable conversation. Missing/mismatched admission journals,
+`.booted`, or backend session IDs remain held and recovery reports the proof error.
+Restore original evidence if it exists. If no backend conversation was ever saved,
+inspect and preserve the task artifacts, then use the explicit destructive recovery
+`ours-fleet task delete <task-id> <task-id>` and create a new task from the accepted
+brief. This retires the partial launch; it cannot preserve a conversation that was
+never persisted, and Fleet never silently substitutes one.
+
+One parent failure can temporarily suspend all managed members. SIGTERM/SIGKILL
+recovery must preserve each member's intent and private conversation while preventing
+overlapping generations. Migration and operator-hook requirements are described in
+[the central service migration runbook](validation/central-supervisor-migration.md).
