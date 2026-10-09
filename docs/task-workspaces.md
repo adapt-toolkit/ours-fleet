@@ -197,6 +197,15 @@ session. Task deletion removes its exact member registration before retiring and
 its resources; failed process quiescence retains retryable cleanup state. The shared
 Fleet service and permanent members stay registered.
 
+Explicit stop of a task member terminally releases its exact recorded CID/action
+owner and archives the launch; it does not turn that member into a resumable
+stopped task. Parent shutdown remains a suspension. A failed launch whose seat
+has not recorded its CID refuses `TASK_MEMBER_RETIREMENT_CID_MISSING` rather than
+guessing another owner. Its private runtime/launch evidence stays available for
+the seat's retry or retirement saga, which must recover the original binding
+before cleanup. Preserve that evidence; do not create a second identity to bypass
+an uncertain launch.
+
 Install or upgrade the shared service explicitly with `ours-fleet init`. Creating
 members or running `up` does not rewrite the installed service, change its Node/CLI
 path, reload the OS manager, or change linger. A missing parent reports
