@@ -1,3 +1,4 @@
+import { writeV2Fixture } from './v2-fixture.js';
 import { retirePermanentRegistration, resumeFleetTransfers } from '../src/supervisor/adoption.js';
 import { ensureFleetParent, fleetHostBackend, makeFleetBackend } from '../src/supervisor/fleet.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
@@ -120,6 +121,40 @@ describe('Fleet parent lifecycle', () => {
       expect(readFileSync(path)).toEqual(bytes); expect(statSync(path).mtimeMs).toBe(mtime);
       expect(calls.every(call => call[0] === 'systemctl' && call[2] === 'show')).toBe(true);
     } finally { stop = true; await parent; }
+  });
+  it('up of one permanent leaves another legacy role and its native plist untouched', async () => {
+    const calls: string[][] = [];
+    const exec = async (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      if (args.some(arg => arg.includes('network.ours.fleet.Other'))) throw Error('other role must not be inspected');
+      return { code: 0, stdout: 'state = running', stderr: '' };
+    };
+    const cfgPath = join(root, 'fleet.yaml');
+    writeV2Fixture(cfgPath, { roles: { Selected: { harness: 'codex' }, Other: { harness: 'codex' } } });
+    const dir = agentDir('Selected'); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.config-path'), cfgPath);
+    await fleetHostBackend(exec, 'darwin').init('/installed/fleet');
+    const legacy = join(root, 'Library/LaunchAgents/network.ours.fleet.Other.plist');
+    writeFileSync(legacy, 'operator-owned-other-role');
+    const before = readFileSync(legacy); let stop = false;
+    const parent = runFleetManager('/unused', { shouldStop: () => stop, spawnChild: worker });
+    try {
+      await makeFleetBackend(exec, 'darwin').install('Selected', '/installed/fleet');
+      expect(readMember('permanent-Selected')?.desired).toBe('running');
+      expect(readMember('permanent-Other')).toBeUndefined();
+      expect(readFileSync(legacy)).toEqual(before);
+      expect(calls.some(call => call.includes('bootout') || call.some(arg => arg.includes('network.ours.fleet.Other')))).toBe(false);
+    } finally { stop = true; await parent; }
+  });
+  it('explicit service upgrade preserves operator parent drop-ins', async () => {
+    const exec = async () => ({ code: 0, stdout: '', stderr: '' });
+    await fleetHostBackend(exec, 'linux').init('/installed/old/fleet');
+    const path = join(root, '.config/systemd/user/ours-fleet.service.d/operator.conf');
+    mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, '[Service]\nExecStartPre=/operator/wait-ready\n');
+    const before = readFileSync(path);
+    await fleetHostBackend(exec, 'linux').init('/installed/new/fleet');
+    expect(readFileSync(path)).toEqual(before);
+    expect(readFileSync(join(root, '.config/systemd/user/ours-fleet.service'), 'utf8')).toContain('/installed/new/fleet');
   });
   it('requires explicit initialization and refuses isolated real OS supervision without issuing OS calls', async () => {
     await expect(ensureFleetParent(async () => ({ code: 0, stdout: 'active', stderr: '' }), 'linux')).rejects.toThrow('FLEET_SERVICE_NOT_INSTALLED');

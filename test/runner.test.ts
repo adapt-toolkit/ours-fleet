@@ -674,13 +674,18 @@ describe('runOnce', () => {
     expect(starts[0].mode).toBe('resume');
     expect(submittedPrompts.length).toBe(expected ? 1 : 0);
     if (expected) expect(submittedPrompts[0]).toContain(expected);
+    if (initial === 'dispatching') expect(submittedPrompts[0]).toContain(join(d, 'briefing.md'));
+    if (active || initial === 'dispatching') expect(submittedPrompts[0]).toContain('do not redo completed steps');
     expect(submittedPrompts.every(prompt => !prompt.includes('Fleet readiness check.'))).toBe(true);
     expect(readManagedRecovery(d)).toMatchObject({ initial: 'completed', active: false });
+    const successor = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, successor.deps);
+    expect(successor.submittedPrompts).toEqual([]);
   });
 
-  it('retries the first session before any task delivery, retaining its logical identity', async () => {
+  it.each(['acp', 'codex-app-server'] as const)('retries the first %s session before any task delivery, retaining its logical identity', async session => {
     const name = 'FirstSessionRetry', d = agentDir(name, true); mkdirSync(d, { recursive: true });
-    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp', mission: 'Do the work' }));
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session, mission: 'Do the work' }));
     prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
     writeFileSync(join(d, '.session-id'), 'unchanged-runner'); writeFileSync(join(d, '.booted'), 'failed-before-session');
     writeManagedRecovery(d, { version: 1, session: 'pending', readiness: false, initial: 'pending', active: false });

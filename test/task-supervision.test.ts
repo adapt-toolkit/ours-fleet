@@ -1,3 +1,4 @@
+import { writeManagedRecovery } from '../src/managed-recovery.js';
 import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
@@ -240,6 +241,16 @@ it('leaves running legacy members untouched, then adopts only proven stopped sta
     } } });
   expect(resume).toHaveBeenCalledTimes(1);
   expect(readTempSupervisor(f.dir)?.launchId).toBe(f.metadata.launchId);
+});
+
+it('permits a first backend retry under the exact admitted owner only before any prompt could run', () => {
+  const f = admittedFixture(); rmSync(join(f.dir, '.acp-session-id'));
+  writeManagedRecovery(f.dir, { version: 1, session: 'pending', readiness: false, initial: 'pending', active: false });
+  expect(taskSupervisorMayRun(f.name)).toBe(true);
+  writeManagedRecovery(f.dir, { version: 1, session: 'established', readiness: false, initial: 'pending', active: false });
+  expect(() => taskSupervisorMayRun(f.name)).toThrow();
+  writeManagedRecovery(f.dir, { version: 1, session: 'pending', readiness: false, initial: 'dispatching', active: true });
+  expect(() => taskSupervisorMayRun(f.name)).toThrow();
 });
 
 it.each(['unknown', 'session', 'owner', 'workspace', 'retirement', 'remote'])('fails recovery closed for %s evidence', async missing => {

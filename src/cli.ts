@@ -587,7 +587,7 @@ cOpt(program.command('status <name>').description('declared persistent Agent uni
         + `${ledger.lastTermination.runStartedAt ?? 'unknown'}) died without an orderly exit; `
         + `observed ${ledger.lastTermination.observedAt}`
         + `\n  abrupt terminations recorded: ${ledger.abruptTerminations ?? 1}`
-        + `\n  cause (signal / OOM-kill): journalctl --user -u ours-fleet-agent@${name}.service`);
+        + `\n  inspect member output: ours-fleet logs ${name}`);
     const modelStatus = joinPath(agentDir(name), '.model-status');
     if (existsSync(modelStatus)) {
       try {

@@ -223,7 +223,9 @@ Missing/mismatched identity, workspace or room journals always require reconcili
 Task agents require a resumable harness; unsupported harnesses fail before their
 identity/launch reservation with `TASK_HARNESS_RESUME_UNSUPPORTED`. Plain temporary
 Hermes agents remain supported. Since Hermes cannot resume a conversation, parent
-shutdown retires and archives these finite temporary agents; an abrupt worker failure
+shutdown retires and archives these finite temporary agents. Previously their independent
+transient service could survive another permanent agent service restarting; a common
+parent restart now affects them too. An abrupt worker failure
 also retires their evidence rather than promising durable recovery. Permanent agents
 retain their existing readiness/continuity prompt sequence on restart.
 

@@ -640,7 +640,10 @@ export async function runOnce(
   const sidFile = join(dir, '.session-id');
   const backendSidFile = join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id');
   let recovery = retainedManaged ? readManagedRecovery(dir) : undefined;
-  const firstSessionRetry = retainedManaged && existsSync(join(dir, '.booted')) && !existsSync(backendSidFile)
+  // Native Codex shares .session-id with the runner's pre-launch UUID, so file
+  // existence alone is not evidence that its first backend thread was created.
+  const firstSessionRetry = retainedManaged && existsSync(join(dir, '.booted'))
+    && (!existsSync(backendSidFile) || (role.session === 'codex-app-server' && recovery?.session === 'pending'))
     && firstManagedSessionMayStart(dir);
   if (retainedManaged && existsSync(join(dir, '.booted'))
       && (!existsSync(sidFile) || !existsSync(backendSidFile)) && !firstSessionRetry)
@@ -1056,7 +1059,9 @@ export async function runOnce(
     const interruptedWork = retainedManaged && (recoveryBefore?.active || recoveryBefore?.initial === 'dispatching');
     const workPrompt = retainedManaged
       ? initialPending && configuredWork ? managedTaskPrompt(dir, 'fresh', false)
-        : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
+        : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. '
+          + (recoveryBefore?.initial === 'dispatching' ? `If you have not yet received your assignment, read ${join(dir, 'briefing.md')} once before acting. ` : '')
+          + 'Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
       : configuredWork || booted ? managedTaskPrompt(dir, mode, booted) : undefined;
     if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
       saveRecovery({ initial: 'dispatching', active: true });

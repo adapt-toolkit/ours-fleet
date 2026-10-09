@@ -5,7 +5,6 @@ import type { Exec } from '../exec.js';
 import { realExec } from '../exec.js';
 import { logsRoot } from '../paths.js';
 import type { SupervisorBackend } from '../supervisor/types.js';
-import { unitFor } from '../supervisor/systemd.js';
 import { ROLE_NAME_RE } from '../config.js';
 import { FleetError } from './errors.js';
 import type { LogPage, LogRecord } from './types.js';
@@ -87,12 +86,11 @@ export class StructuredLogService {
 
   private async tail(roleId: string, requested: number, cursor?: string): Promise<LogPage> {
     const limit = Math.min(Math.max(requested, 1), 1_000);
-    const args = this.backend.id === 'systemd'
-      ? {
-          cmd: 'journalctl',
-          args: ['--user', '-u', unitFor(roleId), '-o', 'json', '--no-pager', '-n', String(limit)],
-        }
-      : this.backend.logsArgs(roleId, false);
+    const source = this.backend.logsArgs(roleId, false);
+    const args = { cmd: source.cmd, args: [...source.args] };
+    const count = args.args.indexOf('-n');
+    if (count >= 0) args.args[count + 1] = String(limit);
+    if (args.cmd === 'journalctl') args.args.push('-o', 'json', '--no-pager', '-n', String(limit));
     if (!['journalctl', 'tail', 'tmux'].includes(args.cmd))
       throw new FleetError('capability_unavailable', 'log backend is unsupported');
     const result = await this.exec(args.cmd, args.args);
@@ -102,7 +100,7 @@ export class StructuredLogService {
     const parsed = lines.map((line, index): LogRecord => {
       let text = line;
       let at: string | undefined;
-      if (this.backend.id === 'systemd') {
+      if (args.cmd === 'journalctl') {
         try {
           const json = JSON.parse(line) as { MESSAGE?: unknown; __REALTIME_TIMESTAMP?: unknown; __CURSOR?: unknown };
           text = typeof json.MESSAGE === 'string' ? json.MESSAGE : line;
