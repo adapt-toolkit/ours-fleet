@@ -47,7 +47,7 @@ runtime to force completion.
 
 The only production writer of `.temp-stop-request.json` is
 `stopTempSupervisor`, which writes `reason: operator-stop`. Its callers are
-standalone removal (`ops.ts`), task launch rollback (`spawn.ts`), owned layout
+standalone non-task temporary removal (`ops.ts`), task launch rollback (`spawn.ts`), owned layout
 retirement, task deletion, and managed room closure. Each requests deliberate
 retirement. `requestedTempStopReason` accepts only `operator-stop`; other reason
 values are ignored. Parent TERM/KILL/IPC shutdown does not write this file. The
@@ -57,6 +57,14 @@ ownership; the gate reattaches the same production runtime/seat/action without
 creating a second identity, then exercises the real room saga's original CID
 recovery and exact retirement. This runtime-layer retry does not qualify an
 automatic `task start` handover of a lost or archived launch.
+
+Standalone task-member removal is refused by the shared CLI/web admission check.
+Web preview refuses before confirmation or copying a removal archive. Retire
+task-owned members through the owning task lifecycle. A missing/corrupt task
+record keeps this refusal in place; restore the original task/room and exact
+launch/runtime evidence from backup before retrying `task delete ID ID`. Without
+restorable evidence there is no automatic cleanup path; explicit ownership
+reconciliation is required, without fabricated proof or replacement identities.
 
 Native Linux readiness, linger and boot ordering, physical reboot, macOS
 launchd, migration of the live host, and real provider sessions remain outside

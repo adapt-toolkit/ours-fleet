@@ -610,6 +610,23 @@ describe('explicit operator actions reset the restart circuit', () => {
 });
 
 describe('rmRole', () => {
+  it.each(['active', 'inactive'])('refuses standalone removal of a task-owned member with parent %s before any mutation', async parentState => {
+    writeCfg({});
+    const tempDir = agentDir('OwnedTask', true); mkdirSync(tempDir, { recursive: true });
+    prepareTempSupervisor(tempDir, 'OwnedTask', { taskId: 'task-fixture', roomId: 'room-fixture',
+      roomIdentityCid: 'room-cid', creationActionId: 'original-action' });
+    writeFileSync(join(tempDir, 'WORKLOG.md'), 'retained task work');
+    const before = readFileSync(join(tempDir, '.temp-supervisor.json'));
+    const { backend, calls } = fakeBackend(), { d } = deps(backend);
+    const exec = vi.fn(async () => ({ code: 0, stdout: parentState, stderr: '' })); d.exec = exec;
+    await expect(rmRole(loadConfig(), 'OwnedTask', d)).rejects.toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    expect(exec).not.toHaveBeenCalled(); expect(calls).toEqual([]);
+    expect(readFileSync(join(tempDir, '.temp-supervisor.json'))).toEqual(before);
+    expect(readFileSync(join(tempDir, 'WORKLOG.md'), 'utf8')).toBe('retained task work');
+    expect(existsSync(join(tempDir, '.temp-stop-request.json'))).toBe(false);
+    expect(existsSync(join(dir, '.ours-fleet', 'recovery', 'temporary'))).toBe(false);
+  });
+
   it('removes a proven generated Agent file under a custom manifest stem', async () => {
     const manifest = join(dir, 'custom.yml');
     writeV2Fixture(manifest, { roles: { S: { harness: 'fake' } } });

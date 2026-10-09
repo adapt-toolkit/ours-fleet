@@ -206,6 +206,18 @@ the seat's retry or retirement saga, which must recover the original binding
 before cleanup. Preserve that evidence; do not create a second identity to bypass
 an uncertain launch.
 
+Standalone `ours-fleet rm <task-member-name>` refuses `TASK_MEMBER_IS_TASK_OWNED`
+before changing the member, whether the parent is running or stopped. Web removal
+also refuses at preview, before confirmation or copying any state to a removal
+archive. Use the owning task's finish/cancel/delete commands; their retirement
+sagas can complete the saved-owner cleanup even when no worker is running.
+The guard relies on the member's saved task ownership, so a missing or corrupt
+task record does not grant standalone removal authority. Restore the original
+task/room records and launch/runtime evidence from the operator's backup before
+retrying `ours-fleet task delete ID ID`. If those records cannot be restored,
+automatic cleanup is unavailable: explicit ownership reconciliation is required;
+do not fabricate records or erase the retained owner to bypass the guard.
+
 Install or upgrade the shared service explicitly with `ours-fleet init`. Creating
 members or running `up` does not rewrite the installed service, change its Node/CLI
 path, reload the OS manager, or change linger. A missing parent reports
