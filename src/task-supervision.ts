@@ -105,3 +105,26 @@ export function taskSupervisorMayRun(name: string): boolean {
   if (seat.identity_cid) assertRetainedRuntime(role, owner.creationActionId, seat.identity_cid);
   return true;
 }
+
+/** Resolve the externally recorded CID/action for explicit terminal retirement.
+ * Run only after the same launch passed taskSupervisorMayRun's ownership fence.
+ * An unpublished failed launch stays for its seat's retry/retirement saga. */
+export function taskMemberRetirementProof(name: string): { cid: string; action: string } {
+  const dir = agentDir(name, true), metadata = readTempSupervisor(dir), owner = metadata?.taskOwner;
+  if (!owner || metadata.role !== name) throw Error('TASK_SUPERVISOR_OWNER_MISSING');
+  let cid: string | undefined;
+  if (owner.layout) {
+    const state = JSON.parse(readProof(join(stateRoot(), 'layouts', `${owner.layout.runId}.json`)));
+    const participant = state.participants[owner.layout.participant];
+    if (!participant?.owned || participant.instance?.agent !== name || participant.instance?.remote
+        || participant.instance?.temporary !== true) throw Error('TASK_LAYOUT_PARTICIPANT_MISMATCH');
+    cid = participant.instance.cid;
+  } else {
+    const seat = owner.roomId && getRoomRecord(owner.roomId)?.member_seats.find(member => member.role_name === name);
+    if (!seat || seat.launch?.action_id !== owner.creationActionId || seat.launch.launch_id !== metadata.launchId)
+      throw Error('TASK_SUPERVISOR_OWNERSHIP_MISMATCH');
+    cid = seat.identity_cid;
+  }
+  if (!cid) throw Error('TASK_MEMBER_RETIREMENT_CID_MISSING');
+  return { cid, action: owner.creationActionId };
+}

@@ -4,7 +4,7 @@ import { StartupTelemetry } from './startup-telemetry.js';
 import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
-import { taskSupervisorMayRun } from './task-supervision.js';
+import { taskSupervisorMayRun, taskMemberRetirementProof } from './task-supervision.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { prepareManagedCliLaunch } from './managed-cli.js';
@@ -1545,11 +1545,24 @@ export async function runTemp(
   if (metadata?.taskOwner) {
     // Serialize the entire process lifetime before metadata/session writes.
     const lease = await acquireOwnerBinderLease(join(dir, '.task-supervisor'), 'task-supervisor', name);
+    let ownershipVerified = false;
     try {
-      if (!taskSupervisorMayRun(name)) return;
+      const mayRun = taskSupervisorMayRun(name);
+      ownershipVerified = true;
+      if (!mayRun) return;
       await markTempSupervisorActive(dir);
       await runSupervised(name, { temp: true }, deps, attempt);
-    } finally { lease.release(); }
+    } finally {
+      try {
+        if (ownershipVerified && requestedTempStopReason(dir)) {
+          // Parent shutdown suspends; an explicit stop retires the exact saved
+          // owner even when no harness attempt ran (for example held circuits).
+          await (deps.releaseAgentOurs ?? releaseManagedAgent)(loadTempRole(name), taskMemberRetirementProof(name));
+          const archived = archiveTempState(name, 'operator-stop', 'retired', 'explicit task member retirement');
+          deps.log?.(`[${name}] task member retired: operator-stop${archived ? `; evidence archived at ${archived}` : ''}`);
+        }
+      } finally { lease.release(); }
+    }
     return;
   }
   await markTempSupervisorActive(dir);

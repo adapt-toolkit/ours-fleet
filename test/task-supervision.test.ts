@@ -11,7 +11,7 @@ import { stringify } from 'yaml';
 import { createTask, startTask, updateTaskRoom, beginTaskDeletionIntent } from '../src/rooms-tasks/task-state.js';
 import { createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
 import { agentDir, stateRoot } from '../src/paths.js';
-import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor } from '../src/temp-lifecycle.js';
+import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor, tempArchiveForLaunch, TEMP_STOP_REQUEST_FILE } from '../src/temp-lifecycle.js';
 import { memberKey, memberPath, readMember } from '../src/supervisor/catalog.js';
 import { taskSupervisorMayRun } from '../src/task-supervision.js';
 import { migrateLegacyTaskMembers, taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
@@ -212,6 +212,37 @@ function admittedFixture() {
     display_name: f.name, identity_cid: cid, invite_id: 'invite', role: 'Developer', seat_state: 'active' }] };
   return { ...f, privateDir, cowork: { getRoom: vi.fn(async () => remote as any) } };
 }
+
+it.each(['running', 'held', 'release-failed', 'wrong-owner'])('terminally retires only an explicitly stopped exact task member: %s', async mode => {
+  const f = admittedFixture(), release = vi.fn(async () => {});
+  const stop = () => writeFileSync(join(f.dir, TEMP_STOP_REQUEST_FILE), JSON.stringify({ reason: 'operator-stop' }));
+  const attempt = vi.fn(async () => {
+    stop();
+    return { elapsedSecs: 100, mode: 'resume' as const, rotated: false,
+      exit: { version: 1 as const, class: 'clean' as const, detail: 'operator stop' } };
+  });
+  if (mode === 'held') {
+    writeRestartLedger(f.dir, { version: 1, consecutiveImmediateFailures: 5, circuit: 'open',
+      resumeDiscarded: false, nextDelayMs: 0, updatedAt: '' });
+  }
+  if (mode === 'release-failed') release.mockRejectedValueOnce(Error('release unavailable'));
+  if (mode === 'wrong-owner') {
+    stop(); writeFileSync(join(f.dir, 'creation.json'), JSON.stringify({ role: f.name, creationActionId: 'foreign' }));
+  }
+  const run = runTemp(f.name, { releaseAgentOurs: release, sleep: async () => stop(), log: () => {} }, attempt);
+  if (mode === 'wrong-owner' || mode === 'release-failed') {
+    await expect(run).rejects.toThrow(mode === 'wrong-owner' ? 'TASK_SUPERVISOR_OWNERSHIP_MISMATCH' : 'release unavailable');
+    expect(existsSync(f.dir)).toBe(true); expect(tempArchiveForLaunch(f.name, f.metadata.launchId)).toBeUndefined();
+    if (mode === 'wrong-owner') expect(release).not.toHaveBeenCalled();
+  } else {
+    await run;
+    expect(release).toHaveBeenCalledWith(expect.objectContaining({ name: f.name, identity: f.name }), { cid: 'MEMBERCID', action: 'task-action' });
+    expect(existsSync(f.dir)).toBe(false);
+    const archive = tempArchiveForLaunch(f.name, f.metadata.launchId)!;
+    expect(readFileSync(join(archive, 'termination.jsonl'), 'utf8')).toContain('operator-stop');
+    if (mode === 'held') expect(attempt).not.toHaveBeenCalled();
+  }
+});
 
 it('resumes proven members and resets a held circuit without changing launch/context', async () => {
   const f = admittedFixture(), resume = vi.fn(async () => {});
