@@ -4,7 +4,6 @@ import { agentDir, defaultConfigPath, stateRoot } from '../paths.js';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { loadConfig, findRole } from '../config.js';
 import { realExec, type Exec } from '../exec.js';
-import { migrateLegacyTaskMembers } from '../task-supervisor-service.js';
 import { readMember, memberKey, unregisterMember, registerMember } from './catalog.js';
 import { migrateLegacyPermanentMembers } from './legacy.js';
 import { ensureFleetParent } from './fleet.js';
@@ -21,7 +20,6 @@ export async function adoptConfiguredFleet(binPath: string, exec: Exec, platform
       },
     });
   } else await ensureFleetParent(exec, platform);
-  if (!selectedRole) await migrateLegacyTaskMembers(exec);
 }
 
 /** Boot resumes recorded transfers only. It does not rediscover removed agents
@@ -48,7 +46,6 @@ export async function resumeFleetTransfers(binPath: string, exec: Exec = realExe
       },
     });
   }
-  await migrateLegacyTaskMembers(exec);
 }
 
 /** A remove racing the native-retired → registered seam must not be undone by

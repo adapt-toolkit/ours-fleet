@@ -2,7 +2,6 @@ import { writeV2Fixture } from './v2-fixture.js';
 import { retirePermanentRegistration, resumeFleetTransfers } from '../src/supervisor/adoption.js';
 import { ensureFleetParent, fleetHostBackend, makeFleetBackend } from '../src/supervisor/fleet.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
-import { installTaskSupervisorService } from '../src/task-supervisor-service.js';
 import { assertNativeFleetScope } from '../src/supervisor/scope.js';
 import { realExec } from '../src/exec.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -115,7 +114,8 @@ describe('Fleet parent lifecycle', () => {
       await makeFleetBackend(exec, 'linux').uninstall('Second');
       expect(await catalogLiveness(original.key)).toMatchObject({ state: 'running' });
       const taskDir = agentDir('NewTask', true); mkdirSync(taskDir, { recursive: true });
-      await installTaskSupervisorService('NewTask', '/third/dev/cli.js', taskDir, 'linux', exec, { taskId: 'task2', creationActionId: 'action2' }, 'launch2');
+      prepareTempSupervisor(taskDir, 'NewTask', { taskId: 'task2', creationActionId: 'action2' });
+      await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/third/dev/cli.js', ['_run-temp', 'NewTask'], taskDir);
       await until(async () => (await catalogLiveness('task-NewTask')).state === 'running');
       expect(readMember(original.key)?.pid).toBe(pid);
       expect(readFileSync(path)).toEqual(bytes); expect(statSync(path).mtimeMs).toBe(mtime);

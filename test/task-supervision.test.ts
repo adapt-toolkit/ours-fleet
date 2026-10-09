@@ -11,10 +11,10 @@ import { stringify } from 'yaml';
 import { createTask, startTask, updateTaskRoom, beginTaskDeletionIntent } from '../src/rooms-tasks/task-state.js';
 import { createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
 import { agentDir, stateRoot } from '../src/paths.js';
-import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor, tempArchiveForLaunch, TEMP_STOP_REQUEST_FILE } from '../src/temp-lifecycle.js';
-import { memberKey, memberPath, readMember } from '../src/supervisor/catalog.js';
+import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor, tempSupervisorLiveness, tempArchiveForLaunch, TEMP_STOP_REQUEST_FILE } from '../src/temp-lifecycle.js';
+import { memberKey, memberPath, readMember, unregisterTaskMember, assertTaskRegistrationsAbsent } from '../src/supervisor/catalog.js';
 import { taskSupervisorMayRun } from '../src/task-supervision.js';
-import { migrateLegacyTaskMembers, taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
+import { retireTaskMemberService } from '../src/rooms-tasks/task-service-retirement.js';
 import { runTemp, readRestartLedger, writeRestartLedger } from '../src/runner.js';
 import { recoverTaskMembers } from '../src/rooms-tasks/recovery.js';
 import { adoptLegacyTaskMember } from '../src/rooms-tasks/legacy-task-member.js';
@@ -52,18 +52,6 @@ function fixture() {
   return { task, room, name, dir, metadata };
 }
 
-function seedLegacyService(f: ReturnType<typeof fixture>) {
-  const target = taskSystemdUnit(f.name), path = join(root, '.config/systemd/user', target);
-  const contents = `[Service]\nEnvironment="OURS_CONFIG=${process.env.OURS_CONFIG}"\nExecStart=/fixture/fleet _run-temp ${f.name}\n`;
-  mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, contents);
-  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
-  mkdirSync(join(proof, '..'), { recursive: true });
-  writeFileSync(proof, JSON.stringify({ version: 1, role: f.name, taskOwner: f.metadata.taskOwner,
-    launchId: f.metadata.launchId, kind: 'systemd-persistent', target,
-    fileHash: createHash('sha256').update(contents).digest('hex') }));
-  writeFileSync(join(f.dir, '.temp-supervisor.json'), JSON.stringify({ ...f.metadata, kind: 'systemd-persistent', target, phase: 'active' }));
-}
-
 it.each(['linux', 'darwin'] as const)('registers task members under the single Fleet service on %s and removes only membership', async platform => {
   const f = fixture(), calls: string[][] = [];
   const exec = vi.fn(async (cmd: string, args: string[]) => {
@@ -91,16 +79,6 @@ it.each(['linux', 'darwin'] as const)('registers task members under the single F
   expect(readMember(memberKey(f.name, 'task'))).toBeUndefined();
   expect(readTempSupervisor(f.dir)?.launchId).toBe(id);
   expect(calls.some(call => call.includes('disable') || call.includes('bootout') || call.includes('restart'))).toBe(false);
-});
-
-it('preserves state and retries cleanup after failed persistent service disable', async () => {
-  const f = fixture();
-  seedLegacyService(f);
-  await expect(stopTempSupervisor(f.name, { exec: async () => ({ code: 1, stdout: '', stderr: 'bus unavailable' }) })).rejects.toThrow('TASK_SERVICE_DISABLE_FAILED');
-  expect(existsSync(join(root, '.config/systemd/user', taskSystemdUnit(f.name)))).toBe(true);
-  expect(existsSync(f.dir)).toBe(true);
-  await stopTempSupervisor(f.name, { exec: async () => ({ code: 0, stdout: '', stderr: '' }) });
-  expect(existsSync(join(root, '.config/systemd/user', taskSystemdUnit(f.name)))).toBe(false);
 });
 
 it('fences deleted tasks and mismatched actions before harness/identity work', async () => {
@@ -330,23 +308,12 @@ it('removes the exact retained service after losing live task member state', asy
   const proof = memberPath(memberKey(f.name, 'task'));
   const service = join(root, '.config/systemd/user/ours-fleet.service');
   rmSync(f.dir, { recursive: true });
-  await expect(uninstallRetainedTaskService(f.name, { taskId: 'other-task', creationActionId: 'task-action' }, exec))
+  await expect(unregisterTaskMember(f.name, { taskId: 'other-task', creationActionId: 'task-action' }, { exec }))
     .rejects.toThrow('TASK_SERVICE_OWNER_MISMATCH');
   expect(existsSync(service)).toBe(true); expect(existsSync(proof)).toBe(true);
-  await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec);
+  await unregisterTaskMember(f.name, f.metadata.taskOwner!, { exec });
   expect(existsSync(service)).toBe(true); expect(existsSync(proof)).toBe(false);
-  await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, async () => ({ code: 0, stdout: 'not-found', stderr: '' })); // retry
-});
-
-it('preserves a replaced service file and its cleanup proof', async () => {
-  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
-  seedLegacyService(f);
-  const service = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
-  writeFileSync(service, 'replacement service'); exec.mockClear();
-  await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_FILE_MISMATCH');
-  expect(exec).not.toHaveBeenCalled();
-  expect(readFileSync(service, 'utf8')).toBe('replacement service');
-  expect(existsSync(join(stateRoot(), 'task-supervisors', f.name + '.json'))).toBe(true);
+  await unregisterTaskMember(f.name, f.metadata.taskOwner!, { exec: async () => ({ code: 0, stdout: 'not-found', stderr: '' }) }); // retry
 });
 
 it('refuses corrupt task supervisor metadata instead of entering standalone temporary retirement', async () => {
@@ -364,69 +331,23 @@ it.each(['permanent', 'symlink'])('refuses retained task startup with %s ownersh
   expect(() => taskSupervisorMayRun(f.name)).toThrow();
 });
 
-it('refuses service removal through a symlinked ownership marker', async () => {
-  const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
-  seedLegacyService(f);
-  const path = join(stateRoot(), 'task-supervisors', f.name + '.json'), copy = join(root, 'foreign-service-owner');
-  writeFileSync(copy, readFileSync(path)); rmSync(path); symlinkSync(copy, path); exec.mockClear();
-  await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_UNSAFE_PROOF');
-  expect(exec).not.toHaveBeenCalled(); expect(existsSync(copy)).toBe(true);
-});
-
 it('blocks task erasure while a surviving service proof references a lost layout or room', async () => {
   const f = fixture(), exec = async () => ({ code: 0, stdout: 'active', stderr: '' });
   await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
-  expect(() => assertTaskServicesAbsent('another-task')).not.toThrow();
+  expect(() => assertTaskRegistrationsAbsent('another-task')).not.toThrow();
   rmSync(f.dir, { recursive: true });
-  expect(() => assertTaskServicesAbsent(f.task.task_id)).toThrow('TASK_SERVICES_REMAIN');
-  await uninstallRetainedTaskService(f.name, { taskId: f.task.task_id, launchId: f.metadata.launchId }, exec);
-  expect(() => assertTaskServicesAbsent(f.task.task_id)).not.toThrow();
+  expect(() => assertTaskRegistrationsAbsent(f.task.task_id)).toThrow('TASK_SERVICES_REMAIN');
+  await unregisterTaskMember(f.name, { taskId: f.task.task_id, launchId: f.metadata.launchId }, { exec });
+  expect(() => assertTaskRegistrationsAbsent(f.task.task_id)).not.toThrow();
 });
 
-it('resumes the same legacy task transfer after native removal before central publication', async () => {
-  const f = fixture(); seedLegacyService(f);
-  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
-  let fail = true;
-  const exec = async (_cmd: string, args: string[]) => {
-    if (args.includes('daemon-reload') && fail) { fail = false; return { code: 1, stdout: '', stderr: 'interrupted reload' }; }
-    return { code: 0, stdout: args.includes('is-enabled') ? 'enabled' : '', stderr: '' };
-  };
-  await expect(migrateLegacyTaskMembers(exec)).rejects.toThrow('systemctl --user failed');
-  expect(existsSync(proof)).toBe(true); expect(readMember('task-' + f.name)).toBeUndefined();
-  expect(existsSync(join(root, '.config/systemd/user', taskSystemdUnit(f.name)))).toBe(false);
-  await migrateLegacyTaskMembers(exec);
-  expect(existsSync(proof)).toBe(false);
-  expect(readMember('task-' + f.name)).toMatchObject({ desired: 'running', taskOwner: f.metadata.taskOwner, launchId: f.metadata.launchId });
-  expect(readTempSupervisor(f.dir)).toMatchObject({ kind: 'fleet-managed', launchId: f.metadata.launchId });
-});
-it('serializes task transfer and deletion so a retained crash receipt cannot resurrect a retired member', async () => {
-  const f = fixture(); seedLegacyService(f);
-  let release!: () => void, entered!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  const started = new Promise<void>(resolve => { entered = resolve; });
-  const migration = migrateLegacyTaskMembers(async (_cmd, args) => {
-    if (args.includes('disable')) { entered(); await gate; }
-    return { code: 0, stdout: args.includes('is-enabled') ? 'enabled' : '', stderr: '' };
-  });
-  await started;
-  beginTaskDeletionIntent(f.task.task_id, { kind: 'local_control', surface: 'cli' });
-  const deletion = uninstallRetainedTaskService(f.name, { ...f.metadata.taskOwner!, launchId: f.metadata.launchId }, async () => ({ code: 0, stdout: 'not-found', stderr: '' }));
-  release(); await migration; await deletion;
-  expect(readMember('task-' + f.name)).toBeUndefined();
-  await migrateLegacyTaskMembers(async () => ({ code: 0, stdout: '', stderr: '' }));
-  expect(readMember('task-' + f.name)).toBeUndefined(); expect(existsSync(f.dir)).toBe(true);
-});
-
-it('rejects an unproven legacy profile before any native retirement', async () => {
-  const f = fixture(); seedLegacyService(f);
-  const file = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
-  const contents = '[Service]\nExecStart=/fixture/fleet _run-temp TaskDeveloper\n';
-  writeFileSync(file, contents);
-  const path = join(stateRoot(), 'task-supervisors', f.name + '.json');
-  const owner = JSON.parse(readFileSync(path, 'utf8'));
-  writeFileSync(path, JSON.stringify({ ...owner, fileHash: createHash('sha256').update(contents).digest('hex') }));
-  const exec = vi.fn(async () => ({ code: 0, stdout: 'enabled', stderr: '' }));
-  await expect(migrateLegacyTaskMembers(exec)).rejects.toThrow('TASK_SERVICE_PROFILE_UNPROVEN');
-  expect(exec.mock.calls.some(call => call[1].includes('disable'))).toBe(false);
-  expect(readFileSync(file, 'utf8')).toBe(contents); expect(readMember('task-' + f.name)).toBeUndefined();
+it.each(['systemd-persistent', 'launchd-persistent', 'unknown'])('rejects unsupported supervisor kind %s before startup or retirement', async kind => {
+  const f = fixture(), exec = vi.fn(), attempt = vi.fn();
+  writeFileSync(join(f.dir, '.temp-supervisor.json'), JSON.stringify({ ...f.metadata, kind }));
+  await expect(runTemp(f.name, {}, attempt)).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  await expect(tempSupervisorLiveness(f.dir, { exec })).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  await expect(stopTempSupervisor(f.name, { exec })).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  await expect(retireTaskMemberService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  expect(attempt).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled();
+  expect(existsSync(join(f.dir, TEMP_STOP_REQUEST_FILE))).toBe(false);
 });

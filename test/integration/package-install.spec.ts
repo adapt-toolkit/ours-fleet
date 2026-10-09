@@ -46,7 +46,7 @@ describe('packed root package', () => {
 
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
       expect(existsSync(join(fleetRoot, 'dist', 'supervisor', 'manager.js'))).toBe(true);
-      expect(existsSync(join(fleetRoot, 'docs', 'validation', 'central-supervisor-migration.md'))).toBe(true);
+      expect(existsSync(join(fleetRoot, 'docs', 'fleet-migration.md'))).toBe(true);
       const webProbe = `
         import { join } from 'node:path';
         import { pathToFileURL } from 'node:url';

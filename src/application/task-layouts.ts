@@ -20,7 +20,7 @@ import { FleetError } from './errors.js';
 import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
 import { ownedLayoutRetirementSeats } from '../rooms-tasks/layout-member-retirement.js';
 import { eraseMemberArtifacts } from '../rooms-tasks/erasure.js';
-import { assertTaskRegistrationsAbsent } from '../task-supervisor-service.js';
+import { assertTaskRegistrationsAbsent } from '../supervisor/catalog.js';
 
 export type TaskLayoutOperation = 'open' | 'close-room' | 'close';
 export interface TaskLayoutOperationRecord {

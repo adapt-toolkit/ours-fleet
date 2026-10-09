@@ -319,3 +319,26 @@ describe('bounded stale-state reclamation', () => {
     expect(existsSync(incomplete)).toBe(false);
   });
 });
+
+it.each(['managed', 'none'])('rejects unsupported launch metadata before execution in %s mode', async supervisor => {
+  const dir = temp('UnsupportedLaunch');
+  writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...readTempSupervisor(dir), kind: 'newer-kind' }));
+  const exec = vi.fn(), spawnDetached = vi.fn();
+  await expect(makeTempSupervisorLauncher({ exec, spawnDetached, supervisor })(
+    '/fixture/fleet', ['_run-temp', 'UnsupportedLaunch'], dir)).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  expect(exec).not.toHaveBeenCalled(); expect(spawnDetached).not.toHaveBeenCalled();
+});
+
+it('reclaims an unregistered temporary launch after missing parent installation and launch grace', async () => {
+  const dir = temp('NoParent'), metadata = readTempSupervisor(dir)!;
+  writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...metadata,
+    createdAt: new Date(Date.now() - TEMP_LAUNCH_GRACE_MS - 1000).toISOString() }));
+  rmSync(join(home, '.config/systemd/user/ours-fleet.service'));
+  const exec = vi.fn();
+  await expect(makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })(
+    '/fixture/fleet', ['_run-temp', 'NoParent'], dir)).rejects.toThrow('FLEET_SERVICE_NOT_INSTALLED');
+  expect(await tempSupervisorLiveness(dir, { exec })).toBe('stopped');
+  const archives = await reclaimStaleTempState({ exec });
+  expect(archives).toHaveLength(1); expect(existsSync(dir)).toBe(false);
+  expect(readTempSupervisor(archives[0])?.role).toBe('NoParent'); expect(exec).not.toHaveBeenCalled();
+});

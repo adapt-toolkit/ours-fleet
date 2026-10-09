@@ -1,13 +1,13 @@
 import { existsSync } from 'node:fs';
 import { agentDir } from '../paths.js';
 import { readTempSupervisor, tempArchiveForCreationAction, tempArchiveForLaunch } from '../temp-lifecycle.js';
-import { uninstallRetainedTaskService, hasRetainedTaskService } from '../task-supervisor-service.js';
+import { unregisterTaskMember, hasTaskMemberRegistration } from '../supervisor/catalog.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
 import type { Exec } from '../exec.js';
 
 /** Registration retirement precedes every identity-absence shortcut. A proven
  * legacy transient/detached launch never owned a retained registration.
- * Missing state requires surviving registration proof or manager absence.
+ * Missing state still requires exact catalog ownership before unregistering.
  */
 export async function retireTaskMemberService(name: string,
   expected: { taskId: string; creationActionId?: string; launchId?: string; taskSupervised?: boolean }, exec?: Exec): Promise<void> {
@@ -16,8 +16,8 @@ export async function retireTaskMemberService(name: string,
     : expected.launchId ? { path: tempArchiveForLaunch(name, expected.launchId) } : undefined;
   const source = existsSync(agentDir(name, true)) ? agentDir(name, true) : archive?.path;
   const metadata = source ? readTempSupervisor(source) : undefined;
-  const hasServiceEvidence = hasRetainedTaskService(name);
-  const durableMetadata = metadata?.taskOwner && ['fleet-managed', 'systemd-persistent', 'launchd-persistent'].includes(metadata.kind ?? '');
+  const hasServiceEvidence = hasTaskMemberRegistration(name);
+  const durableMetadata = metadata?.taskOwner && metadata.kind === 'fleet-managed';
   if (!hasServiceEvidence && !expected.taskSupervised && !durableMetadata) return;
-  await uninstallRetainedTaskService(name, expected, exec);
+  await unregisterTaskMember(name, expected, { exec });
 }

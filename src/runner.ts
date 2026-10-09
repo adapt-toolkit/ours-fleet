@@ -1538,7 +1538,7 @@ export async function runTemp(
   if (!metadata?.taskOwner) {
     const role = loadTempRole(name);
     const provenance = readProvenance(dir);
-    if (role.roomMemberStartup?.task_id || existsSync(join(stateRoot(), 'task-supervisors', name + '.json'))
+    if (role.roomMemberStartup?.task_id
         || (name.startsWith('layout-') && provenance?.creationActionId?.startsWith('task-')))
       throw Error('TASK_SUPERVISOR_OWNER_MISSING');
   }

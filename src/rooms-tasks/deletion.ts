@@ -1,7 +1,7 @@
 import { eraseMemberArtifacts } from './erasure.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
 import { retireTaskMemberService } from './task-service-retirement.js';
-import { assertTaskRegistrationsAbsent } from '../task-supervisor-service.js';
+import { assertTaskRegistrationsAbsent } from '../supervisor/catalog.js';
 import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 

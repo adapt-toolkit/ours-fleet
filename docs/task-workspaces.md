@@ -161,107 +161,27 @@ not supported. Room deletion removes the linked Task's dead room/member links an
 Task deletion when the request includes the associated Task and its artifacts.
 
 
-## Retained task supervisors
+## Retained task agents
 
-Permanent and task-created members share one Fleet systemd user service on Linux
-or one Fleet LaunchAgent on macOS. Fleet stores members and desired running state
-internally and invokes the existing agent runner for each member. The resolved role, task cwd, supervisor launch ID, daemon
-identity ownership, room admission and harness conversation stay with the task;
-service restart or the next boot resumes them in place. Task agents remain outside
-the configured standalone roster. Explicit supervisor mode `none` has no boot
-service; use the recovery command after starting the required daemon manually.
+Task agents use the common Fleet service and existing runners while remaining
+outside the standalone agent roster. Recovery retains their original identity,
+private runtime owner, launch, working directory, admitted room and supported
+backend conversation. `ours-fleet task recover-members TASK_ID` resumes proven
+stopped members or resets their held restart circuit; it never creates identities
+or invitations. See [upgrade and rollback](fleet-migration.md) for legacy tasks.
 
-`ours-fleet task recover-members <task-id>` checks retained ownership and room
-admission before resuming stopped members or resetting their held restart circuit.
-It never creates identities or issues/redeems another invitation. Active legacy
-transient members remain unchanged and report `migration_pending`; proven stopped
-single-room members can be adopted into durable supervision without changing their
-identity, launch ID or saved conversation. Legacy layout members with no durable
-ownership marker require explicit reconciliation.
+Recovery delivers an undispatched assignment once, continues interrupted work,
+and sends no readiness/work prompt to a completed idle conversation. An uncertain
+dispatch gets a continuation instead of replaying the assignment. First-session
+retry requires proof that no readiness/work was submitted; established session
+loss requires restoration of the original context. Task agents require a resumable
+harness. Missing ownership, workspace or room evidence keeps recovery held.
 
-`migration_pending` is not boot durability: a still-running legacy transient
-member remains under its old native supervisor. Do not restart it just to clear
-this status. Inspect the exact launch, owner, conversation and admitted-seat
-evidence first; either let the old task retire normally or schedule an operator
-transition as described in the migration runbook. Once that exact process is
-proven stopped with its original retained state intact, run the same
-`ours-fleet task recover-members <task-id>` command and verify every member's
-result. A terminal stop can retire the identity/session and make adoption
-impossible; missing evidence requires reconciliation, never an automatic
-replacement identity or invitation.
-
-Missing private runtime ownership, saved conversation, workspace marker or exact
-room evidence fails closed. Restore the original evidence before retrying. A
-backend that cannot resume the saved conversation cannot silently open a fresh
-session. Task deletion removes its exact member registration before retiring and erasing
-its resources; failed process quiescence retains retryable cleanup state. The shared
-Fleet service and permanent members stay registered.
-
-Explicit stop of a task member terminally releases its exact recorded CID/action
-owner and archives the launch; it does not turn that member into a resumable
-stopped task. Parent shutdown remains a suspension. A failed launch whose seat
-has not recorded its CID refuses `TASK_MEMBER_RETIREMENT_CID_MISSING` rather than
-guessing another owner. Its private runtime/launch evidence stays available for
-the seat's retry or retirement saga, which must recover the original binding
-before cleanup. Preserve that evidence; do not create a second identity to bypass
-an uncertain launch.
-
-Standalone `ours-fleet rm <task-member-name>` refuses `TASK_MEMBER_IS_TASK_OWNED`
-before changing the member, whether the parent is running or stopped. Web removal
-also refuses at preview, before confirmation or copying any state to a removal
-archive. Use the owning task's finish/cancel/delete commands; their retirement
-sagas can complete the saved-owner cleanup even when no worker is running.
-The guard relies on the member's saved task ownership, so a missing or corrupt
-task record does not grant standalone removal authority. Restore the original
-task/room records and launch/runtime evidence from the operator's backup before
-retrying `ours-fleet task delete ID ID`. If those records cannot be restored,
-automatic cleanup is unavailable: explicit ownership reconciliation is required;
-do not fabricate records or erase the retained owner to bypass the guard.
-
-Install or upgrade the shared service explicitly with `ours-fleet init`. Creating
-members or running `up` does not rewrite the installed service, change its Node/CLI
-path, reload the OS manager, or change linger. A missing parent reports
-`FLEET_SERVICE_NOT_INSTALLED`. Managed OS supervision currently requires the OS
-user's home: custom `OURS_FLEET_HOME` reports `FLEET_SERVICE_HOME_CONFLICT`; isolated
-fleets can use explicit `OURS_FLEET_SUPERVISOR=none`. This restriction prevents an
-isolated fleet from taking over the OS user's shared service.
-
-The private member catalog (directory 0700, records 0600) retains the creator's
-client profile path and explicit runtime/profile overrides. It is not part of the
-App agent roster or status output. Where an explicit legacy API token override is
-needed, it stays in private member state and is erased on unregister. Prefer the
-client profile's credential reference. Task recovery preserves its original creator
-selection even when invoked from another shell; changing that selection requires
-explicit retirement and a new launch. Unregister also erases temporary member state.
-
-Managed task/resumable temporary recovery uses a private, body-free delivery cursor.
-A never-dispatched assignment is delivered once after readiness. An assignment whose
-dispatch or terminal result is uncertain receives a short continuation notice asking
-the agent to continue pending work without redoing completed steps. A completed idle
-conversation receives neither readiness nor assignment again. Other console/mail
-turns are tracked too, so a suspended active turn receives continuation. Older saved
-sessions without the cursor receive one conservative continuation notice. Delivery
-and cursor persistence cannot be atomic with a remote backend: an uncertain dispatch
-is treated as potentially delivered and receives continuation, never assignment replay.
-
-A first-attempt crash before the backend session is established can retry using the
-same identity/admission when the cursor proves no readiness/work was submitted. Once
-established, a lost backend ID remains held: restore its original evidence rather
-than silently replacing a conversation. Older partial launches without this proof
-remain held. Inspect and preserve artifacts before any explicit destructive recovery
-`ours-fleet task delete <task-id> <task-id>` and replacement task creation.
-Missing/mismatched identity, workspace or room journals always require reconciliation.
-
-Task agents require a resumable harness; unsupported harnesses fail before their
-identity/launch reservation with `TASK_HARNESS_RESUME_UNSUPPORTED`. Plain temporary
-Hermes agents remain supported. Since Hermes cannot resume a conversation, parent
-shutdown retires and archives these finite temporary agents. Previously their independent
-transient service could survive another permanent agent service restarting; a common
-parent restart now affects them too. An abrupt worker failure
-also retires their evidence rather than promising durable recovery. Permanent agents
-retain their existing readiness/continuity prompt sequence on restart.
-
-One parent failure can temporarily suspend all managed members. SIGTERM/SIGKILL
-recovery must preserve each member's intent and private conversation while preventing
-overlapping generations. Migration and operator-hook requirements are described in
-[the central service migration runbook](validation/central-supervisor-migration.md).
+Parent shutdown suspends task agents. Explicit member stop terminally releases
+the exact saved owner and archives its launch; it does not complete the task.
+Finish/cancel/review retain their existing semantics. Task deletion stops and
+unregisters only owned members, verifies identity absence and retries cleanup
+before erasing task/room/workspace resources. Permanent siblings remain intact.
+Standalone CLI/web removal refuses `TASK_MEMBER_IS_TASK_OWNED`; use the owning
+task lifecycle. Lost/corrupt task or launch records require restoring original
+backup evidence or explicit ownership reconciliation before deletion can finish.

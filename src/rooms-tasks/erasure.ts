@@ -6,7 +6,7 @@ import { dirname, join, relative } from 'node:path';
 import { parse } from 'yaml';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { agentDir, stateRoot } from '../paths.js';
-import { readTempSupervisor, tempSupervisorLiveness, eraseTerminationEvents } from '../temp-lifecycle.js';
+import { readTempSupervisorForScan, tempSupervisorLiveness, eraseTerminationEvents } from '../temp-lifecycle.js';
 import { assertSafeAncestors, auditWorkspaceGit, prepareOwnedDeletionTree } from './workspace.js';
 import type { RoomMemberSeat } from './types.js';
 
@@ -63,7 +63,7 @@ export async function eraseMemberArtifacts(
       const path = join(recovery, entry);
       const stat = lstatSync(path);
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
-      const supervisor = readTempSupervisor(path);
+      const supervisor = readTempSupervisorForScan(path);
       if (!supervisor || !names.has(supervisor.role)) continue;
       const seat = seats.find(s => s.role_name === supervisor.role)!;
       const creation = json(join(path, 'creation.json'));

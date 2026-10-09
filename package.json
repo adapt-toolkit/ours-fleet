@@ -22,8 +22,7 @@
     "docs/live-voice.md",
     "docs/room-layouts.md",
     "docs/validation/managed-cli-permissions.md",
-    "docs/validation/central-supervisor-migration.md",
-    "docs/validation/central-supervisor-recovery.md",
+    "docs/fleet-migration.md",
     "LICENSE",
     "docs/acp-files.md"
   ],

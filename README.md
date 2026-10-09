@@ -108,7 +108,7 @@ become that account and repeat.
 When upgrading from per-agent services, coordinate package installation with
 explicit `ours-fleet init`. Preserve operator readiness hooks on the common
 parent before migration; new task/temporary creation requires that parent.
-See the [migration and rollback runbook](docs/validation/central-supervisor-migration.md)
+See the [migration and rollback runbook](docs/fleet-migration.md)
 for changed stop/restart behaviour and legacy task transfer limits.
 
 ## Quickstart

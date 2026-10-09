@@ -6,8 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
-import { installTaskSupervisorService, uninstallRetainedTaskService } from './task-supervisor-service.js';
-import { captureMemberEnvironment, catalogLiveness, memberKey, readMember, registerMember, unregisterMember } from './supervisor/catalog.js';
+import { captureMemberEnvironment, catalogLiveness, memberKey, readMember, registerMember, unregisterMember, unregisterTaskMember } from './supervisor/catalog.js';
 import { ensureFleetParent } from './supervisor/fleet.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
@@ -18,7 +17,7 @@ const TEMP_GLOBAL_TERMINATION_MARKER = '.termination-globally-recorded';
 export const TEMP_RECLAIM_BATCH = 32;
 export const TEMP_LAUNCH_GRACE_MS = 60_000;
 
-export type TempSupervisorKind = 'fleet-managed' | 'systemd-transient' | 'launchd-transient' | 'systemd-persistent' | 'launchd-persistent' | 'detached';
+export type TempSupervisorKind = 'fleet-managed' | 'systemd-transient' | 'launchd-transient' | 'detached';
 export type TempTerminationReason =
   | 'idle-timeout'
   | 'identity-closed'
@@ -76,12 +75,23 @@ export function prepareTempSupervisor(dir: string, role: string, taskOwner?: Tas
 }
 
 export function readTempSupervisor(dir: string): TempSupervisorRecord | undefined {
+  let value: TempSupervisorRecord;
   try {
-    const value = JSON.parse(readFileSync(metadataPath(dir), 'utf8')) as TempSupervisorRecord;
-    if (value.version !== 1 || typeof value.role !== 'string' || typeof value.launchId !== 'string')
-      return undefined;
-    return value;
+    value = JSON.parse(readFileSync(metadataPath(dir), 'utf8')) as TempSupervisorRecord;
   } catch { return undefined; }
+  if (!value || typeof value !== 'object' || value.version !== 1 || typeof value.role !== 'string' || typeof value.launchId !== 'string') return undefined;
+  if (value.kind !== undefined && !['fleet-managed', 'systemd-transient', 'launchd-transient', 'detached'].includes(value.kind))
+    throw Error('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  return value;
+}
+
+/** Broad scans retain unsupported entries instead of blocking other members. */
+export function readTempSupervisorForScan(dir: string): TempSupervisorRecord | undefined {
+  try { return readTempSupervisor(dir); }
+  catch (error) {
+    if (error instanceof Error && error.message === 'TEMP_SUPERVISOR_KIND_UNSUPPORTED') return undefined;
+    throw error;
+  }
 }
 
 const metadataLockPath = (dir: string) => join(
@@ -118,16 +128,13 @@ export function makeTempSupervisorLauncher(options: {
   return async (binPath, args, dir) => {
     const role = args.at(-1);
     if (!role) throw new Error('temporary supervisor launch requires a role name');
-    if (readTempSupervisor(dir)?.taskOwner && supervisor !== 'none') {
-      await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: memberKey(role, 'task'), binPath });
-      await installTaskSupervisorService(role, binPath, dir, platform, exec, readTempSupervisor(dir)!.taskOwner!, readTempSupervisor(dir)!.launchId);
-      await updateTempSupervisor(dir, { phase: 'active' });
-      return;
-    }
+    const metadata = readTempSupervisor(dir);
     if (supervisor !== 'none') {
+      const kind = metadata?.taskOwner ? 'task' : 'temporary';
+      await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: memberKey(role, kind), binPath });
       await ensureFleetParent(exec, platform);
-      const result = await registerMember({ name: role, kind: 'temporary', dir, environment: await captureMemberEnvironment() });
-      await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: result.member.key, binPath });
+      await registerMember({ name: role, kind, dir, environment: await captureMemberEnvironment(),
+        ...(metadata?.taskOwner ? { taskOwner: metadata.taskOwner, launchId: metadata.launchId } : {}) });
       await updateTempSupervisor(dir, { phase: 'active' });
       return;
     }
@@ -246,7 +253,7 @@ export function archiveTempState(
 }
 
 function isArchiveForLaunch(path: string, role: string, launchId: string): boolean {
-  const supervisor = readTempSupervisor(path);
+  const supervisor = readTempSupervisorForScan(path);
   if (supervisor?.role !== role || supervisor.launchId !== launchId) return false;
   try {
     return readFileSync(join(path, TEMP_TERMINATION_FILE), 'utf8')
@@ -287,7 +294,7 @@ export function tempArchiveForCreationAction(
       .map(entry => join(archiveRoot(), entry.name));
   } catch { return undefined; }
   const matches = entries.flatMap(path => {
-    const supervisor = readTempSupervisor(path);
+    const supervisor = readTempSupervisorForScan(path);
     if (!supervisor || supervisor.role !== role || !isArchiveForLaunch(path, role, supervisor.launchId))
       return [];
     try {
@@ -359,7 +366,12 @@ function recoverInterruptedArchives(now: Date): string[] {
   const recovered: string[] = [];
   for (const name of names) {
     const source = join(archiveRoot(), name);
-    const supervisor = readTempSupervisor(source);
+    let supervisor: TempSupervisorRecord | undefined;
+    try { supervisor = readTempSupervisor(source); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'TEMP_SUPERVISOR_KIND_UNSUPPORTED') continue;
+      throw error;
+    }
     let line: string | undefined;
     try {
       line = readFileSync(join(source, TEMP_TERMINATION_FILE), 'utf8')
@@ -450,7 +462,7 @@ export async function tempSupervisorLiveness(
   if (record.kind === 'fleet-managed') return (await catalogLiveness(record.target ?? memberKey(record.role, record.taskOwner ? 'task' : 'temporary'), exec)).state;
   if (record.pid && (!record.kind || record.kind === 'detached'))
     return detachedProcessLiveness(record, deps);
-  if ((record.kind === 'systemd-transient' || record.kind === 'systemd-persistent') && record.target) {
+  if (record.kind === 'systemd-transient' && record.target) {
     const result = await exec('systemctl', [
       '--user', 'show', '-p', 'ActiveState', '--value', record.target,
     ]);
@@ -460,7 +472,7 @@ export async function tempSupervisorLiveness(
         || /not (?:be )?(?:found|loaded)|could not be found/i.test(result.stderr)) return 'stopped';
     return 'unknown';
   }
-  if ((record.kind === 'launchd-transient' || record.kind === 'launchd-persistent') && record.target) {
+  if (record.kind === 'launchd-transient' && record.target) {
     const result = await exec('launchctl', ['print', `gui/${process.getuid?.() ?? 501}/${record.target}`]);
     if (result.code === 0) return 'running';
     return /could not find service|no such process/i.test(`${result.stdout}\n${result.stderr}`)
@@ -509,13 +521,8 @@ export async function stopTempSupervisor(
     version: 1, role, reason: 'operator-stop', requestedAt: new Date().toISOString(),
   }) + '\n');
   if (record.kind === 'fleet-managed') {
-    if (record.taskOwner) await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
+    if (record.taskOwner) await unregisterTaskMember(role, { ...record.taskOwner, launchId: record.launchId }, { exec, sleep: deps.sleep });
     else await unregisterMember(record.target ?? memberKey(role, 'temporary'), { exec, sleep: deps.sleep });
-    return 'stopped';
-  }
-  if (record.taskOwner && (record.kind === 'systemd-persistent' || record.kind === 'launchd-persistent')) {
-    if (!record.target) throw Error('TASK_SERVICE_TARGET_MISSING');
-    await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
     return 'stopped';
   }
   if (record.kind === 'systemd-transient' && record.target) {
@@ -571,7 +578,6 @@ export async function stopTempSupervisor(
 /** Legacy task snapshots remain recovery evidence even before explicit migration. */
 function hasRetainedTaskReference(dir: string): boolean {
   try {
-    if (existsSync(join(stateRoot(), 'task-supervisors', basename(dir) + '.json'))) return true;
     if (basename(dir).startsWith('layout-')) {
       const provenance = JSON.parse(readFileSync(join(dir, 'creation.json'), 'utf8'));
       if (typeof provenance.creationActionId === 'string' && provenance.creationActionId.startsWith('task-')) return true;
@@ -607,13 +613,12 @@ export async function reclaimStaleTempState(deps: TempLifecycleDeps = {}): Promi
   const archived: string[] = [...recovered];
   for (const entry of entries) {
     const dir = join(tmpRoot(), entry.name);
-    if (readTempSupervisor(dir)?.taskOwner || hasRetainedTaskReference(dir)) continue; // task state is retained until explicit retirement
-    const supervisor = readTempSupervisor(dir);
+    const supervisor = readTempSupervisorForScan(dir);
+    if (!supervisor || supervisor.taskOwner || hasRetainedTaskReference(dir)) continue;
     if (supervisor?.kind === 'fleet-managed' && supervisor.target) {
       try { if (readMember(supervisor.target)?.desired === 'running') continue; }
       catch { continue; } // uncertain catalog intent is never reclamation authority
     }
-    if (!readTempSupervisor(dir)) continue; // legacy evidence has no safe ownership proof
     if (await tempSupervisorLiveness(dir, deps) !== 'stopped') continue;
     const target = archiveTempState(
       entry.name, 'stale-supervisor', 'reclaimed',
