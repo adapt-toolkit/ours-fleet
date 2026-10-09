@@ -12,7 +12,10 @@ instances, remove the shared legacy template, or create a new conversation.
 On Linux, machine-readable effective `ExecStart` must be exactly Node plus a
 Fleet CLI, `_run`, and the configured name (or the direct Fleet executable).
 An older CLI path is allowed when its regular installed package identifies
-`@ours.network/fleet` and binds `ours-fleet` to `dist/cli.js`. The loaded
+`@ours.network/fleet` and binds `ours-fleet` to `dist/cli.js`. A standard launcher
+symlink may resolve one level into that regular installed entry point; the
+receipt records launcher and target paths. A different absolute regular
+executable Node path is allowed. The loaded
 fragment and each template/instance drop-in must be bounded regular files in
 the expected user-unit namespace. Their hashes are recorded before retirement.
 Ambiguous command quoting, extra arguments, foreign fragments, unsupported
@@ -20,7 +23,7 @@ hooks and uncertain native probes abort instead of guessing ownership.
 
 Operator hooks remain operator-owned. A pure `ExecStart=` override can be
 proven through the effective command. For shared/instance `ExecStartPre`,
-integer `TimeoutStartSec`/`RestartSec`, and simple `Environment` settings,
+integer `TimeoutStartSec`/`RestartSec`, `StartLimitIntervalSec`, `Restart`, and simple `Environment` settings,
 preflight requires matching explicit directives under
 `~/.config/systemd/user/ours-fleet.service.d/`. Product code does not copy a
 script or drop-in into that directory. Unsupported/custom directives require
@@ -30,8 +33,9 @@ The known `~/bin/ours-fleet-wait-ready` gate checks Docker health for daemon,
 Cowork and gateway. Fleet's own daemon readiness wait is not equivalent.
 An operator choosing to preserve this gate on the common parent must account
 for its wider scope: tasks and temporary members also wait for this gate at
-parent boot, and a failed gate holds the whole Fleet down. Preserve its reset
-`ExecStartPre=` line and command, `TimeoutStartSec=270`, `RestartSec=15`, and any
+parent boot, and a failed gate holds the whole Fleet down. Preserve its existing
+`ExecStartPre` command, `TimeoutStartSec=270`, `RestartSec=15`, `Restart=on-failure`,
+`[Unit] StartLimitIntervalSec=0`, and any
 applicable environment settings in the explicit parent drop-in. Keep that
 drop-in across future installs; generated unit updates leave it untouched.
 Different per-agent environments cannot silently become one parent environment.
@@ -50,6 +54,12 @@ enabled inactive/failed units. Disabled inactive units remain untouched;
 disabled active units require operator resolution. On macOS a stopped or
 unloaded proven plist transfers desired `stopped`. A later stopped catalog
 record remains stopped when a registration reply is lost and migration retries.
+An enabled agent previously stopped with `ours-fleet stop X` starts during Linux
+migration. After migration, `stop` persists across parent restart and reboot.
+These are deliberate changes from native enabled-unit boot behavior.
+Readiness commands are generic operator-owned paths; migration does not read or
+execute their scripts. Once registered, later operator edits to parent drop-ins
+and readiness scripts do not invalidate completed adoption.
 
 ## Failure and retry
 
@@ -57,8 +67,11 @@ Before deployment, inspect the requested roles, package paths, service overrides
 and parent override directory. For `OPERATOR_DROPIN_REQUIRED`, explicitly
 preserve the named setting on the parent, reload the user manager, ensure the
 parent is active with the intended settings, and retry the same Fleet operation.
-For unsupported hooks or conflicting per-agent settings, resolve the conflict
-as an operator before retrying. There is no default dropped-hooks acknowledgement.
+For `UNSUPPORTED_DROPIN`, inspect the named directive and arrange its equivalent
+ordering/environment in an operator-owned parent drop-in. Unsupported directives
+must then be removed from the legacy drop-in under operator control before retry.
+Resolve conflicting per-agent settings through explicit role/common-parent
+configuration review. There is no default dropped-hooks acknowledgement.
 Do not describe partial migration as a completed one-service deployment.
 
 A preflight failure changes no requested native role. A later runtime failure

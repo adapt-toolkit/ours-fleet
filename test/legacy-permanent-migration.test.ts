@@ -25,7 +25,7 @@ function fixture(platform: 'linux' | 'darwin' = 'linux') {
   const exec = vi.fn(async (command: string, args: string[]) => {
     if (command === 'ps') return { code: 0, stdout: '', stderr: '' };
     if (command === 'systemctl' && args.includes('show')) return { code: state.probeCode,
-      stdout: `LoadState=loaded\nFragmentPath=${state.fragment}\nDropInPaths=${state.dropIns}\nUnitFileState=${state.enabled ? 'enabled' : 'disabled'}\nActiveState=${state.active || (state.live ? 'active' : 'inactive')}\nExecStart=${state.start}\nExecStartPre=${state.pre}\nExecStartPost=\nExecStop=\nExecStopPost=\nExecReload=\nExecCondition=\nEnvironment=${state.environment}\nMainPID=${state.mainPid || (state.live ? '123' : '0')}\nControlGroup=\nTimeoutStartUSec=4min 30s\nRestartUSec=15s\n`, stderr: '' };
+      stdout: `LoadState=loaded\nFragmentPath=${state.fragment}\nDropInPaths=${state.dropIns}\nUnitFileState=${state.enabled ? 'enabled' : 'disabled'}\nActiveState=${state.active || (state.live ? 'active' : 'inactive')}\nExecStart=${state.start}\nExecStartPre=${state.pre}\nExecStartPost=\nExecStop=\nExecStopPost=\nExecReload=\nExecCondition=\nEnvironment=${state.environment}\nMainPID=${state.mainPid || (state.live ? '123' : '0')}\nControlGroup=\nTimeoutStartUSec=4min 30s\nRestartUSec=15s\nStartLimitIntervalUSec=0\nRestart=on-failure\n`, stderr: '' };
     if (command === 'systemctl' && args.includes('disable')) {
       events.push('disable-old'); state.enabled = false; state.live = false; state.active = '';
       return { code: 0, stdout: '', stderr: '' };
@@ -139,13 +139,12 @@ function hostOverrides(f: ReturnType<typeof fixture>) {
   mkdirSync(dirnameOf(shared), { recursive: true }); mkdirSync(dirnameOf(override), { recursive: true });
   const gate = join(root, 'bin/ours-fleet-wait-ready'); mkdirSync(dirnameOf(gate), { recursive: true });
   writeFileSync(gate, '# fixture: wait for daemon, cowork and gateway health');
-  const settings = `[Service]\nExecStartPre=\nExecStartPre=${gate}\nTimeoutStartSec=270\nRestartSec=15\nEnvironment=ROLE_FEATURE=enabled\n`;
+  const settings = `[Unit]\nStartLimitIntervalSec=0\n[Service]\nExecStartPre=${gate}\nTimeoutStartSec=270\nRestartSec=15\nRestart=on-failure\n`;
   writeFileSync(shared, settings);
   writeFileSync(override, `[Service]\nExecStart=\nExecStart=${process.execPath} ${oldCli} _run ${f.name}\n`);
   f.state.dropIns = `${shared} ${override}`;
   f.state.start = f.effective([process.execPath, oldCli, '_run', f.name]);
   f.state.pre = f.effective([gate]);
-  f.state.environment = 'ROLE_FEATURE=enabled';
   const parent = join(root, '.config/systemd/user/ours-fleet.service.d/60-operator-readiness.conf');
   return { parent, settings, oldCli, shared, override, gate };
 }
@@ -200,4 +199,40 @@ it('rejects a lingering native MainPID without registering a replacement', async
   const f = fixture(); f.state.mainPid = '123';
   await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('NATIVE_STOP_UNPROVEN');
   expect(f.register).not.toHaveBeenCalled();
+});
+it('proves a standard launcher symlink into an older installed Fleet package and records both paths', async () => {
+  const f = fixture(), host = hostOverrides(f), launcher = join(root, '.local/bin/ours-fleet');
+  mkdirSync(dirnameOf(launcher), { recursive: true }); symlinkSync(host.oldCli, launcher);
+  f.state.start = f.effective([process.execPath, launcher, '_run', f.name]);
+  writeFileSync(host.override, `[Service]\nExecStart=\nExecStart="${process.execPath}" "${launcher}" _run %i\n`);
+  mkdirSync(dirnameOf(host.parent), { recursive: true }); writeFileSync(host.parent, host.settings);
+  await migrateLegacyPermanentMembers(f.input);
+  const receipt = JSON.parse(readFileSync(f.receiptPath, 'utf8'));
+  expect(receipt.legacyBinPath).toBe(launcher); expect(receipt.cliRealPath).toBe(host.oldCli);
+  expect(receipt.cliLinkTarget).toBe(host.oldCli);
+});
+it('keeps operator-owned settings and gate scripts editable after successful adoption', async () => {
+  const f = fixture(), host = hostOverrides(f);
+  mkdirSync(dirnameOf(host.parent), { recursive: true }); writeFileSync(host.parent, host.settings);
+  await migrateLegacyPermanentMembers(f.input);
+  writeFileSync(host.parent, '[Service]\nRestartSec=30\n'); writeFileSync(host.gate, '# revised operator-owned gate');
+  expect(await migrateLegacyPermanentMembers(f.input)).toEqual([{ name: f.name, status: 'already-migrated' }]);
+  expect(f.register).toHaveBeenCalledTimes(1);
+});
+it('supports a generic explicitly parent-owned readiness gate without reading or executing its script', async () => {
+  const f = fixture(), host = hostOverrides(f), gate = '/operator/custom/readiness';
+  const settings = host.settings.replace(host.gate, gate);
+  writeFileSync(host.shared, settings); f.state.pre = f.effective([gate]);
+  mkdirSync(dirnameOf(host.parent), { recursive: true }); writeFileSync(host.parent, settings);
+  expect(existsSync(gate)).toBe(false);
+  await migrateLegacyPermanentMembers(f.input); expect(f.catalog.get(f.name)).toBe('running');
+});
+it('allows a different regular executable Node path and maps missing package proof to a role-scoped error', async () => {
+  const f = fixture(), node = join(root, 'runtime/node'); mkdirSync(dirnameOf(node), { recursive: true });
+  writeFileSync(node, 'isolated executable fixture', { mode: 0o755 });
+  f.state.start = f.effective([node, f.input.binPath, '_run', f.name]);
+  await migrateLegacyPermanentMembers(f.input); expect(f.catalog.get(f.name)).toBe('running');
+  rmSync(f.receiptPath); f.state.enabled = true; f.state.live = true;
+  f.state.start = f.effective([node, '/missing/installation/dist/cli.js', '_run', f.name]);
+  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow(`LEGACY_PERMANENT_PROOF_UNAVAILABLE: ${f.name}: ENOENT`);
 });

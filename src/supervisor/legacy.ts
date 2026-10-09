@@ -1,6 +1,6 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { agentDir, home, stateRoot } from '../paths.js';
@@ -17,9 +17,11 @@ interface MigrationReceipt {
   legacyBinPath?: string;
   readinessGates?: LegacyReadinessGate[];
   operatorFiles?: { path: string; hash: string }[];
+  cliRealPath?: string;
+  cliLinkTarget?: string;
 }
 export interface LegacyReadinessGate {
-  path: string; hash: string; argv: string[]; timeoutStartSec: number; restartSec: number;
+  path: string; argv: string[]; timeoutStartSec: number; restartSec: number;
 }
 export interface LegacyPermanentMigrationInput {
   roles: Pick<ResolvedRole, 'name' | 'identity'>[];
@@ -50,12 +52,11 @@ function assertReceiptGates(receipt: MigrationReceipt): void {
   if (receipt.readinessGates !== undefined && !Array.isArray(receipt.readinessGates))
     throw Error('LEGACY_PERMANENT_RECEIPT_MISMATCH');
   for (const gate of receipt.readinessGates ?? []) {
-    if (gate.path !== join(home(), 'bin/ours-fleet-wait-ready') || !/^[a-f0-9]{64}$/.test(gate.hash)
-        || JSON.stringify(gate.argv) !== JSON.stringify([gate.path])
+    if (gate.path !== resolve(gate.path) || !Array.isArray(gate.argv) || gate.argv[0] !== gate.path
+        || gate.argv.some(arg => typeof arg !== 'string' || /[\r\n\0]/.test(arg))
         || !Number.isSafeInteger(gate.timeoutStartSec) || gate.timeoutStartSec < 1
         || !Number.isSafeInteger(gate.restartSec) || gate.restartSec < 0)
       throw Error('LEGACY_PERMANENT_RECEIPT_MISMATCH');
-    if (digest(proof(gate.path)) !== gate.hash) throw Error('LEGACY_PERMANENT_READINESS_GATE_CHANGED');
   }
   if (receipt.operatorFiles !== undefined && !Array.isArray(receipt.operatorFiles))
     throw Error('LEGACY_PERMANENT_RECEIPT_MISMATCH');
@@ -100,18 +101,28 @@ function argv(value: string): string[] {
   return args;
 }
 function legacyCli(args: string[], name: string, inputBin: string): string {
-  const command = args.length === 4 && args[0] === process.execPath ? args.slice(1) : args;
+  let command = args;
+  if (args.length === 4) {
+    if (args[0] !== resolve(args[0]) || !/^node(?:js)?$/.test(basename(args[0])))
+      throw Error('LEGACY_PERMANENT_NODE_PROOF_REQUIRED: use the native unit Node or review its executable');
+    const node = lstatSync(args[0]);
+    if (!node.isFile() || node.isSymbolicLink() || !(node.mode & 0o111))
+      throw Error('LEGACY_PERMANENT_NODE_PROOF_REQUIRED');
+    command = args.slice(1);
+  }
   if (command.length !== 3 || command[1] !== '_run' || command[2] !== name
       || command[0] !== resolve(command[0])) throw Error('LEGACY_PERMANENT_NATIVE_OWNER_MISMATCH');
-  if (command[0] !== inputBin) {
-    const packageDir = dirname(dirname(command[0]));
+  let cliPath = command[0];
+  if (existsSync(cliPath) && lstatSync(cliPath).isSymbolicLink()) cliPath = resolve(dirname(cliPath), readlinkSync(cliPath));
+  if (command[0] !== inputBin || cliPath !== command[0]) {
+    const packageDir = dirname(dirname(cliPath));
     const pkg = JSON.parse(proof(join(packageDir, 'package.json')));
     if (pkg.name !== '@ours.network/fleet' || pkg.bin?.['ours-fleet'] !== 'dist/cli.js'
-        || command[0] !== join(packageDir, 'dist/cli.js')) throw Error('LEGACY_PERMANENT_NATIVE_OWNER_MISMATCH');
+        || cliPath !== join(packageDir, 'dist/cli.js')) throw Error('LEGACY_PERMANENT_NATIVE_OWNER_MISMATCH');
     // The installed CLI can exceed the small proof limit. Only its regular
     // non-symlink shape is needed; package metadata binds the entry point.
-    assertSafeAncestors(dirname(command[0]));
-    const stat = lstatSync(command[0]);
+    assertSafeAncestors(dirname(cliPath));
+    const stat = lstatSync(cliPath);
     if (!stat.isFile() || stat.isSymbolicLink()) throw Error('LEGACY_PERMANENT_UNSAFE_PROOF');
   }
   return command[0];
@@ -142,7 +153,8 @@ function assertOperatorDropins(paths: string[]): { path: string; hash: string }[
   for (const path of paths) {
     for (const [key, values] of directives(proof(path))) {
       if (key === '[Service]ExecStart') continue;
-      if (!['[Service]ExecStartPre', '[Service]TimeoutStartSec', '[Service]RestartSec', '[Service]Environment'].includes(key))
+      if (!['[Service]ExecStartPre', '[Service]TimeoutStartSec', '[Service]RestartSec', '[Service]Environment',
+        '[Unit]StartLimitIntervalSec', '[Service]Restart'].includes(key))
         throw Error(`LEGACY_PERMANENT_UNSUPPORTED_DROPIN: operator review required for ${key}`);
       if (key === '[Service]Environment' && values.some(value => !value || /["'\\]/.test(value)
           || value.split(/\s+/).some(field => !/^[A-Za-z_][A-Za-z0-9_]*=\S+$/.test(field))))
@@ -178,7 +190,8 @@ async function assertParentSettings(nativePaths: string[], exec: Exec): Promise<
     if (key !== '[Service]ExecStart') required.set(key, values);
   if (!required.size) return;
   const result = await exec('systemctl', ['--user', 'show', '-p', 'LoadState', '-p', 'ActiveState',
-    '-p', 'ExecStartPre', '-p', 'TimeoutStartUSec', '-p', 'RestartUSec', '-p', 'Environment', 'ours-fleet.service']);
+    '-p', 'ExecStartPre', '-p', 'TimeoutStartUSec', '-p', 'RestartUSec', '-p', 'Environment',
+    '-p', 'StartLimitIntervalUSec', '-p', 'Restart', 'ours-fleet.service']);
   if (result.code !== 0) throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   const value = properties(result.stdout);
   if (value.LoadState !== 'loaded' || value.ActiveState !== 'active') throw Error('LEGACY_PERMANENT_PARENT_NOT_READY');
@@ -198,6 +211,10 @@ async function assertParentSettings(nativePaths: string[], exec: Exec): Promise<
     for (const variable of line.split(/\s+/))
       if (!(value.Environment ?? '').split(/\s+/).includes(variable)) throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   }
+  if (required.has('[Unit]StartLimitIntervalSec') && value.StartLimitIntervalUSec !== '0')
+    throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
+  if (required.has('[Service]Restart') && value.Restart !== required.get('[Service]Restart')?.at(-1))
+    throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
 }
 async function systemdState(name: string, path: string, exec: Exec) {
   const result = await exec('systemctl', ['--user', 'show', '-p', 'LoadState', '-p', 'FragmentPath',
@@ -227,6 +244,8 @@ function systemdProof(name: string, path: string, value: Record<string, string>,
   const operatorFiles = assertOperatorDropins(paths.slice(1));
   // Validate the effective command, not an overridden template ExecStart.
   const legacyBinPath = legacyCli(argv(value.ExecStart), name, inputBin);
+  const cliLinkTarget = existsSync(legacyBinPath) && lstatSync(legacyBinPath).isSymbolicLink() ? readlinkSync(legacyBinPath) : undefined;
+  const cliRealPath = cliLinkTarget === undefined ? legacyBinPath : resolve(dirname(legacyBinPath), cliLinkTarget);
   for (const hook of ['ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload', 'ExecCondition'])
     if (value[hook] !== '') throw Error('LEGACY_PERMANENT_UNSUPPORTED_HOOK');
   if (value.Environment === undefined || /(?:^|\s)OURS_FLEET_HOME=/.test(value.Environment)
@@ -237,16 +256,16 @@ function systemdProof(name: string, path: string, value: Record<string, string>,
   const readinessGates: LegacyReadinessGate[] = [];
   if (value.ExecStartPre) {
     const pre = argv(value.ExecStartPre);
-    const internal = pre.length === 4 && pre[0] === process.execPath && pre[1] === legacyBinPath
+    const internal = pre.length === 4 && pre[1] === legacyBinPath
       && pre[2] === '_wait-daemon' && pre[3] === name;
     if (!internal) {
-      if (pre.length !== 1 || pre[0] !== join(home(), 'bin/ours-fleet-wait-ready'))
+      if (pre[0] !== resolve(pre[0]))
         throw Error('LEGACY_PERMANENT_UNSUPPORTED_READINESS_GATE');
-      readinessGates.push({ path: pre[0], argv: pre, hash: digest(proof(pre[0])),
+      readinessGates.push({ path: pre[0], argv: pre,
         timeoutStartSec: seconds(value.TimeoutStartUSec), restartSec: seconds(value.RestartUSec) });
     }
   } else if (value.ExecStartPre !== '') throw Error('LEGACY_PERMANENT_NATIVE_PROBE_UNKNOWN');
-  return { files, legacyBinPath, readinessGates, operatorFiles };
+  return { files, legacyBinPath, cliLinkTarget, cliRealPath, readinessGates, operatorFiles };
 }
 async function launchdState(name: string, path: string, binPath: string, exec: Exec): Promise<{ loaded: boolean; live: boolean }> {
   const result = await exec('launchctl', ['print', `gui/${process.getuid?.() ?? 501}/network.ours.fleet.${name}`]);
@@ -327,7 +346,6 @@ export async function migrateLegacyPermanentMembers(input: LegacyPermanentMigrat
             || !['running', 'stopped'].includes(receipt.desired)
             || !['prepared', 'native-retired', 'registered'].includes(receipt.phase))
           throw Error('LEGACY_PERMANENT_RECEIPT_MISMATCH');
-        assertReceiptGates(receipt);
         if (receipt.phase === 'registered') {
           if (platform === 'linux') {
             const state = await systemdState(role.name, nativePath, exec);
@@ -337,6 +355,7 @@ export async function migrateLegacyPermanentMembers(input: LegacyPermanentMigrat
           for (const gate of receipt.readinessGates ?? []) gates.set(gate.path, gate);
           return { name: role.name, status: 'already-migrated' as const };
         }
+        assertReceiptGates(receipt);
         // A new CLI may finish an interrupted adoption of the same role. The
         // receipt pins old native artifacts, not the invoking release path.
         if (receipt.configPath !== configPath)
@@ -353,6 +372,9 @@ export async function migrateLegacyPermanentMembers(input: LegacyPermanentMigrat
           throw Error('LEGACY_PERMANENT_NATIVE_FILE_CHANGED');
         if (receipt?.operatorFiles && JSON.stringify(linuxProof?.operatorFiles) !== JSON.stringify(receipt.operatorFiles))
           throw Error('LEGACY_PERMANENT_OPERATOR_DROPIN_CHANGED');
+        if (receipt && (receipt.cliRealPath !== undefined && receipt.cliRealPath !== linuxProof?.cliRealPath
+            || receipt.cliLinkTarget !== undefined && receipt.cliLinkTarget !== linuxProof?.cliLinkTarget))
+          throw Error('LEGACY_PERMANENT_NATIVE_FILE_CHANGED');
       } else if (!receipt || receipt.phase === 'prepared') throw Error('LEGACY_PERMANENT_NATIVE_PROOF_MISSING');
       if (!receipt) {
         let desired: Desired;
@@ -371,7 +393,6 @@ export async function migrateLegacyPermanentMembers(input: LegacyPermanentMigrat
           ...linuxProof, legacyBinPath: linuxProof?.legacyBinPath ?? input.binPath };
       }
       for (const gate of receipt.readinessGates ?? []) {
-        if (digest(proof(gate.path)) !== gate.hash) throw Error('LEGACY_PERMANENT_READINESS_GATE_CHANGED');
         const existing = gates.get(gate.path);
         if (existing && JSON.stringify(existing) !== JSON.stringify(gate)) throw Error('LEGACY_PERMANENT_READINESS_GATE_CONFLICT');
         gates.set(gate.path, gate);
@@ -432,9 +453,17 @@ export async function migrateLegacyPermanentMembers(input: LegacyPermanentMigrat
   );
   // No receipt writes, native changes or registrations until every requested
   // role passes inspection. Revalidate under its lock immediately before use.
-  for (const role of input.roles) await execute(role, true);
+  const checkedExecute = async (role: LegacyPermanentMigrationInput['roles'][number], dryRun: boolean) => {
+    try { return await execute(role, dryRun); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code)
+        throw Error(`LEGACY_PERMANENT_PROOF_UNAVAILABLE: ${role.name}: ${(error as NodeJS.ErrnoException).code}`);
+      throw error;
+    }
+  };
+  for (const role of input.roles) await checkedExecute(role, true);
   if (!input.prepareParent) throw Error('LEGACY_PERMANENT_PARENT_PREPARATION_REQUIRED');
   await input.prepareParent([...gates.values()]);
-  for (const role of input.roles) results.push(await execute(role, false));
+  for (const role of input.roles) results.push(await checkedExecute(role, false));
   return results;
 }
