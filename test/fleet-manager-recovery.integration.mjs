@@ -339,6 +339,11 @@ if (process.argv[2] === 'parent') {
     await until(() => runtime(finite.name).phase === 'RELEASED' && !existsSync(finite.dir), 'normal terminal worker release/archive');
     assert(existsSync(join(runtimeRoot, binderKey(daemonId, finite.name), 'owner.json')));
     await deleteTaskMember(finite, permanent);
+    const taskStop = await addTask('TaskOperatorStop'); await ready(taskStop);
+    console.log('delete: live task worker completed terminal operator stop'); await stopTempSupervisor(taskStop.name);
+    await until(() => runtime(taskStop.name).phase === 'RELEASED' && !existsSync(taskStop.dir), 'task operator terminal release/archive');
+    assert(existsSync(join(runtimeRoot, binderKey(daemonId, taskStop.name), 'owner.json')));
+    await deleteTaskMember(taskStop, permanent);
     const second = await addTask('TaskDeleteDown'); await ready(second);
     console.log('delete: parent down'); await stopParent(); await deleteTaskMember(second, permanent);
     await startParent(); await ready(permanent); await pause(400);
@@ -361,7 +366,7 @@ if (process.argv[2] === 'parent') {
     assert.equal(runtime(permanent.name).cid, originalPermanent.cid);
     const baselineRestartExit = once(baselineRestart, 'exit'); baselineRestart.kill('SIGTERM'); await baselineRestartExit;
     assert.equal(runtime(permanent.name).phase, 'RELEASED');
-    console.log('PASS: default-spawn production runManagedMember/runOnce SIGTERM/SIGKILL; same real SDK CID/instance/contact admission and ACP session ID; one worker/member, exact observed generations; real control responsiveness; initial/interrupted/completed-idle ACP delivery cursor, first-session missing backend ID, uncertain dispatch briefing pointer, saved-owner release acknowledgement retry, SDK-remove-before-CID-verify retry and post-verification retry, normal live operator terminal release, actual layout-owned retirement; parent-up/down full task/room/workspace/artifact deletion preserves permanent record. Parent TERM/KILL gracefully releases permanent instances; task instance/admission remain retained. Direct permanent supervisor SIGKILL retains its instance, explicitly differing from parent IPC quiescence. Native services/reboot and authenticated model harness remain unqualified.');
+    console.log('PASS: default-spawn production runManagedMember/runOnce SIGTERM/SIGKILL; same real SDK CID/instance/contact admission and ACP session ID; one worker/member, exact observed generations; real control responsiveness; initial/interrupted/completed-idle ACP delivery cursor, first-session missing backend ID, uncertain dispatch briefing pointer, saved-owner release acknowledgement retry, SDK-remove-before-CID-verify retry and post-verification retry, normal live finite/task operator terminal release, actual layout-owned retirement; parent-up/down full task/room/workspace/artifact deletion preserves permanent record. Parent TERM/KILL gracefully releases permanent instances; task instance/admission remain retained. Direct permanent supervisor SIGKILL retains its instance, explicitly differing from parent IPC quiescence. Native services/reboot and authenticated model harness remain unqualified.');
   } catch (error) {
     console.error('parent diagnostics:', messages.join('').slice(-2000));
     for (const key of members.keys()) { const m = readMember(key); console.error('worker state:', key, m?.desired, m?.generation, m?.pid, m?.retryAt); }

@@ -32,8 +32,8 @@ The gate injects lost responses after saved-owner release, between SDK removal
 and CID verification, and after verification before artifact erasure. Retrying
 must finish deletion without changing the permanent catalog or SDK identity
 row. Layout retirement uses the actual owned-layout helper and erasure saga;
-a borrowed permanent instance remains untouched. A live finite worker's
-operator stop must leave a released owner journal that deletion can consume.
+a borrowed permanent instance remains untouched. Live finite and task workers'
+operator stops must leave a released owner journal that deletion can consume.
 
 `MEMBER_RUNTIME_RETIREMENT_SOURCE_MISSING` means a task-supervised seat still
 has an identity but neither its live launch directory nor the exact archive
