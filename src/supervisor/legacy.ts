@@ -224,6 +224,10 @@ async function systemdState(name: string, path: string, exec: Exec) {
     `ours-fleet-agent@${name}.service`]);
   if (result.code !== 0) throw Error('LEGACY_PERMANENT_NATIVE_PROBE_UNKNOWN');
   const value = properties(result.stdout);
+  // systemctl omits unset properties unless --all is used. Required state
+  // fields stay mandatory; omitted optional hooks/environment mean empty.
+  for (const key of ['DropInPaths', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost', 'ExecReload',
+    'ExecCondition', 'Environment', 'ControlGroup']) value[key] ??= '';
   if (value.LoadState === 'not-found' && !value.FragmentPath && !value.DropInPaths && value.MainPID === '0')
     return { enabled: false, live: false, absent: true, value };
   if (value.LoadState !== 'loaded' || value.FragmentPath !== path)

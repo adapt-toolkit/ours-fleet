@@ -63,6 +63,36 @@ it.each(['linux', 'darwin'] as const)('maps native boot intent during %s migrati
   await migrateLegacyPermanentMembers(f.input);
   expect(f.catalog.get(f.name)).toBe(platform === 'linux' ? 'running' : 'stopped');
 });
+it.each(['PersonalAssistant', 'Coordinator'])('accepts systemctl omission of unset properties for %s', async name => {
+  const f = fixture(), original = f.exec.getMockImplementation()!;
+  // Real systemctl show omits empty hooks, Environment and an inactive
+  // ControlGroup; do not let the fixture's printed empty keys hide this.
+  f.exec.mockImplementation(async (command, args) => {
+    const result = await original(command, args);
+    if (command === 'systemctl' && args.includes('show'))
+      return { ...result, stdout: result.stdout.replace(/^[A-Za-z]+=\n/gm, '') };
+    return result;
+  });
+  if (name !== f.name) {
+    const dir = agentDir(name); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.identity'), f.identity);
+    writeFileSync(join(dir, '.config-path'), f.input.configPath);
+    f.state.start = f.effective([process.execPath, f.input.binPath, '_run', name]);
+  }
+  await migrateLegacyPermanentMembers({ ...f.input, roles: [{ name, identity: f.identity }] });
+  expect(f.catalog.get(name)).toBe('running');
+  expect(f.events).toEqual(['disable-old', 'register-central']);
+});
+it('still refuses omitted required systemctl state before any mutation', async () => {
+  const f = fixture(), original = f.exec.getMockImplementation()!;
+  f.exec.mockImplementation(async (command, args) => {
+    const result = await original(command, args);
+    return command === 'systemctl' && args.includes('show')
+      ? { ...result, stdout: result.stdout.replace(/^MainPID=.*\n/m, '') } : result;
+  });
+  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('LEGACY_PERMANENT_NATIVE_PROBE_UNKNOWN');
+  expect(f.events).toEqual([]); expect(f.register).not.toHaveBeenCalled();
+});
 it('does not discover unconfigured roles or mutate a disabled legacy unit', async () => {
   const f = fixture(); f.state.enabled = false; f.state.live = false;
   expect(await migrateLegacyPermanentMembers({ ...f.input, roles: [] })).toEqual([]); expect(f.exec).not.toHaveBeenCalled();
