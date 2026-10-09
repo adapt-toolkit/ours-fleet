@@ -106,6 +106,23 @@ member unchanged and reports `migration_pending`. Such a member has not acquired
 the common parent's boot durability. Do not count the task as fully migrated
 until every required member has transferred or retired.
 
+For a member already running on an old transient service when the new package
+is installed and `init` is run:
+
+| Event | Result and operator action | Evidence boundary |
+| --- | --- | --- |
+| Install and `init`, old member remains running | Untouched; `recover-members` reports `migration_pending`. It is not durable under the parent. | `task-supervision.test.ts`: `leaves running legacy members untouched, then adopts only proven stopped state`; injected liveness/identity observer/resume. |
+| Clean host shutdown or stop of its old native service | The legacy runner handles SIGTERM, releases the temporary runtime and archives its state, as before this change. The old task member does not survive this retirement. | Base `runTemp` terminal release/archive path; physical host shutdown is unqualified. |
+| Abrupt old-process death or power loss | If the original private owner, CID, conversation, launch, workspace and admission survive, and exact process absence is proven, `task recover-members <task-id>` can adopt a stopped single-room member in place under the parent. Missing or mismatched evidence stays held. | The same stopped-adoption regression; isolated runtime SIGKILL/daemon-restart gate separately checks retained owner/CID/admission. A physical power-loss adoption is unqualified. |
+| Explicit task deletion | Existing legacy quiescence/archive/identity-absence retirement remains in use; cleanup retries rather than dropping uncertain ownership. | `rooms-tasks-close.test.ts` retirement saga and `layout-member-retirement.test.ts`: `stops and archives the exact owned factory launch before removing identity and artifacts, preserving a borrowed permanent binding`; native/identity calls are fixtures. |
+| Legacy layout member without durable ownership | Automatic adoption refuses. Preserve the layout run, exact member/runtime/session/creation and remote-seat evidence; reconcile the recorded owner before retrying. If that owner cannot be established, deliberately retire/delete the old task and create a replacement task with new work. Never edit ownership files to bypass proof. | `recovery.ts` rejects `Legacy layout member requires explicit reconciliation`; no automated live layout handover. |
+
+Tasks created before the upgrade do not automatically become durable. A running
+pre-upgrade transient member may be recoverable after abrupt process loss, while
+a clean legacy shutdown terminally retires it. Newly created task members after
+successful init use the common parent. This backward-compatibility limit must be
+considered when scheduling the host upgrade.
+
 Before any operator transition, preserve the task/room records and the exact
 member's private launch, creator profile, runtime owner, session, admission and
 workspace evidence. Inspect the native target recorded by that launch and prove
