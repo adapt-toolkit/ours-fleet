@@ -6,7 +6,9 @@ import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
-import { installTaskSupervisorService, taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService } from './task-supervisor-service.js';
+import { installTaskSupervisorService, uninstallRetainedTaskService } from './task-supervisor-service.js';
+import { catalogLiveness, memberKey, readMember, registerMember, stopMember } from './supervisor/catalog.js';
+import { fleetHostBackend } from './supervisor/fleet.js';
 import { stateRoot, tmpRoot } from './paths.js';
 
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
@@ -16,7 +18,7 @@ const TEMP_GLOBAL_TERMINATION_MARKER = '.termination-globally-recorded';
 export const TEMP_RECLAIM_BATCH = 32;
 export const TEMP_LAUNCH_GRACE_MS = 60_000;
 
-export type TempSupervisorKind = 'systemd-transient' | 'launchd-transient' | 'systemd-persistent' | 'launchd-persistent' | 'detached';
+export type TempSupervisorKind = 'fleet-managed' | 'systemd-transient' | 'launchd-transient' | 'systemd-persistent' | 'launchd-persistent' | 'detached';
 export type TempTerminationReason =
   | 'idle-timeout'
   | 'identity-closed'
@@ -118,51 +120,20 @@ export function makeTempSupervisorLauncher(options: {
   const platform = options.platform ?? process.platform;
   const supervisor = options.supervisor ?? process.env.OURS_FLEET_SUPERVISOR;
   return async (binPath, args, dir) => {
-    const inherited = [
-      'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME',
-      // Preserve runtime selection across the service-manager boundary, including
-      // an explicit empty value which selects the bundle over manager defaults.
-      'CODEX_PATH',
-      // The child supervisor performs daemon identity and wake probes itself;
-      // it must resolve the same ours profile as the spawning supervisor.
-      'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN', 'OURS_CONFIG',
-    ]
-      .flatMap(key => process.env[key] !== undefined ? [`${key}=${process.env[key]}`] : []);
     const role = args.at(-1);
     if (!role) throw new Error('temporary supervisor launch requires a role name');
-    const log = join(dir, 'supervisor.log');
     if (readTempSupervisor(dir)?.taskOwner && supervisor !== 'none') {
-      const kind = platform === 'linux' ? 'systemd-persistent' : 'launchd-persistent';
-      const target = platform === 'linux' ? taskSystemdUnit(role) : taskLaunchdLabel(role);
-      await updateTempSupervisor(dir, { phase: 'launching', kind, target, binPath });
+      await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: memberKey(role, 'task'), binPath });
       await installTaskSupervisorService(role, binPath, dir, platform, exec, readTempSupervisor(dir)!.taskOwner!, readTempSupervisor(dir)!.launchId);
       await updateTempSupervisor(dir, { phase: 'active' });
       return;
     }
-    if (supervisor !== 'none' && platform === 'linux') {
-      const target = tempSystemdUnit(role);
-      await updateTempSupervisor(dir, { phase: 'launching', kind: 'systemd-transient', target, binPath });
-      const result = await exec('systemd-run', [
-        '--user', '--quiet', '--collect', `--unit=${target}`,
-        '--property=Type=exec', '--property=KillMode=control-group', '--property=TimeoutStopSec=15s',
-        `--property=StandardOutput=append:${log}`, `--property=StandardError=append:${log}`,
-        ...inherited.map(value => `--setenv=${value}`),
-        process.execPath, binPath, ...args,
-      ]);
-      if (result.code !== 0)
-        throw new Error(`systemd-run ${target} failed: ${result.stderr.trim() || `exit ${result.code}`}`);
-      await updateTempSupervisor(dir, { phase: 'active' });
-      return;
-    }
-    if (supervisor !== 'none' && platform === 'darwin') {
-      const target = tempLaunchdLabel(role);
-      await updateTempSupervisor(dir, { phase: 'launching', kind: 'launchd-transient', target, binPath });
-      const result = await exec('launchctl', [
-        'submit', '-l', target, '-o', log, '-e', log, '--',
-        '/usr/bin/env', ...inherited, process.execPath, binPath, ...args,
-      ]);
-      if (result.code !== 0)
-        throw new Error(`launchctl submit ${target} failed: ${result.stderr.trim() || `exit ${result.code}`}`);
+    if (supervisor !== 'none') {
+      const result = await registerMember({ name: role, kind: 'temporary', dir });
+      await updateTempSupervisor(dir, { phase: 'launching', kind: 'fleet-managed', target: result.member.key, binPath });
+      const host = fleetHostBackend(exec, platform);
+      await host.init(binPath);
+      await host.install('fleet', binPath);
       await updateTempSupervisor(dir, { phase: 'active' });
       return;
     }
@@ -482,6 +453,7 @@ export async function tempSupervisorLiveness(
       && (!Number.isFinite(age) || age < TEMP_LAUNCH_GRACE_MS)) return 'unknown';
   // Older writers could lose `kind` in an unlocked metadata RMW while retaining
   // the supervisor pid. Exact argv ownership is stronger than the missing tag.
+  if (record.kind === 'fleet-managed') return (await catalogLiveness(record.target ?? memberKey(record.role, record.taskOwner ? 'task' : 'temporary'), exec)).state;
   if (record.pid && (!record.kind || record.kind === 'detached'))
     return detachedProcessLiveness(record, deps);
   if ((record.kind === 'systemd-transient' || record.kind === 'systemd-persistent') && record.target) {
@@ -542,6 +514,11 @@ export async function stopTempSupervisor(
   replaceFileAtomically(join(dir, TEMP_STOP_REQUEST_FILE), JSON.stringify({
     version: 1, role, reason: 'operator-stop', requestedAt: new Date().toISOString(),
   }) + '\n');
+  if (record.kind === 'fleet-managed') {
+    if (record.taskOwner) await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
+    else await stopMember(record.target ?? memberKey(role, 'temporary'), { exec, sleep: deps.sleep });
+    return 'stopped';
+  }
   if (record.taskOwner && (record.kind === 'systemd-persistent' || record.kind === 'launchd-persistent')) {
     if (!record.target) throw Error('TASK_SERVICE_TARGET_MISSING');
     await uninstallRetainedTaskService(role, { ...record.taskOwner, launchId: record.launchId }, exec);
@@ -637,6 +614,11 @@ export async function reclaimStaleTempState(deps: TempLifecycleDeps = {}): Promi
   for (const entry of entries) {
     const dir = join(tmpRoot(), entry.name);
     if (readTempSupervisor(dir)?.taskOwner || hasRetainedTaskReference(dir)) continue; // task state is retained until explicit retirement
+    const supervisor = readTempSupervisor(dir);
+    if (supervisor?.kind === 'fleet-managed' && supervisor.target) {
+      try { if (readMember(supervisor.target)?.desired === 'running') continue; }
+      catch { continue; } // uncertain catalog intent is never reclamation authority
+    }
     if (!readTempSupervisor(dir)) continue; // legacy evidence has no safe ownership proof
     if (await tempSupervisorLiveness(dir, deps) !== 'stopped') continue;
     const target = archiveTempState(

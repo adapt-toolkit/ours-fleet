@@ -106,6 +106,8 @@ export interface RunnerDeps {
   reportOwnerStartupFailure(stateDir: string): Promise<'delivered' | 'duplicate'>;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
+  /** Parent shutdown suspends a managed transient member; explicit stop still retires. */
+  suspendOnStop?: boolean;
 }
 
 export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
@@ -1217,7 +1219,7 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (readTempSupervisor(dir)?.taskOwner || (!temp && deps.shouldStop?.()))
+  if (readTempSupervisor(dir)?.taskOwner || ((!temp || deps.suspendOnStop) && deps.shouldStop?.()))
     deps.log(`[${name}] supervisor/context retained -> next start RESUMES context`);
   else if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
@@ -1507,7 +1509,8 @@ export async function runTemp(
     process.off('SIGTERM', onTerm);
     process.off('SIGINT', onInt);
     // A recycle replaces the supervisor process, not the logical temporary agent.
-    if (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.()) {
+    if (!((signal || deps.shouldStop?.()) && deps.suspendOnStop && !requestedTempStopReason(dir))
+        && (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.())) {
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason

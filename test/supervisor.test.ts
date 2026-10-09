@@ -21,6 +21,7 @@ function recorder(code = 0) {
   const calls: string[][] = [];
   const exec: Exec = async (cmd, args): Promise<ExecResult> => {
     calls.push([cmd, ...args]);
+    if (cmd === 'launchctl' && args[0] === 'print') return calls.some(c => c[1] === 'bootstrap') ? { stdout: 'state = running', stderr: '', code: 0 } : { stdout: '', stderr: 'Could not find service', code: 113 };
     return { stdout: '', stderr: '', code };
   };
   return { calls, exec };
@@ -30,12 +31,12 @@ describe('systemd backend', () => {
   it('init writes the unit template with the bin path and reloads', async () => {
     const { calls, exec } = recorder();
     const msgs = await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
-    const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+    const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet.service'), 'utf8');
     // Anchored: this file now carries `#` comments, and a substring match can be
     // satisfied by one of them rather than by the directive itself.
-    expect(unit).toContain(`ExecStart="${process.execPath}" "/usr/local/bin/ours-fleet" _run %i`);
-    expect(unit).toContain(`ExecStartPre="${process.execPath}" "/usr/local/bin/ours-fleet" _wait-daemon %i`);
-    expect(unit).toMatch(/^TimeoutStartSec=270$/m);
+    expect(unit).toContain(`ExecStart="${process.execPath}" "/usr/local/bin/ours-fleet" _run-fleet`);
+    expect(unit).not.toContain('ExecStartPre=');
+    expect(unit).toMatch(/^KillMode=control-group$/m);
     expect(unit).toMatch(/^StartLimitIntervalSec=0$/m);
     expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
     expect(unit).toContain('/usr/local/bin');
@@ -56,7 +57,7 @@ describe('systemd backend', () => {
     process.env.OURS_CONFIG = configPath;
     try {
       await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
-      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet.service'), 'utf8');
       expect(unit).toContain(`Environment="OURS_CONFIG=${configPath}"`);
       // The port and state directory are deliberately NOT frozen into the unit: the
       // selected daemon's own config file stays authoritative for those, so editing
@@ -76,7 +77,7 @@ describe('systemd backend', () => {
     delete process.env.OURS_CONFIG;
     try {
       await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
-      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet.service'), 'utf8');
       expect(unit).toContain('.ours-client/profile.json');
       expect(unit).not.toContain('OURS_PORT');
       expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
@@ -88,14 +89,14 @@ describe('systemd backend', () => {
   it('install enables the instance unit', async () => {
     const { calls, exec } = recorder();
     await makeSystemdBackend(exec).install('A', '/b');
-    expect(calls).toContainEqual(['systemctl', '--user', 'enable', '--now', 'ours-fleet-agent@A.service']);
-    expect(unitFor('A')).toBe('ours-fleet-agent@A.service');
+    expect(calls).toContainEqual(['systemctl', '--user', 'enable', '--now', 'ours-fleet.service']);
+    expect(unitFor('A')).toBe('ours-fleet.service');
   });
 
   it('logsArgs targets journalctl', () => {
     const { args, cmd } = makeSystemdBackend().logsArgs('A', true);
     expect(cmd).toBe('journalctl');
-    expect(args).toEqual(['--user', '-u', 'ours-fleet-agent@A.service', '-f']);
+    expect(args).toEqual(['--user', '-u', 'ours-fleet.service', '-f']);
   });
 });
 
@@ -103,13 +104,13 @@ describe('launchd backend', () => {
   it('install writes plist and bootstraps into gui domain', async () => {
     const { calls, exec } = recorder();
     await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
-    const plist = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist'), 'utf8');
-    expect(plist).toContain('<string>network.ours.fleet.A</string>');
+    const plist = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
+    expect(plist).toContain('<string>network.ours.fleet</string>');
     expect(plist).toContain('<string>/usr/local/bin/ours-fleet</string>');
-    expect(plist).toContain('<string>_run</string>');
+    expect(plist).toContain('<string>_run-fleet</string>');
     expect(plist).toMatch(/^\s*<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>$/m);
     expect(calls.some(c => c[0] === 'launchctl' && c[1] === 'bootstrap' && c[2] === 'gui/501')).toBe(true);
-    expect(labelFor('A')).toBe('network.ours.fleet.A');
+    expect(labelFor('A')).toBe('network.ours.fleet');
   });
 
   it('install persists an XML-safe prepared profile selection only when supplied', async () => {
@@ -118,12 +119,12 @@ describe('launchd backend', () => {
     process.env.OURS_CONFIG = selected;
     try {
       await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
-      const configured = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist'), 'utf8');
+      const configured = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
       expect(configured).toContain('<key>EnvironmentVariables</key>');
       expect(configured).toContain(`<key>OURS_CONFIG</key><string>${selected.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}</string>`);
       delete process.env.OURS_CONFIG;
       await makeLaunchdBackend(exec, 501).install('B', '/usr/local/bin/ours-fleet');
-      const defaulted = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.B.plist'), 'utf8');
+      const defaulted = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
       expect(defaulted).toContain('OURS_CONFIG');
       expect(defaulted).toContain('.ours-client/profile.json');
     } finally {
@@ -134,7 +135,7 @@ describe('launchd backend', () => {
   it('logsArgs tails the role log file', () => {
     const { cmd, args } = makeLaunchdBackend(undefined, 501).logsArgs('A', true);
     expect(cmd).toBe('tail');
-    expect(args[1]).toContain('.ours-fleet/logs/A.log');
+    expect(args[1]).toContain('.ours-fleet/logs/fleet.log');
   });
 });
 
@@ -146,7 +147,7 @@ describe('systemd liveness', () => {
     await makeSystemdBackend(exec).liveness('A');
     expect(calls).toContainEqual([
       'systemctl', '--user', 'show', '-p', 'ActiveState', '-p', 'SubState', '--value',
-      'ours-fleet-agent@A.service',
+      'ours-fleet.service',
     ]);
   });
 
@@ -177,7 +178,7 @@ describe('launchd liveness', () => {
   const printing = (stdout: string, stderr = '', code = 0): Exec => async () => ({ stdout, stderr, code });
 
   it('a loaded service is running and reports its launchd state', async () => {
-    const l = await makeLaunchdBackend(printing('network.ours.fleet.A = {\n\tstate = running\n}'), 501).liveness('A');
+    const l = await makeLaunchdBackend(printing('network.ours.fleet = {\n\tstate = running\n}'), 501).liveness('A');
     expect(l).toEqual({ state: 'running', detail: 'loaded (state = running)' });
   });
 
@@ -187,9 +188,9 @@ describe('launchd liveness', () => {
   });
 
   it('an unknown service is a definite stop', async () => {
-    const err = 'Could not find service "network.ours.fleet.A" in domain for gui/501';
+    const err = 'Could not find service "network.ours.fleet" in domain for gui/501';
     const l = await makeLaunchdBackend(printing('', err, 113), 501).liveness('A');
-    expect(l).toEqual({ state: 'stopped', detail: 'not loaded (network.ours.fleet.A)' });
+    expect(l).toEqual({ state: 'stopped', detail: 'not loaded (network.ours.fleet)' });
   });
 
   it('any other probe failure is unknown, not a stop', async () => {
@@ -278,7 +279,7 @@ describe('systemd bus-error hint (#9)', () => {
   });
 
   it('unrelated failures stay unhinted', async () => {
-    const e = await makeSystemdBackend(failing('Unit ours-fleet-agent@A.service not found.'))
+    const e = await makeSystemdBackend(failing('Unit ours-fleet.service not found.'))
       .restart('A').then(() => null, err => err as Error);
     expect(String(e)).toContain('not found');
     expect(String(e)).not.toContain('enable-linger');
@@ -289,7 +290,7 @@ describe('service managers no longer run the child-session loop', () => {
   it('systemd restarts the runner only when it FAILS, not on every exit', async () => {
     const { exec } = recorder();
     await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
-    const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+    const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet.service'), 'utf8');
     // Restart=always would resume the uncounted two-second relaunch loop and
     // would restart a runner that is deliberately holding an agent down.
     expect(unit).toMatch(/^Restart=on-failure$/m);
@@ -300,7 +301,7 @@ describe('service managers no longer run the child-session loop', () => {
   it('launchd keeps the runner alive only on unsuccessful exit', async () => {
     const { exec } = recorder();
     await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
-    const plist = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist'), 'utf8');
+    const plist = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.plist'), 'utf8');
     expect(plist).toMatch(/^\s*<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>$/m);
     expect(plist).not.toMatch(/^\s*<key>KeepAlive<\/key><true\/>$/m);
   });
@@ -312,11 +313,11 @@ describe('install/uninstall outcomes are explicit and idempotent', () => {
 
   it('systemd reports whether it created the registration', async () => {
     const enabled = answering({
-      'systemctl --user is-enabled ours-fleet-agent@A.service':
+      'systemctl --user is-enabled ours-fleet.service':
         { stdout: 'enabled\n', stderr: '', code: 0 },
     });
     const fresh = answering({
-      'systemctl --user is-enabled ours-fleet-agent@A.service':
+      'systemctl --user is-enabled ours-fleet.service':
         { stdout: '', stderr: 'not found', code: 1 },
     });
     expect(await makeSystemdBackend(fresh).install('A', '/b')).toMatchObject({ created: true });
@@ -325,11 +326,11 @@ describe('install/uninstall outcomes are explicit and idempotent', () => {
 
   it('systemd uninstall is idempotent and says whether anything was there', async () => {
     const enabled = answering({
-      'systemctl --user is-enabled ours-fleet-agent@A.service':
+      'systemctl --user is-enabled ours-fleet.service':
         { stdout: 'enabled\n', stderr: '', code: 0 },
     });
     const absent = answering({
-      'systemctl --user is-enabled ours-fleet-agent@A.service':
+      'systemctl --user is-enabled ours-fleet.service':
         { stdout: '', stderr: '', code: 1 },
     });
     expect(await makeSystemdBackend(enabled).uninstall('A')).toMatchObject({ removed: true });
@@ -364,13 +365,14 @@ describe('install/uninstall outcomes are explicit and idempotent', () => {
  * failed spawn leaves a live launch artifact behind.
  */
 describe('a failed registration leaves no artifact', () => {
-  const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist');
+  const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.plist');
 
   /** bootstrap fails; everything else succeeds. */
   const bootstrapFails = () => {
     const calls: string[][] = [];
     const exec: Exec = async (cmd, args): Promise<ExecResult> => {
       calls.push([cmd, ...args]);
+      if (args[0] === 'print') return { stdout: '', stderr: 'Could not find service', code: 113 };
       return args[0] === 'bootstrap'
         ? { stdout: '', stderr: 'Bootstrap failed: 5: Input/output error', code: 5 }
         : { stdout: '', stderr: '', code: 0 };
@@ -385,7 +387,7 @@ describe('a failed registration leaves no artifact', () => {
     // at the next login, for a role whose spawn failed.
     expect(existsSync(launchAgent())).toBe(false);
     // and it was booted out of the domain, not merely deleted from disk.
-    expect(calls.filter(c => c[1] === 'bootout').length).toBeGreaterThanOrEqual(2);
+    expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);
   });
 
   it('launchd does NOT delete a plist that was already there', async () => {
@@ -407,7 +409,7 @@ describe('a failed registration leaves no artifact', () => {
     };
     await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
     expect(calls).toContainEqual(
-      ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+      ['systemctl', '--user', 'disable', '--now', 'ours-fleet.service']);
   });
 
   /**
@@ -445,7 +447,7 @@ describe('a failed registration leaves no artifact', () => {
       expect(err!.message).toContain('failed (failed)');
       // and it entered the same rollback path as any other failed registration.
       expect(calls).toContainEqual(
-        ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+        ['systemctl', '--user', 'disable', '--now', 'ours-fleet.service']);
     });
 
     it('an INACTIVE unit is a failed install too', async () => {
@@ -457,7 +459,7 @@ describe('a failed registration leaves no artifact', () => {
     it('a unit that really started installs normally, and says what state it is in', async () => {
       const { calls, exec } = systemctl(0, 'active', 'running');
       expect(await makeSystemdBackend(exec).install('A', '/b'))
-        .toMatchObject({ created: true, detail: 'enabled ours-fleet-agent@A.service (active (running))' });
+        .toMatchObject({ created: true, detail: 'enabled ours-fleet.service (active (running))' });
       expect(calls.filter(c => c[2] === 'disable')).toEqual([]);
     });
 
@@ -498,7 +500,7 @@ describe('a failed registration leaves no artifact', () => {
       const { calls, exec } = systemctl(1, 'failed', 'failed');
       await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
       expect(calls).toContainEqual(
-        ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+        ['systemctl', '--user', 'disable', '--now', 'ours-fleet.service']);
     });
   });
 
@@ -521,17 +523,18 @@ describe('a failed registration leaves no artifact', () => {
       const exec: Exec = async (cmd, args): Promise<ExecResult> => {
         calls.push([cmd, ...args]);
         if (args[0] === 'bootstrap') return { stdout: '', stderr: '', code: bootstrapCode };
+        if (args[0] === 'print' && !calls.some(c => c[1] === 'bootstrap')) return { stdout: '', stderr: 'Could not find service', code: 113 };
         if (args[0] === 'print')
           return { stdout: print.stdout ?? '', stderr: print.stderr ?? '', code: print.code ?? 0 };
         return { stdout: '', stderr: '', code: 0 };
       };
       return { calls, exec };
     };
-    const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist');
+    const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.plist');
 
     it('a job left DEAD by a zero-exit bootstrap is a failed install', async () => {
       const { calls, exec } = launchctl(0, {
-        stdout: 'network.ours.fleet.A = {\n\tstate = not running\n\tlast exit code = 1\n}',
+        stdout: 'network.ours.fleet = {\n\tstate = not running\n\tlast exit code = 1\n}',
       });
       const err = await makeLaunchdBackend(exec, 501).install('A', '/b').then(() => null, e => e as Error);
       expect(err, 'install resolved on a dead job').not.toBeNull();
@@ -540,12 +543,12 @@ describe('a failed registration leaves no artifact', () => {
       // and it entered the SAME rollback path as a failed bootstrap: nothing
       // is left behind, on disk or in the domain.
       expect(existsSync(launchAgent())).toBe(false);
-      expect(calls.filter(c => c[1] === 'bootout').length).toBeGreaterThanOrEqual(2);
+      expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);
     });
 
     it('a job that bootstrap loaded but the domain does not have is a failed install', async () => {
       const { exec } = launchctl(0, {
-        stderr: 'Could not find service "network.ours.fleet.A" in domain for gui/501', code: 113,
+        stderr: 'Could not find service "network.ours.fleet" in domain for gui/501', code: 113,
       });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
         .rejects.toThrow(/not running.*not loaded in the domain/s);
@@ -555,9 +558,9 @@ describe('a failed registration leaves no artifact', () => {
     it('a job that really started installs normally, and says what state it is in', async () => {
       const { calls, exec } = launchctl(0, { stdout: '\tstate = running\n\tpid = 4242\n' });
       expect(await makeLaunchdBackend(exec, 501).install('A', '/b'))
-        .toMatchObject({ created: true, detail: 'installed network.ours.fleet.A (state = running)' });
+        .toMatchObject({ created: true, detail: 'installed network.ours.fleet (state = running)' });
       expect(existsSync(launchAgent())).toBe(true);
-      expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);   // the pre-bootstrap refresh only
+      expect(calls.filter(c => c[1] === 'bootout').length).toBe(0);
     });
 
     it('a job WAITING for a KeepAlive restart is not a failed start', async () => {
@@ -613,7 +616,7 @@ describe('a failed registration leaves no artifact', () => {
       const dead = '\tstate = not running\n\tlast exit code = 1\n';
       expect(classifyStart({ loaded: true, notFound: false, state: 'not running', lastExit: '1' }).started)
         .toBe('no');
-      const l = await makeLaunchdBackend(launchctl(0, { stdout: dead }).exec, 501).liveness('A');
+      const l = await makeLaunchdBackend(async () => ({ stdout: dead, stderr: '', code: 0 }), 501).liveness('A');
       expect(l).toEqual({ state: 'running', detail: 'loaded (state = not running)' });
     });
   });

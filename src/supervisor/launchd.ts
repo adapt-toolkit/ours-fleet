@@ -5,7 +5,7 @@ import { home, logsRoot } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { SupervisorBackend } from './types.js';
 
-export const labelFor = (name: string) => `network.ours.fleet.${name}`;
+export const labelFor = (_name: string) => 'network.ours.fleet';
 
 /**
  * What `launchctl print` said about a job, parsed ONCE so that the two questions
@@ -55,16 +55,17 @@ const xml = (value: string) => value
   .replaceAll("'", '&apos;');
 
 function plist(name: string, binPath: string): string {
-  const log = join(logsRoot(), `${name}.log`);
+  const log = join(logsRoot(), 'fleet.log');
   const config = clientConfigPath(process.env);
+  const env = { OURS_CONFIG: config, ...Object.fromEntries(['PATH', 'OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME', 'CODEX_PATH'].flatMap(key => process.env[key] !== undefined ? [[key, process.env[key]!]] : [])) };
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${labelFor(name)}</string>
   <key>ProgramArguments</key>
-  <array><string>${binPath}</string><string>_run</string><string>${name}</string></array>
-${config ? `  <key>EnvironmentVariables</key><dict><key>OURS_CONFIG</key><string>${xml(config)}</string></dict>\n` : ''}  <!-- The runner owns the child-session restart loop. launchd must only
+  <array><string>${xml(process.execPath)}</string><string>${xml(binPath)}</string><string>_run-fleet</string></array>
+${`  <key>EnvironmentVariables</key><dict>${Object.entries(env).map(([key,value]) => `<key>${key}</key><string>${xml(value)}</string>`).join('')}</dict>\n`}  <!-- The runner owns the child-session restart loop. launchd must only
        recover the runner PROCESS crashing: a bare KeepAlive would resume the
        uncounted relaunch loop and restart a deliberately held-down agent. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -149,7 +150,9 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       // The plist's prior existence is the record of whether we created this.
       const existed = existsSync(plistPath(name));
       writeFileSync(plistPath(name), plist(name, binPath));
-      await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]); // best-effort refresh
+      const loaded = await printJob(name);
+      if (loaded.loaded) return { created: !existed, detail: 'Fleet service already loaded' };
+      if (!loaded.notFound) throw new Error('Fleet launchd liveness unknown');
       // Undo only what WE wrote. A plist that was already there belongs to
       // whoever put it there, and rollback may never remove it.
       const undo = async () => {
@@ -243,7 +246,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
         : { removed: false, detail: `${labelFor(name)} was not installed` };
     },
     logsArgs(name, follow) {
-      const log = join(logsRoot(), `${name}.log`);
+      const log = join(logsRoot(), 'fleet.log');
       return { cmd: 'tail', args: follow ? ['-f', log] : ['-n', '200', log] };
     },
   };

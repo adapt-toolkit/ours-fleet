@@ -10,6 +10,7 @@ import { createTask, startTask, updateTaskRoom, beginTaskDeletionIntent } from '
 import { createRoomRecord, updateMemberSeats } from '../src/rooms-tasks/room-state.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { prepareTempSupervisor, readTempSupervisor, makeTempSupervisorLauncher, reclaimStaleTempState, stopTempSupervisor } from '../src/temp-lifecycle.js';
+import { memberKey, memberPath, readMember } from '../src/supervisor/catalog.js';
 import { taskSupervisorMayRun } from '../src/task-supervision.js';
 import { taskSystemdUnit, taskLaunchdLabel, uninstallRetainedTaskService, assertTaskServicesAbsent } from '../src/task-supervisor-service.js';
 import { runTemp, readRestartLedger, writeRestartLedger } from '../src/runner.js';
@@ -46,19 +47,33 @@ function fixture() {
   return { task, room, name, dir, metadata };
 }
 
-it.each(['linux', 'darwin'] as const)('persists a separate enabled task service on %s and removes it before archive', async platform => {
+function seedLegacyService(f: ReturnType<typeof fixture>) {
+  const target = taskSystemdUnit(f.name), path = join(root, '.config/systemd/user', target);
+  const contents = 'saved legacy unit';
+  mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, contents);
+  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
+  mkdirSync(join(proof, '..'), { recursive: true });
+  writeFileSync(proof, JSON.stringify({ version: 1, role: f.name, taskOwner: f.metadata.taskOwner,
+    launchId: f.metadata.launchId, kind: 'systemd-persistent', target,
+    fileHash: createHash('sha256').update(contents).digest('hex') }));
+  writeFileSync(join(f.dir, '.temp-supervisor.json'), JSON.stringify({ ...f.metadata, kind: 'systemd-persistent', target, phase: 'active' }));
+}
+
+it.each(['linux', 'darwin'] as const)('registers task members under the single Fleet service on %s and removes only membership', async platform => {
   const f = fixture(), calls: string[][] = [];
   const exec = vi.fn(async (cmd: string, args: string[]) => {
     calls.push([cmd, ...args]);
-    if (cmd === 'launchctl' && args[0] === 'print') return { code: 1, stdout: '', stderr: 'Could not find service' };
+    if (cmd === 'launchctl' && args[0] === 'print') return calls.some(call => call[1] === 'bootstrap')
+      ? { code: 0, stdout: 'state = running', stderr: '' } : { code: 1, stdout: '', stderr: 'Could not find service' };
     return { code: 0, stdout: 'active\n', stderr: '' };
   });
   await makeTempSupervisorLauncher({ platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
   const service = platform === 'linux'
-    ? join(root, '.config/systemd/user', taskSystemdUnit(f.name))
-    : join(root, 'Library/LaunchAgents', `${taskLaunchdLabel(f.name)}.plist`);
+    ? join(root, '.config/systemd/user/ours-fleet.service')
+    : join(root, 'Library/LaunchAgents/network.ours.fleet.plist');
   const text = readFileSync(service, 'utf8');
-  expect(text).toContain('_run-temp');
+  expect(text).toContain('_run-fleet');
+  expect(readMember(memberKey(f.name, 'task'))?.taskOwner).toEqual(f.metadata.taskOwner);
   expect(text).toContain(platform === 'linux' ? 'WantedBy=default.target' : '<key>RunAtLoad</key><true/>');
   expect(text).not.toContain('OURS_API_TOKEN');
   expect(calls.some(call => call[0] === 'systemd-run' || call[1] === 'submit')).toBe(false);
@@ -67,15 +82,15 @@ it.each(['linux', 'darwin'] as const)('persists a separate enabled task service 
   await reclaimStaleTempState({ now: () => Date.now() + 100_000, exec: async () => ({ code: 0, stdout: 'inactive\n', stderr: '' }) });
   expect(existsSync(f.dir)).toBe(true);
   await stopTempSupervisor(f.name, { exec });
-  expect(existsSync(service)).toBe(false);
+  expect(existsSync(service)).toBe(true);
+  expect(readMember(memberKey(f.name, 'task'))).toBeUndefined();
   expect(readTempSupervisor(f.dir)?.launchId).toBe(id);
-  if (platform === 'linux') expect(calls).toContainEqual(['systemctl', '--user', 'disable', '--now', taskSystemdUnit(f.name)]);
-  else expect(calls.some(call => call[1] === 'bootout')).toBe(true);
+  expect(calls.some(call => call.includes('disable') || call.includes('bootout') || call.includes('restart'))).toBe(false);
 });
 
 it('preserves state and retries cleanup after failed persistent service disable', async () => {
   const f = fixture();
-  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec: async () => ({ code: 0, stdout: '', stderr: '' }) })('/fixture/fleet', ['_run-temp', f.name], f.dir);
+  seedLegacyService(f);
   await expect(stopTempSupervisor(f.name, { exec: async () => ({ code: 1, stdout: '', stderr: 'bus unavailable' }) })).rejects.toThrow('TASK_SERVICE_DISABLE_FAILED');
   expect(existsSync(join(root, '.config/systemd/user', taskSystemdUnit(f.name)))).toBe(true);
   expect(existsSync(f.dir)).toBe(true);
@@ -239,7 +254,7 @@ it.each(['unknown', 'session', 'owner', 'workspace', 'retirement', 'remote'])('f
 it('does not bootstrap an existing macOS service when liveness cannot be read', async () => {
   const f = fixture(), exec = vi.fn(async () => ({ code: 1, stdout: '', stderr: 'permission denied' }));
   await expect(makeTempSupervisorLauncher({ platform: 'darwin', supervisor: 'launchd', exec })(
-    '/fixture/fleet', ['_run-temp', f.name], f.dir)).rejects.toThrow('TASK_SERVICE_LIVENESS_UNKNOWN');
+    '/fixture/fleet', ['_run-temp', f.name], f.dir)).rejects.toThrow('Fleet launchd liveness unknown');
   expect(exec.mock.calls).toHaveLength(1);
 });
 
@@ -266,21 +281,20 @@ it('removes the exact retained service after losing live task member state', asy
   const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
   await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })(
     '/fixture/fleet', ['_run-temp', f.name], f.dir);
-  const proof = join(stateRoot(), 'task-supervisors', f.name + '.json');
-  const service = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
+  const proof = memberPath(memberKey(f.name, 'task'));
+  const service = join(root, '.config/systemd/user/ours-fleet.service');
   rmSync(f.dir, { recursive: true });
   await expect(uninstallRetainedTaskService(f.name, { taskId: 'other-task', creationActionId: 'task-action' }, exec))
     .rejects.toThrow('TASK_SERVICE_OWNER_MISMATCH');
   expect(existsSync(service)).toBe(true); expect(existsSync(proof)).toBe(true);
   await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec);
-  expect(existsSync(service)).toBe(false); expect(existsSync(proof)).toBe(false);
+  expect(existsSync(service)).toBe(true); expect(existsSync(proof)).toBe(false);
   await uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, async () => ({ code: 0, stdout: 'not-found', stderr: '' })); // retry
 });
 
 it('preserves a replaced service file and its cleanup proof', async () => {
   const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
-  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })(
-    '/fixture/fleet', ['_run-temp', f.name], f.dir);
+  seedLegacyService(f);
   const service = join(root, '.config/systemd/user', taskSystemdUnit(f.name));
   writeFileSync(service, 'replacement service'); exec.mockClear();
   await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_FILE_MISMATCH');
@@ -306,7 +320,7 @@ it.each(['permanent', 'symlink'])('refuses retained task startup with %s ownersh
 
 it('refuses service removal through a symlinked ownership marker', async () => {
   const f = fixture(), exec = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
-  await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd', exec })('/fixture/fleet', ['_run-temp', f.name], f.dir);
+  seedLegacyService(f);
   const path = join(stateRoot(), 'task-supervisors', f.name + '.json'), copy = join(root, 'foreign-service-owner');
   writeFileSync(copy, readFileSync(path)); rmSync(path); symlinkSync(copy, path); exec.mockClear();
   await expect(uninstallRetainedTaskService(f.name, f.metadata.taskOwner!, exec)).rejects.toThrow('TASK_SERVICE_UNSAFE_PROOF');

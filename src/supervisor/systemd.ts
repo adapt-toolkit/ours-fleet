@@ -6,7 +6,7 @@ import { home } from '../paths.js';
 import { realExec, type Exec, type ExecResult } from '../exec.js';
 import type { Liveness, LivenessState, SupervisorBackend } from './types.js';
 
-export const UNIT_TEMPLATE = 'ours-fleet-agent@.service';
+export const UNIT_TEMPLATE = 'ours-fleet.service';
 
 /**
  * Actionable hint when systemctl cannot reach the user bus. After the cli.ts
@@ -19,7 +19,7 @@ export const busHint = (stderr: string): string =>
     ? `\nhint: no user runtime dir — enable linger: sudo loginctl enable-linger ${userInfo().username}` +
       `\n      (if linger is already on: export XDG_RUNTIME_DIR=/run/user/$(id -u))`
     : '';
-export const unitFor = (name: string) => `ours-fleet-agent@${name}.service`;
+export const unitFor = (_name: string) => UNIT_TEMPLATE;
 
 /** Quote a systemd unit argument and escape its specifier marker. */
 const unitArg = (value: string): string =>
@@ -81,30 +81,27 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
       // are picked up by every fresh process, including lingering user services.
       const unitEnv = ['PATH=' + servicePath];
       unitEnv.push('OURS_CONFIG=' + clientConfigPath(process.env));
+      for (const key of ['OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME', 'CODEX_PATH']) {
+        if (process.env[key] !== undefined) unitEnv.push(key + '=' + process.env[key]);
+      }
       const environmentLines = unitEnv
         .map(value => `Environment="${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`)
         .join('\n');
       mkdirSync(unitDir, { recursive: true });
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
-Description=ours-fleet agent %i
+Description=ours-fleet process manager
 After=default.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ${environmentLines}
-# Wait outside the runner so boot-time daemon unavailability cannot consume
-# the agent crash budget. Selection comes from the same role and profile.
-ExecStartPre=${unitArg(process.execPath)} ${unitArg(binPath)} _wait-daemon %i
-TimeoutStartSec=270
-ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
-# The RUNNER owns the child-session restart loop, with a counted, backed-off
-# circuit breaker. systemd must only recover the runner PROCESS crashing —
-# Restart=always here would resume the uncounted two-second relaunch loop, and
-# would also restart a runner that is deliberately holding a failing agent down.
+ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run-fleet
+# Fleet owns agent startup and restart; the OS recovers only the Fleet parent.
+KillMode=control-group
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=15
+TimeoutStopSec=25
 
 [Install]
 WantedBy=default.target
