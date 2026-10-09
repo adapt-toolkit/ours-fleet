@@ -128,6 +128,7 @@ function legacyCli(args: string[], name: string, inputBin: string): string {
   return command[0];
 }
 function seconds(value: string): number {
+  if (value === '0') return 0;
   if (/^\d+s$/.test(value)) return Number(value.slice(0, -1));
   const parts = /^(?:(\d+)min )?(\d+)s$/.exec(value);
   if (!parts) throw Error('LEGACY_PERMANENT_NATIVE_PROBE_UNKNOWN');
@@ -194,12 +195,14 @@ async function assertParentSettings(nativePaths: string[], exec: Exec): Promise<
     '-p', 'StartLimitIntervalUSec', '-p', 'Restart', 'ours-fleet.service']);
   if (result.code !== 0) throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   const value = properties(result.stdout);
+  value.ExecStartPre ??= ''; value.Environment ??= '';
   if (value.LoadState !== 'loaded' || value.ActiveState !== 'active') throw Error('LEGACY_PERMANENT_PARENT_NOT_READY');
   const pre = required.get('[Service]ExecStartPre');
   if (pre) {
     const commands: string[] = [];
     for (const command of pre) { if (!command) commands.length = 0; else commands.push(command); }
-    if (commands.length !== 1 || JSON.stringify(argv(value.ExecStartPre)) !== JSON.stringify(commands[0].split(/\s+/)))
+    if (commands.length !== 1 || !value.ExecStartPre
+        || JSON.stringify(argv(value.ExecStartPre)) !== JSON.stringify(commands[0].split(/\s+/)))
       throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   }
   for (const [key, property] of [['[Service]TimeoutStartSec', 'TimeoutStartUSec'], ['[Service]RestartSec', 'RestartUSec']]) {
@@ -211,7 +214,8 @@ async function assertParentSettings(nativePaths: string[], exec: Exec): Promise<
     for (const variable of line.split(/\s+/))
       if (!(value.Environment ?? '').split(/\s+/).includes(variable)) throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   }
-  if (required.has('[Unit]StartLimitIntervalSec') && value.StartLimitIntervalUSec !== '0')
+  if (required.has('[Unit]StartLimitIntervalSec')
+      && seconds(value.StartLimitIntervalUSec) !== Number(required.get('[Unit]StartLimitIntervalSec')?.at(-1)))
     throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
   if (required.has('[Service]Restart') && value.Restart !== required.get('[Service]Restart')?.at(-1))
     throw Error('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');

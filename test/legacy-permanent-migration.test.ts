@@ -266,3 +266,15 @@ it('allows a different regular executable Node path and maps missing package pro
   f.state.start = f.effective([node, '/missing/installation/dist/cli.js', '_run', f.name]);
   await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow(`LEGACY_PERMANENT_PROOF_UNAVAILABLE: ${f.name}: ENOENT`);
 });
+
+it('reports absent parent readiness hook as actionable parent-settings proof failure', async () => {
+  const f = fixture(), host = hostOverrides(f), original = f.exec.getMockImplementation()!;
+  mkdirSync(dirnameOf(host.parent), { recursive: true }); writeFileSync(host.parent, host.settings);
+  f.exec.mockImplementation(async (command, args) => {
+    const result = await original(command, args);
+    return command === 'systemctl' && args.includes('ours-fleet.service')
+      ? { ...result, stdout: result.stdout.replace(/^ExecStartPre=.*\n/m, '') } : result;
+  });
+  await expect(migrateLegacyPermanentMembers(f.input)).rejects.toThrow('LEGACY_PERMANENT_PARENT_SETTINGS_UNPROVEN');
+  expect(f.events).toEqual([]); expect(f.register).not.toHaveBeenCalled();
+});
