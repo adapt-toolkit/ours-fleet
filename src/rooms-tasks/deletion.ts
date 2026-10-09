@@ -1,7 +1,7 @@
 import { eraseMemberArtifacts } from './erasure.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
 import { retireTaskMemberService } from './task-service-retirement.js';
-import { assertTaskServicesAbsent } from '../task-supervisor-service.js';
+import { assertTaskRegistrationsAbsent } from '../task-supervisor-service.js';
 import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
@@ -327,7 +327,7 @@ export async function settleTaskDeletion(input: {
       }
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
-      assertTaskServicesAbsent(taskId);
+      assertTaskRegistrationsAbsent(taskId);
       await eraseMemberArtifacts('task', taskId, task.deletion.members.map(cursorSeat),
         task.deletion.room_id ? [task.deletion.room_id] : []);
       if (task.workspace) {

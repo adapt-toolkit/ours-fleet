@@ -20,7 +20,7 @@ import { FleetError } from './errors.js';
 import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
 import { ownedLayoutRetirementSeats } from '../rooms-tasks/layout-member-retirement.js';
 import { eraseMemberArtifacts } from '../rooms-tasks/erasure.js';
-import { assertTaskServicesAbsent } from '../task-supervisor-service.js';
+import { assertTaskRegistrationsAbsent } from '../task-supervisor-service.js';
 
 export type TaskLayoutOperation = 'open' | 'close-room' | 'close';
 export interface TaskLayoutOperationRecord {
@@ -254,10 +254,10 @@ export class TaskLayouts {
       await engine.delete(layoutSupervisorId());
       const state = engine.snapshot();
       const rooms = Object.values(state.rooms).flatMap(room => room.native ? [room.native.room_id] : []);
-      assertTaskServicesAbsent(task.task_id);
+      assertTaskRegistrationsAbsent(task.task_id);
       await eraseMemberArtifacts('task', task.task_id, ownedLayoutRetirementSeats(state, link.run_id), rooms);
     }
-    assertTaskServicesAbsent(task.task_id);
+    assertTaskRegistrationsAbsent(task.task_id);
     await this.withTaskLock(link.run_id, async () => {
       for (const path of [layoutRunPath(link.run_id), this.provenancePath(link.run_id), taskBriefPath(task)])
         rmSync(path, { force: true });

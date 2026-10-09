@@ -180,17 +180,21 @@ export async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<
   });
 }
 
+async function retireMemberRegistration(room: RoomOrchestrationRecord, current: RoomMemberSeat, deps: RoomCloseDeps): Promise<void> {
+  if (room.task_id) await (deps.retireTaskService ?? retireTaskMemberService)(current.role_name, {
+    taskId: room.task_id, creationActionId: current.launch?.action_id,
+    taskSupervised: current.launch?.task_supervised,
+    ...(current.launch?.launch_id ? { launchId: current.launch.launch_id } : {}),
+  });
+}
+
 async function retireMember(
   roomId: string, seat: RoomMemberSeat, deps: RoomCloseDeps,
 ): Promise<void> {
   assertMemberNotPermanent(seat.role_name);
   let room = getRoomRecord(roomId)!;
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
-  if (room.task_id) await (deps.retireTaskService ?? retireTaskMemberService)(current.role_name, {
-    taskId: room.task_id, creationActionId: current.launch?.action_id,
-    taskSupervised: current.launch?.task_supervised,
-    ...(current.launch?.launch_id ? { launchId: current.launch.launch_id } : {}),
-  });
+  await retireMemberRegistration(room, current, deps);
   let retirement = current.retirement;
   if (retirement?.phase === 'identity_absent') {
     if (!deps.inspectMember) {
@@ -327,6 +331,10 @@ export async function closeManagedRoom(input: {
   return lock(roomCloseLockPath(input.roomId), async () => {
     let room = beginRoomClose(input.roomId);
     if (room.state === 'closed') {
+      for (const seat of room.member_seats) {
+        assertMemberNotPermanent(seat.role_name);
+        await retireMemberRegistration(room, seat, deps);
+      }
       if (!deps.inspectMember) for (const seat of room.member_seats) {
         if (existsSync(agentDir(seat.role_name, true))) throw new Error('Closed room has replacement live state');
         await assertMemberIdentityAbsent(seat);

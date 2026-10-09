@@ -5,9 +5,9 @@ import { uninstallRetainedTaskService, hasRetainedTaskService } from '../task-su
 import { assertMemberNotPermanent } from './member-ownership.js';
 import type { Exec } from '../exec.js';
 
-/** Boot-service retirement precedes every identity-absence shortcut. A proven
- * legacy transient/detached launch never owned the task-service namespace.
- * Missing state requires surviving service proof or manager absence.
+/** Registration retirement precedes every identity-absence shortcut. A proven
+ * legacy transient/detached launch never owned a retained registration.
+ * Missing state requires surviving registration proof or manager absence.
  */
 export async function retireTaskMemberService(name: string,
   expected: { taskId: string; creationActionId?: string; launchId?: string; taskSupervised?: boolean }, exec?: Exec): Promise<void> {
@@ -17,7 +17,7 @@ export async function retireTaskMemberService(name: string,
   const source = existsSync(agentDir(name, true)) ? agentDir(name, true) : archive?.path;
   const metadata = source ? readTempSupervisor(source) : undefined;
   const hasServiceEvidence = hasRetainedTaskService(name);
-  const durableMetadata = metadata?.taskOwner && ['systemd-persistent', 'launchd-persistent'].includes(metadata.kind ?? '');
+  const durableMetadata = metadata?.taskOwner && ['fleet-managed', 'systemd-persistent', 'launchd-persistent'].includes(metadata.kind ?? '');
   if (!hasServiceEvidence && !expected.taskSupervised && !durableMetadata) return;
   await uninstallRetainedTaskService(name, expected, exec);
 }
