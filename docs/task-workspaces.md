@@ -159,3 +159,29 @@ claiming complete erasure. An identity with no recoverable authenticated binding
 requires restoring its actual ownership evidence; a name-only force removal is
 not supported. Room deletion removes the linked Task's dead room/member links and preserves its workspace; use explicit
 Task deletion when the request includes the associated Task and its artifacts.
+
+
+## Retained task agents
+
+Task agents use the common Fleet service and existing runners while remaining
+outside the standalone agent roster. Recovery retains their original identity,
+private runtime owner, launch, working directory, admitted room and supported
+backend conversation. `ours-fleet task recover-members TASK_ID` resumes proven
+stopped members or resets their held restart circuit; it never creates identities
+or invitations. See [upgrade and rollback](fleet-migration.md) for legacy tasks.
+
+Recovery delivers an undispatched assignment once, continues interrupted work,
+and sends no readiness/work prompt to a completed idle conversation. An uncertain
+dispatch gets a continuation instead of replaying the assignment. First-session
+retry requires proof that no readiness/work was submitted; established session
+loss requires restoration of the original context. Task agents require a resumable
+harness. Missing ownership, workspace or room evidence keeps recovery held.
+
+Parent shutdown suspends task agents. Explicit member stop terminally releases
+the exact saved owner and archives its launch; it does not complete the task.
+Finish/cancel/review retain their existing semantics. Task deletion stops and
+unregisters only owned members, verifies identity absence and retries cleanup
+before erasing task/room/workspace resources. Permanent siblings remain intact.
+Standalone CLI/web removal refuses `TASK_MEMBER_IS_TASK_OWNED`; use the owning
+task lifecycle. Lost/corrupt task or launch records require restoring original
+backup evidence or explicit ownership reconciliation before deletion can finish.

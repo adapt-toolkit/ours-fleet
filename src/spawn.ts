@@ -1,3 +1,4 @@
+import { taskSupervisorMayRun } from './task-supervision.js';
 import { randomUUID } from 'node:crypto';
 import { storeRoomSecret, storeTemporaryLaunch, preparePermanentAssignment } from './agent-ours/service.js';
 import { ensureWorkspace } from './rooms-tasks/workspace.js';
@@ -36,7 +37,8 @@ import './harness/hermes.js';
 import { getAdapter } from './harness/registry.js';
 import {
   archiveTempState, makeTempSupervisorLauncher, prepareTempSupervisor, reclaimStaleTempState,
-  type SupervisorLauncher,
+  stopTempSupervisor, secureStoppedTempArchive, readTempSupervisor, requestedTempStopReason,
+  type SupervisorLauncher, type TaskSupervisorOwner,
 } from './temp-lifecycle.js';
 
 /**
@@ -48,6 +50,8 @@ export let lastProvenance: CreationProvenance | undefined;
 export interface SpawnOpts {
   name: string;
   temp?: boolean;
+  /** Internal exact task-layout ownership, never a standalone manifest entry. */
+  taskOwner?: TaskSupervisorOwner;
   brain?: AgentSelection;
   role?: AgentSelection;
   /** Trusted canonical definition used by room provisioning; never a second schema. */
@@ -406,6 +410,8 @@ export async function spawnTemp(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
+  if ((o.taskOwner || o.roomMemberStartup?.task_id) && !getAdapter(prepared.role.harness).supportsResume)
+    throw Error('TASK_HARNESS_RESUME_UNSUPPORTED: task agents require a resumable harness');
   if (o.roomMemberStartup?.workspace) {
     const workspace = o.roomMemberStartup.workspace;
     if (prepared.role.cwd !== workspace.path)
@@ -459,7 +465,13 @@ async function spawnTempInner(
   lastProvenance = provenance;
   tx.record({
     stage: `temp state dir ${dir}`,
-    undo: () => {
+    undo: async () => {
+      if (o.taskOwner || role.roomMemberStartup?.task_id) {
+        await stopTempSupervisor(o.name);
+        const supervisor = readTempSupervisor(dir);
+        if (supervisor) await secureStoppedTempArchive(o.name, supervisor.launchId);
+        return;
+      }
       // A failed launch is still lifecycle evidence: briefing, provenance,
       // metadata and supervisor output explain what happened. Remove it from
       // the live roster by atomic archive, never recursive deletion.
@@ -475,11 +487,27 @@ async function spawnTempInner(
   // out; a lone temp spawn still waits zero (time-based gate).
   if (cfg.startStaggerMs > 0)
     writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
-  prepareTempSupervisor(dir, o.name);
+  prepareTempSupervisor(dir, o.name, o.taskOwner ?? (o.roomMemberStartup?.task_id ? {
+    taskId: o.roomMemberStartup.task_id,
+    roomId: o.roomMemberStartup.room_id,
+    roomIdentityCid: o.roomMemberStartup.room_identity_cid,
+    creationActionId: o.creationActionId!,
+  } : undefined));
+  if (o.taskOwner || o.roomMemberStartup?.task_id) taskSupervisorMayRun(o.name);
   // Run the supervisor independently. On a service-managed host the temp
   // runner gets its own transient unit/job, so stopping the coordinator's unit
   // cannot kill a live worker in the coordinator's cgroup.
   onStage?.('starting_temp');
   await launch(binPath, ['_run-temp', o.name], dir);
   return dir;
+}
+
+/** Resume the exact durable task launch; no creation, invite issuance or state rotation. */
+export async function resumeTaskSupervisor(name: string, binPath: string): Promise<void> {
+  if (!taskSupervisorMayRun(name)) throw Error('TASK_SUPERVISOR_RETIRED');
+  const dir = agentDir(name, true);
+  if (requestedTempStopReason(dir)) throw Error('TASK_SUPERVISOR_STOP_REQUESTED');
+  const launcher = readTempSupervisor(dir)?.kind === 'detached'
+    ? makeTempSupervisorLauncher({ spawnDetached, supervisor: 'none' }) : independentSupervisor;
+  await launcher(binPath, ['_run-temp', name], dir);
 }

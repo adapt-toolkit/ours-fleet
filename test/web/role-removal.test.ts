@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { fleetHostBackend } from '../../src/supervisor/fleet.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -27,6 +28,23 @@ function fixture(roles: string): { root: string; calls: string[]; service: RoleR
 }
 
 describe('safe web role removal', () => {
+  it('refuses task-owned preview and removal before copying state or stopping the member, even without a task record', async () => {
+    const { root, calls, service } = fixture('  Stable: {}\n');
+    const state = agentDir('OwnedTask', true); mkdirSync(state, { recursive: true });
+    prepareTempSupervisor(state, 'OwnedTask', { taskId: 'missing-task', roomId: 'original-room',
+      roomIdentityCid: 'original-room-cid', creationActionId: 'original-action' });
+    writeFileSync(join(state, 'owner.json'), 'original owner proof');
+    const before = readFileSync(join(state, '.temp-supervisor.json'));
+    expect(() => service.previewWeb('OwnedTask')).toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    await expect(service.removeWeb({ role: 'OwnedTask', confirmed: true })).rejects.toMatchObject({ code: 'conflict' });
+    await expect(service.removeDirect({ actor: { kind: 'local_control', surface: 'cli' }, role: 'OwnedTask' }))
+      .rejects.toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    expect(calls).toEqual([]);
+    expect(readFileSync(join(state, '.temp-supervisor.json'))).toEqual(before);
+    expect(readFileSync(join(state, 'owner.json'), 'utf8')).toBe('original owner proof');
+    expect(existsSync(join(state, '.temp-stop-request.json'))).toBe(false);
+    expect(existsSync(join(root, '.ours-fleet', 'recovery'))).toBe(false);
+  });
   it('preserves direct CLI removal policy without web preview, archive, or coordinator gates', async () => {
     const { root, calls, service } = fixture(
       '  Coordinator: {}\n  Worker: { coordinator: Coordinator }\n');
@@ -94,9 +112,10 @@ describe('safe web role removal', () => {
     writeFileSync(join(state, 'role.yaml'), 'name: Temp\nharness: codex\nsession: acp\n');
     writeFileSync(join(state, 'WORKLOG.md'), 'temporary evidence');
     prepareTempSupervisor(state, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], state);
     (service as any).options.ops.exec = async (_command: string, args: string[]) => ({
       stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,

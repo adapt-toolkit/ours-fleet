@@ -1,4 +1,7 @@
 import { eraseMemberArtifacts } from './erasure.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
+import { retireTaskMemberService } from './task-service-retirement.js';
+import { assertTaskRegistrationsAbsent } from '../supervisor/catalog.js';
 import { proveArchivedAbsence, verifyArchivedAbsence, verifyArchivedMemberStillAbsent } from './archived-absence.js';
 import { existsSync } from 'node:fs';
 
@@ -115,6 +118,12 @@ function cursorSeat(cursor: TaskDeletionMemberCursor): RoomMemberSeat {
 async function retireCursorMember(
   taskId: string, cursor: TaskDeletionMemberCursor, deps: TaskDeletionSettleDeps,
 ): Promise<void> {
+  assertMemberNotPermanent(cursor.name);
+  await (deps.roomClose?.retireTaskService ?? retireTaskMemberService)(cursor.name, { taskId,
+    creationActionId: cursor.action_id,
+    taskSupervised: cursor.task_supervised,
+    ...((cursor.launch_id && !['never-launched', 'absent-verified'].includes(cursor.launch_id)) ? { launchId: cursor.launch_id } : {}),
+  });
   let phase = cursor.phase;
   let launchId = cursor.launch_id;
   if (phase === 'identity_absent') {
@@ -318,6 +327,7 @@ export async function settleTaskDeletion(input: {
       }
       if (cleanup.snapshotHash)
         releaseLaunchSnapshotForDeletingTask(cleanup.snapshotHash, taskId);
+      assertTaskRegistrationsAbsent(taskId);
       await eraseMemberArtifacts('task', taskId, task.deletion.members.map(cursorSeat),
         task.deletion.room_id ? [task.deletion.room_id] : []);
       if (task.workspace) {

@@ -1,24 +1,27 @@
-import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, loadRoomsConfig, splitRootFor, type AgentTemplateDefinition } from '../config.js';
 import { agentDir, stateRoot, defaultConfigPath } from '../paths.js';
 import { controlRequest } from '../session/control.js';
 import { spawnTemp } from '../spawn.js';
-import { tempSupervisorLiveness } from '../temp-lifecycle.js';
 import { layoutSupervisorId, type LayoutControlRequest } from './layout-control.js';
 import { RoomLayout, type LayoutInstance, type LayoutSupervisor, type RoomLayoutState } from './layout.js';
 import { assertLayoutFile, validLayoutKey, readRoomLayout, readRoomLayouts, type RoomLayoutDefinition } from './layout-config.js';
 import { createCoworkAdapter } from './cowork-adapter.js';
 import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-binding-client.js';
 import { readClientProfile } from '../client-profile.js';
+import { tempSupervisorLiveness } from '../temp-lifecycle.js';
+import { layoutOwnedMemberName, retireOwnedLayoutMember } from './layout-member-retirement.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
+  readonly taskSupervised: boolean;
   readonly id: string;
   constructor(private configPath: string | undefined,
     private runId: string, private templates: Record<string, AgentTemplateDefinition>) {
     mkdirSync(stateRoot(), { recursive: true, mode: 0o700 }); this.id = layoutSupervisorId();
+    this.taskSupervised = runId.startsWith('task-') && process.env.OURS_FLEET_SUPERVISOR !== 'none';
   }
   private async request(agent: string, temporary: boolean, request: LayoutControlRequest): Promise<unknown> {
     if (!/^[A-Za-z0-9_-]+$/.test(agent)) throw Error('invalid agent name');
@@ -37,8 +40,13 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
   async spawn(key: string, template: string): Promise<LayoutInstance> {
     const definition = this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
-    const name = `layout-${createHash('sha256').update(this.runId + ':' + key).digest('hex').slice(0, 16)}`;
+    const name = layoutOwnedMemberName(this.runId, key);
+    const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
+    const task = taskId ? (await import('./task-state.js')).getTask(taskId) : undefined;
+    if (task && task.layout?.run_id !== this.runId) throw Error('TASK_LAYOUT_OWNER_MISMATCH');
     await spawnTemp({ name, temp: true, configPath: this.configPath, agentDefinition: definition,
+      ...(task ? { taskOwner: { taskId: task.task_id, layout: { runId: this.runId, participant: key },
+        creationActionId: `${this.runId}:${key}` } } : {}),
       creationActionId: `${this.runId}:${key}`, surface: 'cli' }, fileURLToPath(new URL('../cli.js', import.meta.url)));
     const deadline = Date.now() + 120_000; let last: unknown;
     while (Date.now() < deadline) {
@@ -70,11 +78,19 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     if (i.remote) throw Error('cannot retire a borrowed cross-Fleet instance');
     if (i.supervisor !== this.id || !i.agent || !/^[A-Za-z0-9_-]+$/.test(i.agent) || i.temporary !== true)
       throw Error('invalid local temporary layout instance');
-    const dir = agentDir(i.agent, true);
-    const stopped = async () => !existsSync(dir) || await tempSupervisorLiveness(dir) === 'stopped';
-    if (await stopped()) return;
-    try { await this.call(i, { action: 'retire' }); }
-    catch (error) { if (!await stopped()) throw error; }
+    if (!this.runId.startsWith('task-')) {
+      const dir = agentDir(i.agent, true);
+      const stopped = async () => !existsSync(dir) || await tempSupervisorLiveness(dir) === 'stopped';
+      if (await stopped()) return;
+      try { await this.call(i, { action: 'retire' }); }
+      catch (error) { if (!await stopped()) throw error; }
+      return;
+    }
+    const snapshot = JSON.parse(readFileSync(layoutRunPath(this.runId), 'utf8')) as RoomLayoutState;
+    const owned = Object.entries(snapshot.participants).filter(([, participant]) => participant.owned
+      && participant.instance?.agent === i.agent && JSON.stringify(participant.instance) === JSON.stringify(i));
+    if (owned.length !== 1) throw Error('LAYOUT_MEMBER_NOT_OWNED');
+    await retireOwnedLayoutMember(i, this.runId, owned[0][0], {}, owned[0][1].task_supervised);
   }
 }
 export const layoutRunPath = (id: string): string => {

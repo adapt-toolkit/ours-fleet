@@ -1,10 +1,13 @@
 import { preparePermanentAssignment } from '../../src/agent-ours/service.js';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { RoleRepository } from '../../src/application/role-repository.js';
+import { FleetQueryService } from '../../src/application/fleet-query-service.js';
+import { deriveTopology } from '../../src/web/topology.js';
+import { loadConfig } from '../../src/config.js';
 import { FleetError, normalizeError } from '../../src/application/errors.js';
 import { roleCapabilities } from '../../src/application/capabilities.js';
 import { RoleCreationService } from '../../src/application/role-creation-service.js';
@@ -56,6 +59,37 @@ function canonicalWeb(input: Record<string, any>): Record<string, any> {
 }
 
 describe('application services', () => {
+  it('keeps durable task members out of standalone agent lists and topology across repository reloads', async () => {
+    const root = fixture();
+    const configPath = join(root, 'fleet.yaml');
+    writeV2Fixture(configPath, 'roles:\n  PersonalAssistant:\n    session: acp\n');
+    const dir = join(root, '.ours-fleet', 'tmp', 'task-worker');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'role.yaml'), 'harness: codex\nsession: acp\nidentity: task-worker\n');
+    writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: 'task-worker',
+      launchId: 'retained-launch', kind: 'fleet-managed', taskOwner: {
+        taskId: '0mv03vs1e34acae5c', layout: { runId: 'task-0mv03vs1e34acae5c', participant: 'developer' }, creationActionId: 'retained-action',
+      } }));
+    for (let restart = 0; restart < 2; restart++) {
+      const repository = new RoleRepository({ configPath });
+      const query = new FleetQueryService({ repository, supervisor: backend,
+        control: async () => ({ ok: true, result: { backend: 'acp', alive: true, readiness: 'idle' } }) });
+      const listed = await query.list();
+      expect(listed.map(item => item.role.id)).toEqual(['PersonalAssistant']);
+      expect(listed[0].role.taskId).toBeUndefined();
+      expect(deriveTopology(loadConfig(configPath), listed).nodes.filter(node => node.kind === 'agent').map(node => node.label))
+        .toEqual(['PersonalAssistant']);
+      const detail = (await query.detail('task-worker')).role;
+      expect(detail).toMatchObject({ configured: false, lifetime: 'temporary', taskId: '0mv03vs1e34acae5c' });
+      expect(JSON.stringify(detail)).not.toContain('retained-action');
+      expect(JSON.stringify(detail)).not.toContain('participant');
+      expect((await query.list(true)).map(item => item.role.id)).toEqual(['PersonalAssistant', 'task-worker']);
+    }
+    const metadata = join(dir, '.temp-supervisor.json'), target = join(root, 'untrusted-metadata');
+    writeFileSync(target, readFileSync(metadata)); unlinkSync(metadata); symlinkSync(target, metadata);
+    expect((await new RoleRepository({ configPath }).get('task-worker'))?.taskId).toBeUndefined();
+  });
+
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
     const root = fixture();
     writeV2Fixture(join(root, 'fleet.yaml'), `

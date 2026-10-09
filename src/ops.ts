@@ -11,10 +11,10 @@ import type { ResolvedWatchdog } from './watchdog/config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
 import { managedCliBriefing } from './managed-cli.js';
-import { resetRestartLedger } from './runner.js';
+import { resetRestartLedger, loadTempRole } from './runner.js';
 import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
 import {
-  archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
+  archiveTempState, stopTempSupervisor, tempSupervisorLiveness, readTempSupervisor,
 } from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
 import {
@@ -277,8 +277,19 @@ export async function restartRoles(
   }
 }
 
+/** Read-only admission check shared by CLI removal and web preview, before any archive. */
+export function assertStandaloneRoleRemoval(cfg: FleetConfig, name: string): void {
+  if (cfg.roles.some(role => role.name === name) || !/^[A-Za-z0-9_-]+$/.test(name)) return;
+  const dir = agentDir(name, true);
+  if (!existsSync(dir)) return;
+  const taskId = readTempSupervisor(dir)?.taskOwner?.taskId
+    ?? (existsSync(join(dir, 'role.yaml')) ? loadTempRole(name).roomMemberStartup?.task_id : undefined);
+  if (taskId) throw Error(`TASK_MEMBER_IS_TASK_OWNED: ${name} belongs to task ${taskId}; use the owning task lifecycle; if its record is missing or corrupt, preserve evidence and restore the original records before retrying task delete`);
+}
+
 /** Stop + forget a role: unit, state dir, and its fleet.d file when spawned. */
 export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Promise<void> {
+  assertStandaloneRoleRemoval(cfg, name);
   const temporaryDir = /^[A-Za-z0-9_-]+$/.test(name) ? agentDir(name, true) : '';
   const configured = cfg.roles.find(role => role.name === name);
   if (!configured && temporaryDir && existsSync(temporaryDir)) {

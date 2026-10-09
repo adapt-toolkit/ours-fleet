@@ -307,6 +307,8 @@ export interface AgentTemplateInstance {
 
 /** Internal first-boot payload for a Fleet-provisioned Cowork room member. */
 export interface RoomMemberStartup {
+  /** Task ownership; absent for standalone rooms and legacy snapshots. */
+  task_id?: string;
   workspace?: import('./rooms-tasks/workspace.js').OwnedWorkspace;
   room_id: string;
   room_identity_cid: string;

@@ -1,7 +1,10 @@
+import { readProvenance } from './creation.js';
+import { firstManagedSessionMayStart, managedRecoveryPath, readManagedRecovery, writeManagedRecovery, type ManagedRecovery } from './managed-recovery.js';
 import { StartupTelemetry } from './startup-telemetry.js';
 import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
+import { taskSupervisorMayRun, taskMemberRetirementProof } from './task-supervision.js';
 import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
 import { prepareManagedHarness } from './agent-ours/harness.js';
 import { prepareManagedCliLaunch } from './managed-cli.js';
@@ -62,7 +65,7 @@ import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
 import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
 import {
-  archiveTempState, markTempSupervisorActive, requestedTempStopReason,
+  archiveTempState, markTempSupervisorActive, requestedTempStopReason, readTempSupervisor,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
 import { FleetCommandAuditStore } from './fleet-command-audit.js';
@@ -104,6 +107,8 @@ export interface RunnerDeps {
   reportOwnerStartupFailure(stateDir: string): Promise<'delivered' | 'duplicate'>;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
+  /** Parent shutdown suspends a managed transient member; explicit stop still retires. */
+  suspendOnStop?: boolean;
 }
 
 export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
@@ -630,13 +635,39 @@ export async function runOnce(
   else if (rotation.rotated)
     deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
 
+  const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
+  const retainedManaged = durableTask || Boolean(deps.suspendOnStop && adapter.supportsResume);
   const sidFile = join(dir, '.session-id');
+  const backendSidFile = join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id');
+  let recovery = retainedManaged ? readManagedRecovery(dir) : undefined;
+  // Native Codex shares .session-id with the runner's pre-launch UUID, so file
+  // existence alone is not evidence that its first backend thread was created.
+  const firstSessionRetry = retainedManaged && existsSync(join(dir, '.booted'))
+    && (!existsSync(backendSidFile) || (role.session === 'codex-app-server' && recovery?.session === 'pending'))
+    && firstManagedSessionMayStart(dir);
+  if (retainedManaged && existsSync(join(dir, '.booted'))
+      && (!existsSync(sidFile) || !existsSync(backendSidFile)) && !firstSessionRetry)
+    throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
   const sessionId = readFileSync(sidFile, 'utf8').trim();
   const bootedFile = join(dir, '.booted');
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
-  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
+  if (durableTask && !adapter.supportsResume) throw Error('TASK_HARNESS_RESUME_UNSUPPORTED');
+  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume && !firstSessionRetry ? 'resume' : 'fresh';
+  const requireResume = retainedManaged && mode === 'resume';
+  if (retainedManaged && !recovery) {
+    // Older admitted sessions have no cursor. Continue once, without replaying
+    // their assignment; fresh sessions record intent before the first attempt.
+    recovery = { version: 1, session: booted ? 'established' : 'pending', readiness: booted,
+      initial: booted ? 'dispatching' : 'pending', active: booted };
+    writeManagedRecovery(dir, recovery);
+  }
+  const recoveryBefore = recovery ? { ...recovery } : undefined;
+  const saveRecovery = (update: Partial<ManagedRecovery>) => {
+    if (!recovery) return;
+    recovery = { ...recovery, ...update }; writeManagedRecovery(dir, recovery);
+  };
   // Stamp EVERY attempt, not just the first. `.booted` used to be written only
   // on the fresh path, so after a restart — including one the supervisor never
   // saw, like an OOM-kill — its mtime still read the original boot and any
@@ -796,11 +827,12 @@ export async function runOnce(
       managedOurs: managedHarness.ours,
       role, prep,
       launch: { ...launch, argv: wrappedArgv, env: managedHarness.env },
-      cwd: runCwd, stateDir: dir, mode, permissions: perms,
+      cwd: runCwd, stateDir: dir, mode, requireResume, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
     }));
     managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
     startupTelemetry.mark('harness_ready');
+    saveRecovery({ session: 'established' });
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
@@ -819,7 +851,20 @@ export async function runOnce(
         startMonitorAfterStartup();
       }
     });
-    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); };
+    const activePrompts = new Set<string>();
+    const unsubscribeContinuity = agentSession.subscribeConversation?.(event => {
+      if (!recovery?.readiness) return;
+      if (event.kind === 'prompt.started') {
+        if (event.promptId) activePrompts.add(event.promptId);
+        saveRecovery({ active: true });
+      } else if (event.kind === 'turn.completed' && 'outcome' in event.payload) {
+        if (event.promptId) activePrompts.delete(event.promptId);
+        // A shutdown/failed turn needs continuation; a successful terminal turn
+        // proves it may stay idle. Never store prompt bodies in this cursor.
+        if (event.payload.outcome === 'completed') saveRecovery({ active: activePrompts.size > 0 });
+      }
+    });
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); unsubscribeContinuity?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
@@ -935,8 +980,13 @@ export async function runOnce(
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never completed its readiness turn.
-    startupTelemetry.mark('startup_submitted');
-    const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
+    const retainedResume = retainedManaged && mode === 'resume' && recoveryBefore?.readiness === true;
+    if (!retainedResume) startupTelemetry.mark('startup_submitted');
+    // The backend already verified the saved conversation. Resuming a managed
+    // member admits new wakes/console input without replaying startup or work.
+    const starting: Promise<TurnResult> = retainedResume
+      ? Promise.resolve({ accepted: false, succeeded: true, outcome: 'completed', detail: 'retained backend resumed; no readiness prompt submitted' })
+      : arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
     // Keep the early cursor baseline; do not deliver wakes into the protected
     // first turn. Steering can pre-empt startup just like cancellation.
     // Owner traffic and agent replies must be observed during a long first
@@ -998,21 +1048,31 @@ export async function runOnce(
         + 'keeping temporary supervisor alive');
     startupRecoveryAllowed = interruptedForWake;
     sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
-    if (started.succeeded) startupTelemetry.mark('readiness_turn_completed');
+    if (started.succeeded && !retainedResume) startupTelemetry.mark('readiness_turn_completed');
+    if (started.succeeded) saveRecovery({ readiness: true });
     // Readiness is now complete. Configured work (or retained continuity) is
     // admitted as a distinct turn; its terminal result must not block console
     // readiness, mail delivery, or supervisor liveness. Empty fresh agents wait
     // for authenticated console input or the monitor's unread/arrival wake.
-    if (started.succeeded && !deps.shouldStop?.() && (
-      role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim() || booted
-    )) {
-      const queued = await arbiter.queuePrompt(managedTaskPrompt(dir, mode, booted), {
+    const configuredWork = Boolean(role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim());
+    const initialPending = retainedManaged && recoveryBefore?.initial === 'pending';
+    const interruptedWork = retainedManaged && (recoveryBefore?.active || recoveryBefore?.initial === 'dispatching');
+    const workPrompt = retainedManaged
+      ? initialPending && configuredWork ? managedTaskPrompt(dir, 'fresh', false)
+        : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. '
+          + (recoveryBefore?.initial === 'dispatching' ? `If you have not yet received your assignment, read ${join(dir, 'briefing.md')} once before acting. ` : '')
+          + 'Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
+      : configuredWork || booted ? managedTaskPrompt(dir, mode, booted) : undefined;
+    if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
+      saveRecovery({ initial: 'dispatching', active: true });
+      const queued = await arbiter.queuePrompt(workPrompt, {
         origin: { kind: 'startup' },
       });
       void queued.completion.then(result => {
+        if (result.succeeded) saveRecovery({ initial: 'completed', active: activePrompts.size > 0 });
         deps.log(`[${name}] configured task turn ${result.outcome}`);
       }, () => deps.log(`[${name}] configured task turn failed`));
-    }
+    } else if (started.succeeded && initialPending && !configuredWork) saveRecovery({ initial: 'completed' });
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -1090,7 +1150,7 @@ export async function runOnce(
   });
 
   let chatIdle: TemporaryChatIdle | undefined;
-  try { if(temp && !role.roomMemberStartup) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
+  try { if(temp && !role.roomMemberStartup && !readTempSupervisor(dir)?.taskOwner) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
   catch { deps.log(`[${name}] automatic idle closure disabled: activity state is unreadable`); }
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
@@ -1209,11 +1269,12 @@ export async function runOnce(
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
+    rmSync(managedRecoveryPath(dir), { force: true });
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (!temp && deps.shouldStop?.())
-    deps.log(`[${name}] supervisor stop requested -> next start RESUMES context`);
+  if (readTempSupervisor(dir)?.taskOwner || ((!temp || deps.suspendOnStop) && deps.shouldStop?.()))
+    deps.log(`[${name}] supervisor/context retained -> next start RESUMES context`);
   else if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
@@ -1261,18 +1322,20 @@ export async function runOnce(
  */
 export async function runSupervised(
   name: string,
-  opts: { configPath?: string } = {},
+  opts: { configPath?: string; temp?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
   attempt: (
-    n: string, o: { configPath?: string; allowResumeRotation?: boolean }, d: Partial<RunnerDeps>,
+    n: string, o: { configPath?: string; allowResumeRotation?: boolean; temp?: boolean }, d: Partial<RunnerDeps>,
   ) => Promise<AttemptResult> = runOnce,
 ): Promise<RestartLedger> {
   const deps = { ...defaultDeps(), ...partialDeps };
-  const dir = agentDir(name);
+  const taskMember = opts.temp === true;
+  const dir = agentDir(name, taskMember);
   mkdirSync(dir, { recursive: true });
   let stopping = false;
   const requestStop = () => { stopping = true; };
-  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false);
+  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false)
+    || (taskMember && requestedTempStopReason(dir) === 'operator-stop');
   deps.shouldStop = shouldStop;
   const stamp = () => new Date(deps.now()).toISOString();
 
@@ -1302,10 +1365,11 @@ export async function runSupervised(
   process.on('SIGINT', requestStop);
   try {
   while (!shouldStop()) {
+    if (taskMember && !taskSupervisorMayRun(name)) break;
     let ledger = readRestartLedger(dir);
     try {
       const configPath = resolveConfigPath(dir, opts.configPath);
-      const role = findRole(loadConfig(configPath), name);
+      const role = taskMember ? loadTempRole(name) : findRole(loadConfig(configPath), name);
       reconcileModelRecovery(dir, role, stamp());
       if (modelRecoveryHeld(dir)) {
         await deps.sleep(HELD_DOWN_POLL_MS);
@@ -1322,19 +1386,26 @@ export async function runSupervised(
       continue;
     }
 
+    if (attempt === runOnce && taskMember) {
+      // Boot-time daemon unavailability must not consume the harness crash budget.
+      const { waitForRoleDaemon } = await import('./startup-readiness.js');
+      await waitForRoleDaemon(name, undefined, {}, true);
+    }
+    if (taskMember && (shouldStop() || !taskSupervisorMayRun(name))) break;
     let result: AttemptResult;
     try {
       // Service-manager boot and automatic retry bypass the operator-facing
       // up/restart commands. Reconcile again immediately before every real
       // permanent harness attempt; the operation is idempotent and releases its
       // provisioning lease before the agent or owner channel binds.
-      if (attempt === runOnce) {
+      if (attempt === runOnce && !taskMember) {
         const configPath = resolveConfigPath(dir, opts.configPath);
         const role = findRole(loadConfig(configPath), name);
         await reconcilePermanentRoleIdentities(role, undefined, deps.log);
       }
       result = await attempt(
-        name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
+        name, { configPath: opts.configPath, ...(taskMember ? { temp: true } : {}),
+          allowResumeRotation: taskMember ? false : !ledger.resumeDiscarded }, deps);
     } catch (e) {
       if (e instanceof SupervisorRecycleRequiredError) {
         writeRestartLedger(dir, {
@@ -1356,7 +1427,7 @@ export async function runSupervised(
       };
     }
 
-    if (stopping) break;
+    if (stopping || (taskMember && (shouldStop() || result.retirementReason))) break;
 
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
@@ -1374,7 +1445,8 @@ export async function runSupervised(
       await deps.sleep(HELD_DOWN_POLL_MS);
       continue;
     }
-    const fastFailSecs = fastFailSecsFor(name, opts.configPath);
+    const fastFailSecs = taskMember ? getAdapter(loadTempRole(name).harness).exitPolicy.fastFailSecs
+      : fastFailSecsFor(name, opts.configPath);
     // The fast-fail boundary starts a recovery episode; it must not also be
     // the boundary that declares recovery successful. Otherwise alternating
     // 19s and 20s deaths erase one another forever. Require the configured
@@ -1413,7 +1485,7 @@ export async function runSupervised(
       next.nextDelayMs = 0;
       writeRestartLedger(dir, next);
       deps.log(`[${name}] HELD DOWN after ${failures} immediate failures at ${next.openedAt} — ` +
-        `${reason}; the agent will not be restarted until: ours-fleet restart ${name}`);
+        `${reason}; recover with: ${taskMember ? `ours-fleet task recover-members ${readTempSupervisor(dir)!.taskOwner!.taskId}` : `ours-fleet restart ${name}`}`);
       continue;
     }
     writeRestartLedger(dir, next);
@@ -1427,7 +1499,7 @@ export async function runSupervised(
     process.off('SIGINT', requestStop);
     // An orderly shutdown clears the marker; an unhandled signal or OOM-kill
     // leaves it so the successor can identify an abrupt termination.
-    if (shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
+    if (!taskMember && shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
     releaseSupervisorRun(dir);
   }
 }
@@ -1445,11 +1517,54 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
+/** The parent uses the same adapter-relative sustained-uptime reset boundary. */
+export function stableSupervisorWindow(name: string, temp: boolean, configPath?: string): number {
+  try {
+    const role = temp ? loadTempRole(name) : findRole(loadConfig(configPath), name);
+    return getAdapter(role.harness).exitPolicy.fastFailSecs * RESTART_FAIL_THRESHOLD;
+  } catch { return 20 * RESTART_FAIL_THRESHOLD; }
+}
+
 export async function runTemp(
   name: string, deps: Partial<RunnerDeps> = {},
   attempt: typeof runOnce = runOnce,
 ): Promise<void> {
   const dir = agentDir(name, true);
+  const metadata = readTempSupervisor(dir);
+  // Non-resumable standalone temporaries retain their prior finite lifecycle:
+  // a parent stop retires them rather than promising retained conversation.
+  if (!metadata?.taskOwner && deps.suspendOnStop && !getAdapter(loadTempRole(name).harness).supportsResume)
+    deps = { ...deps, suspendOnStop: false };
+  if (!metadata?.taskOwner) {
+    const role = loadTempRole(name);
+    const provenance = readProvenance(dir);
+    if (role.roomMemberStartup?.task_id
+        || (name.startsWith('layout-') && provenance?.creationActionId?.startsWith('task-')))
+      throw Error('TASK_SUPERVISOR_OWNER_MISSING');
+  }
+  if (metadata?.taskOwner) {
+    // Serialize the entire process lifetime before metadata/session writes.
+    const lease = await acquireOwnerBinderLease(join(dir, '.task-supervisor'), 'task-supervisor', name);
+    let ownershipVerified = false;
+    try {
+      const mayRun = taskSupervisorMayRun(name);
+      ownershipVerified = true;
+      if (!mayRun) return;
+      await markTempSupervisorActive(dir);
+      await runSupervised(name, { temp: true }, deps, attempt);
+    } finally {
+      try {
+        if (ownershipVerified && requestedTempStopReason(dir)) {
+          // Parent shutdown suspends; an explicit stop retires the exact saved
+          // owner even when no harness attempt ran (for example held circuits).
+          await (deps.releaseAgentOurs ?? releaseManagedAgent)(loadTempRole(name), taskMemberRetirementProof(name));
+          const archived = archiveTempState(name, 'operator-stop', 'retired', 'explicit task member retirement');
+          deps.log?.(`[${name}] task member retired: operator-stop${archived ? `; evidence archived at ${archived}` : ''}`);
+        }
+      } finally { lease.release(); }
+    }
+    return;
+  }
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
   const onTerm = () => { signal = 'SIGTERM'; };
@@ -1473,7 +1588,8 @@ export async function runTemp(
     process.off('SIGTERM', onTerm);
     process.off('SIGINT', onInt);
     // A recycle replaces the supervisor process, not the logical temporary agent.
-    if (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.()) {
+    if (!((signal || deps.shouldStop?.()) && deps.suspendOnStop && !requestedTempStopReason(dir))
+        && (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.())) {
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason

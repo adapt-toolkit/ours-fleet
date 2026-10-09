@@ -908,6 +908,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
+  cOpt(taskCmd.command('recover-members <id>'))
+    .description('resume proven stopped task members in-place; never create identities or replay invites')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const { recoverTaskMembers } = await import('./recovery.js');
+        const task = getTask(id), cfg = loadConfig(opts.configuration);
+        const members = await recoverTaskMembers({ taskId: id, binPath: getBinPath(),
+          cowork: task.layout ? undefined : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config }) });
+        if (opts.json) console.log(JSON.stringify({ schema_version: 1, task_id: id, members }, null, 2));
+        else for (const member of members) console.log(`${member.name}: ${member.status}`);
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
   cOpt(taskCmd.command('start <id>'))
     .description('idempotently select a plan, provision, and start a task')
     .option('--template <name>', 'room template')

@@ -10,8 +10,9 @@ turns such sessions into **roles**: long-lived agents that
 
 - **run through structured managed sessions** behind one provider-neutral
   agent-session interface, which you can inspect or prompt,
-- are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
-  and brings them back after a reboot,
+- are **supervised** — one Fleet systemd service (Linux) or LaunchAgent (macOS)
+  runs their existing agent runners, restarts them on crash, and restores the
+  desired running roster at boot or login,
 - **resume their context** across restarts (when the harness supports it),
 - **bind an ours.network identity**, so you — and every other agent — can message
   them by name over an end-to-end-encrypted channel
@@ -44,11 +45,11 @@ brain: { inline: { harness: codex, session: codex-app-server } }
 
 ```
 ~/fleet.yaml + ~/fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml   your declaration
-        │  ours-fleet up
+        │  ours-fleet init, then up
         ▼
-briefing.md per role  ──►  agent session adapter  ──►  native app-server or ACP transport
-        ▲                        │
- systemd --user / launchd ───────┘   restart on crash, start at boot/login
+one Fleet OS service  ──►  private member catalog + existing agent runners
+                                               │
+briefing.md per member  ──►  session adapter  ──►  native app-server or ACP transport
 ```
 
 Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing,
@@ -81,9 +82,10 @@ The state dir contract:
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours` CLI + shared daemon | identity + agent-to-agent messaging | `ours-install client --config /absolute/private/profile.json --integrations fleet --fleet-settings /absolute/fleet-settings.json` |
 
-Linux only: `ours-fleet init` enables *linger* so roles run without a login session
-and survive reboots. macOS: launchd agents start **at login** (no linger
-equivalent); logs land in `~/.ours-fleet/logs/`.
+Linux only: `ours-fleet init` enables *linger* so Fleet runs without a login session
+and restores running members after reboot. On macOS the Fleet LaunchAgent starts
+**at login** (no linger equivalent). Member logs live in each member's state
+directory; use `ours-fleet logs <Name>` to read them.
 
 ## Install
 
@@ -102,6 +104,12 @@ maintained adapters require Node 22 or newer.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
+
+When upgrading from per-agent services, coordinate package installation with
+explicit `ours-fleet init`. Preserve operator readiness hooks on the common
+parent before migration; new task/temporary creation requires that parent.
+See the [migration and rollback runbook](docs/fleet-migration.md)
+for changed stop/restart behaviour and legacy task transfer limits.
 
 ## Quickstart
 
@@ -331,9 +339,9 @@ Installs predating the stamp are compared by hashing their `dist/`, so two of
 those are still told apart.
 
 A permanent role brought up via `-c custom.yaml` remembers that file (`.config-path`
-in its state dir) across supervisor-triggered restarts — systemd/launchd re-invoke the
-agent process with no arguments, so without this the role would silently fall back to
-the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
+in its state dir and its private member registration) across supervisor-triggered
+restarts. Its runner resolves that original configuration instead of falling back
+to the default `~/fleet.yaml`.
 
 ## split configuration field reference
 

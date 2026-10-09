@@ -1,6 +1,6 @@
 import { preparePermanentAssignment } from '../src/agent-ours/service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -10,6 +10,7 @@ import {
 } from '../src/spawn.js';
 import { creationBuildNote, formatProvenance, type CreationProvenance } from '../src/creation.js';
 import { agentDir, stateRoot } from '../src/paths.js';
+import { prepareTempSupervisor, TEMP_SUPERVISOR_FILE } from '../src/temp-lifecycle.js';
 import { buildInfo } from '../src/provenance.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { getAdapter } from '../src/harness/registry.js';
@@ -288,6 +289,13 @@ describe('spawn Codex options', () => {
 });
 
 describe('spawnTemp', () => {
+  it('refuses non-resumable task harnesses before launch or state reservation', async () => {
+    const launch = vi.fn();
+    await expect(spawnTemp({ name: 'HermesTask', harness: 'hermes', model: 'fixture-model', taskOwner: { taskId: 'task', creationActionId: 'action' } }, '/fixture/fleet', launch))
+      .rejects.toThrow('TASK_HARNESS_RESUME_UNSUPPORTED');
+    expect(launch).not.toHaveBeenCalled(); expect(existsSync(agentDir('HermesTask', true))).toBe(false);
+  });
+
   it('snapshots the role and launches the supervisor detached', async () => {
     const launched: { binPath: string; args: string[]; dir: string }[] = [];
     const d = await spawnTemp(
@@ -895,3 +903,16 @@ vi.mock('../src/agent-ours/service.js', async importOriginal => ({
  prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
  releaseManagedAgent:async()=>{},
 }));
+
+it('spawns another role while retaining unsupported live and archived supervisor records', async () => {
+  const bad = [agentDir('Unsupported', true), join(stateRoot(), 'recovery/temporary/unsupported'),
+    join(stateRoot(), 'recovery/temporary/.Unsupported-deadbeef.retiring')];
+  for (const path of bad) {
+    mkdirSync(path, { recursive: true });
+    const record = prepareTempSupervisor(path, 'Unsupported');
+    writeFileSync(join(path, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...record, kind: 'newer-kind' }));
+  }
+  const launched = await spawnTemp({ name: 'Other', mission: 'work' }, '/fixture/fleet', () => {});
+  expect(existsSync(join(launched, 'role.yaml'))).toBe(true);
+  for (const path of bad) expect(JSON.parse(readFileSync(join(path, TEMP_SUPERVISOR_FILE), 'utf8')).kind).toBe('newer-kind');
+});

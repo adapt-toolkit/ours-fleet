@@ -1,6 +1,9 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
+import { readMember, managedMemberEnvironment } from '../src/supervisor/catalog.js';
+import { agentDir } from '../src/paths.js';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -114,21 +117,20 @@ describe('Codex runtime provenance', () => {
       const persistent = await makeCodexAdapter().prepareSession(role(env),
         { stateDir: persistentDir, runCwd: persistentDir });
       const expected = harnessChildEnv(role(env), persistent.env, persistentDir).OURS_FLEET_REAL_CODEX_PATH;
-      const dir = temp();
+      vi.stubEnv('OURS_FLEET_HOME', temp());
+      const dir = agentDir('Runtime', true); mkdirSync(dir, { recursive: true });
       prepareTempSupervisor(dir, 'Runtime');
-      let serviceArgs: string[] = [];
+      await fleetHostBackend(async () => ({ code: 0, stdout: '', stderr: '' }), platform).init('/installed/fleet');
       await makeTempSupervisorLauncher({
         platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd',
         exec: async (_command, args) => {
-          serviceArgs = args;
-          return { code: 0, stdout: '', stderr: '' };
+          return { code: 0, stdout: _command === 'launchctl' ? 'state = running' : 'active', stderr: '' };
         },
       })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
-      const prefix = platform === 'linux' ? '--setenv=CODEX_PATH=' : 'CODEX_PATH=';
-      const entry = serviceArgs.find(arg => arg.startsWith(prefix));
-      expect(entry).toBe(prefix + inherited);
-      // Simulate only the environment explicitly passed to the temporary service.
-      vi.stubEnv('CODEX_PATH', entry?.slice(prefix.length));
+      const member = readMember('temporary-Runtime')!;
+      const selectedEnv = managedMemberEnvironment(member, { CODEX_PATH: '/other-parent/codex' });
+      expect(selectedEnv.CODEX_PATH).toBe(inherited);
+      vi.stubEnv('CODEX_PATH', selectedEnv.CODEX_PATH);
       const prep = await makeCodexAdapter().prepareSession(role(env), { stateDir: dir, runCwd: dir });
       const child = harnessChildEnv(role(env), prep.env, dir);
       expect(child.OURS_FLEET_REAL_CODEX_PATH).toBe(expected);

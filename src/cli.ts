@@ -587,7 +587,7 @@ cOpt(program.command('status <name>').description('declared persistent Agent uni
         + `${ledger.lastTermination.runStartedAt ?? 'unknown'}) died without an orderly exit; `
         + `observed ${ledger.lastTermination.observedAt}`
         + `\n  abrupt terminations recorded: ${ledger.abruptTerminations ?? 1}`
-        + `\n  cause (signal / OOM-kill): journalctl --user -u ours-fleet-agent@${name}.service`);
+        + `\n  inspect member output: ours-fleet logs ${name}`);
     const modelStatus = joinPath(agentDir(name), '.model-status');
     if (existsSync(modelStatus)) {
       try {
@@ -1654,6 +1654,20 @@ program.command('_wait-daemon <name>', { hidden: true }).description('internal: 
     try { await waitForRoleDaemon(name, opts.configuration); } catch (e) { die(e); }
   });
 
+program.command('_wait-temp-daemon <name>', { hidden: true })
+  .action(async name => {
+    try { await waitForRoleDaemon(name, undefined, {}, true); } catch (error) { die(error); }
+  });
+
+program.command('_run-fleet', { hidden: true }).action(async () => {
+  try { const { runFleetManager } = await import('./supervisor/manager.js'); await runFleetManager(process.argv[1]); }
+  catch (error) { die(error); }
+});
+program.command('_run-managed <key> <generation>', { hidden: true }).action(async (key, generation) => {
+  try { const { runManagedMember } = await import('./supervisor/manager.js'); await runManagedMember(key, generation); }
+  catch (error) { die(error); }
+});
+
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {
@@ -1668,8 +1682,9 @@ program.command('_run-temp <name>', { hidden: true }).description('internal: tem
   });
 
 program.command('_run-temp-worker <name>', { hidden: true })
-  .action(async name => {
-    try {await runTemp(name);}
+  .option('--suspend-on-stop')
+  .action(async (name, options) => {
+    try {await runTemp(name, { suspendOnStop: options.suspendOnStop === true });}
     catch(error){if(error instanceof SupervisorRecycleRequiredError)process.exitCode=TEMP_RECYCLE_EXIT;else die(error);}
   });
 

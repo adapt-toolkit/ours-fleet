@@ -44,6 +44,10 @@ jobs:
       - run: npm run test:pack
       - name: Verify real daemon recovery through the shared gateway profile
         run: npm run test:v1-recovery
+      - name: Verify retained temporary task identity across process and daemon restart
+        run: npm run test:task-recovery
+      - name: Verify common Fleet parent recovery and exact task retirement
+        run: npm run test:fleet-recovery
       - run: npm pack --dry-run
         working-directory: integrations/claude-code
       - run: npm pack --dry-run

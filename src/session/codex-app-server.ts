@@ -47,6 +47,7 @@ export interface CodexAppServerSessionOptions {
   env: Record<string, string>;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  requireResume?: boolean;
   permissions: CommonPermissions;
   permissionMode: NonNullable<SessionSnapshot['permissionMode']>;
   model?: string | null;
@@ -254,6 +255,7 @@ export class CodexAppServerSession implements AgentSession {
       alive: this.isAlive(),
       readiness: this.readiness,
       sessionId: this.threadId,
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -495,6 +497,7 @@ export class CodexAppServerSession implements AgentSession {
     this.transport.notify('initialized');
     const persisted = this.options.mode === 'resume' && existsSync(this.threadFile)
       ? readFileSync(this.threadFile, 'utf8').trim() : '';
+    if (this.options.requireResume && !persisted) throw new Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
     const common: JsonObject = {
       cwd: this.options.cwd,
       approvalPolicy: this.options.approvalPolicy,
@@ -514,6 +517,7 @@ export class CodexAppServerSession implements AgentSession {
     const thread = isObject(response.thread) ? response.thread : undefined;
     this.threadId = string(thread?.id);
     if (!this.threadId) throw new Error('Codex app-server did not return a thread id');
+    if (this.options.requireResume && this.threadId !== persisted) throw new Error('TASK_CONTEXT_RESUME_MISMATCH');
     writeFileSync(this.threadFile, this.threadId + '\n', { mode: 0o600 });
     const model = string(response.model) ?? this.options.model ?? undefined;
     if (model) this.runtimeModel = { value: model };

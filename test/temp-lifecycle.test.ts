@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
@@ -12,12 +13,16 @@ import {
   tempArchiveForCreationAction, tempArchiveForLaunch, tempSupervisorLiveness, tempSystemdUnit,
 } from '../src/temp-lifecycle.js';
 import { agentDir, stateRoot } from '../src/paths.js';
+import { memberKey, readMember, registerMember } from '../src/supervisor/catalog.js';
 import type { Exec } from '../src/exec.js';
 
 let home: string;
-beforeEach(() => {
+beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), 'ours-fleet-temp-life-'));
   process.env.OURS_FLEET_HOME = home;
+  const setup = async () => ({ code: 0, stdout: '', stderr: '' });
+  await fleetHostBackend(setup, 'linux').init('/fixture/fleet');
+  await fleetHostBackend(setup, 'darwin').init('/fixture/fleet');
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -33,124 +38,67 @@ function temp(name: string): string {
   return dir;
 }
 
-describe('independent temporary supervisor ownership', () => {
-  it.each(['linux', 'darwin'] as const)('preserves CODEX_PATH exactly across the %s service boundary', async platform => {
+describe('Fleet-managed temporary process ownership', () => {
+  it.each(['linux', 'darwin'] as const)('persists runtime and profile selection in the shared %s service', async platform => {
     for (const value of ['/fixture/native codex', '', undefined]) {
       vi.stubEnv('CODEX_PATH', value);
+      vi.stubEnv('OURS_CONFIG', '/profile/client.json');
+      await fleetHostBackend(async () => ({ code: 0, stdout: '', stderr: '' }), platform).init('/fixture/fleet');
       const dir = temp('Runtime');
-      let argv: string[] = [];
-      let command = '';
-      await makeTempSupervisorLauncher({
-        platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd',
-        exec: async (cmd, args) => {
-          command = cmd; argv = args;
-          return { stdout: '', stderr: '', code: 0 };
-        },
-      })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
-      expect(command).toBe(platform === 'linux' ? 'systemd-run' : 'launchctl');
-      const prefix = platform === 'linux' ? '--setenv=CODEX_PATH=' : 'CODEX_PATH=';
-      expect(argv.filter(arg => arg.startsWith(prefix)))
-        .toEqual(value === undefined ? [] : [prefix + value]);
+      let bootstrapped = false;
+      await makeTempSupervisorLauncher({ platform, supervisor: 'managed', exec: async (cmd, args) => {
+        if (args[0] === 'bootstrap') bootstrapped = true;
+        if (cmd === 'launchctl' && args[0] === 'print') return bootstrapped
+          ? { stdout: 'state = running', stderr: '', code: 0 }
+          : { stdout: '', stderr: 'Could not find service', code: 113 };
+        return { stdout: 'active', stderr: '', code: 0 };
+      } })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
+      const path = platform === 'linux' ? join(home, '.config/systemd/user/ours-fleet.service')
+        : join(home, 'Library/LaunchAgents/network.ours.fleet.plist');
+      const content = readFileSync(path, 'utf8');
+      expect(content).toContain('_run-fleet'); expect(content).toContain('/profile/client.json');
+      if (value !== undefined) expect(content).toContain(platform === 'linux' ? `CODEX_PATH=${value}` : `<key>CODEX_PATH</key><string>${value}</string>`);
+      else expect(content).not.toContain('CODEX_PATH');
+      expect(readMember(memberKey('Runtime', 'temporary'))?.desired).toBe('running');
     }
   });
-
-  it('uses a collected transient systemd unit, outside the caller role unit', async () => {
-    const dir = temp('Worker');
-    const calls: Array<[string, string[]]> = [];
-    const exec: Exec = async (command, args) => {
-      calls.push([command, args]);
-      return { stdout: '', stderr: '', code: 0 };
-    };
-    const launch = makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'systemd' });
-
-    await launch('/opt/ours-fleet', ['_run-temp', 'Worker'], dir);
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0][0]).toBe('systemd-run');
-    expect(calls[0][1]).toContain(`--unit=${tempSystemdUnit('Worker')}`);
-    expect(calls[0][1]).toContain('--collect');
-    expect(calls[0][1].join(' ')).not.toContain('ours-fleet-agent@Coordinator');
-    expect(readTempSupervisor(dir)).toMatchObject({
-      phase: 'active', kind: 'systemd-transient', target: tempSystemdUnit('Worker'),
-    });
+  it('adding a temporary member does not stop or restart the Fleet parent', async () => {
+    const calls: string[][] = [], dir = temp('Worker');
+    const exec: Exec = async (cmd, args) => { calls.push([cmd, ...args]); return { stdout: 'active', stderr: '', code: 0 }; };
+    await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/fixture/fleet', ['_run-temp', 'Worker'], dir);
+    expect(readTempSupervisor(dir)).toMatchObject({ kind: 'fleet-managed', target: 'temporary-Worker', phase: 'active' });
+    expect(calls.some(call => call[0] === 'systemd-run' || call.includes('stop') || call.includes('restart') || call.includes('disable'))).toBe(false);
+    expect(calls.some(call => call.includes('daemon-reload') || call[0] === 'loginctl' || call.includes('enable'))).toBe(false);
   });
-
-  it('records launch failure without pretending the transient unit started', async () => {
-    const dir = temp('Broken');
-    const launch = makeTempSupervisorLauncher({
-      platform: 'linux', supervisor: 'systemd',
+  it('operator retirement removes the temporary catalog and private selection without stopping the parent', async () => {
+    const dir = temp('Retired'), calls: string[][] = [];
+    const exec: Exec = async (cmd, args) => { calls.push([cmd, ...args]); return { stdout: 'active', stderr: '', code: 0 }; };
+    await makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })('/fixture/fleet', ['_run-temp', 'Retired'], dir);
+    await stopTempSupervisor('Retired', { exec });
+    expect(readMember('temporary-Retired')).toBeUndefined();
+    expect(existsSync(join(home, '.config/systemd/user/ours-fleet.service'))).toBe(true);
+    expect(calls.some(call => call.includes('stop') || call.includes('disable'))).toBe(false);
+  });
+  it('retains exact launch state when the Fleet service cannot be started', async () => {
+    const dir = temp('Broken'), launchId = readTempSupervisor(dir)!.launchId;
+    await expect(makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'managed',
       exec: async () => ({ stdout: '', stderr: 'user bus unavailable', code: 1 }),
-    });
-    await expect(launch('/opt/ours-fleet', ['_run-temp', 'Broken'], dir))
-      .rejects.toThrow(/user bus unavailable/);
+    })('/fixture/fleet', ['_run-temp', 'Broken'], dir)).rejects.toThrow('FLEET_SERVICE_LIVENESS_UNKNOWN');
+    expect(readTempSupervisor(dir)?.launchId).toBe(launchId);
   });
-
-  it('never archives a role while its transient unit is still being registered', async () => {
-    const dir = temp('Racing');
-    let entered!: () => void;
-    let finish!: () => void;
-    const registrationStarted = new Promise<void>(resolve => { entered = resolve; });
-    const registrationGate = new Promise<void>(resolve => { finish = resolve; });
-    const launch = makeTempSupervisorLauncher({
-      platform: 'linux', supervisor: 'systemd',
-      exec: async () => {
-        entered();
-        await registrationGate;
-        return { stdout: '', stderr: '', code: 0 };
-      },
-    });
-    const pending = launch('/opt/ours-fleet', ['_run-temp', 'Racing'], dir);
-    await registrationStarted;
-    const createdAt = Date.parse(readTempSupervisor(dir)!.createdAt);
-
-    const archived = await reclaimStaleTempState({
-      now: () => createdAt + TEMP_LAUNCH_GRACE_MS - 1,
-      exec: async () => ({ stdout: 'inactive\n', stderr: '', code: 0 }),
-    });
-
-    expect(archived).toEqual([]);
+  it('reclamation preserves stopped children with retained running Fleet intent', async () => {
+    const dir = temp('Restarting');
+    await registerMember({ name: 'Restarting', kind: 'temporary', dir });
+    writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...readTempSupervisor(dir), phase: 'active', kind: 'fleet-managed', target: 'temporary-Restarting' }));
+    expect(await reclaimStaleTempState({ now: () => Date.now() + 100_000 })).toEqual([]);
     expect(existsSync(dir)).toBe(true);
-    finish();
-    await pending;
-  });
-
-  it('propagates the daemon profile into a transient supervisor', async () => {
-    const dir = temp('Profiled');
-    const previous = Object.fromEntries([
-      'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN', 'OURS_CONFIG',
-    ].map(key => [key, process.env[key]]));
-    Object.assign(process.env, {
-      OURS_PORT: '4567', OURS_STATE_DIR: '/profile/state',
-      OURS_API_TOKEN: 'fixture-token', OURS_CONFIG: '/profile/config.json',
-    });
-    let args: string[] = [];
-    try {
-      await makeTempSupervisorLauncher({
-        platform: 'linux', supervisor: 'systemd',
-        exec: async (_command, actual) => {
-          args = actual;
-          return { stdout: '', stderr: '', code: 0 };
-        },
-      })('/opt/ours-fleet', ['_run-temp', 'Profiled'], dir);
-    } finally {
-      for (const [key, value] of Object.entries(previous))
-        value === undefined ? delete process.env[key] : process.env[key] = value;
-    }
-    expect(args).toEqual(expect.arrayContaining([
-      '--setenv=OURS_PORT=4567', '--setenv=OURS_STATE_DIR=/profile/state',
-      '--setenv=OURS_API_TOKEN=fixture-token', '--setenv=OURS_CONFIG=/profile/config.json',
-    ]));
   });
 });
 
 describe('exact operator targeting and evidence', () => {
   it('stops only the transient unit recorded for the exact temp role', async () => {
     const dir = temp('Exact');
-    const setup = makeTempSupervisorLauncher({
-      platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
-    });
-    await setup('/opt/ours-fleet', ['_run-temp', 'Exact'], dir);
+    writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...readTempSupervisor(dir), kind: 'systemd-transient', target: tempSystemdUnit('Exact'), phase: 'active' }));
     const calls: Array<[string, string[]]> = [];
 
     const outcome = await stopTempSupervisor('Exact', {
@@ -299,12 +247,11 @@ describe('bounded stale-state reclamation', () => {
     const legacy = agentDir('Legacy', true);
     mkdirSync(legacy, { recursive: true });
     writeFileSync(join(legacy, 'role.yaml'), 'name: Legacy\n');
-    const setupExec: Exec = async () => ({ stdout: '', stderr: '', code: 0 });
-    const launch = makeTempSupervisorLauncher({
-      platform: 'linux', supervisor: 'systemd', exec: setupExec,
-    });
-    await launch('/opt/ours-fleet', ['_run-temp', 'Stopped'], stopped);
-    await launch('/opt/ours-fleet', ['_run-temp', 'Live'], live);
+    for (const [name, dir] of [['Stopped', stopped], ['Live', live]]) {
+      writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({
+        ...readTempSupervisor(dir), kind: 'systemd-transient', target: tempSystemdUnit(name), phase: 'active',
+      }));
+    }
 
     const archived = await reclaimStaleTempState({
       exec: async (_command, args) => ({
@@ -371,4 +318,27 @@ describe('bounded stale-state reclamation', () => {
     expect(archived[0]).toContain('-IncompleteStale-');
     expect(existsSync(incomplete)).toBe(false);
   });
+});
+
+it.each(['managed', 'none'])('rejects unsupported launch metadata before execution in %s mode', async supervisor => {
+  const dir = temp('UnsupportedLaunch');
+  writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...readTempSupervisor(dir), kind: 'newer-kind' }));
+  const exec = vi.fn(), spawnDetached = vi.fn();
+  await expect(makeTempSupervisorLauncher({ exec, spawnDetached, supervisor })(
+    '/fixture/fleet', ['_run-temp', 'UnsupportedLaunch'], dir)).rejects.toThrow('TEMP_SUPERVISOR_KIND_UNSUPPORTED');
+  expect(exec).not.toHaveBeenCalled(); expect(spawnDetached).not.toHaveBeenCalled();
+});
+
+it('reclaims an unregistered temporary launch after missing parent installation and launch grace', async () => {
+  const dir = temp('NoParent'), metadata = readTempSupervisor(dir)!;
+  writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ ...metadata,
+    createdAt: new Date(Date.now() - TEMP_LAUNCH_GRACE_MS - 1000).toISOString() }));
+  rmSync(join(home, '.config/systemd/user/ours-fleet.service'));
+  const exec = vi.fn();
+  await expect(makeTempSupervisorLauncher({ exec, platform: 'linux', supervisor: 'managed' })(
+    '/fixture/fleet', ['_run-temp', 'NoParent'], dir)).rejects.toThrow('FLEET_SERVICE_NOT_INSTALLED');
+  expect(await tempSupervisorLiveness(dir, { exec })).toBe('stopped');
+  const archives = await reclaimStaleTempState({ exec });
+  expect(archives).toHaveLength(1); expect(existsSync(dir)).toBe(false);
+  expect(readTempSupervisor(archives[0])?.role).toBe('NoParent'); expect(exec).not.toHaveBeenCalled();
 });

@@ -7,6 +7,7 @@ export async function runTempSupervisor(
   name: string,
   entrypoint: string,
   initial: () => Promise<void> = () => runTemp(name),
+  suspendOnStop = false,
 ): Promise<void> {
   try {
     await initial();
@@ -15,7 +16,7 @@ export async function runTempSupervisor(
     if (!(error instanceof SupervisorRecycleRequiredError)) throw error;
   }
   for (let attempt = 0; attempt < 3; attempt++) {
-    const child = spawn(process.execPath, [entrypoint, '_run-temp-worker', name], {
+    const child = spawn(process.execPath, [entrypoint, '_run-temp-worker', name, ...(suspendOnStop ? ['--suspend-on-stop'] : [])], {
       stdio: 'inherit',
       env: process.env,
     });

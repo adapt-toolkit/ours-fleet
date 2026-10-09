@@ -1,11 +1,16 @@
 import { detachDeletedRoom } from './task-state.js';
 import { binderKey } from '../agent-ours/state.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
+import { retireTaskMemberService } from './task-service-retirement.js';
 import { eraseMemberArtifacts } from './erasure.js';
 import { deleteWorkspace, assertWorkspaceDeletable } from './workspace.js';
 import { collectWorkspaceArchives } from './workspace-artifacts.js';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { parse } from 'yaml';
+import type { ResolvedRole } from '../config.js';
+import { privateRuntimeRoot, releaseManagedAgent } from '../agent-ours/service.js';
 import { attachOursClient, type OursClient } from '@ours.network/sdk/client';
 
 import { withFileLock } from '../atomic-file.js';
@@ -31,6 +36,7 @@ export function roomCloseLockPath(roomId: string): string {
 }
 
 export interface RoomCloseDeps {
+  retireTaskService?: typeof retireTaskMemberService;
   inspectMember?(seat: RoomMemberSeat): Promise<{ launchId: string }>;
   requestStop?(role: string): Promise<void>;
   waitForLivenessAbsent?(role: string, launchId: string): Promise<void>;
@@ -68,6 +74,7 @@ function exactMemberIdentity(seat: RoomMemberSeat): void {
 }
 
 export async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
+  assertMemberNotPermanent(seat.role_name);
   exactMemberIdentity(seat);
   const supervisor = readTempSupervisor(agentDir(seat.role_name, true));
   if (!supervisor || supervisor.role !== seat.role_name
@@ -126,7 +133,43 @@ export async function identityCidPresent(cid: string): Promise<boolean> {
   });
 }
 
+/** A managed temporary identity belongs to its durable external lease even
+ * after worker exit. Retire that exact logical owner before generic removal. */
+async function releaseRetainedMemberRuntime(seat: RoomMemberSeat): Promise<void> {
+  const live = agentDir(seat.role_name, true);
+  const source = existsSync(live) ? live
+    : (seat.launch?.launch_id ? tempArchiveForLaunch(seat.role_name, seat.launch.launch_id) : undefined);
+  if (!source) {
+    if (seat.launch?.task_supervised) throw Error('MEMBER_RUNTIME_RETIREMENT_SOURCE_MISSING');
+    return;
+  }
+  const path = join(source, 'role.yaml');
+  if (!existsSync(path)) return; // pre-managed compatibility evidence has no runtime
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 256 * 1024) throw Error('MEMBER_RUNTIME_UNSAFE_PROOF');
+  const role = parse(readFileSync(path, 'utf8')) as ResolvedRole;
+  const profile = readClientProfile({ ...process.env, ...role.env });
+  const runtime = join(privateRuntimeRoot(), binderKey(profile.expectedInstanceId, seat.role_name));
+  const metadata = readTempSupervisor(source);
+  if (!existsSync(join(runtime, 'instance.json'))) {
+    if (metadata?.kind === 'fleet-managed') throw Error('MEMBER_RUNTIME_RETIREMENT_MISSING');
+    return;
+  }
+  const creationPath = join(source, 'creation.json'), creationStat = lstatSync(creationPath);
+  if (!creationStat.isFile() || creationStat.isSymbolicLink() || creationStat.size > 256 * 1024)
+    throw Error('MEMBER_RUNTIME_UNSAFE_PROOF');
+  const creation = JSON.parse(readFileSync(creationPath, 'utf8'));
+  if (role.name !== seat.role_name || role.identity !== seat.role_name || !seat.identity_cid
+      || !seat.launch?.action_id || !seat.launch.launch_id || creation.role !== seat.role_name
+      || creation.creationActionId !== seat.launch.action_id || metadata?.role !== seat.role_name
+      || metadata.launchId !== seat.launch.launch_id
+      || (metadata.taskOwner && metadata.taskOwner.creationActionId !== seat.launch.action_id))
+    throw Error('MEMBER_RUNTIME_RETIREMENT_MISMATCH');
+  await releaseManagedAgent(role, { cid: seat.identity_cid, action: seat.launch.action_id });
+}
+
 export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
+  assertMemberNotPermanent(seat.role_name);
   await withIdentityClient(async client => {
     const rows = await client.listIdentities();
     const before = listedIdentity(rows, seat.role_name);
@@ -134,6 +177,11 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
       if (rows.some(row => row.name === seat.role_name || (seat.identity_cid && 'cid' in row
           && row.cid.toLowerCase() === seat.identity_cid.toLowerCase())))
         throw new Error(`room member '${seat.role_name}' identity absence is not proven`);
+      // A terminal release can remove the SDK identity before its response is
+      // recorded. Finish the exact retained launch's release journal on retry.
+      if (existsSync(agentDir(seat.role_name, true)) || (seat.launch?.launch_id
+          && tempArchiveForLaunch(seat.role_name, seat.launch.launch_id)))
+        await releaseRetainedMemberRuntime(seat);
       return;
     }
     if (!seat.identity_cid) {
@@ -146,7 +194,9 @@ export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<v
         `room member '${seat.role_name}' identity absence is not proven: CID mismatch: recorded ${seat.identity_cid}, found ${before.cid ?? 'none'}`,
       );
     }
+    await releaseRetainedMemberRuntime(seat);
     try {
+      assertMemberNotPermanent(seat.role_name);
       await client.removeIdentity({ name: seat.role_name });
     } catch (error) {
       const code = error instanceof Error && error.name === 'OursError'
@@ -174,11 +224,21 @@ export async function assertMemberIdentityAbsent(seat: RoomMemberSeat): Promise<
   });
 }
 
+async function retireMemberRegistration(room: RoomOrchestrationRecord, current: RoomMemberSeat, deps: RoomCloseDeps): Promise<void> {
+  if (room.task_id) await (deps.retireTaskService ?? retireTaskMemberService)(current.role_name, {
+    taskId: room.task_id, creationActionId: current.launch?.action_id,
+    taskSupervised: current.launch?.task_supervised,
+    ...(current.launch?.launch_id ? { launchId: current.launch.launch_id } : {}),
+  });
+}
+
 async function retireMember(
   roomId: string, seat: RoomMemberSeat, deps: RoomCloseDeps,
 ): Promise<void> {
+  assertMemberNotPermanent(seat.role_name);
   let room = getRoomRecord(roomId)!;
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
+  await retireMemberRegistration(room, current, deps);
   let retirement = current.retirement;
   if (retirement?.phase === 'identity_absent') {
     if (!deps.inspectMember) {
@@ -315,6 +375,10 @@ export async function closeManagedRoom(input: {
   return lock(roomCloseLockPath(input.roomId), async () => {
     let room = beginRoomClose(input.roomId);
     if (room.state === 'closed') {
+      for (const seat of room.member_seats) {
+        assertMemberNotPermanent(seat.role_name);
+        await retireMemberRegistration(room, seat, deps);
+      }
       if (!deps.inspectMember) for (const seat of room.member_seats) {
         if (existsSync(agentDir(seat.role_name, true))) throw new Error('Closed room has replacement live state');
         await assertMemberIdentityAbsent(seat);

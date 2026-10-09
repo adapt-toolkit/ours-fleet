@@ -17,6 +17,8 @@ import { TaskRoomApplicationService } from '../src/application/task-room-service
 import { RoomLayoutService, layoutRunPath } from '../src/rooms-tasks/layout-service.js';
 import { RoomLayout, type LayoutInstance, type LayoutSupervisor } from '../src/rooms-tasks/layout.js';
 import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
+import { stateRoot } from '../src/paths.js';
+import { layoutOwnedMemberName } from '../src/rooms-tasks/layout-member-retirement.js';
 
 const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
 let root: string, previousHome: string | undefined, previousUmask: number;
@@ -33,10 +35,10 @@ function fakes() {
   const rooms = new Map<string, { seats: any[]; closed?: boolean; briefing: string; name: string }>();
   const running = new Map<string, LayoutInstance>();
   const events: string[] = [];
-  let n = 0;
-  const supervisor: LayoutSupervisor = { id: 'e2e',
+  let n = 0, runId = '';
+  const supervisor: LayoutSupervisor = { id: stateRoot(),
     verify: async i => { if (JSON.stringify(running.get(i.launch)) !== JSON.stringify(i)) throw Error('stale instance'); },
-    spawn: async (key, template) => { const i = { supervisor: 'e2e', launch: `launch-${key}`, cid: `cid-${key}`, session: `s-${key}`, agent: `layout-${key}`, temporary: true };
+    spawn: async (key, template) => { const i = { supervisor: stateRoot(), launch: `launch-${key}`, cid: `cid-${key}`, session: `s-${key}`, agent: layoutOwnedMemberName(runId, key), temporary: true };
       running.set(i.launch, i); events.push(`spawn ${key}:${template}`); return i; },
     join: async (i, invite) => { const [id, role] = invite.split('|'); rooms.get(id)!.seats.push({ identity_cid: i.cid, role, seat_state: 'active' }); events.push(`join ${i.cid}->${id}`); },
     assign: async (i, a) => { events.push(`assign ${a.id}`); expect(a.contract).toContain('Current task brief:'); },
@@ -48,8 +50,9 @@ function fakes() {
     getSeats: async (id: string) => rooms.get(id)!.seats,
     getRoom: async (id: string) => { const r = rooms.get(id); return r && { identity_cid: `cid-room-${id.split('-')[1]}`, state: r.closed ? 'closed' : 'active', seats: r.seats }; },
     closeRoom: async (id: string) => { rooms.get(id)!.closed = true; events.push(`close ${id}`); },
+    deleteRoom: async (id: string) => { rooms.delete(id); events.push(`delete ${id}`); },
   } as unknown as CoworkAdapter;
-  return { rooms, running, events, supervisor, cowork };
+  return { rooms, running, events, supervisor, cowork, setRunId: (id: string) => { runId = id; } };
 }
 
 it('authors a layout, runs a multi-room task through its lifecycle over HTTP, and cleans up on finish and deletion', async () => {
@@ -59,7 +62,7 @@ it('authors a layout, runs a multi-room task through its lifecycle over HTTP, an
   const f = fakes();
   // The real #199 service, with the engine bound to the in-memory Cowork and supervisor.
   class FakeBoundLayouts extends RoomLayoutService {
-    override open(id: string): RoomLayout { return new RoomLayout(layoutRunPath(id), f.cowork, f.supervisor); }
+    override open(id: string): RoomLayout { f.setRunId(id); return new RoomLayout(layoutRunPath(id), f.cowork, f.supervisor); }
   }
   const workers: Promise<unknown>[] = [];
   let app!: TaskRoomApplicationService;
@@ -142,7 +145,10 @@ it('authors a layout, runs a multi-room task through its lifecycle over HTTP, an
 
     // Delete: the run, provenance, brief and op record are gone with the task.
     const deleted = await call('DELETE', `/api/v1/tasks/${id}?confirm=${id}`);
-    await Promise.all(deletions);
+    expect(await Promise.all(deletions)).not.toEqual(expect.arrayContaining([expect.any(Error)]));
+    expect(f.rooms.size).toBe(0);
+    expect(f.running.size).toBe(0);
+    expect(f.events.filter(e => e.startsWith('delete'))).toEqual(['delete native-1', 'delete native-2']);
     expect([200, 202]).toContain(deleted.status);
     expect((await call('GET', `/api/v1/tasks/${id}`)).status).toBe(404);
     for (const path of [layoutRunPath(`task-${id}`), layoutRunPath(`task-${id}`).replace(/\.json$/, '.provenance.json'), taskBriefPath({ task_id: id })])

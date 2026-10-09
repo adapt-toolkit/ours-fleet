@@ -1,3 +1,4 @@
+import { assertNativeFleetScope } from './scope.js';
 import { clientConfigPath } from '../client-profile.js';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -5,7 +6,7 @@ import { home, logsRoot } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { SupervisorBackend } from './types.js';
 
-export const labelFor = (name: string) => `network.ours.fleet.${name}`;
+export const labelFor = (_name: string) => 'network.ours.fleet';
 
 /**
  * What `launchctl print` said about a job, parsed ONCE so that the two questions
@@ -55,16 +56,17 @@ const xml = (value: string) => value
   .replaceAll("'", '&apos;');
 
 function plist(name: string, binPath: string): string {
-  const log = join(logsRoot(), `${name}.log`);
+  const log = join(logsRoot(), 'fleet.log');
   const config = clientConfigPath(process.env);
+  const env = { OURS_CONFIG: config, ...Object.fromEntries(['PATH', 'OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME', 'CODEX_PATH'].flatMap(key => process.env[key] !== undefined ? [[key, process.env[key]!]] : [])) };
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${labelFor(name)}</string>
   <key>ProgramArguments</key>
-  <array><string>${binPath}</string><string>_run</string><string>${name}</string></array>
-${config ? `  <key>EnvironmentVariables</key><dict><key>OURS_CONFIG</key><string>${xml(config)}</string></dict>\n` : ''}  <!-- The runner owns the child-session restart loop. launchd must only
+  <array><string>${xml(process.execPath)}</string><string>${xml(binPath)}</string><string>_run-fleet</string></array>
+${`  <key>EnvironmentVariables</key><dict>${Object.entries(env).map(([key,value]) => `<key>${key}</key><string>${xml(value)}</string>`).join('')}</dict>\n`}  <!-- The runner owns the child-session restart loop. launchd must only
        recover the runner PROCESS crashing: a bare KeepAlive would resume the
        uncounted relaunch loop and restart a deliberately held-down agent. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -116,6 +118,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
 
   /** Read `launchctl print` once; both callers classify it for their own question. */
   const printJob = async (name: string): Promise<LaunchdJob> => {
+    assertNativeFleetScope(exec);
     const r = await exec('launchctl', ['print', `${domain}/${labelFor(name)}`]);
     const out = `${r.stdout}\n${r.stderr}`;
     if (r.code !== 0) return {
@@ -134,9 +137,11 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
   return {
     id: 'launchd',
 
-    async init() {
+    async init(binPath) {
+      assertNativeFleetScope(exec);
       mkdirSync(agentsDir(), { recursive: true });
       mkdirSync(logsRoot(), { recursive: true });
+      writeFileSync(plistPath('fleet'), plist('fleet', binPath));
       return [
         `LaunchAgents dir ready: ${agentsDir()}`,
         'note: launchd agents start at login (macOS has no linger equivalent)',
@@ -144,12 +149,12 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
     },
 
     async install(name, binPath) {
-      mkdirSync(agentsDir(), { recursive: true });
-      mkdirSync(logsRoot(), { recursive: true });
-      // The plist's prior existence is the record of whether we created this.
-      const existed = existsSync(plistPath(name));
-      writeFileSync(plistPath(name), plist(name, binPath));
-      await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]); // best-effort refresh
+      assertNativeFleetScope(exec);
+      if (!existsSync(plistPath(name))) throw Error('FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init');
+      const existed = true;
+      const loaded = await printJob(name);
+      if (loaded.loaded) return { created: !existed, detail: 'Fleet service already loaded' };
+      if (!loaded.notFound) throw new Error('Fleet launchd liveness unknown');
       // Undo only what WE wrote. A plist that was already there belongs to
       // whoever put it there, and rollback may never remove it.
       const undo = async () => {
@@ -193,14 +198,17 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
         : { created: true, detail: `installed ${labelFor(name)} (${start.detail})` };
     },
     async start(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['bootstrap', domain, plistPath(name)]);
       if (r.code !== 0) await exec('launchctl', ['kickstart', `${domain}/${labelFor(name)}`]);
     },
     async stop(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
       if (r.code !== 0) throw new Error(`launchctl bootout ${labelFor(name)} failed: ${r.stderr.trim()}`);
     },
     async restart(name) {
+      assertNativeFleetScope(exec);
       const r = await exec('launchctl', ['kickstart', '-k', `${domain}/${labelFor(name)}`]);
       if (r.code !== 0) throw new Error(`launchctl kickstart ${labelFor(name)} failed: ${r.stderr.trim()}`);
     },
@@ -235,6 +243,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       };
     },
     async uninstall(name) {
+      assertNativeFleetScope(exec);
       const existed = existsSync(plistPath(name));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);   // idempotent
       rmSync(plistPath(name), { force: true });
@@ -243,7 +252,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
         : { removed: false, detail: `${labelFor(name)} was not installed` };
     },
     logsArgs(name, follow) {
-      const log = join(logsRoot(), `${name}.log`);
+      const log = join(logsRoot(), 'fleet.log');
       return { cmd: 'tail', args: follow ? ['-f', log] : ['-n', '200', log] };
     },
   };

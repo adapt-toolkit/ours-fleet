@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { canonicalJson } from '../canonical-json.js';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import type { CoworkAdapter, CoworkRoomCreateResult } from './cowork-adapter.js';
+import { CoworkProtocolError } from './cowork-adapter.js';
 
 export interface LayoutOwner { cid: string; role: string; invite: string }
 const ownerReference = (owner: LayoutOwner) => ({ cid: owner.cid, role: owner.role, fingerprint: createHash('sha256').update(owner.invite).digest('hex') });
@@ -27,6 +28,7 @@ export interface LayoutAssignment {
   participant: string; room_role?: string; contract?: string;
 }
 export interface LayoutSupervisor {
+  readonly taskSupervised?: boolean;
   id: string;
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
@@ -36,10 +38,11 @@ export interface LayoutSupervisor {
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
   retire(instance: LayoutInstance): Promise<void>;
 }
-type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean; participant?: string; room?: string };
+type ParticipantState = { instance?: LayoutInstance; owned: boolean; retired?: boolean; participant?: string; room?: string; task_supervised?: boolean };
 type RoomState = {
   spec: LayoutRoom; native?: CoworkRoomCreateResult; ready: string[];
   state: 'provisioning' | 'active' | 'closed'; owner_ready?: boolean;
+  deleted?: boolean;
 };
 export interface RoomLayoutState {
   version: 1; owner?: ReturnType<typeof ownerReference>; agent_templates?: Record<string, import('../config.js').AgentTemplateDefinition>; definition: LayoutDefinition; controller: string;
@@ -148,6 +151,7 @@ export class RoomLayout {
       if (!p.instance) {
         const template = s.definition.participants[member]?.agent_template;
         need(template, `no factory for ${member}`);
+        if (this.supervisor.taskSupervised) p.task_supervised = true;
         await this.mutation(s, `spawn:${resolvedKey}`, () => this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
         await this.verify(p.instance!);
       }
@@ -235,6 +239,27 @@ export class RoomLayout {
       if (s.uncertain) errors.push(`known resources cleaned where possible; inspection still required: ${s.uncertain}`);
       if (errors.length) throw Error(`layout cleanup incomplete: ${errors.join('; ')}`);
       s.closed = true; delete s.closing; this.save(s);
+    }, true);
+  }
+
+  /** Explicit deletion retains a per-room checkpoint until the run is erased.
+   * Finish/cancel continue to use close(), preserving archived rooms.
+   */
+  async delete(actor: string): Promise<void> {
+    await this.close(actor);
+    await this.operation(actor, async state => {
+      for (const room of Object.values(state.rooms)) {
+        if (!room.native || room.deleted) continue;
+        let remote;
+        try { remote = await this.cowork.getRoom(room.native.room_id); }
+        catch (error) { if (!(error instanceof CoworkProtocolError && error.code === 'not_found')) throw error; }
+        if (remote) {
+          need(remote.identity_cid === room.native.identity_cid, 'native room identity changed during deletion');
+          try { await this.cowork.deleteRoom(room.native.room_id); }
+          catch (error) { if (!(error instanceof CoworkProtocolError && error.code === 'not_found')) throw error; }
+        }
+        room.deleted = true; this.save(state);
+      }
     }, true);
   }
 }

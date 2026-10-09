@@ -263,6 +263,7 @@ export interface AcpSessionOptions {
   inheritEnvironment?: boolean;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  requireResume?: boolean;
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
@@ -605,6 +606,7 @@ export class AcpSession implements AgentSession {
       readiness: this.readiness === 'idle' && this.steeringOccupied
         ? 'running' : this.readiness,
       sessionId: this.sessionId,
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -718,6 +720,10 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
+    // A tool-boundary wait may outlive its original turn. Recheck the current
+    // typed source at delivery, since an Owner turn can begin during the wait.
+    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.origin?.kind === 'owner-admin-console')
+      return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);
@@ -1270,6 +1276,8 @@ export class AcpSession implements AgentSession {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
+    if (this.options.requireResume && (!persisted || !(this.agentCapabilities?.sessionCapabilities?.resume != null || this.agentCapabilities?.loadSession)))
+      throw new Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
     let advertisedModes: acp.SessionModeState | null | undefined;
     let advertisedModelId: string | undefined;

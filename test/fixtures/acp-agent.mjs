@@ -200,6 +200,11 @@ createInterface({ input: process.stdin }).on('line', line => {
   }
   if (process.env.ACP_FIXTURE_REQUEST_LOG && message.method)
     appendFileSync(process.env.ACP_FIXTURE_REQUEST_LOG, message.method + '\n');
+  if (process.env.ACP_FIXTURE_REQUEST_JSON_LOG && message.method)
+    appendFileSync(process.env.ACP_FIXTURE_REQUEST_JSON_LOG, JSON.stringify({
+      pid: process.pid, method: message.method, sessionId: message.params?.sessionId,
+      prompt: message.method === 'session/prompt' ? message.params?.prompt : undefined,
+    }) + '\n');
   switch (message.method) {
     case 'initialize':
       send({
@@ -397,7 +402,13 @@ createInterface({ input: process.stdin }).on('line', line => {
       activePromptId = message.id;
       if (/\bstubborn\b/i.test(text)) stubbornPrompts.add(message.id);
       const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);
-      if (PROMPT_DELAY_MS > 0) {
+      if (process.env.ACP_FIXTURE_PROMPT_HOLD_FILE && existsSync(process.env.ACP_FIXTURE_PROMPT_HOLD_FILE)) {
+        const answerWhenReleased = () => {
+          if (existsSync(process.env.ACP_FIXTURE_PROMPT_HOLD_FILE)) setTimeout(answerWhenReleased, 30);
+          else answerPrompt(message.id, stopReasonFor(text));
+        };
+        setTimeout(answerWhenReleased, 30);
+      } else if (PROMPT_DELAY_MS > 0) {
         setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), PROMPT_DELAY_MS);
       } else if (slow) {
         // A turn that stays running for a while: the "busy agent" case. It

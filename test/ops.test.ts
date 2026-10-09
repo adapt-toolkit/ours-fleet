@@ -1,3 +1,4 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
 import { preparePermanentAssignment } from '../src/agent-ours/service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
@@ -252,9 +253,10 @@ describe('up / down / restart', () => {
     const tempDir = agentDir('Temp', true);
     mkdirSync(tempDir, { recursive: true });
     prepareTempSupervisor(tempDir, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
     const { calls, backend } = fakeBackend();
     const commands: string[][] = [];
@@ -608,6 +610,23 @@ describe('explicit operator actions reset the restart circuit', () => {
 });
 
 describe('rmRole', () => {
+  it.each(['active', 'inactive'])('refuses standalone removal of a task-owned member with parent %s before any mutation', async parentState => {
+    writeCfg({});
+    const tempDir = agentDir('OwnedTask', true); mkdirSync(tempDir, { recursive: true });
+    prepareTempSupervisor(tempDir, 'OwnedTask', { taskId: 'task-fixture', roomId: 'room-fixture',
+      roomIdentityCid: 'room-cid', creationActionId: 'original-action' });
+    writeFileSync(join(tempDir, 'WORKLOG.md'), 'retained task work');
+    const before = readFileSync(join(tempDir, '.temp-supervisor.json'));
+    const { backend, calls } = fakeBackend(), { d } = deps(backend);
+    const exec = vi.fn(async () => ({ code: 0, stdout: parentState, stderr: '' })); d.exec = exec;
+    await expect(rmRole(loadConfig(), 'OwnedTask', d)).rejects.toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    expect(exec).not.toHaveBeenCalled(); expect(calls).toEqual([]);
+    expect(readFileSync(join(tempDir, '.temp-supervisor.json'))).toEqual(before);
+    expect(readFileSync(join(tempDir, 'WORKLOG.md'), 'utf8')).toBe('retained task work');
+    expect(existsSync(join(tempDir, '.temp-stop-request.json'))).toBe(false);
+    expect(existsSync(join(dir, '.ours-fleet', 'recovery', 'temporary'))).toBe(false);
+  });
+
   it('removes a proven generated Agent file under a custom manifest stem', async () => {
     const manifest = join(dir, 'custom.yml');
     writeV2Fixture(manifest, { roles: { S: { harness: 'fake' } } });
@@ -639,9 +658,10 @@ describe('rmRole', () => {
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(join(tempDir, 'WORKLOG.md'), 'keep this\n');
     prepareTempSupervisor(tempDir, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
     const { calls, backend } = fakeBackend();
     const { d, logs } = deps(backend);
