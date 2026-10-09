@@ -179,6 +179,17 @@ single-room members can be adopted into durable supervision without changing the
 identity, launch ID or saved conversation. Legacy layout members with no durable
 ownership marker require explicit reconciliation.
 
+`migration_pending` is not boot durability: a still-running legacy transient
+member remains under its old native supervisor. Do not restart it just to clear
+this status. Inspect the exact launch, owner, conversation and admitted-seat
+evidence first; either let the old task retire normally or schedule an operator
+transition as described in the migration runbook. Once that exact process is
+proven stopped with its original retained state intact, run the same
+`ours-fleet task recover-members <task-id>` command and verify every member's
+result. A terminal stop can retire the identity/session and make adoption
+impossible; missing evidence requires reconciliation, never an automatic
+replacement identity or invitation.
+
 Missing private runtime ownership, saved conversation, workspace marker or exact
 room evidence fails closed. Restore the original evidence before retrying. A
 backend that cannot resume the saved conversation cannot silently open a fresh

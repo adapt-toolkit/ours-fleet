@@ -99,6 +99,34 @@ short continuation notice. Plain non-resumable temporaries retire on shutdown.
 These differences are explicit lifecycle behaviour, not a physical-reboot or
 live-host migration qualification.
 
+## Legacy task members still running
+
+`ours-fleet task recover-members <task-id>` leaves a running legacy transient
+member unchanged and reports `migration_pending`. Such a member has not acquired
+the common parent's boot durability. Do not count the task as fully migrated
+until every required member has transferred or retired.
+
+Before any operator transition, preserve the task/room records and the exact
+member's private launch, creator profile, runtime owner, session, admission and
+workspace evidence. Inspect the native target recorded by that launch and prove
+its ownership; do not derive a target from a name alone. Let existing work retire
+normally when that is sufficient. A controlled native transition requires an
+operator-reviewed way to quiesce that exact old process without terminally
+retiring its runtime. `ours-fleet stop` is an explicit retirement request for a
+temporary member and is not a general nonterminal migration command. This
+release provides no automatic live transfer for legacy transient members.
+
+After exact native/process absence is proven, retry
+`ours-fleet task recover-members <task-id>` only if the original ownership,
+conversation and room evidence are intact. Verify the returned per-member
+status and private catalog registration. Lost or terminally retired runtime
+evidence, unknown liveness, ambiguous native targets and legacy layout members
+without durable ownership remain held for explicit reconciliation. Do not
+delete journals, issue another invite or create another identity to force the
+transfer. A stopped legacy member adopted by this command keeps its original
+CID, launch and conversation; that guarantee does not cover a terminally
+retired old process.
+
 ## Failure and retry
 
 Before deployment, inspect the requested roles, package paths, service overrides

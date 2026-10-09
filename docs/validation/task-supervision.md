@@ -1,46 +1,60 @@
 # Retained task members
 
-Open task members keep their temporary external identity lifetime and private
-runtime owner. They use separate task supervisor services instead of configured
-standalone agent entries. Linux units are enabled for the user default target
-with linger; macOS LaunchAgents run at user login. Explicit supervisor mode
-`none` remains detached and requires manual recovery after process loss.
+Permanent and task-created members share one Fleet OS service: a systemd user
+service on Linux or a LaunchAgent on macOS. The parent reads a private member
+catalog and launches the existing agent runner and SDK runtime; Fleet creates no
+new per-task native service. Tasks stay outside the configured standalone roster.
+Explicit supervisor mode `none` retains manual recovery after process loss.
 
-The supervisor resumes the retained role snapshot, cwd, launch and backend
-conversation. Ordinary stop suspends the managed runtime; it does not release
-the identity or archive the member. The counted restart circuit persists and
-never rotates task conversations to escape a failing resume. Saved ACP sessions
-must support load/resume, and native resume must return the same thread ID.
-Missing or conflicting ownership/context fails closed.
+Open task members keep their temporary external identity lifetime, private
+runtime owner, cwd, launch, room admission and supported backend conversation.
+Parent shutdown suspends these retained members. Explicit temporary-member stop,
+terminal retirement and deletion remain retirement operations. Counted restart
+limits hold failing members without rotating conversations. Missing or conflicting
+ownership/context fails closed.
 
-`task recover-members` is an explicit operator recovery path for admitted members.
-It validates the task, workspace token, supervisor/action, private owner/runtime,
-backend context and exact retained room readiness. It resumes stopped services
-or resets a held circuit. Running legacy transient members report
-`migration_pending` without mutation; stopped single-room members require verified
-in-place adoption. Legacy layout members without durable ownership require
-reconciliation. A recovery never provisions a replacement identity or invitation.
+A private body-free cursor distinguishes original assignment pending, interrupted
+work and completed idle conversation. Recovery delivers pending original work,
+continues interrupted work without replaying the assignment, and leaves completed
+idle sessions without another readiness/work prompt. A session not yet established
+may retry only with proof that no readiness or work was submitted. Established
+session loss remains held. Remote dispatch and local persistence are not atomic;
+an uncertain initial dispatch gets a continuation with the briefing path.
 
-Boot-service intent is checkpointed on the seat or owned layout participant
-before spawn and copied to deletion cursors. Service ownership is recorded
-outside temporary state before installation, with
-the original task/action/launch and a hash of the complete unit/plist. Cleanup
-validates this proof before disabling or removing the service and deletes the
-proof last. Lost temporary state and already-absent identities do not bypass
-service retirement; a lost layout run with retained service proof blocks deletion.
-Legacy launches with no boot-service evidence retain transient compatibility.
-Existing lifecycle retirement remains terminal; terminal tasks are
-not automatically relaunched.
+`task recover-members` validates the task, workspace, supervisor/action, private
+owner/runtime, backend context and retained room readiness. It resumes proven
+stopped members or resets a held circuit. Running legacy transient members report
+`migration_pending` without mutation and have not acquired boot durability.
+Stopped single-room members require verified in-place adoption; legacy layout
+members without durable ownership require reconciliation. Recovery never
+provisions a replacement identity or invitation.
+
+Task deletion stops and unregisters the exact owned catalog member, then releases
+its saved runtime owner after seat/launch/action/CID checks. Identity removal,
+absence verification and artifact erasure are retryable. Permanent agents and the
+shared parent remain registered. Legacy native service retirement uses separately
+retained ownership receipts, exact unit/plist hashes and native/process absence
+checks; lost temporary state never bypasses this proof.
+
+Upgrade requires explicit `ours-fleet init` and preservation of operator readiness
+hooks on the common parent. Parent restart affects all members; permanent agents
+retain their existing readiness/continuity prompts and may receive a new private
+runtime instance after orderly release. Managed `stop` persists across reboot.
+Non-resumable temporary members retire on parent shutdown, and managed native
+supervision refuses a custom Fleet home. See the
+[migration, legacy task and rollback runbook](central-supervisor-migration.md).
 
 ## Qualification boundaries
 
-| Check | Evidence | Limit |
+| Check | Required evidence | Limit |
 | --- | --- | --- |
-| Boot-service configuration | Isolated Linux/macOS files and injected manager calls; systemd syntax verification | No actual host boot, systemd install or launchd bootstrap |
-| Supervisor process loss | Actual overlapping processes, SIGTERM, SIGKILL and successor launch | Injected harness attempt |
-| Identity owner and daemon restart | Actual isolated daemon and SDK external lease; member process replacement and isolated daemon restart | Seat observation and conversation bytes are fixtures; no actual Cowork service or authenticated harness |
+| Parent and legacy migration | Isolated Linux/macOS files and injected manager calls; exact owner/native absence and operator hook checks | No physical boot or live native service migration |
+| Default parent lifecycle | Real parent/default worker spawn through existing runner, isolated daemon and SDK owner, ACP protocol fixture | No authenticated provider or live Cowork service |
+| Task recovery and cleanup | Original/interrupted/idle cursor cases, TERM/KILL, parent-up/down deletion, layout retirement and retry faults at one integrated source head | Qualification results must identify their exact source head |
 | Harness context retention | Runner, ACP and native transport tests | Protocol fixtures rather than provider conversations |
-| Default standalone roster | Fleet configured-role/default-list regressions | Explicit temporary inspection remains supported; App Agents filtering requires its companion PR |
+| Standalone roster | Fleet metadata and App companion PR | Explicit task-member inspection stays available |
 
-No deployed-service change, physical reboot or live task relaunch is part of
-this source qualification. Owner acceptance and rollout are separate.
+This document describes acceptance criteria and scope; the PR records actual
+results. Physical reboot, linger/boot ordering, macOS launchd on a real host,
+live host migration and real provider sessions remain unqualified. No deployment,
+merge or Owner acceptance follows from source/test qualification.
