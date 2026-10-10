@@ -185,3 +185,41 @@ before erasing task/room/workspace resources. Permanent siblings remain intact.
 Standalone CLI/web removal refuses `TASK_MEMBER_IS_TASK_OWNED`; use the owning
 task lifecycle. Lost/corrupt task or launch records require restoring original
 backup evidence or explicit ownership reconciliation before deletion can finish.
+
+## Owner lifecycle notifications
+
+A task mutation commits its notification event in the same atomic task record as
+its effective status. Creation, backlog, provisioning, active, review, done,
+cancelled and failed are covered; block/unblock and deletion are effective changes
+as well. Editing a description, list, block reason or saga checkpoint is not a
+status transition. Each event freezes the task identity, title, old/new status and
+navigation route at commit time, so several transitions between delivery polls
+remain separate. Legacy records begin emitting on their next actual change and
+are not retroactively announced as newly created.
+
+The Fleet manager drains committed task events without requiring the web console
+or restarting agents. Its notification producer uses the installation's existing
+owner-scoped credential; it grants no agent arbitrary-send capability. Missing
+configuration or service failure retains the events. Delivery acknowledgement
+runs under the task lock and removes only the accepted event, preserving newer
+changes. A corrupt/unreadable task record is isolated with a safe warning, so
+other tasks continue. Bounded rotating batches prevent one rejected task from
+blocking the entire sender. The built-in `default` task list is unchanged.
+
+Deleting is announced only after its intent commits. Before unlink, settlement
+prepares retained pending events plus a stable deleted event outside the task-owned
+workspace. The sender admits that retained copy only when the original task record
+is absent; an interrupted or failed unlink cannot announce deletion. The final
+event opens the task list and includes the removed task's identity. Earlier events
+keep their immutable detail routes, which may be absent after explicit deletion.
+
+A service restart or producer crash after acceptance may replay an event; the
+Notifications service must retain its acceptance receipts across read/delete to
+make that replay harmless. Upgrade Notifications alongside Fleet to obtain this
+stronger guarantee. The service's authenticated delivery diagnostics distinguish
+provider acceptance, retry, expired subscription and foreground suppression.
+Provider acceptance is not evidence of actual phone receipt. iPhone Web Push
+requires a supported Home Screen installation and granted device/browser permission;
+reopen the workspace to reconcile an expired subscription and explicitly re-enable
+permission if it was revoked. Every received push must display a notification to
+honor Safari's user-visible push requirement.

@@ -1,5 +1,5 @@
 import type { ArchivedMemberAbsence } from './types.js';
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically } from '../atomic-file.js';
@@ -8,7 +8,7 @@ import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
-  TaskDeletionActor, TaskDeletionMemberPhase,
+  TaskDeletionActor, TaskDeletionMemberPhase, TaskNotificationEvent,
 } from './types.js';
 import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
@@ -88,7 +88,66 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
   mkdirSync(tasksDir(), { recursive: true });
   const persisted = { ...record } as Record<string, unknown>;
   delete persisted.list_name;
+  const path = taskPath(record.task_id);
+  const previous = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord : undefined;
+  const status = (task: StoredTaskRecord) => task.deletion?.status === 'pending' ? 'deleting' : task.blocked ? `${task.state} (blocked)` : task.state;
+  // Read pending events under the same task lock as every mutation. Metadata edits
+  // and retries preserve the queue; acknowledgement cannot be resurrected by stale input.
+  const pending = [...(previous?.notification_events ?? [])];
+  if (!previous || status(previous) !== status(record)) {
+    const next = status(record), before = previous ? status(previous) : undefined;
+    pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
+      title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
+      body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
+      url: `/fleet/tasks/${record.task_id}` });
+  }
+  if (pending.length) persisted.notification_events = pending;
+  else delete persisted.notification_events;
   replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
+}
+
+const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
+
+/** Atomic snapshots contain the events, including intermediate states between polls. */
+export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[] }> {
+  const result: Array<{ taskId: string; events: TaskNotificationEvent[] }> = [];
+  for (const dir of [tasksDir(), retiredNotificationsDir()]) {
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir).filter(file => TASK_ID_PATTERN.test(file.slice(0, -5)) && file.endsWith('.json'))) {
+      try {
+        const path = join(dir, file), stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('invalid notification source');
+        const value = JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord;
+        const id = file.slice(0, -5);
+        // A prepared deletion copy has no authority while the original still exists.
+        if (dir === retiredNotificationsDir() && existsSync(taskPath(id))) continue;
+        if (value.notification_events === undefined) continue;
+        if (!Array.isArray(value.notification_events) || value.notification_events.some(e => !e
+          || typeof e.eventId !== 'string' || !e.eventId.startsWith(`task:${id}:`) || e.eventId.length > 512
+          || e.taskId !== id || (e.url !== `/fleet/tasks/${id}` && !(e.eventId === `task:${id}:deleted` && e.url === `/fleet/tasks?deletedTask=${id}`)) || typeof e.title !== 'string' || !e.title.trim() || e.title.length > 160
+          || typeof e.body !== 'string' || !e.body.trim() || e.body.length > 512)) throw new Error('invalid notification events');
+        if (value.notification_events.length) result.push({ taskId: id, events: value.notification_events });
+      } catch (error) {
+        if (!isNotFoundError(error)) warn('Task notification record unavailable; other task deliveries continue');
+      }
+    }
+  }
+  return result;
+}
+
+/** Service event-id dedupe covers acceptance followed by a crash before this acknowledgement. */
+export function acknowledgeTaskNotification(id: string, eventId: string): void {
+  assertCanonicalTaskId(id);
+  withTaskLock(id, () => {
+    for (const path of [taskPath(id), join(retiredNotificationsDir(), `${id}.json`)]) {
+      if (!existsSync(path)) continue;
+      const value = JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord;
+      if (!value.notification_events?.some(event => event.eventId === eventId)) continue;
+      value.notification_events = value.notification_events.filter(event => event.eventId !== eventId);
+      replaceFileAtomically(path, JSON.stringify(value, null, 2) + '\n');
+      if (path.startsWith(retiredNotificationsDir() + '/') && !value.notification_events.length) unlinkSync(path);
+    }
+  });
 }
 
 function presentTask(record: StoredTaskRecord): TaskRecord {
@@ -919,6 +978,13 @@ export function unlinkDeletedTask(id: string): boolean {
   }
   if (stored.deletion?.status !== 'pending')
     throw new TaskStateError(`task ${id} has no pending deletion`);
+  // Preserve committed deliveries outside the record before deletion. A crash
+  // before unlink may replay two copies; both carry identical service dedupe IDs.
+  const removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
+    title: `Task deleted: ${stored.title}`.slice(0, 160), body: `Task ${id}: deleting → deleted.`,
+    url: `/fleet/tasks?deletedTask=${id}` };
+  replaceFileAtomically(join(retiredNotificationsDir(), `${id}.json`),
+    JSON.stringify({ notification_events: [...(stored.notification_events ?? []), removed] }) + '\n');
   try {
     unlinkSync(taskPath(id));
   } catch (error) {

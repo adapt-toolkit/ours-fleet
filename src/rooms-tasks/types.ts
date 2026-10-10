@@ -131,7 +131,13 @@ export interface TaskLayoutLink {
   definition_hash: string;
 }
 
+export interface TaskNotificationEvent {
+  eventId: string; title: string; body: string; url: string; taskId: string;
+}
+
 export interface TaskRecord {
+  /** Pending lifecycle events, committed atomically with their task change. */
+  notification_events?: TaskNotificationEvent[];
   workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
