@@ -1,6 +1,6 @@
 import { preparePermanentAssignment } from '../src/agent-ours/service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -156,6 +156,7 @@ describe('spawnPermanent', () => {
       bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt'),
     }, d);
     const doc = parse(readFileSync(file, 'utf8'));
+    expect(statSync(file).mode & 0o777).toBe(0o600);
     expect(doc.role.inline.bio).toBe('A public card.');
     expect(doc.role.inline.persona).toBe('An operating contract.');
     expect(doc.coordinator).toBe('Coord');

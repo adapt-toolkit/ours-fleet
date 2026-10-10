@@ -441,10 +441,10 @@ export function daemonIdentityInventoryProvisioner(
   });
 }
 
-/** Atomically write a bare Agent file, journalling it for rollback. */
+/** Atomically write an owner-private Agent file, journalling it for rollback. */
 export function writeRoleFile(tx: CreationTransaction, file: string, contents: string): void {
   const existed = existsSync(file);
-  replaceFileAtomically(file, contents, 0o644);
+  replaceFileAtomically(file, contents, 0o600);
   tx.record({
     stage: `Agent file ${file}`,
     // Only remove what THIS transaction created; never delete a file the
