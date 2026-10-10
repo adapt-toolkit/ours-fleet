@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { closeSync, existsSync, openSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { producerConfig } from '../notifications/outbox.js';
+import { TaskNotificationProducer } from '../notifications/task-producer.js';
 import { acquireOwnerBinderLease } from '../owner-channel/binder.js';
 import { stateRoot } from '../paths.js';
 import { readRestartLedger, writeRestartLedger, backoffFor, RESTART_FAIL_THRESHOLD } from '../runner.js';
@@ -40,6 +42,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
       });
     } finally { closeSync(fd); }
   });
+  let notifications: TaskNotificationProducer | undefined;
   async function reconcile(key: string): Promise<void> {
     await withMemberLock(key, async () => {
       const member = readMember(key);
@@ -131,6 +134,10 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
   }
   try {
     try {
+      const config = producerConfig(process.env, undefined, log);
+      if (config) notifications = new TaskNotificationProducer(config, log);
+    } catch { log('[fleet] task notifications unavailable; committed events retained'); }
+    try {
       const { resumeFleetTransfers } = await import('./adoption.js');
       await resumeFleetTransfers(entrypoint, exec);
     } catch (error) {
@@ -147,6 +154,7 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
     }
   } finally {
     stopping = true;
+    await notifications?.close();
     // Shutdown preserves desired intent; the successor resumes the same catalog.
     const deadline = Date.now() + 17_000;
     while (children.size && Date.now() < deadline) {
