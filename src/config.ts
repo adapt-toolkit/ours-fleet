@@ -70,15 +70,21 @@ export type MonitorInterrupt = boolean | 'after_tool';
 export const MANAGED_CLI_WORKFLOW_IDS = ['task-workflow'] as const;
 export type ManagedCliWorkflowId = (typeof MANAGED_CLI_WORKFLOW_IDS)[number];
 
-export interface FileDeliveryConfig { enabled: boolean; directory: string }
+/** Retired opt-in. Both keys are accepted so existing manifests load, and neither has any effect. */
+export interface FileDeliveryConfig { enabled?: boolean; directory?: string }
 
+/**
+ * Current-chat file delivery is on for every Agent and takes the path the Agent
+ * provides. A legacy block is shape-checked only: `enabled: false` does not turn
+ * delivery off and `directory` does not restrict or create anything.
+ */
 export function validateFileDelivery(value: unknown): FileDeliveryConfig | undefined {
   if (value === undefined) return undefined;
   if (!isPlainObject(value) || Object.keys(value).some(k => !['enabled', 'directory'].includes(k))
-      || typeof value.enabled !== 'boolean' || typeof value.directory !== 'string'
-      || !value.directory || value.directory.split('/').some(p => !p || p.startsWith('.') || /[\\\x00-\x1f]/.test(p)))
-    throw new ConfigError('file_delivery requires enabled:boolean and a relative non-hidden directory');
-  return value as unknown as FileDeliveryConfig;
+      || (value.enabled !== undefined && typeof value.enabled !== 'boolean')
+      || (value.directory !== undefined && typeof value.directory !== 'string'))
+    throw new ConfigError('file_delivery is retired and ignored; it accepts only the legacy enabled:boolean and directory:string keys');
+  return value as FileDeliveryConfig;
 }
 
 export interface CommonPermissions {
@@ -265,7 +271,7 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
   /** Fleet-prepared CLI workflows this role may run outside its command sandbox. */
   managed_cli?: ManagedCliWorkflowId[];
-  /** Explicit per-Agent export opt-in; not inherited from manifest defaults. */
+  /** Retired and ignored; current-chat file delivery needs no Agent setting. */
   file_delivery?: FileDeliveryConfig;
 }
 
@@ -290,7 +296,7 @@ export interface AgentDefinition {
   auth_proxy?: Partial<AuthProxyConfig>;
   /** Fleet-prepared CLI workflows this Agent may run outside its command sandbox. */
   managed_cli?: ManagedCliWorkflowId[];
-  /** Explicit per-Agent export opt-in; not inherited from manifest defaults. */
+  /** Retired and ignored; current-chat file delivery needs no Agent setting. */
   file_delivery?: FileDeliveryConfig;
   /** Scheduled turns scoped only to temporary launches; persistent Agents reject this field. */
   loops?: AgentLoopsConfig;

@@ -1,8 +1,10 @@
-import type { ExportRoot } from '../file-delivery/reader.js';
 import { randomUUID } from 'node:crypto';
 import type { FileExecutionContext } from '@ours.network/mcp/server';
 import type { ToolRequestExtra } from '@ours.network/mcp/dist/types/mcp/tool.js';
 import { MAX_CHUNK_BYTES, type Wire } from './wire.js';
+
+/** Bridge refusals of a current-chat file that are safe to relay verbatim. */
+const CHAT_FILE_REFUSAL = /^(INVALID_CHAT_FILE_PATH|CHAT_FILE_[A-Z_]{1,40}|FILE_EXCEEDS_20_MIB)$/;
 
 /** Call-scoped callbacks carry no daemon credentials or upload receipts. */
 export class FileCallbacks implements FileExecutionContext {
@@ -18,7 +20,7 @@ export class FileCallbacks implements FileExecutionContext {
     if (!p) throw Error('UNSOLICITED_FILE_RESPONSE');
     this.pending.delete(frame.id);
     clearTimeout(p.timer);
-    if (frame.error) p.reject(Error('AGENT_FILE_OPERATION_FAILED'));
+    if (frame.error) p.reject(Error(typeof frame.error === 'string' && CHAT_FILE_REFUSAL.test(frame.error) ? frame.error : 'AGENT_FILE_OPERATION_FAILED'));
     else p.resolve(frame.value);
   }
   close(): void {
@@ -60,18 +62,20 @@ export class FileCallbacks implements FileExecutionContext {
   async read(path: string, extra: ToolRequestExtra) {
     return this.openRead(path, extra);
   }
-  async readExport(path: string, root: ExportRoot, extra: ToolRequestExtra) {
-    return this.openRead(path, extra, root);
+  /** Current-chat source: integrity-checked by the bridge, with its real path. */
+  async readChatFile(path: string, extra: ToolRequestExtra) {
+    return this.openRead(path, extra, true) as Promise<Awaited<ReturnType<FileCallbacks['read']>> & { path: string }>;
   }
-  private async openRead(path: string, extra: ToolRequestExtra, root?: ExportRoot) {
+  private async openRead(path: string, extra: ToolRequestExtra, chat = false) {
     const call = String(extra.requestId),
       handle = randomUUID();
-    const meta = await this.rpc(call, root ? 'export-open' : 'read-open', { path, handle, ...(root ? { root } : {}) }, extra.signal);
+    const meta = await this.rpc(call, chat ? 'export-open' : 'read-open', { path, handle }, extra.signal);
     if (
       !meta ||
       typeof meta.filename !== 'string' ||
       !Number.isSafeInteger(meta.size) ||
-      meta.size < 0
+      meta.size < 0 ||
+      (chat && typeof meta.path !== 'string')
     )
       throw Error('INVALID_FILE_METADATA');
     let closed = false;
@@ -99,7 +103,7 @@ export class FileCallbacks implements FileExecutionContext {
       },
       cancel: close,
     });
-    return { filename: meta.filename, size: meta.size, body, close };
+    return { filename: meta.filename, size: meta.size, body, close, ...(chat ? { path: meta.path as string } : {}) };
   }
   async write(path: string, body: ReadableStream<Uint8Array>, extra: ToolRequestExtra) {
     const call = String(extra.requestId),
