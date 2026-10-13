@@ -648,7 +648,8 @@ export function makeCodexAdapter(
             'accept that readiness and continue without rebinding or profile reconciliation. ' +
             'Mail wakes arrive as `[fleet-monitor]` lines; do NOT arm arm_monitor/foreground_monitor. ' +
             'Announce console readiness first without tools, then end that readiness turn. ' +
-            `For a separate continuation task, read ${worklog} once for continuity and reuse it in that wake. ` +
+            `For a separate continuation task, read ${worklog} once for continuity if it records previous work; ` +
+            'do not read it again later in this session. ' +
             'Do not re-run whatever crashed you.';
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +

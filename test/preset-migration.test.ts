@@ -189,7 +189,9 @@ describe('packaged role-default adoption', () => {
         'coordinator: FleetCoordinator',
         'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
         '',
-      ].join('\n') : readFileSync(path, 'utf8')
+      // The revision-5 continuity loop is the one revision 10 still shipped.
+      ].join('\n') : readFileSync(role === 'LocalCoordinator'
+        ? new URL('./fixtures/presets/LocalCoordinator.revision-10.yaml', import.meta.url) : path, 'utf8')
         .replace('monitor: { mode: fleet, interrupt: after_tool }\n', '')
         // Revision 5 asked before acting; the packaged files have since been given the testing default.
         .replace('permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
@@ -225,6 +227,33 @@ describe('packaged role-default adoption', () => {
     expect(current).not.toContain('If delivery fails');
     expect(current).toContain('introduce yourself in your first reply');
     expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: `coordinator-${revision}-again` }).replacements).toEqual([]);
+  });
+
+  it('adopts the untouched revision-10 LocalCoordinator template, whose continuity loop reread state files every pass', () => {
+    const config = join(dir, 'local-coordinator-10.yaml');
+    bootstrapPresets(config);
+    const path = join(splitRootFor(config), 'agent_templates', 'LocalCoordinator.yaml');
+    const previous = readFileSync(new URL('./fixtures/presets/LocalCoordinator.revision-10.yaml', import.meta.url), 'utf8');
+    expect(previous).toContain('Re-read ROUTINES.md');
+    writeFileSync(path, previous, { mode: 0o600 });
+    expect(migratePackagedRoleDefaults(config).replacements).toContain(path);
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: 'local-coordinator-10' });
+    const current = readFileSync(path, 'utf8');
+    expect(current).toBe(readFileSync(join(packagedPresetRoot(), 'fleet', 'agent_templates', 'LocalCoordinator.yaml'), 'utf8'));
+    expect(current).not.toContain('Re-read');
+    expect(current).toContain('suppress a semantic duplicate');
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'local-coordinator-10-again' }).replacements).toEqual([]);
+  });
+
+  it('preserves an edited revision-10 LocalCoordinator template byte-for-byte', () => {
+    const config = join(dir, 'local-coordinator-custom.yaml');
+    bootstrapPresets(config);
+    const path = join(splitRootFor(config), 'agent_templates', 'LocalCoordinator.yaml');
+    const custom = readFileSync(new URL('./fixtures/presets/LocalCoordinator.revision-10.yaml', import.meta.url), 'utf8')
+      .replace('interval: 15m', 'interval: 20m');
+    writeFileSync(path, custom, { mode: 0o600 });
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'local-coordinator-custom' }).replacements).not.toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(custom);
   });
 
   it('preserves an edited Coordinator role byte-for-byte', () => {

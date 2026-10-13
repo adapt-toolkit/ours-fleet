@@ -436,7 +436,8 @@ export function makeClaudeCodeAdapter(
           'Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
           'do NOT arm an in-session Monitor. ' +
           'Announce console readiness first without tools, then end that readiness turn. ' +
-          `For a separate continuation task, read ${worklog} once for continuity and reuse it in that wake. ` +
+          `For a separate continuation task, read ${worklog} once for continuity if it records previous work; ` +
+          'do not read it again later in this session. ' +
           'Do not re-run whatever crashed you.'
         : `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
           `then ${armMonitor(id)}, then continue from ${worklog}. Do not re-run whatever crashed you.`,

@@ -20,7 +20,7 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(10);
+    expect(seeded.revision).toBe(11);
     expect(seeded.created).toHaveLength(102);
     // The standard experiences are also seeded as editable, web-visible room layouts.
     expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
@@ -38,6 +38,10 @@ describe('packaged preset bootstrap', () => {
     expect(continuity?.prompt).toMatch(/CONTINUITY CHECK/);
     expect(continuity?.prompt).toMatch(/CONTINUITY STALLED/);
     expect(continuity?.prompt).toMatch(/suppress a semantic duplicate/);
+    // The checkpoint is dedupe state the session already holds, not a per-pass reread.
+    expect(continuity?.prompt).toMatch(/Read the\s+checkpoint in WORKLOG\.md only when it is missing from your context/);
+    expect(continuity?.prompt).toMatch(/Append a secret-free WORKLOG checkpoint/);
+    expect(continuity?.prompt).not.toMatch(/Re-read/);
     expect(cfg.agentTemplates?.Developer.loops).toBeUndefined();
     expect(cfg.agentTemplates?.Critic.loops).toBeUndefined();
     for (const template of listTemplates(cfg.roomTemplates ?? {})) {

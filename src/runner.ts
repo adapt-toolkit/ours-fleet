@@ -1,7 +1,7 @@
 import { readProvenance } from './creation.js';
 import { firstManagedSessionMayStart, managedRecoveryPath, readManagedRecovery, writeManagedRecovery, type ManagedRecovery } from './managed-recovery.js';
 import { StartupTelemetry } from './startup-telemetry.js';
-import { managedStartupPrompt, managedTaskPrompt } from './startup-prompt.js';
+import { managedStartupPrompt, managedTaskPrompt, worklogRecordsPriorWork } from './startup-prompt.js';
 import { createLayoutControl } from './rooms-tasks/layout-control.js';
 import { TemporaryChatIdle } from './temp-idle.js';
 import { taskSupervisorMayRun, taskMemberRetirementProof } from './task-supervision.js';
@@ -976,7 +976,10 @@ export async function runOnce(
         };
       },
     };
-    const firstPrompt = managedStartupPrompt(dir, mode, booted);
+    // The worklog is continuity input only when it records work. It outlives `.booted`,
+    // which a rotation to a fresh conversation clears, so the log itself is the evidence.
+    const priorWork = worklogRecordsPriorWork(dir);
+    const firstPrompt = managedStartupPrompt(dir, mode, priorWork);
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never completed its readiness turn.
@@ -1062,7 +1065,7 @@ export async function runOnce(
         : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. '
           + (recoveryBefore?.initial === 'dispatching' ? `If you have not yet received your assignment, read ${join(dir, 'briefing.md')} once before acting. ` : '')
           + 'Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
-      : configuredWork || booted ? managedTaskPrompt(dir, mode, booted) : undefined;
+      : configuredWork || booted || priorWork ? managedTaskPrompt(dir, mode, priorWork) : undefined;
     if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
       saveRecovery({ initial: 'dispatching', active: true });
       const queued = await arbiter.queuePrompt(workPrompt, {

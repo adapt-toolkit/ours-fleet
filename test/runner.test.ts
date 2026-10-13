@@ -1,5 +1,6 @@
 import { writeManagedRecovery, readManagedRecovery } from '../src/managed-recovery.js';
 import { gatewayFixture } from './gateway-fixture.js';
+import { controlRequest } from '../src/session/control.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
@@ -26,7 +27,7 @@ import { agentDir, stateRoot } from '../src/paths.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
 import type { HarnessAdapter } from '../src/harness/types.js';
-import type { MonitorOpts } from '../src/monitor.js';
+import { formatNotificationLine, type MonitorOpts } from '../src/monitor.js';
 import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
@@ -1489,10 +1490,14 @@ describe('runOnce ACP startup outcome', () => {
 });
 
 describe('runOnce monitor integration', () => {
-  it.each([false, true])('starts configured work after readiness without waiting for task completion (prior boot=%s)', async priorBoot => {
+  it.each([
+    [false, false], [true, false], [true, true],
+  ])('starts configured work after readiness without waiting for task completion (prior boot=%s, recorded work=%s)', async (priorBoot, priorWork) => {
     writeCfg({ A: { harness: 'fake', mission: 'Inspect the assigned fixture patch.' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     if (priorBoot) writeFileSync(join(d, '.booted'), 'earlier run\n');
+    // A restart alone is not continuity: only a worklog with entries is read back.
+    writeFileSync(join(d, 'WORKLOG.md'), priorWork ? '- earlier milestone\n' : '');
     const world = fakeWorld();
     const prompts: string[] = [], logs: string[] = [];
     let completeReady!: (value: TurnResult) => void;
@@ -1520,10 +1525,107 @@ describe('runOnce monitor integration', () => {
     await running; // Task turn remains unsettled; supervisor still ran the monitor.
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain('Readiness has already been announced');
-    expect(prompts[1].includes('WORKLOG.md')).toBe(priorBoot);
+    expect(prompts[0].includes('WORKLOG.md')).toBe(priorWork);
+    expect(prompts[1].includes('WORKLOG.md')).toBe(priorWork);
+    // The fake harness resumes: a restored conversation keeps the briefing it already read.
+    expect(prompts[1]).toContain(priorBoot ? 'Your conversation was restored and already holds'
+      : 'This is the one briefing read of this session');
     expect(world.monitor.ranPid).toBe(4242);
     expect(logs.some(line => line.includes('stage=readiness_turn_completed'))).toBe(true);
     expect(logs.some(line => line.includes('] up;'))).toBe(true);
+  });
+
+  it('reads the briefing in the session startup turns only: repeated mail wakes and a restart add no reread', async () => {
+    writeCfg({ A: { harness: 'fake', mission: 'Inspect the assigned fixture patch.' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'WORKLOG.md'), '');
+    const wake = (id: number) => formatNotificationLine([{ event: 'message_received', from: 'Peer', msg_id: id }]);
+    const userTurn = 'Please also update the changelog.';
+    const session = async (wakes: string[], exitCode = '1') => {
+      // A non-zero exit keeps the conversation; a clean exit rotates to a fresh one.
+      const world = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') }), prompts: string[] = [];
+      const start = world.deps.startAgentSession, alive = world.deps.isAlive;
+      // The session outlives its deliveries, so the control socket is still serving the user turn.
+      let delivered = false;
+      world.deps.isAlive = () => !delivered || alive();
+      // The fake clock never yields; socket I/O needs the event loop while the session is held open.
+      const sleep = world.deps.sleep;
+      world.deps.sleep = async ms => { if (!delivered) await new Promise(r => setImmediate(r)); return sleep(ms); };
+      world.deps.startAgentSession = async (...args) => {
+        const live = await start(...args), queue = live.queuePrompt, liveAlive = live.isAlive;
+        live.isAlive = () => !delivered || liveAlive();
+        live.queuePrompt = async text => { prompts.push(text); return queue(text); };
+        live.submitPrompt = async text => (await live.queuePrompt(text)).completion;
+        return live;
+      };
+      world.deps.createMonitor = opts => ({
+        prime: async () => {},
+        run: async () => {
+          for (const text of wakes) await opts.deps.delivery!.submit(text, { interrupt: false });
+          // An ordinary user turn through the production control socket.
+          const sent = await controlRequest(d, { command: 'submit_prompt', text: userTurn });
+          expect(sent.ok).toBe(true);
+          delivered = true;
+        },
+        stop: () => {},
+      });
+      const result = await runOnce('A', {}, world.deps);
+      return { prompts, mode: result.mode };
+    };
+    const reads = (text: string) => /briefing\.md|WORKLOG\.md|ROUTINES\.md|routines|worklog/i.test(text);
+
+    // Initial session: readiness, then the one task turn that reads the briefing.
+    const first = await session([wake(1), wake(2), wake(3)]);
+    expect(first.mode).toBe('fresh');
+    expect(first.prompts).toHaveLength(6);
+    expect(first.prompts[0]).toContain('Fleet readiness check');
+    expect(first.prompts[1]).toContain(`Read and follow ${join(d, 'briefing.md')}`);
+    expect(first.prompts[1]).not.toContain('WORKLOG.md');
+    // Every later arrival is delivered verbatim, with no instruction-file read attached.
+    expect(first.prompts.slice(2)).toEqual([wake(1), wake(2), wake(3), userTurn]);
+    expect(first.prompts.slice(2).some(reads)).toBe(false);
+
+    // Restart with recorded work: the restored conversation keeps its briefing.
+    writeFileSync(join(d, 'WORKLOG.md'), '- opened the PR\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+    const restarted = await session([wake(4)], '0');
+    expect(restarted.mode).toBe('resume');
+    expect(restarted.prompts).toHaveLength(4);
+    expect(restarted.prompts[0]).toContain('Fleet readiness check');
+    for (const prompt of restarted.prompts.slice(0, 2)) {
+      expect(prompt).toContain(`already holds ${join(d, 'briefing.md')}`);
+      expect(prompt).not.toContain('Read and follow');
+      expect(prompt).toContain(`${join(d, 'WORKLOG.md')} only as needed to recover your next action`);
+    }
+    expect(restarted.prompts.slice(2)).toEqual([wake(4), userTurn]);
+    expect(restarted.prompts.slice(2).some(reads)).toBe(false);
+
+    // That clean exit rotated to a fresh conversation: `.booted` is gone, the worklog is not.
+    expect(existsSync(join(d, '.booted'))).toBe(false);
+    const rotated = await session([wake(5)]);
+    expect(rotated.mode).toBe('fresh');
+    expect(rotated.prompts).toHaveLength(4);
+    expect(rotated.prompts[0]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
+    expect(rotated.prompts[1]).toContain(`Read and follow ${join(d, 'briefing.md')}`);
+    expect(rotated.prompts[1]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
+    expect(rotated.prompts.slice(2)).toEqual([wake(5), userTurn]);
+  });
+
+  it('restores continuity in a fresh conversation that has a retained worklog but no configured task', async () => {
+    writeCfg({ A: { harness: 'fake', bio: 'Public charter only' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'WORKLOG.md'), '- earlier milestone\n');
+    const world = fakeWorld(), prompts: string[] = [];
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args), queue = session.queuePrompt;
+      session.queuePrompt = async text => { prompts.push(text); return queue(text); };
+      return session;
+    };
+    const result = await runOnce('A', {}, world.deps);
+    expect(result.mode).toBe('fresh');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
   });
 
   it('leaves a fresh agent with no configured task idle after readiness', async () => {

@@ -88,6 +88,14 @@ const OWNER_CHANNEL_COORDINATOR_FINGERPRINTS: Readonly<Record<string, readonly s
   ],
 });
 
+// The packaged revision-10 LocalCoordinator continuity loop reread ROUTINES.md and the WORKLOG
+// checkpoint on every 15-minute pass. Untouched copies adopt the current template; edited ones stay.
+const REREADING_CONTINUITY_LOOP_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'agent_templates/LocalCoordinator.yaml': [
+    '53889cd3987e25ca42be64ddcfa1cf46a73ab769070db144f5b7d86085734178',
+  ],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'roles/Engineer.yaml',
@@ -242,6 +250,7 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(V4_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V5_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS),
+      ...Object.keys(REREADING_CONTINUITY_LOOP_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -254,6 +263,7 @@ export function migratePackagedRoleDefaults(
         V5_ROLE_DEFAULT_FINGERPRINTS[relative],
         V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
         ...(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS[relative] ?? []),
+        ...(REREADING_CONTINUITY_LOOP_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);

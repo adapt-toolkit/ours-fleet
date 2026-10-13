@@ -183,13 +183,21 @@ describe('generateBriefing', () => {
     expect(b).toContain(`Authenticated Owner seat CID: \`${owner}\``);
     expect(b).toContain(`authenticated author CID equals \`${owner}\``);
     expect(b).toMatch(/display name or role says “Owner”/i);
+    // A task-room member reads its instruction files once per session, never per wake.
+    expect(b).toContain('Read this briefing once per session');
+    expect(b).toContain('/s/agents/Alice/ROUTINES.md` exists, read it once per session before acting');
+    expect(b).toContain('In a new conversation with recorded previous work, read the worklog once');
+    expect(b).toContain('A restored conversation continues from its own context.');
+    expect(b).toContain('including a fresh temporary agent');
+    expect(b).not.toMatch(/For a concrete task or mail wake|in that wake|in each later wake|[Ww]ithin a wake|same wake/);
   });
 
   it('renders the Routines section with the injected routinesPath', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('## Routines');
     expect(b).toContain('/s/agents/Alice/ROUTINES.md');
-    expect(b).toContain('read it once in that wake before acting');
+    expect(b).toContain('read it once per session before acting');
+    expect(b).toContain('not at the start of every wake');
     // Mechanical section: sits right after the Durable log section.
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });

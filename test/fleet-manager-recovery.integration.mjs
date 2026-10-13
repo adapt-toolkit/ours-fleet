@@ -304,7 +304,8 @@ if (process.argv[2] === 'parent') {
     const permanentPrompts = lines(permanent.wire).filter(row => row.method === 'session/prompt')
       .map(row => row.prompt.filter(part => part.type === 'text').map(part => part.text).join(''));
     assert.deepEqual(permanentPrompts, Array.from({ length: 3 }, () => [
-      managedStartupPrompt(permanent.dir, 'resume', true), managedTaskPrompt(permanent.dir, 'resume', true),
+      // A restart that recorded no work is not continuity: the restored conversation gets no worklog read.
+      managedStartupPrompt(permanent.dir, 'resume', false), managedTaskPrompt(permanent.dir, 'resume', false),
     ]).flat());
     assert.match(taskPrompts()[1], /^Fleet supervisor restarted\. Continue pending work/);
     assert(taskPrompts()[1].includes(join(task.dir, 'briefing.md')));
