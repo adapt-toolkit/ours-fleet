@@ -976,8 +976,9 @@ export async function runOnce(
         };
       },
     };
-    // The worklog is continuity input only when an earlier start left work in it.
-    const priorWork = booted && worklogRecordsPriorWork(dir);
+    // The worklog is continuity input only when it records work. It outlives `.booted`,
+    // which a rotation to a fresh conversation clears, so the log itself is the evidence.
+    const priorWork = worklogRecordsPriorWork(dir);
     const firstPrompt = managedStartupPrompt(dir, mode, priorWork);
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
@@ -1064,7 +1065,7 @@ export async function runOnce(
         : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. '
           + (recoveryBefore?.initial === 'dispatching' ? `If you have not yet received your assignment, read ${join(dir, 'briefing.md')} once before acting. ` : '')
           + 'Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
-      : configuredWork || booted ? managedTaskPrompt(dir, mode, priorWork) : undefined;
+      : configuredWork || booted || priorWork ? managedTaskPrompt(dir, mode, priorWork) : undefined;
     if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
       saveRecovery({ initial: 'dispatching', active: true });
       const queued = await arbiter.queuePrompt(workPrompt, {
