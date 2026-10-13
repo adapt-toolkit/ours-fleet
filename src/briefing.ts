@@ -60,12 +60,16 @@ function startupGuidance(v: BriefingVocab): string[] {
     'or file reads. End that readiness turn; the supervisor delivers configured work in a separate turn.',
     'If readiness was already announced, do not repeat it. An idle agent waits for a concrete task or wake',
     'without reading routines, worklog, inbox, history, or unrelated files. A charter or bio alone is not a task.',
-    'For a concrete task or mail wake, read this briefing once before acting. If a curated briefing has no',
+    'Read this briefing once per session: in the first task turn after readiness, or on your first concrete',
+    'task or wake when no task turn is delivered. It then stays in your context; later tasks, user turns,',
+    'mail wakes and ordinary continuation reuse it without another read. If a curated briefing has no',
     'concrete assignment, stop after that read and await work rather than exploring other files.',
-    'For assigned work, read any existing routines once. On a continuation task after restart or resume,',
-    'also read the active worklog once to recover unfinished work. Never read a worklog for fresh initialization,',
-    'including a fresh temporary agent. Within a wake, reuse details already read; reread only when a file',
-    'changed or you need a specific missing detail.',
+    'For assigned work, read any existing routines once per session. The worklog is continuity input only:',
+    'read it once when a new conversation starts after a restart and it records previous work. A restored',
+    'conversation already holds that context; consult the worklog there only as needed to recover your next',
+    'action. Never read a worklog for fresh initialization, including a fresh temporary agent, and never',
+    'reread it because you appended to it. Reread an instruction file only when you are told it changed,',
+    'the owner asks you to, or a specific detail is genuinely missing from your context.',
     'Fleet owns identity binding, readiness, required room admission, and application of the configured Role',
     'bio/persona before the model starts. Accept that launch context; no model-side profile setup is needed.',
     'Avoid startup identity/profile checks, broad tool discovery, CLI help/config exploration, or searching',
@@ -77,8 +81,8 @@ function startupGuidance(v: BriefingVocab): string[] {
     `On a mail wake, use **${v.getMessagesTool}** once to read that arrival and its authenticated provenance.`,
     'Read another batch only if unread messages remain, a new arrival is signalled, or a concrete task',
     'requires a fresh inbox check. Use history only for needed context or pagination, not a startup ritual.',
-    'Read routines for concrete work in each later wake, then act on that work. Do not reread the worklog',
-    'within the same wake by habit. Supervisor wakes replace a separate model-owned monitor.',
+    'A later turn or wake needs no briefing, routines or worklog read: act on it with the context you',
+    'already hold. Supervisor wakes replace a separate model-owned monitor.',
     'After readiness, acknowledge the actual task and next concrete action through its assigned reply route.',
     'Room task acknowledgements go to the assigned room; console tasks use the console response. A readiness',
     'response does not prove task completion. Do not claim unperformed work.',
@@ -163,11 +167,13 @@ function generateRoomMemberBriefing(
   L.push('Append important commands / decisions / results to `' + opts.worklogPath + '` as you go —');
   L.push('it survives restarts. Never store invite material or secrets there.');
   L.push('', '## Routines');
-  L.push('For concrete work, if `' + opts.routinesPath + '` exists, read it once in that wake before acting.');
-  L.push('Do not read routines in the readiness turn or merely because the agent is idle.');
+  L.push('For concrete work, if `' + opts.routinesPath + '` exists, read it once per session before acting.');
+  L.push('Do not read routines in the readiness turn or merely because the agent is idle. Reread it only');
+  L.push('when you are told it changed or a specific detail is genuinely missing from your context.');
   L.push('', '## On restart');
   L.push('Your supervisor verifies the same assigned identity and room before resuming. Announce readiness first.');
-  L.push('For a separate continuation task, read the worklog once and recover unfinished work.');
+  L.push('In a new conversation with recorded previous work, read the worklog once and recover unfinished work.');
+  L.push('A restored conversation continues from its own context.');
   L.push('', '## House rules');
   L.push('- Never broad `rm -rf` on home/critical paths; quote globs; use explicit paths.');
   L.push('- When you stop, be in a declared state (DONE / BLOCKED / resting ≤2h).');
@@ -313,13 +319,15 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
       'Continue writing only WORKLOG.md.');
   }
   L.push('', '## Routines');
-  L.push(`For concrete work, if \`${opts.routinesPath}\` exists, read it once in that wake before acting`);
+  L.push(`For concrete work, if \`${opts.routinesPath}\` exists, read it once per session before acting`);
   L.push('on that work and follow it for recurring or scheduled tasks. Do not read it in the readiness turn');
   L.push('or merely because the agent is idle. It may');
-  L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
+  L.push('change without a restart: reread it when you are told it changed or a specific detail is');
+  L.push('genuinely missing from your context, not at the start of every wake.');
   L.push('', '## On restart (you run under a supervised launcher)');
   L.push('The supervisor verifies your identity and room before resuming. Announce readiness first.');
-  L.push('For a separate continuation task, read your worklog once and recover unfinished work.');
+  L.push('In a new conversation with recorded previous work, read your worklog once and recover unfinished work.');
+  L.push('A restored conversation continues from its own context.');
   L.push(wakeNote);
   L.push('Do not blindly re-run whatever may have crashed you.');
   L.push('', '## House rules');

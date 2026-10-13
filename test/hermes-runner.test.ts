@@ -108,6 +108,7 @@ describe('Hermes through the production runner', () => {
     const opts = { temp: temporary, configPath: p.configPath };
     const first = await runOnce('Worker', opts, w.deps);
     writeFileSync(join(p.stateDir, '.booted'), 'previously started');
+    writeFileSync(join(p.stateDir, 'WORKLOG.md'), '- earlier milestone\n');
     writeFileSync(join(p.stateDir, '.acp-session-id'), 'stale-native-id');
     const second = await runOnce('Worker', opts, w.deps);
     expect([first.mode, second.mode]).toEqual(['fresh', 'fresh']);
@@ -121,6 +122,7 @@ describe('Hermes through the production runner', () => {
     ]);
     expect(w.prompts[1].text).not.toContain('WORKLOG.md');
     expect(w.prompts[3].text).toContain('WORKLOG.md once for continuity');
+    expect(w.prompts[3].text).toContain('Read and follow');
     expect(w.prompts.every(prompt => prompt.options?.origin?.kind === 'startup')).toBe(true);
     expect(w.prompts[1].briefing).toContain('Complete the distinctive full mission.');
     expect(readFileSync(memory, 'utf8')).toBe('retained');

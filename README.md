@@ -63,9 +63,9 @@ The state dir contract:
 
 | File | Owner | Lifecycle |
 |---|---|---|
-| `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit |
-| `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts |
-| `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
+| `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit; the agent reads it once per model session, not per turn or wake |
+| `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts; read back once only when a new conversation starts after a restart and it records previous work |
+| `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; read once per session for concrete work, hot-editable **without a restart** — tell the agent it changed so it rereads; absence means "no routines" |
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
 | `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
