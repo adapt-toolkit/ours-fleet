@@ -21,13 +21,14 @@ export interface EndpointOptions {
   client: OursClient;
   identities: ApplicationIdentityStore;
   remoteDaemonFiles: boolean;
-  currentChatFileDirectory?: string;
   currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
 }
 export async function startMcpEndpoint(
   options: EndpointOptions,
 ): Promise<{ close(): Promise<void> }> {
-  if (options.currentChatFile && (managedMcp as typeof managedMcp & { MANAGED_FILE_DELIVERY_VERSION?: number }).MANAGED_FILE_DELIVERY_VERSION !== 1) throw Error('INCOMPATIBLE_MANAGED_FILE_DELIVERY');
+  // Every managed Agent offers current-chat delivery, so a package without the contract is a broken install, not a quiet downgrade.
+  if (options.currentChatFile && (managedMcp as typeof managedMcp & { MANAGED_FILE_DELIVERY_VERSION?: number }).MANAGED_FILE_DELIVERY_VERSION !== 1)
+    throw Error('INCOMPATIBLE_MANAGED_FILE_DELIVERY: installed @ours.network/mcp lacks MANAGED_FILE_DELIVERY_VERSION 1; reinstall Fleet with its pinned @ours.network/mcp');
   const sockets = new Set<Wire>();
   const server: Server = createServer((socket) => {
     if (sockets.size >= 4) {
@@ -57,7 +58,7 @@ export async function startMcpEndpoint(
     };
     const mcp = createManagedOursMcpServer(options.client, 'managed-v1', options.identities, {
       remoteDaemonFiles: options.remoteDaemonFiles,
-      ...(options.currentChatFile ? { currentChatFileDirectory: options.currentChatFileDirectory, currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
+      ...(options.currentChatFile ? { currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
       fileContext: files,
       admit: async () => {
         if (!authenticated || inFlight >= 32) throw Error('MCP_ADMISSION_LIMIT');

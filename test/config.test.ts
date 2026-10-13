@@ -840,9 +840,9 @@ describe('rooms-tasks split-config backward compat', () => {
   });
 });
 
-it('file delivery is explicit per Agent, default off, and rejects unsafe/unknown configuration',()=>{
- base('roles:\n  A: {session: acp, file_delivery: {enabled: true, directory: deliverables}}\n  B: {session: acp}\n');
- expect(findRole(loadConfig(),'A').file_delivery).toEqual({enabled:true,directory:'deliverables'});expect(findRole(loadConfig(),'B').file_delivery).toBeUndefined();
- for(const value of [null,{}, {enabled:true,directory:'/absolute'}, {enabled:true,directory:'../parent'}, {enabled:true,directory:'a/.hidden'}, {enabled:true,directory:'a//b'}, {enabled:true,directory:'a',retry:true}, {enabled:'true',directory:'a'}])expect(()=>validateFileDelivery(value)).toThrow();
- expect(validateFileDelivery({enabled:false,directory:'deliverables'})).toEqual({enabled:false,directory:'deliverables'});
+it('file delivery needs no Agent setting; a legacy file_delivery block still loads and gates nothing',()=>{
+ base('roles:\n  A: {session: acp, file_delivery: {enabled: true, directory: deliverables}}\n  B: {session: acp}\n  C: {session: acp, file_delivery: {enabled: false, directory: /absolute/../.hidden}}\n  D: {session: acp, file_delivery: {}}\n');
+ const config=loadConfig();for(const name of ['A','B','C','D'])expect(findRole(config,name).session).toBe('acp');
+ for(const value of [undefined,{},{enabled:false},{directory:'../anything/.hidden'},{enabled:true,directory:'deliverables'}])expect(()=>validateFileDelivery(value)).not.toThrow();
+ for(const value of [null,[],'on',{enabled:'true'},{directory:1},{enabled:true,directory:'a',retry:true}])expect(()=>validateFileDelivery(value)).toThrow('retired and ignored');
 });

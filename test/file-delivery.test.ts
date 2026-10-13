@@ -1,9 +1,14 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, renameSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, rmSync, appendFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { Duplex } from 'node:stream';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { pinExportRoot, openExportFile, openDirectory, MAX_FILE_BYTES } from '../src/file-delivery/reader.js';
+import { openChatFile, openDirectory, MAX_FILE_BYTES } from '../src/file-delivery/reader.js';
+import { currentChatFileHandler } from '../src/agent-ours/service.js';
+import { FileCallbacks } from '../src/agent-ours/file-rpc.js';
+import { Wire } from '../src/agent-ours/wire.js';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { conversationEventVisible, conversationHasAttachment } from '../src/application/conversation-history.js';
 import { ArtifactStore, readDeliveredFile } from '../src/file-delivery/store.js';
@@ -16,16 +21,96 @@ const binding={sessionGeneration:'g',acpSessionId:'actual',turnId:'t'};
 const policy={approval:'allow',filesystem:'workspace',unattended:'deny'} as const;
 async function live(){const dir=temp(); const s=await AcpSession.start({name:'A',argv:[process.execPath,resolve('test/fixtures/acp-agent.mjs')],cwd:dir,env:{},stateDir:dir,mode:'fresh',permissions:policy,log:()=>{}});sessions.push(s);return {dir,s};}
 async function running(s:AcpSession){const task=s.submitPrompt('block 20000');await new Promise<void>((r,j)=>{const stop=setTimeout(()=>j(Error('no turn')),2000);const check=()=>{if(s.snapshot().readiness==='running'){clearTimeout(stop);r();}else setTimeout(check,5);};check();});return {task};}
-it('safe reader enforces original cwd paths, symlink/hardlink/hidden/traversal boundaries and pinned root',async()=>{
- const dir=temp(),root=join(dir,'deliverables');mkdirSync(root,{mode:0o700});writeFileSync(join(root,'file.bin'),'abc');writeFileSync(join(dir,'file.bin'),'different');
- const pin=await pinExportRoot(root);
- try{
-  for(const p of ['deliverables/file.bin',join(root,'file.bin')]){const f=await openExportFile(pin.root,dir,p);expect(await f.readFile()).toEqual(Buffer.from('abc'));await f.close();}
-  symlinkSync(join(dir,'file.bin'),join(root,'link'));linkSync(join(root,'file.bin'),join(root,'hard'));
-  for(const p of ['file.bin','deliverables/link','deliverables/hard','deliverables/../file.bin','deliverables/.secret'])await expect(openExportFile(pin.root,dir,p)).rejects.toThrow();
-  renameSync(root,join(dir,'moved'));mkdirSync(root,{mode:0o700});writeFileSync(join(root,'file.bin'),'replacement');
-  await expect(openExportFile(pin.root,dir,'deliverables/file.bin')).rejects.toThrow('EXPORT_ROOT_CHANGED');
- }finally{await pin.handle.close();}
+it('reader accepts the provided path anywhere: relative, parent-relative, absolute, hidden and through a symlinked ancestor',async()=>{
+ const base=temp(),cwd=join(base,'work'),outside=join(base,'.hidden','elsewhere');mkdirSync(cwd);mkdirSync(outside,{recursive:true});
+ writeFileSync(join(cwd,'in.bin'),'in');writeFileSync(join(outside,'out.bin'),'out');writeFileSync(join(outside,'.env'),'dot');symlinkSync(outside,join(cwd,'linked-dir'));
+ for(const [path,bytes] of [['in.bin','in'],['./in.bin','in'],['../.hidden/elsewhere/out.bin','out'],[join(outside,'out.bin'),'out'],[join(outside,'.env'),'dot'],['linked-dir/out.bin','out']]){
+  const opened=await openChatFile(cwd,path);
+  try{expect((await opened.file.readFile()).toString()).toBe(bytes);expect(opened.path).toBe(path.startsWith('linked-dir')?join(outside,'out.bin'):resolve(cwd,path));}finally{await opened.file.close();}
+ }
+});
+it('reader keeps ordinary file integrity checks and names each refusal',async()=>{
+ const cwd=temp();writeFileSync(join(cwd,'file.bin'),'abc');symlinkSync(join(cwd,'file.bin'),join(cwd,'link'));linkSync(join(cwd,'file.bin'),join(cwd,'hard'));mkdirSync(join(cwd,'dir'));
+ execFileSync('mkfifo',[join(cwd,'fifo')]);writeFileSync(join(cwd,'single.bin'),'abc');
+ const big=join(cwd,'big.bin');fs.closeSync(fs.openSync(big,'w'));fs.truncateSync(big,MAX_FILE_BYTES+1);
+ for(const [path,reason] of [['link','CHAT_FILE_IS_SYMLINK'],['hard','CHAT_FILE_HARDLINKED'],['file.bin','CHAT_FILE_HARDLINKED'],['dir','CHAT_FILE_NOT_REGULAR'],['fifo','CHAT_FILE_NOT_REGULAR'],
+   ['missing','CHAT_FILE_NOT_FOUND'],['file.bin/child','CHAT_FILE_NOT_FOUND'],['big.bin','FILE_EXCEEDS_20_MIB'],['','INVALID_CHAT_FILE_PATH'],['a\0b','INVALID_CHAT_FILE_PATH']])
+  await expect(openChatFile(cwd,path)).rejects.toThrow(reason);
+ const ok=await openChatFile(cwd,'single.bin');await ok.file.close();
+});
+function bridgePair(){
+ let a!:Duplex,b!:Duplex;
+ a=new Duplex({read(){},write(chunk,_e,done){b.push(chunk);done();}});b=new Duplex({read(){},write(chunk,_e,done){a.push(chunk);done();}});
+ return [a,b] as const;
+}
+/** The real bridge-side open and supervisor-side callbacks, joined by an in-memory wire. */
+function chatFiles(cwd:string){
+ const [left,right]=bridgePair();const server=new Wire(left as never),bridge=new Wire(right as never);const files=new FileCallbacks(server);
+ const handles=new Map<string,{file:Awaited<ReturnType<typeof openChatFile>>['file'];size:number;mtimeMs:number}>();
+ server.onFrame=frame=>files.receive(frame);
+ bridge.onFrame=async(raw:any)=>{try{
+   let value:unknown=null;
+   if(raw.op==='export-open'){const opened=await openChatFile(cwd,raw.args.path);const stat=await opened.file.stat();handles.set(raw.args.handle,{file:opened.file,size:stat.size,mtimeMs:stat.mtimeMs});value={filename:opened.path.split('/').at(-1),size:stat.size,path:opened.path};}
+   else if(raw.op==='read'){const row=handles.get(raw.args.handle)!;const stat=await row.file.stat();if(stat.size!==row.size||stat.mtimeMs!==row.mtimeMs)throw Error('CHAT_FILE_CHANGED');const buffer=Buffer.alloc(65536);const {bytesRead}=await row.file.read(buffer);value=bytesRead?buffer.subarray(0,bytesRead).toString('base64'):null;}
+   else if(raw.op==='close'){await handles.get(raw.args.handle)?.file.close();handles.delete(raw.args.handle);}
+   await bridge.send({kind:'fs-result',id:raw.id,value});
+  }catch(error){await bridge.send({kind:'fs-result',id:raw.id,error:(error as Error).message});}};
+ return files;
+}
+const extra=()=>({requestId:randomUUID(),signal:signal()}) as never;
+it('default handler needs no Agent setting: sends an out-of-tree absolute path on the live ACP turn with exact bytes',async()=>{
+ const base=temp();process.env.OURS_FLEET_HOME=base;mkdirSync(join(base,'.ours-fleet'));const {dir,s}=await live();writeFileSync(join(dir,'.session-id'),randomUUID());
+ const outside=join(base,'.elsewhere');mkdirSync(outside);const bytes=Buffer.from([0,255,128,42,10,0,64]);writeFileSync(join(outside,'report.pdf'),bytes);
+ // A role as resolved from a manifest with no file_delivery block at all.
+ const role={harness:'claude-code',session:'acp',permissions:policy} as const;
+ const handler=currentChatFileHandler({role,cwd:dir,store:new ArtifactStore(dir),sender:()=>s.sendFileToChat.bind(s),privateState:[join(base,'.ours-fleet','private-ours')]});
+ const files=chatFiles(dir);
+ await expect(handler({path:join(outside,'report.pdf')},extra(),files)).rejects.toThrow('CURRENT_CHAT_DELIVERY_UNAVAILABLE'); // idle: no turn to bind
+ const {task}=await running(s);
+ // Outside the role's `workspace` boundary the neutral policy asks a human instead of auto-allowing; nothing else gates the path.
+ s.setControllerAttached(true);let asked=0;const approve=setInterval(()=>{for(const e of s.conversationPage({}).events.filter(e=>e.kind==='permission.requested'))if(s.respondPermission(e.permissionId!,'send'))asked++;},5);
+ const sent=await handler({path:join(outside,'report.pdf')},extra(),files);
+ expect(sent).toMatchObject({name:'report.pdf',mimeType:'application/pdf',size:bytes.length,acpSessionId:s.snapshot().sessionId});
+ expect((await readDeliveredFile(dir,sent.id)).bytes).toEqual(bytes);
+ const relative=await handler({path:'../'+base.split('/').at(-1)+'/.elsewhere/report.pdf',filename:'renamed.bin'},extra(),files);expect(relative.name).toBe('renamed.bin');
+ clearInterval(approve);expect(asked).toBe(2);
+ writeFileSync(join(dir,'inside.txt'),'in');expect((await handler({path:'inside.txt'},extra(),files)).mimeType).toBe('text/plain');expect(asked).toBe(2); // inside: auto-allowed
+ expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(3);
+ await expect(handler({path:join(dir,'absent.pdf')},extra(),files)).rejects.toThrow('CHAT_FILE_NOT_FOUND');
+ await expect(handler({path:'inside.txt',filename:'a/b'},extra(),files)).rejects.toThrow('INVALID_FILENAME');
+ await expect(handler({path:'inside.txt',mime:'not a mime'},extra(),files)).rejects.toThrow('INVALID_MIME');
+ expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(3);
+ await s.interrupt();await task;
+});
+it('a source changed while it is read is refused and never published',async()=>{
+ const base=temp();process.env.OURS_FLEET_HOME=base;mkdirSync(join(base,'.ours-fleet'));const {dir,s}=await live();writeFileSync(join(dir,'.session-id'),randomUUID());
+ const path=join(dir,'growing.txt');writeFileSync(path,'abc');const files=chatFiles(dir);
+ const store=new ArtifactStore(dir);const copy=store.copy.bind(store);
+ const handler=currentChatFileHandler({role:{harness:'codex',session:'acp',permissions:policy},cwd:dir,sender:()=>s.sendFileToChat.bind(s),privateState:[],
+  store:{copy:(...args)=>{appendFileSync(path,'more');return copy(...args);}}});
+ const {task}=await running(s);
+ await expect(handler({path:'growing.txt'},extra(),files)).rejects.toThrow(/CHAT_FILE_CHANGED|SOURCE_SIZE_CHANGED/);
+ expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);await s.interrupt();await task;
+});
+it('Fleet private state is refused by provided path before approval and by real path after open',async()=>{
+ const base=temp(),secret=join(base,'private-ours');mkdirSync(secret);writeFileSync(join(secret,'token'),'secret');symlinkSync(secret,join(base,'alias'));
+ let approvals=0,copies=0;const sender=async(_i:any,_s:any,copy:any)=>{approvals++;return copy(binding);};
+ const handler=currentChatFileHandler({role:{harness:'codex',session:'acp',permissions:policy},cwd:base,sender:()=>sender as never,privateState:[secret],
+  store:{copy:async()=>{copies++;throw Error('unexpected copy');}}});
+ const files=chatFiles(base);
+ for(const path of ['private-ours/token',join(secret,'token'),'x/../private-ours/token']){await expect(handler({path},extra(),files)).rejects.toThrow('PRIVATE_STATE_CANNOT_BE_SENT');}
+ expect(approvals).toBe(0);
+ await expect(handler({path:'alias/token'},extra(),files)).rejects.toThrow('PRIVATE_STATE_CANNOT_BE_SENT');expect(approvals).toBe(1);expect(copies).toBe(0);
+});
+it.each([['codex','tmux'],['claude-code','tmux'],['gemini','acp'],['opencode','acp']])('unsupported backend %s/%s gets a precise result, never a read',async(harness,session)=>{
+ let touched=0;const fail=()=>{touched++;throw Error('unexpected');};
+ const handler=currentChatFileHandler({role:{harness,session,permissions:policy} as never,cwd:'/work',sender:()=>fail as never,privateState:[],store:{copy:fail as never}});
+ await expect(handler({path:'x'},extra(),{readChatFile:fail} as never)).rejects.toThrow(`CURRENT_CHAT_DELIVERY_UNAVAILABLE: sending a file to this chat requires a Codex or Claude ACP session; this Agent runs ${harness}/${session}. Pass contact to send through Ours instead`);
+ expect(touched).toBe(0);
+});
+it('a supported role whose session exposes no chat sender reports that precisely',async()=>{
+ const handler=currentChatFileHandler({role:{harness:'codex',session:'acp',permissions:policy},cwd:'/work',sender:()=>undefined,privateState:[],store:{copy:async()=>{throw Error('unexpected');}}});
+ await expect(handler({path:'x'},extra(),{} as never)).rejects.toThrow('CURRENT_CHAT_DELIVERY_UNAVAILABLE: this session has no ACP chat to attach to');
 });
 it('private immutable copy retains original bytes, rejects short/oversized input, and manual repetition is independent',async()=>{
  const dir=temp();process.env.OURS_FLEET_HOME=dir;mkdirSync(join(dir,'.ours-fleet'));const state=join(dir,'role');mkdirSync(state);writeFileSync(join(state,'.session-id'),randomUUID());const store=new ArtifactStore(state);let closed=0;

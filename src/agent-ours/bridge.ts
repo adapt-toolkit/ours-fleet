@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { openExportFile } from '../file-delivery/reader.js';
+import { openChatFile } from '../file-delivery/reader.js';
 import { createHash } from 'node:crypto';
 import { connect } from 'node:net';
 import { access, mkdir, open, readFile, type FileHandle } from 'node:fs/promises';
@@ -7,6 +7,9 @@ import { constants } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MAX_CHUNK_BYTES, MAX_FRAME_BYTES, Wire } from './wire.js';
+
+/** A current-chat refusal the agent may see; it names a reason, never a path or content. */
+class ChatFileError extends Error {}
 
 /** Runs inside exactly the harness OS sandbox. Only this process opens agent paths. */
 export async function runBridge(descriptorPath: string): Promise<void> {
@@ -79,13 +82,19 @@ export async function runBridge(descriptorPath: string): Promise<void> {
               throw Error('FILE_LIMIT');
             const path = resolve(args.path);
             if (op === 'write-open') await mkdir(dirname(path), { recursive: true });
-            const file = op === 'export-open' ? await openExportFile(args.root, process.cwd(), args.path) : await open(path, op === 'write-open' ? 'w' : 'r');
-            const stat = await file.stat();
-            handles.set(args.handle, { file, call, write: op === 'write-open', ...(op === 'export-open' ? { original: { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } } : {}) });
-            value =
-              op === 'write-open'
-                ? path
-                : { filename: basename(path), size: (await file.stat()).size };
+            if (op === 'export-open') {
+              const opened = await openChatFile(process.cwd(), args.path).catch((error: Error) => { throw new ChatFileError(error.message); });
+              const stat = await opened.file.stat();
+              handles.set(args.handle, { file: opened.file, call, write: false, original: { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } });
+              value = { filename: basename(opened.path), size: stat.size, path: opened.path };
+            } else {
+              const file = await open(path, op === 'write-open' ? 'w' : 'r');
+              handles.set(args.handle, { file, call, write: op === 'write-open' });
+              value =
+                op === 'write-open'
+                  ? path
+                  : { filename: basename(path), size: (await file.stat()).size };
+            }
           } else {
             const row = handles.get(args.handle);
             if (!row) {
@@ -101,7 +110,7 @@ export async function runBridge(descriptorPath: string): Promise<void> {
               } else if (op === 'read' && !row.write) {
                 if (row.original) {
                   const stat = await row.file.stat();
-                  if (!stat.isFile() || stat.nlink !== 1 || stat.size !== row.original.size || stat.mtimeMs !== row.original.mtimeMs || stat.ctimeMs !== row.original.ctimeMs) throw Error('EXPORT_SOURCE_CHANGED');
+                  if (!stat.isFile() || stat.nlink !== 1 || stat.size !== row.original.size || stat.mtimeMs !== row.original.mtimeMs || stat.ctimeMs !== row.original.ctimeMs) throw new ChatFileError('CHAT_FILE_CHANGED');
                 }
                 const buffer = Buffer.alloc(MAX_CHUNK_BYTES);
                 const { bytesRead } = await row.file.read(buffer);
@@ -124,8 +133,8 @@ export async function runBridge(descriptorPath: string): Promise<void> {
             }
           }
           await wire.send({ kind: 'fs-result', id: raw.id, value });
-        } catch {
-          await wire.send({ kind: 'fs-result', id: raw.id, error: 'FILE_OPERATION_FAILED' });
+        } catch (error) {
+          await wire.send({ kind: 'fs-result', id: raw.id, error: error instanceof ChatFileError ? error.message : 'FILE_OPERATION_FAILED' });
         }
       })
       .catch(fail);
