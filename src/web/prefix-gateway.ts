@@ -113,9 +113,10 @@ export function createPrefixGateway(options: GatewayOptions) {
     if (socketCredential !== undefined || String(headers['sec-websocket-protocol'] ?? '').includes(DEVICE_SOCKET_BEARER)) delete headers['sec-websocket-protocol'];
     return { ...route, headers, session, authHeaders, deviceSocket: socketCredential !== undefined };
   };
-  const track = (authHeaders: IncomingMessage['headers'], session: { id: string } | undefined, close: () => void) => {
+  const track = (authHeaders: IncomingMessage['headers'], session: { id: string; absoluteExpiresAt: number } | undefined, close: () => void) => {
     if (!session) return () => {};
-    const unbind = auth!.bindTransport(session.id, close);
+    // The session authenticated for this request, with its own deadline, not whatever is current later.
+    const unbind = auth!.bindTransport(session, close);
     const timer = setInterval(() => { try { auth!.authenticate({ headers: authHeaders } as FastifyRequest); } catch { close(); } }, 30_000);
     timer.unref();
     return () => { clearInterval(timer); unbind(); };

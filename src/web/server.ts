@@ -199,13 +199,41 @@ export async function buildWebServer(
   app.get('/api/v1/workspace/identity',async () => auth.workspaceIdentity());
   app.post('/api/v1/devices/enroll',async (request,reply) => {
     reply.header('Cache-Control','no-store');
-    const input=request.body as { enrollment: string; workspaceId: string; label: string };
+    const input=request.body as { enrollment: string; workspaceId: string; label: string; credential?: unknown };
     if (!input) throw new FleetError('invalid_request','device enrollment body required');
     return auth.enrollWorkspace(request,input);
   });
-  app.post('/api/v1/devices/link',async request => {
+  // Refresh credentials travel between the account server and this host; these routes refuse browsers.
+  const refreshInput=(request: { body: unknown }, name: 'refreshToken' | 'refreshHash') => {
+    const value=(request.body as Record<string, unknown> | null)?.[name];
+    if (typeof value!=='string') throw new FleetError('invalid_request',`${name} is required`);
+    return value;
+  };
+  app.post('/api/v1/devices/refresh',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.refreshWorkspace(request,refreshInput(request,'refreshToken'));
+  });
+  app.post('/api/v1/devices/exchange',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.exchangeWorkspace(request);
+  });
+  app.post('/api/v1/devices/revoke',async request => ({revoked:auth.revokeWorkspaceRefresh(request,refreshInput(request,'refreshHash'))}));
+  app.post('/api/v1/devices/link',async (request,reply) => {
+    const proof=(request.body as Record<string, unknown> | null)?.refreshToken;
+    if (proof!==undefined) {
+      reply.header('Cache-Control','no-store');
+      const {enrollment,enrollmentExpiresAt,...credentials}=auth.linkWorkspaceDevice(request,refreshInput(request,'refreshToken'));
+      return {...credentials,code:{version:1,origin:auth.origin,enrollment,workspaceId:credentials.workspaceId,expiresAt:enrollmentExpiresAt}};
+    }
     const session=auth.authenticate(request,true);
+    // A short-lived access credential must not be able to create a lasting one.
+    if (session.rotating) throw new FleetError('forbidden','linking another device requires this link\'s refresh credential');
     return {version:1,origin:auth.origin,...auth.workspaceEnrollment(session.id)};
+  });
+  app.get('/api/v1/devices/current',async request => {
+    const session=auth.authenticate(request);
+    if (!session.id.startsWith('workspace:')) throw new FleetError('resource_not_found','no workspace device');
+    return {deviceId:session.id.slice(10),authorizedUntil:session.absoluteExpiresAt};
   });
   app.get('/api/v1/devices',async request => {auth.authenticate(request);return {devices:auth.listWorkspaceDevices()};});
   app.delete<{Params:{id:string}}>('/api/v1/devices/:id',async request => {auth.authenticate(request,true);auth.revokeWorkspaceDevice(request.params.id);return {revoked:true};});
@@ -1053,18 +1081,23 @@ export async function buildWebServer(
     const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
     const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
     reply.raw.once('close', close);
-    unbind = auth.bindTransport(browser.id, close);
+    // A voice session outlives one access credential; its page renews this stream by name.
+    const renewal = browser.rotating ? randomBytes(32).toString('base64url') : undefined;
+    unbind = auth.bindTransport(browser, close, renewal);
     try {
       follow = await control.followConversation({
         after: page.nextCursor,
-        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true }); },
+        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true, ...(renewal ? { renewal } : {}) }); },
         onEvent: event => { if (event.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } },
         onClose: () => close(),
       });
       if (ended) follow.close();
-      else heartbeat = setInterval(() => { try { auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
+      // A renewable stream is ended by its own deadline and by revocation, not by the first credential's expiry.
+      else heartbeat = setInterval(() => { try { if (!renewal) auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
     } catch { write({ error: 'Agent controller connection failed.' }); close(); }
   });
+
+  app.post<{ Params: { id: string } }>('/api/v1/transports/:id/renew', async request => auth.renewTransport(request, request.params.id));
 
   app.post('/api/v1/ws-tickets', async request => {
     const body = request.body as {
@@ -1107,7 +1140,7 @@ export async function buildWebServer(
     requireSubprotocol(request, 'ours-fleet-events.v1');
     authorizeSocket(socket, request, async hello => {
       const session = auth.consumeTicket(request, String(hello.ticket ?? ''), 'events');
-      auth.bindSocket(session.id, socket);
+      auth.bindSocket(session, socket);
       const detach = events.attach(socket, typeof hello.lastEventId === 'string' ? hello.lastEventId : undefined);
       socket.on('close', detach);
       socket.send(JSON.stringify({ kind: 'ready', at: new Date().toISOString() }));
@@ -1120,7 +1153,7 @@ export async function buildWebServer(
       authorizeSocket(socket, request, async hello => {
         const session = auth.consumeTicket(
           request, String(hello.ticket ?? ''), 'conversation', request.params.id);
-        auth.bindSocket(session.id, socket);
+        auth.bindSocket(session, socket);
         const control = await services.session(request.params.id);
         if (!control.followConversation)
           throw new FleetError('capability_unavailable', 'this role has no conversation ledger');

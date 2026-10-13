@@ -175,7 +175,9 @@ never enables it or requests root privileges.
 Use `ours-fleet web revoke-all` to revoke every linked device and active
 session. Only a domain-separated SHA-256 device-secret hash and bounded
 timestamps are stored in the owner-private fleet state directory (`0700`
-directory, `0600` atomic file). The link and revoke controls use an
+directory, `0600` atomic file). App browser links use 5-minute access
+credentials and rotating refresh credentials; see
+[workspace onboarding](docs/workspace-onboarding.md#browser-link-credentials). The link and revoke controls use an
 owner-private Unix socket; local processes running as the same OS user are
 therefore inside the trust boundary.
 

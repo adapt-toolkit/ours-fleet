@@ -29,7 +29,7 @@ describe('workspace devices',()=>{
     try {
       const session=auth.authenticate(request(one.token));expect(auth.authenticate(request(two.token)).id).not.toBe(session.id);
       expect(()=>auth.authenticate(request(one.token,'https://attacker.invalid'))).toThrow();
-      let closed=0;const cleanup=auth.bindTransport(session.id,()=>closed++);
+      let closed=0;const cleanup=auth.bindTransport(session,()=>closed++);
       auth.revokeWorkspaceDevice(one.device.id);expect(closed).toBe(1);expect(()=>auth.authenticate(request(one.token))).toThrow();expect(auth.authenticate(request(two.token)).id).toContain(two.device.id);cleanup();
     } finally {auth.shutdown();rmSync(dir,{recursive:true,force:true});}
   });
