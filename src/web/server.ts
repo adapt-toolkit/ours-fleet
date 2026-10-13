@@ -1081,18 +1081,23 @@ export async function buildWebServer(
     const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
     const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
     reply.raw.once('close', close);
-    unbind = auth.bindTransport(browser, close);
+    // A voice session outlives one access credential; its page renews this stream by name.
+    const renewal = browser.rotating ? randomBytes(32).toString('base64url') : undefined;
+    unbind = auth.bindTransport(browser, close, renewal);
     try {
       follow = await control.followConversation({
         after: page.nextCursor,
-        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true }); },
+        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true, ...(renewal ? { renewal } : {}) }); },
         onEvent: event => { if (event.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } },
         onClose: () => close(),
       });
       if (ended) follow.close();
-      else heartbeat = setInterval(() => { try { auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
+      // A renewable stream is ended by its own deadline and by revocation, not by the first credential's expiry.
+      else heartbeat = setInterval(() => { try { if (!renewal) auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
     } catch { write({ error: 'Agent controller connection failed.' }); close(); }
   });
+
+  app.post<{ Params: { id: string } }>('/api/v1/transports/:id/renew', async request => auth.renewTransport(request, request.params.id));
 
   app.post('/api/v1/ws-tickets', async request => {
     const body = request.body as {

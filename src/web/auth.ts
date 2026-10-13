@@ -47,6 +47,7 @@ export class WebAuth {
   private readonly tickets = new Map<string, Ticket>();
   private readonly rates = new Map<string, { count: number; resetAt: number }>();
   private readonly transports = new Map<string, Set<() => void>>();
+  private readonly renewals = new Map<string, { sessionId: string; deadline: number }>();
   private readonly sockets = new Map<string, Set<WebSocket>>();
 
   constructor(
@@ -226,19 +227,34 @@ export class WebAuth {
   }
 
   /** Raw service streams share the same logout/revocation boundary as native sockets. */
-  bindTransport(session: Pick<BrowserSession, 'id' | 'absoluteExpiresAt'>, close: () => void): () => void {
-    const sessionId = session.id, deadline = sessionId.startsWith('workspace:') ? session.absoluteExpiresAt : undefined;
+  bindTransport(session: Pick<BrowserSession, 'id' | 'absoluteExpiresAt'>, close: () => void, renewal?: string): () => void {
+    const sessionId = session.id, workspace = sessionId.startsWith('workspace:');
     let transports = this.transports.get(sessionId);
     if (!transports) { transports = new Set(); this.transports.set(sessionId, transports); }
     transports.add(close);
-    const expiry = setInterval(() => { const current=this.sessions.get(sessionId); if (!current || (deadline !== undefined ? !this.workspaceDevices?.valid(sessionId.slice(10)) : current.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); transports.delete(close); close(); } },1000);
+    const lease = { sessionId, deadline: session.absoluteExpiresAt };
+    if (workspace && renewal) this.renewals.set(renewal, lease);
+    const expiry = setInterval(() => { const current=this.sessions.get(sessionId); if (!current || (workspace ? !this.workspaceDevices?.valid(sessionId.slice(10)) : current.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (workspace && lease.deadline<=this.now()) { clearInterval(expiry); transports.delete(close); if (renewal) this.renewals.delete(renewal); close(); } },1000);
     expiry.unref();
-    return () => { clearInterval(expiry); transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
+    return () => { clearInterval(expiry); transports.delete(close); if (renewal) this.renewals.delete(renewal); if (!transports.size) this.transports.delete(sessionId); };
+  }
+
+  /**
+   * Keep one open transport past the credential that opened it. Only its own reader knows the
+   * name it was given, and it must authenticate with a newer credential of the same device while
+   * the transport is still open: a copied credential cannot renew after it has expired.
+   */
+  renewTransport(request: FastifyRequest, renewal: string): { authorizedUntil: number } {
+    const session = this.authenticate(request, true), lease = this.renewals.get(renewal);
+    if (!lease || lease.sessionId !== session.id || lease.deadline <= this.now()) throw new FleetError('resource_not_found', 'transport is not open');
+    lease.deadline = Math.max(lease.deadline, session.absoluteExpiresAt);
+    return { authorizedUntil: lease.deadline };
   }
 
   clearSessions(): void {
     for (const transports of this.transports.values()) for (const close of transports) close();
     this.transports.clear();
+    this.renewals.clear();
     for (const sockets of this.sockets.values())
       for (const socket of sockets) socket.close(4401, 'authentication revoked');
     this.sockets.clear();
@@ -330,6 +346,7 @@ export class WebAuth {
   private removeSession(id: string): void {
     for (const close of this.transports.get(id) ?? []) close();
     this.transports.delete(id);
+    for (const [renewal, lease] of this.renewals) if (lease.sessionId === id) this.renewals.delete(renewal);
     this.sessions.delete(id);
     this.sessionDevices.delete(id);
     for (const [ticket, value] of this.tickets)

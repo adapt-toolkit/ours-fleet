@@ -366,6 +366,31 @@ describe('workspace link authorization',()=>{
       expect(()=>auth.refreshWorkspace(machine({host:'attacker.invalid'}),issued.refreshToken)).toThrow();
     } finally {auth.shutdown();}
   });
+  it('renews a named transport only for its own device, with a live newer credential, while it is still open',()=>{
+    const {store,auth,link,browser}=boot();
+    const renew=(token: string)=>({...browser(token),method:'POST',url:'/api/v1/transports/x/renew'} as unknown as FastifyRequest);
+    try {
+      const issued=link(),other=link();
+      let closed=0,copyClosed=0;
+      auth.bindTransport(auth.authenticate(browser(issued.accessToken)),()=>closed++,'voice-stream-name');
+      // The same credential, copied, opened a stream of its own.
+      auth.bindTransport(auth.authenticate(browser(issued.accessToken)),()=>copyClosed++,'copied-stream-name');
+      expect(()=>auth.renewTransport(renew(other.accessToken),'voice-stream-name')).toThrow(/transport is not open/);
+      expect(()=>auth.renewTransport(renew(issued.accessToken),'unknown-name')).toThrow(/transport is not open/);
+      vi.advanceTimersByTime(4*60_000);
+      const renewed=store.refresh(issued.refreshToken);
+      // Renewing with the credential that opened it gains nothing.
+      expect(auth.renewTransport(renew(issued.accessToken),'voice-stream-name').authorizedUntil).toBe(issued.accessExpiresAt);
+      expect(auth.renewTransport(renew(renewed.accessToken),'voice-stream-name').authorizedUntil).toBe(renewed.accessExpiresAt);
+      vi.advanceTimersByTime(62_000);
+      // The page's stream lives on; the copy, which has no newer credential, ended at its deadline and cannot come back.
+      expect([closed,copyClosed]).toEqual([0,1]);
+      expect(()=>auth.renewTransport(renew(renewed.accessToken),'copied-stream-name')).toThrow(/transport is not open/);
+      vi.advanceTimersByTime(4*60_000);
+      expect(closed).toBe(1);
+      expect(()=>auth.renewTransport(renew(store.refresh(renewed.refreshToken).accessToken),'voice-stream-name')).toThrow(/transport is not open/);
+    } finally {auth.shutdown();}
+  });
   it('gives a socket ticket the deadline of the credential that minted it, whatever is refreshed meanwhile',()=>{
     const {store,auth,link,browser}=boot();
     const mutation=(token: string)=>({...browser(token),method:'POST',url:'/api/v1/ws-tickets'} as unknown as FastifyRequest);

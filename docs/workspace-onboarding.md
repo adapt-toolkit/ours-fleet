@@ -95,7 +95,12 @@ again.
 
 A stream, socket or socket ticket ends when the access credential that opened
 or minted it expires, whatever newer credentials the same link holds; the App
-reconnects with its current one. Revocation, replay and sign-out
+reconnects with its current one. The live-voice stream cannot reconnect without
+ending the voice session, so it is renewed instead: the host names the stream to
+its reader, and `transports/:id/renew` moves that stream's deadline to that of
+a newer access credential of the same device while the stream is still open. A
+copied credential cannot renew: once it has expired it has nothing newer to
+present. Revocation, replay and sign-out
 close everything the link has open at once.
 
 Fixed bearers issued to earlier App versions are exchanged once through
