@@ -124,7 +124,7 @@ saving after a workspace change.
 
 This source requires the companion MCP implementation's
 `MANAGED_FILE_DELIVERY_VERSION = 1`. Fleet pins published
-`@ours.network/mcp@1.2.0-nightly.13`, which includes it and already treats the
+`@ours.network/mcp@1.2.0-nightly.14`, which includes it and already treats the
 export-directory hint as optional, so default delivery needs no MCP change. An
 installed MCP package without the capability fails Agent startup with
 `INCOMPATIBLE_MANAGED_FILE_DELIVERY` instead of quietly requiring a contact.
