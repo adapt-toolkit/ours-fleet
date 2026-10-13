@@ -156,17 +156,20 @@ describe('pending inventory', () => {
       ['owner_admin_console', 'console text'],
       ['fleet_monitor', undefined],
       ['owner_channel', 'shown to owner'],
-      ['local_console', 'x'.repeat(500)],
+      ['local_console', 'x'.repeat(200)],
     ]);
     expect(pendingPrompts[3]).toMatchObject({ bytes: 800, textTruncated: true });
     expect(JSON.stringify(pendingPrompts)).not.toContain('secret');
   });
 
-  it('bounds the list and still reports the true total', () => {
-    const pending = Array.from({ length: 120 }, (_, at) => prompt(`m${at}`, consoleOrigin));
+  it('lists every waiting prompt however many wait, each with a short preview', () => {
+    const pending = Array.from({ length: 320 }, (_, at) => prompt(`m${at} ` + 'y'.repeat(1_000), consoleOrigin));
     const inventory = pendingInventory(pending);
-    expect(inventory.pendingPromptCount).toBe(120);
-    expect(inventory.pendingPrompts).toHaveLength(50);
-    expect(inventory.pendingPrompts[0]!.text).toBe('m0');
+    expect(inventory.pendingPromptCount).toBe(320);
+    expect(inventory.pendingPrompts.map(item => item.promptId)).toEqual(pending.map(item => item.promptId));
+    expect(inventory.pendingPrompts.at(-1)!.text!.startsWith('m319 ')).toBe(true);
+    expect(inventory.pendingPrompts.every(item => item.text!.length === 200 && item.textTruncated)).toBe(true);
+    // 320 thousand-character prompts stay a small snapshot.
+    expect(JSON.stringify(inventory).length).toBeLessThan(140_000);
   });
 });

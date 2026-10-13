@@ -21,9 +21,12 @@ export interface PendingPrompt {
   released?: Promise<TurnResult>;
 }
 
-/** Bodies shown in the pending inventory are a preview, not a second copy of the conversation. */
-const INVENTORY_TEXT_CHARS = 500;
-const INVENTORY_ENTRIES = 50;
+/**
+ * The inventory names every waiting prompt — a client must be able to show the
+ * whole queue, not a count of what it could not see. What keeps a snapshot
+ * small is the body: each entry carries a short preview, not the prompt.
+ */
+const INVENTORY_TEXT_CHARS = 200;
 
 /**
  * How a waiting prompt takes part in a release.
@@ -106,13 +109,13 @@ export function memberAuthority(source: ConversationSource): string {
   }
 }
 
-/** What a client may show for prompts still waiting; bounded, and never an unpersisted body. */
+/** What a client may show for prompts still waiting: all of them, in order, and never an unpersisted body. */
 export function pendingInventory(pending: readonly PendingPrompt[]): {
   pendingPrompts: PendingPromptSummary[]; pendingPromptCount: number;
 } {
   return {
     pendingPromptCount: pending.length,
-    pendingPrompts: pending.slice(0, INVENTORY_ENTRIES).map(prompt => {
+    pendingPrompts: pending.map(prompt => {
       const display = prompt.origin?.kind === 'owner' ? prompt.origin.displayText
         : prompt.persistBody ? prompt.text : undefined;
       return {

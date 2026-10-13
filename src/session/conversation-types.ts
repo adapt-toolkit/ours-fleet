@@ -354,7 +354,7 @@ export interface ConversationSnapshot {
   queueDepth: number;
   pendingPermissionIds: string[];
   historyDegraded?: boolean;
-  /** Waiting prompts in delivery order; bounded, with `pendingPromptCount` as the true total. */
+  /** Every waiting prompt, in delivery order; `pendingPromptCount` equals its length. */
   pendingPrompts?: PendingPromptSummary[];
   pendingPromptCount?: number;
 }
