@@ -1,4 +1,4 @@
-import { WorkspaceDeviceStore, WorkspaceDeviceAuthError } from './workspace-devices.js';
+import { WorkspaceDeviceStore, WorkspaceDeviceAuthError, WorkspaceRefreshReuseError } from './workspace-devices.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
@@ -12,6 +12,8 @@ export interface BrowserSession {
   createdAt: number;
   lastSeenAt: number;
   absoluteExpiresAt: number;
+  /** A workspace access credential, which cannot create further device links. */
+  rotating?: boolean;
 }
 
 export interface AuthResult {
@@ -142,7 +144,8 @@ export class WebAuth {
       if(!this.workspaceDevices)throw new WorkspaceDeviceAuthError('workspace bearer credential is invalid');
       const device = this.requireWorkspaceDevices().authenticate(authorization.slice(7));
       const id = `workspace:${device.id}`;
-      const session = { id, csrf: '', createdAt: device.createdAt, lastSeenAt: this.now(), absoluteExpiresAt: device.expiresAt };
+      // A transport opened with this credential ends when this credential does, whatever replaces it.
+      const session = { id, csrf: '', createdAt: device.createdAt, lastSeenAt: this.now(), absoluteExpiresAt: device.authorizedUntil, rotating: device.rotating };
       this.sessions.set(id,session); this.sessionDevices.set(id,id);
       if (mutation) this.consumeRate(`mutation:${id}`,120,60000);
       return session;
@@ -204,7 +207,9 @@ export class WebAuth {
     let sockets = this.sockets.get(sessionId);
     if (!sockets) { sockets = new Set(); this.sockets.set(sessionId, sockets); }
     sockets.add(socket);
-    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || session.absoluteExpiresAt<=this.now() || (sessionId.startsWith('workspace:') && !this.workspaceDevices?.valid(sessionId.slice(10)))) this.removeSession(sessionId); },1000);
+    // Workspace devices share one session id across credentials; each socket keeps its own deadline.
+    const deadline = sessionId.startsWith('workspace:') ? this.sessions.get(sessionId)?.absoluteExpiresAt : undefined;
+    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || (sessionId.startsWith('workspace:') ? !this.workspaceDevices?.valid(sessionId.slice(10)) : session.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); socket.close(4401, 'authentication expired'); } },1000);
     expiry.unref();
     socket.once('close', () => { clearInterval(expiry); sockets?.delete(socket); });
   }
@@ -214,7 +219,9 @@ export class WebAuth {
     let transports = this.transports.get(sessionId);
     if (!transports) { transports = new Set(); this.transports.set(sessionId, transports); }
     transports.add(close);
-    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || session.absoluteExpiresAt<=this.now() || (sessionId.startsWith('workspace:') && !this.workspaceDevices?.valid(sessionId.slice(10)))) this.removeSession(sessionId); },1000);
+    // As for sockets: a newer credential of the same device never extends this transport.
+    const deadline = sessionId.startsWith('workspace:') ? this.sessions.get(sessionId)?.absoluteExpiresAt : undefined;
+    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || (sessionId.startsWith('workspace:') ? !this.workspaceDevices?.valid(sessionId.slice(10)) : session.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); transports.delete(close); close(); } },1000);
     expiry.unref();
     return () => { clearInterval(expiry); transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
   }
@@ -239,9 +246,51 @@ export class WebAuth {
 
   workspaceIdentity() { return {workspaceId:this.requireWorkspaceDevices().workspaceId}; }
   workspaceEnrollment(issuer: string | null = null) { return this.requireWorkspaceDevices().mint(issuer?.startsWith('workspace:') ? issuer.slice(10) : null); }
-  enrollWorkspace(request: FastifyRequest, input: { enrollment: string; workspaceId: string; label: string }) {
+  enrollWorkspace(request: FastifyRequest, input: { enrollment: string; workspaceId: string; label: string; credential?: unknown }) {
+    if (input.credential === 2) {
+      this.machineOnly(request); this.consumeRate('workspace-enrollment',30,60000);
+      return this.requireWorkspaceDevices().enroll(input.enrollment,input.workspaceId,input.label,true);
+    }
     this.validateBoundary(request,true); this.consumeRate('workspace-enrollment',30,60000);
     return this.requireWorkspaceDevices().enroll(input.enrollment,input.workspaceId,input.label);
+  }
+  /**
+   * Refresh credentials are exchanged between the account server and this host only. A browser
+   * always states where a request comes from, so a request that does is refused: no page can be
+   * handed refresh material, whichever origin it runs on.
+   */
+  private machineOnly(request: FastifyRequest): void {
+    this.validateBoundary(request,false);
+    if (request.headers.origin !== undefined || Object.keys(request.headers).some(name => name.startsWith('sec-fetch-')) || request.headers.cookie !== undefined)
+      throw new FleetError('forbidden','this endpoint does not accept browser requests');
+  }
+  refreshWorkspace(request: FastifyRequest, refreshToken: string) {
+    this.machineOnly(request); this.consumeRate('workspace-refresh',240,60000);
+    try { return this.requireWorkspaceDevices().refresh(refreshToken); }
+    catch (error) {
+      if (error instanceof WorkspaceRefreshReuseError) for (const id of error.revoked) this.removeSession(`workspace:${id}`);
+      throw error;
+    }
+  }
+  exchangeWorkspace(request: FastifyRequest) {
+    this.machineOnly(request); this.consumeRate('workspace-enrollment',30,60000);
+    const authorization = String(request.headers.authorization ?? '');
+    const issued = this.requireWorkspaceDevices().exchange(authorization.startsWith('Bearer ') ? authorization.slice(7) : '');
+    // Whatever the fixed bearer had open ends with it.
+    this.removeSession(`workspace:${issued.device.id}`);
+    return issued;
+  }
+  revokeWorkspaceRefresh(request: FastifyRequest, refreshHash: string): boolean {
+    this.machineOnly(request); this.consumeRate('workspace-revoke',120,60000);
+    const id = this.requireWorkspaceDevices().revokeByRefreshHash(refreshHash);
+    if (id) this.removeSession(`workspace:${id}`);
+    return Boolean(id);
+  }
+  /** A link code for another browser, on proof of the issuing link's own current refresh credential. */
+  linkWorkspaceDevice(request: FastifyRequest, refreshToken: string) {
+    this.machineOnly(request); this.consumeRate('workspace-link',10,60000);
+    const devices = this.requireWorkspaceDevices();
+    return devices.mint(devices.prove(refreshToken).id);
   }
   listWorkspaceDevices() { return this.requireWorkspaceDevices().list(); }
   revokeWorkspaceDevice(id: string): void {

@@ -199,13 +199,37 @@ export async function buildWebServer(
   app.get('/api/v1/workspace/identity',async () => auth.workspaceIdentity());
   app.post('/api/v1/devices/enroll',async (request,reply) => {
     reply.header('Cache-Control','no-store');
-    const input=request.body as { enrollment: string; workspaceId: string; label: string };
+    const input=request.body as { enrollment: string; workspaceId: string; label: string; credential?: unknown };
     if (!input) throw new FleetError('invalid_request','device enrollment body required');
     return auth.enrollWorkspace(request,input);
   });
+  // Refresh credentials travel between the account server and this host; these routes refuse browsers.
+  const refreshInput=(request: { body: unknown }, name: 'refreshToken' | 'refreshHash') => {
+    const value=(request.body as Record<string, unknown> | null)?.[name];
+    if (typeof value!=='string') throw new FleetError('invalid_request',`${name} is required`);
+    return value;
+  };
+  app.post('/api/v1/devices/refresh',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.refreshWorkspace(request,refreshInput(request,'refreshToken'));
+  });
+  app.post('/api/v1/devices/exchange',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.exchangeWorkspace(request);
+  });
+  app.post('/api/v1/devices/revoke',async request => ({revoked:auth.revokeWorkspaceRefresh(request,refreshInput(request,'refreshHash'))}));
   app.post('/api/v1/devices/link',async request => {
+    const proof=(request.body as Record<string, unknown> | null)?.refreshToken;
+    if (proof!==undefined) return {version:1,origin:auth.origin,...auth.linkWorkspaceDevice(request,refreshInput(request,'refreshToken'))};
     const session=auth.authenticate(request,true);
+    // A short-lived access credential must not be able to create a lasting one.
+    if (session.rotating) throw new FleetError('forbidden','linking another device requires this link\'s refresh credential');
     return {version:1,origin:auth.origin,...auth.workspaceEnrollment(session.id)};
+  });
+  app.get('/api/v1/devices/current',async request => {
+    const session=auth.authenticate(request);
+    if (!session.id.startsWith('workspace:')) throw new FleetError('resource_not_found','no workspace device');
+    return {deviceId:session.id.slice(10),authorizedUntil:session.absoluteExpiresAt};
   });
   app.get('/api/v1/devices',async request => {auth.authenticate(request);return {devices:auth.listWorkspaceDevices()};});
   app.delete<{Params:{id:string}}>('/api/v1/devices/:id',async request => {auth.authenticate(request,true);auth.revokeWorkspaceDevice(request.params.id);return {revoked:true};});
