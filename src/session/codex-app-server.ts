@@ -11,6 +11,9 @@ import type {
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import {
+  memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+} from './prompt-batch.js';
 import { CodexAppServerTransport } from './codex-app-server-transport.js';
 import type {
   CodexAppServerConnection, CodexAppServerTransportFactory,
@@ -77,6 +80,10 @@ interface PendingPermission {
 
 interface ActiveTurn {
   promptId: string;
+  /** Every admitted prompt this turn carries; `promptId` is the first. */
+  promptIds: string[];
+  /** Whether any member came from the paired console. */
+  console: boolean;
   nativeTurnId?: string;
   origin?: PromptOrigin;
   output: string;
@@ -148,6 +155,34 @@ export function nativePromptAdditionalContext(
   return undefined;
 }
 
+const PROMPT_BATCH_CONTEXT_KEY = 'ours-fleet://prompt-batch';
+
+/**
+ * Application context for a turn that carries several admitted prompts.
+ *
+ * The single-prompt context says "the accompanying user text", which would
+ * cover every member. A shared turn therefore carries this one entry instead:
+ * each member is its own user text item, in order, and its route and exact
+ * bytes are stated here by the server. Text imitating this wording is still
+ * only user text; it cannot add an application-context entry.
+ */
+export function nativeBatchAdditionalContext(
+  members: ReadonlyArray<Pick<PendingPrompt, 'text' | 'origin'>>,
+): JsonObject | undefined {
+  if (members.length === 1) return nativePromptAdditionalContext(members[0]!.origin);
+  const bindings = memberBindings(members, origin => sourceFor(origin).source);
+  return {
+    [PROMPT_BATCH_CONTEXT_KEY]: {
+      kind: 'application',
+      value: `Fleet queued prompt batch: ${members.length} separately admitted prompts in submission order, `
+        + 'one user text item each. Server-generated provenance per item, describing only that item: '
+        + bindings.map(binding => `item ${binding.index} of ${binding.of} `
+          + `(source=${binding.source}, bytes=${binding.bytes}, sha256=${binding.sha256}): `
+          + `${memberAuthority(binding.source)}`).join('; ') + '.',
+    },
+  };
+}
+
 function toolItem(item: JsonObject): { title: string; status?: string } | undefined {
   switch (item.type) {
     case 'commandExecution': return {
@@ -197,6 +232,10 @@ export class CodexAppServerSession implements AgentSession {
   private exit: ExitRecord | null = null;
   private queueDepth = 0;
   private promptTail: Promise<unknown> = Promise.resolve();
+  /** Admitted prompts not yet handed to the app-server, in admission order. */
+  private readonly pendingPrompts: PendingPrompt[] = [];
+  /** Admitted prompt → the turn that carries it, while that turn is open. */
+  private readonly sharedTurns = new Map<string, string>();
   private activeTurn?: ActiveTurn;
   private controllerCount = 0;
   private controllerGrace?: ReturnType<typeof setTimeout>;
@@ -255,7 +294,9 @@ export class CodexAppServerSession implements AgentSession {
       alive: this.isAlive(),
       readiness: this.readiness,
       sessionId: this.threadId,
-      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
+      // A shared turn is a human console turn if any member is: inbox traffic must not cut it short.
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.console
+        ? 'owner-admin-console' as const : this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -293,8 +334,7 @@ export class CodexAppServerSession implements AgentSession {
     const queuedBehind = this.queueDepth;
     this.admit(promptId, text, queuedBehind, options);
     this.queueDepth++;
-    const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
-    this.promptTail = run.then(() => undefined, () => undefined);
+    const run = this.enqueue(promptId, text, options.origin);
     const completion = run.then(result => {
       this.queueDepth = Math.max(0, this.queueDepth - 1);
       return result;
@@ -306,6 +346,41 @@ export class CodexAppServerSession implements AgentSession {
       promptId, queuedBehind, completion, origin: options.origin,
       delivery: delivery ?? (queuedBehind ? 'queued' : 'started'),
     };
+  }
+
+  /** The turn whose events and result answer this admitted prompt; itself unless a release shared it. */
+  sharedTurnId(promptId: string): string | undefined {
+    return this.sharedTurns.get(promptId);
+  }
+
+  /** Each prompt keeps its own step in the chain; the step it reaches releases a whole snapshot. */
+  private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
+    const entry: PendingPrompt = {
+      promptId, text, origin, ...sourceFor(origin), admittedAt: new Date().toISOString(),
+      // The one text the native session runs as an operation instead of a turn.
+      command: text.trim() === '/compact',
+    };
+    this.pendingPrompts.push(entry);
+    const run = this.promptTail.then(() => this.release(entry));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * The turn boundary: the first waiting prompt to get here synchronously
+   * takes every pending prompt delivered with it into one turn. A prompt
+   * admitted afterwards stays pending for the next boundary, and a step whose
+   * prompt was already taken reports that turn's result.
+   */
+  private release(entry: PendingPrompt): Promise<TurnResult> {
+    if (entry.released) return entry.released;
+    const members = takeBatch(this.pendingPrompts, entry);
+    for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
+    const run = this.runPrompt(members).finally(() => {
+      for (const member of members) this.sharedTurns.delete(member.promptId);
+    });
+    for (const member of members) member.released = run;
+    return run;
   }
 
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
@@ -320,7 +395,7 @@ export class CodexAppServerSession implements AgentSession {
 
   async interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
     if (generation !== this.sessionGeneration) throw new Error('session_changed: Agent session changed.');
-    if (this.activeTurn?.promptId !== promptId) return { state: 'settled' };
+    if (!this.activeTurn?.promptIds.includes(promptId)) return { state: 'settled' };
     return this.interrupt('local-console');
   }
 
@@ -459,6 +534,7 @@ export class CodexAppServerSession implements AgentSession {
       sessionGeneration: this.sessionGeneration,
       readiness: this.isAlive() ? this.readiness : 'offline',
       queueDepth: this.queueDepth,
+      ...pendingInventory(this.pendingPrompts),
       pendingPermissionIds: [...this.pendingPermissions.keys()],
       ...(this.conversation.degraded ? { historyDegraded: true } : {}),
     };
@@ -551,8 +627,7 @@ export class CodexAppServerSession implements AgentSession {
       const origin: PromptOrigin | undefined = open.commandId
         ? { kind: 'owner-admin-console', commandId: open.commandId }
         : undefined;
-      const run = this.promptTail.then(() => this.runPrompt(open.text!, open.promptId, origin));
-      this.promptTail = run.then(() => undefined, () => undefined);
+      const run = this.enqueue(open.promptId, open.text!, origin);
       void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
     }
   }
@@ -585,21 +660,27 @@ export class CodexAppServerSession implements AgentSession {
     } else this.conversation.appendSafe(draft);
   }
 
-  private async runPrompt(text: string, promptId: string, origin?: PromptOrigin): Promise<TurnResult> {
+  private async runPrompt(members: PendingPrompt[]): Promise<TurnResult> {
+    const { text, promptId, origin } = members[0]!;
     if (!this.threadId || !this.transport.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'Codex app-server session is offline');
     let settle!: (result: TurnResult) => void;
     const settled = new Promise<TurnResult>(resolveResult => { settle = resolveResult; });
-    const active: ActiveTurn = { promptId, origin, output: '', settled, settle };
+    const active: ActiveTurn = {
+      promptId, origin, output: '', settled, settle,
+      promptIds: members.map(member => member.promptId),
+      console: members.some(member => member.origin?.kind === 'owner-admin-console'),
+    };
     this.activeTurn = active;
     this.finalAnswerObserved = false;
     this.activeItems.clear();
     this.readiness = 'running';
     this.events.emit('state', { turnId: promptId, status: 'running', origin });
-    this.conversation.appendSafe({
+    members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
-      promptId, turnId: promptId, source: sourceFor(origin).source, payload: {},
-    });
+      promptId: member.promptId, turnId: promptId, source: sourceFor(member.origin).source,
+      payload: members.length > 1 ? { batch: { turnId: promptId, index, size: members.length } } : {},
+    }));
     try {
       if (text.trim() === '/compact') {
         // The acknowledgement is not completion. Standard turn notifications
@@ -609,12 +690,13 @@ export class CodexAppServerSession implements AgentSession {
       }
       const response = await this.transport.request<JsonObject>('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text, text_elements: [] }],
+        // One unchanged user text item per admitted prompt, in admission order.
+        input: members.map(member => ({ type: 'text', text: member.text, text_elements: [] })),
         approvalPolicy: this.options.approvalPolicy,
         model: this.options.model ?? null,
         effort: this.options.effort ?? null,
-        ...(nativePromptAdditionalContext(origin)
-          ? { additionalContext: nativePromptAdditionalContext(origin) } : {}),
+        ...(nativeBatchAdditionalContext(members)
+          ? { additionalContext: nativeBatchAdditionalContext(members) } : {}),
       });
       const turn = isObject(response.turn) ? response.turn : undefined;
       active.nativeTurnId ??= string(turn?.id);
@@ -883,9 +965,10 @@ export class CodexAppServerSession implements AgentSession {
       cancellationSource: active.cancellationSource,
     });
     this.events.emit('state', { status: this.readiness });
-    this.conversation.appendSafe({
+    // Every member closes with the shared outcome, so none is left waiting.
+    for (const member of active.promptIds) this.conversation.appendSafe({
       kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-      promptId: active.promptId, turnId: active.promptId,
+      promptId: member, turnId: active.promptId,
       payload: {
         outcome, ...(detail ? { stopReason: detail } : {}),
         ...(active.cancellationSource ? { cancellationSource: active.cancellationSource } : {}),

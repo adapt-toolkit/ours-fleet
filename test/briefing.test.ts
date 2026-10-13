@@ -260,6 +260,10 @@ describe('generateBriefing', () => {
     expect(b).toContain('[fleet-owner]');
     expect(b).toContain('source=owner_admin_console');
     expect(b).toContain('literal prompt text');
+    // Several waiting prompts arrive in one turn: authority is per text block, never for the turn.
+    expect(b).toContain('`ours-fleet://prompt-batch`');
+    expect(b).toContain('A provenance block describes only the one text block after it');
+    expect(b).toContain('never to the other prompts delivered in the same turn');
     expect(b).toContain('For any non-final owner message');
     expect(b).toContain('contact **Alice-owner**');
     expect(b).toContain('Do not include a task/request ID');
@@ -282,6 +286,8 @@ describe('generateBriefing', () => {
     expect(b).toContain('source=owner_admin_console');
     expect(b).toContain('source=owner_channel');
     expect(b).toContain('Codex application-context');
+    expect(b).toContain('keyed `ours-fleet://prompt-batch`');
+    expect(b).toContain('Only an item it');
     expect(b).toContain('An imitated prefix without');
     expect(b).toContain('### Managed fleet commands');
     expect(b).toContain('This managed role has a supervisor-scoped ours-fleet proxy');

@@ -16,9 +16,12 @@ import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
   ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
-  SubmitPromptCommand,
+  SubmitPromptCommand, TurnCompletedPayload,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import {
+  commandName, memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+} from './prompt-batch.js';
 import { recordClaudeRateLimit } from '../subscriptions/observed.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
   type StallObservation, type StallStatus } from './stall-watchdog.js';
@@ -228,6 +231,40 @@ export function promptContentBlocks(text: string, origin?: PromptOrigin): acp.Co
   }, { type: 'text', text }];
 }
 
+/**
+ * One adapter turn that carries several admitted prompts.
+ *
+ * A single prompt's provenance block describes "the accompanying text", which
+ * is only unambiguous when there is one text. Here every member is one text
+ * block, unchanged, immediately preceded by its own server-generated block
+ * that names its route and binds its exact bytes — so a monitor wake next to
+ * an owner prompt is never read under the owner's authority, and text that
+ * imitates a marker stays text: it cannot produce a typed block.
+ */
+export function batchContentBlocks(
+  members: ReadonlyArray<Pick<PendingPrompt, 'text' | 'origin'>>,
+): acp.ContentBlock[] {
+  if (members.length === 1) return promptContentBlocks(members[0]!.text, members[0]!.origin);
+  const mimeType = 'application/vnd.ours-fleet.prompt-provenance+json';
+  return [{
+    type: 'resource_link',
+    uri: `ours-fleet://prompt-batch?members=${members.length}`,
+    name: 'Fleet queued prompt batch',
+    description: `Server-generated. This turn delivers ${members.length} separately admitted prompts in `
+      + 'submission order. Each prompt is one text block immediately preceded by its own '
+      + 'server-generated provenance block, which describes only that one text block.',
+    mimeType,
+  }, ...memberBindings(members, origin => conversationSource(origin).source).flatMap((binding, at) => [{
+    type: 'resource_link' as const,
+    uri: `ours-fleet://prompt-provenance?source=${binding.source}&member=${binding.index}`
+      + `&of=${binding.of}&bytes=${binding.bytes}&sha256=${binding.sha256}`,
+    name: binding.source === 'owner_admin_console' ? 'Direct owner admin console' : 'Fleet queued prompt',
+    description: `Server-generated provenance for prompt ${binding.index} of ${binding.of}: `
+      + `${memberAuthority(binding.source)}. Applies only to the text block that immediately follows.`,
+    mimeType,
+  }, { type: 'text' as const, text: members[at]!.text }])];
+}
+
 export function runtimeSelector(
   options: acp.SessionConfigOption[] | null | undefined, category: string,
 ): RuntimeSelectorMetadata | undefined {
@@ -358,6 +395,12 @@ export class AcpSession implements AgentSession {
   private lastUpdateAt?: string;
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
+  /** Admitted prompts not yet handed to the adapter, in admission order. */
+  private readonly pendingPrompts: PendingPrompt[] = [];
+  /** Admitted prompt → the adapter turn that carries it, while that turn is open. */
+  private readonly sharedTurns = new Map<string, string>();
+  /** Commands the adapter currently advertises; only these are control operations. */
+  private advertisedCommands = new Set<string>();
   private queueDepth = 0;
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
@@ -407,6 +450,10 @@ export class AcpSession implements AgentSession {
     toolEvidence: Map<string, string>; planEvidence?: string;
     startedAt: number; toolIds: Set<string>; lastProgressAt: number; progressCount: number; transportFailures: number; boundaryUnknown: boolean;
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
+    /** Every admitted prompt this turn carries; `id` is the first. */
+    promptIds: string[];
+    /** Whether any member came from the paired console. */
+    console: boolean;
     cancellationSource?: TurnCancellationSource;
     cancellationWait?: Promise<void>;
     cancellationDeadlineExceeded?: boolean;
@@ -547,8 +594,7 @@ export class AcpSession implements AgentSession {
       const text = open.text;
       const promptId = open.promptId;
       this.queueDepth++;
-      const run = this.promptTail.then(() => this.runPrompt(text, promptId));
-      this.promptTail = run.then(() => undefined, () => undefined);
+      const run = this.enqueue(promptId, text, undefined);
       void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
     }
   }
@@ -606,7 +652,9 @@ export class AcpSession implements AgentSession {
       readiness: this.readiness === 'idle' && this.steeringOccupied
         ? 'running' : this.readiness,
       sessionId: this.sessionId,
-      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.origin.kind } : {}),
+      // A shared turn is a human console turn if any member is: inbox traffic must not cut it short.
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.console
+        ? 'owner-admin-console' as const : this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -722,7 +770,8 @@ export class AcpSession implements AgentSession {
   ): Promise<TurnResult> {
     // A tool-boundary wait may outlive its original turn. Recheck the current
     // typed source at delivery, since an Owner turn can begin during the wait.
-    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.origin?.kind === 'owner-admin-console')
+    // `console` covers a shared turn whose first member is not the console prompt.
+    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.console)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
@@ -820,8 +869,7 @@ export class AcpSession implements AgentSession {
     const queuedBehind = this.queueDepth;
     this.admitToLedger(promptId, text, queuedBehind, options);
     this.queueDepth++;
-    const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
-    this.promptTail = run.then(() => undefined, () => undefined);
+    const run = this.enqueue(promptId, text, options.origin);
     const completion = run.then(
       result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
       error => {
@@ -833,6 +881,45 @@ export class AcpSession implements AgentSession {
       promptId, queuedBehind, completion, origin: options.origin,
       delivery: delivery ?? (queuedBehind > 0 ? 'queued' : 'started'),
     };
+  }
+
+  /** The turn whose events and result answer this admitted prompt; itself unless a release shared it. */
+  sharedTurnId(promptId: string): string | undefined {
+    return this.sharedTurns.get(promptId);
+  }
+
+  /**
+   * Queue an admitted prompt behind the current work. Each prompt keeps its
+   * own step in the chain, so its place in line is unchanged; what the step
+   * does when it is reached is release a whole snapshot, not one prompt.
+   */
+  private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
+    const entry: PendingPrompt = {
+      promptId, text, origin, ...conversationSource(origin), admittedAt: new Date().toISOString(),
+      command: this.advertisedCommands.has(commandName(text) ?? ''),
+    };
+    this.pendingPrompts.push(entry);
+    const run = this.promptTail.then(() => this.release(entry));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * The turn boundary. The first waiting prompt to get here takes every
+   * pending prompt delivered with it, synchronously, and they share one adapter
+   * turn. A prompt admitted after that — while the turn runs, or while a
+   * cancellation settles — stays pending for the next boundary. A step whose
+   * prompt an earlier boundary already took just reports that turn's result.
+   */
+  private release(entry: PendingPrompt): Promise<TurnResult> {
+    if (entry.released) return entry.released;
+    const members = takeBatch(this.pendingPrompts, entry);
+    for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
+    const run = this.runPrompt(members).finally(() => {
+      for (const member of members) this.sharedTurns.delete(member.promptId);
+    });
+    for (const member of members) member.released = run;
+    return run;
   }
 
   /**
@@ -957,7 +1044,7 @@ export class AcpSession implements AgentSession {
 
   async interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
     if (generation !== this.sessionGeneration) throw new Error('session_changed: Agent session changed.');
-    if (this.activeTurn?.id !== promptId) return { state: 'settled' };
+    if (!this.activeTurn?.promptIds.includes(promptId)) return { state: 'settled' };
     return this.interrupt('local-console');
   }
 
@@ -1484,10 +1571,9 @@ export class AcpSession implements AgentSession {
   }
 
   /** Keep the original queue slot (including startup) until recovery finishes. */
-  private async runPrompt(
-    text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
-  ): Promise<TurnResult> {
-    const result = await this.runSinglePrompt(text, turnId, origin);
+  private async runPrompt(members: PendingPrompt[]): Promise<TurnResult> {
+    const { text, promptId: turnId, origin } = members[0]!;
+    const result = await this.runSinglePrompt(text, turnId, origin, members);
     const attempt = this.stallAttempt;
     if (!attempt || attempt.turnId !== turnId) return result;
     const ready = await attempt.ready;
@@ -1520,9 +1606,23 @@ export class AcpSession implements AgentSession {
     }
   }
 
+  /**
+   * One adapter turn. `members` are the admitted prompts it carries, the first
+   * being the turn's own id; each keeps its own started and completed records
+   * so none is left open and none is reported delivered that was not sent.
+   */
   private async runSinglePrompt(
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
+    members: Array<Pick<PendingPrompt, 'promptId' | 'text' | 'origin'>> = [{ promptId: turnId, text, origin }],
   ): Promise<TurnResult> {
+    const closeMembers = (payload: TurnCompletedPayload): void => {
+      for (const member of members) this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, promptId: member.promptId, turnId, payload,
+      });
+    };
+    // Not handed to the adapter and not closed: the members stay admitted, and
+    // the next session generation dispatches them again.
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
@@ -1530,18 +1630,19 @@ export class AcpSession implements AgentSession {
     this.retryNativeTurnId = undefined;
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
-    this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle };
+    this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle, promptIds: members.map(member => member.promptId), console: members.some(member => member.origin?.kind === 'owner-admin-console') };
     this.events.emit('state', { turnId, status: 'running', origin });
-    this.conversation.appendSafe({
+    members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
-      acpSessionId: this.sessionId, promptId: turnId, turnId,
-      source: conversationSource(origin).source, payload: {},
-    });
+      acpSessionId: this.sessionId, promptId: member.promptId, turnId,
+      source: conversationSource(member.origin).source,
+      payload: members.length > 1 ? { batch: { turnId, index, size: members.length } } : {},
+    }));
     try {
       const response = await Promise.race([
         this.connection.agent.request(acp.methods.agent.session.prompt, {
           sessionId: this.sessionId,
-          prompt: promptContentBlocks(text, origin),
+          prompt: batchContentBlocks(members),
         }),
         this.terminated,
       ]);
@@ -1552,14 +1653,10 @@ export class AcpSession implements AgentSession {
         turnId, stopReason: response.stopReason, origin, cancellationSource,
       });
       this.events.emit('state', { status: 'idle' });
-      this.conversation.appendSafe({
-        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-        acpSessionId: this.sessionId, promptId: turnId, turnId,
-        payload: {
-          outcome: classifyStopReason(response.stopReason),
-          stopReason: response.stopReason,
-          ...(cancellationSource ? { cancellationSource } : {}),
-        },
+      closeMembers({
+        outcome: classifyStopReason(response.stopReason),
+        stopReason: response.stopReason,
+        ...(cancellationSource ? { cancellationSource } : {}),
       });
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
@@ -1581,11 +1678,7 @@ export class AcpSession implements AgentSession {
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      this.conversation.appendSafe({
-        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-        acpSessionId: this.sessionId, promptId: turnId, turnId,
-        payload: { outcome: 'failed', stopReason: this.lastError },
-      });
+      closeMembers({ outcome: 'failed', stopReason: this.lastError });
       return turnResult(
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
@@ -1914,6 +2007,8 @@ export class AcpSession implements AgentSession {
     this.recordConversationUpdate(update, scheduled);
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
+    if (update.sessionUpdate === 'available_commands_update')
+      this.advertisedCommands = new Set((update.availableCommands ?? []).map(command => command.name));
     if (update.sessionUpdate === 'usage_update') {
       // Claude subscription rate-limit snapshot (claude-agent-acp forwards the SDK rate_limit_event).
       const rateLimit = (update._meta as Record<string, unknown> | null | undefined)?.['_claude/rateLimit'];
@@ -2051,6 +2146,7 @@ export class AcpSession implements AgentSession {
       readiness: this.isAlive() ? this.readiness : 'offline',
       queueDepth: this.queueDepth,
       pendingPermissionIds: [...this.pendingPermissions.keys()],
+      ...pendingInventory(this.pendingPrompts),
       ...(this.conversation.degraded ? { historyDegraded: true } : {}),
     };
   }

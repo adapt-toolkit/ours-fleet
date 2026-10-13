@@ -2153,6 +2153,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     const progressMs = this.options.config.progress_interval_ms;
     let lastSeq = activityCursor;
     let startedAt: number | undefined;
+    // When one turn delivers several waiting prompts, its events carry the turn's
+    // id, not this request's: follow the turn that actually carries this request.
+    const inTurn = (turnId: string | undefined): boolean =>
+      turnId === (this.options.session.sharedTurnId?.(queued.promptId) ?? queued.promptId);
     let phase: OwnerProgressPhase = 'starting request';
     let timer: ReturnType<typeof setInterval> | undefined;
 
@@ -2204,7 +2208,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
     const acceptCommentary = (event: SessionEvent) => {
       if (!this.commentsEnabled
-          || active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
+          || active.commentaryDisabled || active.finalizing || !inTurn(event.turnId)
           || event.kind !== 'agent_text' || event.messagePhase !== 'commentary'
           || event.replayed || event.origin?.kind !== 'owner'
           || event.origin.requestId !== active.requestId
@@ -2243,7 +2247,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const reportProgress = () => {
       const events = this.options.session.eventsSince(lastSeq);
       lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
-      const activity = events.filter(event => event.turnId === queued.promptId);
+      const activity = events.filter(event => inTurn(event.turnId));
       if (!activity.length) return;
       startedAt ??= Date.parse(activity[0].at) || Date.now();
       phase = this.progressPhase(activity) ?? phase;
@@ -2269,9 +2273,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     // the interval only after this exact prompt emits its first session event.
     const startProgress = (event?: SessionEvent) => {
       if (timer || progressMs <= 0) return;
-      if (event && event.turnId !== queued.promptId) return;
+      if (event && !inTurn(event.turnId)) return;
       const observed = event ? [event] : this.options.session.eventsSince(activityCursor)
-        .filter(item => item.turnId === queued.promptId);
+        .filter(item => inTurn(item.turnId));
       if (!observed.length) return;
       startedAt = Date.parse(observed[0].at) || Date.now();
       timer = setInterval(reportProgress, progressMs);

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,11 +25,11 @@ afterEach(async () => {
  * AcpRoleSessionAdapter -> private control socket -> AcpSession -> fixture
  * adapter, with the durable ledger in between.
  */
-async function startStack() {
+async function startStack(env: Record<string, string> = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-conv-real-'));
   cleanups.push(() => rmSync(stateDir, { recursive: true, force: true }));
   const session = await AcpSession.start({
-    name: 'Alpha', argv: [process.execPath, fixture], cwd: stateDir, env: {},
+    name: 'Alpha', argv: [process.execPath, fixture], cwd: stateDir, env,
     stateDir, mode: 'fresh',
     permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     log: () => {},
@@ -79,7 +79,7 @@ async function startStack() {
     .map(value => value.split(';')[0]).join('; ');
   const csrf = (await exchange.json() as { csrfToken: string }).csrfToken;
   const jsonHeaders = { origin, cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
-  return { origin, cookie, csrf, jsonHeaders, session };
+  return { origin, cookie, csrf, jsonHeaders, session, stateDir };
 }
 
 interface StreamMessage { type: string; [key: string]: unknown }
@@ -203,4 +203,74 @@ describe('conversation stream over the real stack', () => {
     });
     expect(closed.code).toBe(4403);
   }, 15_000);
+
+  it('queues browser prompts while a turn runs and delivers them together on interrupt', async () => {
+    const log = join(mkdtempSync(join(tmpdir(), 'ours-conv-real-log-')), 'requests.jsonl');
+    cleanups.push(() => rmSync(dirname(log), { recursive: true, force: true }));
+    const { origin, cookie, jsonHeaders } = await startStack({ ACP_FIXTURE_REQUEST_JSON_LOG: log });
+    const delivered = (): string[][] => !existsSync(log) ? []
+      : readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        .filter(entry => entry.method === 'session/prompt')
+        .map(entry => (entry.prompt as Array<{ type: string; text: string }>)
+          .filter(block => block.type === 'text').map(block => block.text));
+    const post = (path: string, body: unknown) => fetch(`${origin}/api/v1/roles/Alpha/${path}`, {
+      method: 'POST', headers: jsonHeaders, body: JSON.stringify(body),
+    });
+    const page = async () => (await (await fetch(
+      `${origin}/api/v1/roles/Alpha/conversation?limit=200`, { headers: { origin, cookie } })).json()) as {
+      events: ConversationEventV1[];
+      snapshot: { readiness: string; queueDepth: number; pendingPromptCount?: number;
+        pendingPrompts?: Array<{ promptId: string; source: string; text?: string }> };
+    };
+    const until = async (ready: () => boolean | Promise<boolean>) => {
+      for (let i = 0; i < 300; i++) {
+        if (await ready()) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      throw new Error('condition not reached');
+    };
+
+    // "late" keeps the first turn running until it is interrupted.
+    const running = await (await post('input', { text: 'late first', commandId: 'cmd-1' })).json();
+    expect(running.state).toBe('starting');
+    await until(() => delivered().length === 1);
+
+    // Ordinary sends while busy are admitted and queued; none of them interrupts.
+    const second = await (await post('input', { text: 'second', commandId: 'cmd-2' })).json();
+    const third = await (await post('input', { text: 'third\nwith a line', commandId: 'cmd-3' })).json();
+    expect([second.state, third.state]).toEqual(['queued', 'queued']);
+    // A retried send is the same prompt, not a second one.
+    const replay = await (await post('input', { text: 'second', commandId: 'cmd-2' })).json();
+    expect(replay.promptId).toBe(second.promptId);
+
+    const waiting = (await page()).snapshot;
+    expect(waiting.readiness).toBe('running');
+    expect(waiting.pendingPromptCount).toBe(2);
+    expect(waiting.pendingPrompts!.map(item => [item.promptId, item.source, item.text])).toEqual([
+      [second.promptId, 'owner_admin_console', 'second'],
+      [third.promptId, 'owner_admin_console', 'third\nwith a line'],
+    ]);
+    expect(delivered()).toEqual([['late first']]);
+
+    // The explicit interrupt ends the turn; both waiting prompts are then one adapter turn.
+    expect((await post('interrupt', { commandId: 'int-1' })).ok).toBe(true);
+    await until(async () => (await page()).snapshot.queueDepth === 0);
+    expect(delivered()).toEqual([['late first'], ['second', 'third\nwith a line']]);
+
+    const { events, snapshot } = await page();
+    expect([snapshot.readiness, snapshot.pendingPromptCount]).toEqual(['idle', 0]);
+    const closed = (promptId: string) => events.filter(event =>
+      event.kind === 'turn.completed' && event.promptId === promptId)
+      .map(event => (event.payload as { outcome: string }).outcome);
+    expect(closed(running.promptId)).toEqual(['cancelled']);
+    expect(closed(second.promptId)).toEqual(['completed']);
+    expect(closed(third.promptId)).toEqual(['completed']);
+    const started = events.filter(event => event.kind === 'prompt.started'
+      && [second.promptId, third.promptId].includes(event.promptId!));
+    expect(started.map(event => [event.promptId, event.turnId, (event.payload as { batch?: unknown }).batch]))
+      .toEqual([
+        [second.promptId, second.promptId, { turnId: second.promptId, index: 0, size: 2 }],
+        [third.promptId, second.promptId, { turnId: second.promptId, index: 1, size: 2 }],
+      ]);
+  }, 20_000);
 });

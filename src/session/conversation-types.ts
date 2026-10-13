@@ -204,6 +204,8 @@ export interface PromptAdmittedPayload {
 
 export interface PromptStartedPayload {
   queuedBehind?: number;
+  /** Present when one adapter turn carries several admitted prompts; `turnId` is the shared turn. */
+  batch?: { turnId: string; index: number; size: number };
 }
 
 export interface PromptInterruptRequestedPayload {
@@ -335,12 +337,26 @@ export interface PermissionDecisionCommand {
   optionId: string;
 }
 
+/** One admitted prompt not yet handed to the agent, as reported by the queue that owns it. */
+export interface PendingPromptSummary {
+  promptId: string;
+  source: ConversationSource;
+  admittedAt: string;
+  bytes: number;
+  /** A bounded preview, present only for a body the ledger already holds. */
+  text?: string;
+  textTruncated?: boolean;
+}
+
 export interface ConversationSnapshot {
   sessionGeneration: string;
   readiness: 'starting' | 'idle' | 'running' | 'awaiting_permission' | 'failed' | 'offline';
   queueDepth: number;
   pendingPermissionIds: string[];
   historyDegraded?: boolean;
+  /** Every waiting prompt, in delivery order; `pendingPromptCount` equals its length. */
+  pendingPrompts?: PendingPromptSummary[];
+  pendingPromptCount?: number;
 }
 
 export interface ConversationPage {

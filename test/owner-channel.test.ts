@@ -567,6 +567,7 @@ describe('owner channel daemon-generation recovery', () => {
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
   comments?: boolean; stateDir?: string; backend?: string;
+  sharedTurnId?: (promptId: string) => string | undefined;
 } = {}) {
   const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   if (!options.stateDir) dirs.push(dir);
@@ -588,6 +589,7 @@ function liveSetup(options: {
     backend: options.backend ?? 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
     queuePrompt, interrupt,
+    ...(options.sharedTurnId ? { sharedTurnId: options.sharedTurnId } : {}),
     eventsSince: (seq: number) => events.filter(event => event.seq > seq),
     subscribe: (listener: (event: SessionEvent) => void) => {
       listeners.add(listener);
@@ -2093,6 +2095,33 @@ describe('OwnerChannel notice presentation', () => {
     const sentBefore = client.calls.filter(call => call.name === 'sendMessage').length;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(sentBefore);
+  });
+
+  it('follows the shared turn when one turn delivers this request with other waiting prompts', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
+    // The request is prompt-1, but the turn that carries it is another member's.
+    const { channel, client, completions, emit } = liveSetup({
+      progressIntervalMs: 30_000,
+      sharedTurnId: promptId => (promptId === 'prompt-1' ? 'shared-turn' : undefined),
+    });
+    client.batches.push([ownerMessage(1, 'wire-shared', 'Work safely')]);
+    await channel.drain();
+
+    // Activity under the request's own id belongs to no running turn and is not reported.
+    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'stale', title: 'stale', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.calls.filter(call => call.name === 'sendMessage')
+      .some(call => String(call.args?.text).startsWith('⏳'))).toBe(false);
+
+    emit({ kind: 'tool_call', turnId: 'shared-turn', toolCallId: 'ours', title: 'run', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(lastReply(client)).toBe(
+      '⏳ Working for 30s · using tools · 1 tool action started since the last update.');
+
+    completions[0](done('Answer to everything delivered together'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastReply(client)).toBe('Answer to everything delivered together');
   });
 
   it('keeps concurrent request progress isolated and correlated', async () => {
