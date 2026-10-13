@@ -17,6 +17,8 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     readiness: 'running',
     lastError: undefined,
     promptTail: Promise.resolve(),
+    pendingPrompts: [],
+    sharedTurns: new Map(),
     queueDepth: 0,
     steeringSupported: true,
     closing: false,

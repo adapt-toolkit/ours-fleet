@@ -191,6 +191,7 @@ export class RoleTurnArbiter implements AgentSession {
       return true;
     });
   }
+  sharedTurnId(promptId: string): string | undefined { return this.session.sharedTurnId?.(promptId); }
   stopScheduledAdmission(): void { this.stopping = true; }
   isAlive(): boolean { return this.session.isAlive(); }
   snapshot(): SessionSnapshot { return this.session.snapshot(); }
