@@ -218,9 +218,13 @@ export async function buildWebServer(
     return auth.exchangeWorkspace(request);
   });
   app.post('/api/v1/devices/revoke',async request => ({revoked:auth.revokeWorkspaceRefresh(request,refreshInput(request,'refreshHash'))}));
-  app.post('/api/v1/devices/link',async request => {
+  app.post('/api/v1/devices/link',async (request,reply) => {
     const proof=(request.body as Record<string, unknown> | null)?.refreshToken;
-    if (proof!==undefined) return {version:1,origin:auth.origin,...auth.linkWorkspaceDevice(request,refreshInput(request,'refreshToken'))};
+    if (proof!==undefined) {
+      reply.header('Cache-Control','no-store');
+      const {enrollment,enrollmentExpiresAt,...credentials}=auth.linkWorkspaceDevice(request,refreshInput(request,'refreshToken'));
+      return {...credentials,code:{version:1,origin:auth.origin,enrollment,workspaceId:credentials.workspaceId,expiresAt:enrollmentExpiresAt}};
+    }
     const session=auth.authenticate(request,true);
     // A short-lived access credential must not be able to create a lasting one.
     if (session.rotating) throw new FleetError('forbidden','linking another device requires this link\'s refresh credential');
@@ -1077,7 +1081,7 @@ export async function buildWebServer(
     const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
     const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
     reply.raw.once('close', close);
-    unbind = auth.bindTransport(browser.id, close);
+    unbind = auth.bindTransport(browser, close);
     try {
       follow = await control.followConversation({
         after: page.nextCursor,
@@ -1131,7 +1135,7 @@ export async function buildWebServer(
     requireSubprotocol(request, 'ours-fleet-events.v1');
     authorizeSocket(socket, request, async hello => {
       const session = auth.consumeTicket(request, String(hello.ticket ?? ''), 'events');
-      auth.bindSocket(session.id, socket);
+      auth.bindSocket(session, socket);
       const detach = events.attach(socket, typeof hello.lastEventId === 'string' ? hello.lastEventId : undefined);
       socket.on('close', detach);
       socket.send(JSON.stringify({ kind: 'ready', at: new Date().toISOString() }));
@@ -1144,7 +1148,7 @@ export async function buildWebServer(
       authorizeSocket(socket, request, async hello => {
         const session = auth.consumeTicket(
           request, String(hello.ticket ?? ''), 'conversation', request.params.id);
-        auth.bindSocket(session.id, socket);
+        auth.bindSocket(session, socket);
         const control = await services.session(request.params.id);
         if (!control.followConversation)
           throw new FleetError('capability_unavailable', 'this role has no conversation ledger');

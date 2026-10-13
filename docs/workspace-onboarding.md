@@ -85,9 +85,17 @@ the user their link.
 
 An access credential cannot create a link code: `devices/link` needs the link's
 current refresh credential, which the account server sends only after a recent
-reauthentication of the owning account. A stream or socket ends when the access
-credential that opened it expires, whatever newer credentials the same link
-holds; the App reconnects with its current one. Revocation, replay and sign-out
+reauthentication of the owning account. That requirement stops a copied access
+credential from becoming a lasting one; it does not stop script that is running
+in the page during those minutes. Making a code rotates the refresh credential
+and counts its successor as in use at once, so a copy of the spent credential
+is a replay on its next refresh, which also ends the link made from that code.
+An answer lost while making a code is therefore not retried: the browser links
+again.
+
+A stream, socket or socket ticket ends when the access credential that opened
+or minted it expires, whatever newer credentials the same link holds; the App
+reconnects with its current one. Revocation, replay and sign-out
 close everything the link has open at once.
 
 Fixed bearers issued to earlier App versions are exchanged once through

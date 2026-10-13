@@ -27,6 +27,8 @@ interface Ticket {
   purpose: 'events' | 'conversation';
   roleId?: string;
   expiresAt: number;
+  /** When the credential that minted this ticket stops authorizing; a socket opened with it ends then. */
+  authorizedUntil: number;
 }
 
 const token = (bytes = 32) => randomBytes(bytes).toString('base64url');
@@ -183,7 +185,8 @@ export class WebAuth {
     const value = token();
     const ticket: Ticket = {
       value, sessionId: session.id, purpose, roleId,
-      expiresAt: this.now() + 30_000,
+      expiresAt: Math.min(this.now() + 30_000, session.absoluteExpiresAt),
+      authorizedUntil: session.absoluteExpiresAt,
     };
     this.tickets.set(value, ticket);
     return { ticket: value, expiresAt: new Date(ticket.expiresAt).toISOString() };
@@ -200,28 +203,35 @@ export class WebAuth {
       throw new FleetError('unauthorized', 'WebSocket ticket is invalid, expired, or already used');
     const session = this.sessions.get(ticket.sessionId);
     if (!session || (session.id.startsWith('workspace:') && !this.workspaceDevices?.valid(session.id.slice(10)))) throw new FleetError('unauthorized', 'browser session expired');
-    return session;
+    if (!session.id.startsWith('workspace:')) return session;
+    // A workspace device's session entry is replaced by each newer credential; the ticket carries
+    // the deadline of the credential that minted it, and nothing newer extends it.
+    if (ticket.authorizedUntil <= this.now()) throw new FleetError('unauthorized', 'WebSocket ticket is invalid, expired, or already used');
+    return { ...session, absoluteExpiresAt: ticket.authorizedUntil };
   }
 
-  bindSocket(sessionId: string, socket: WebSocket): void {
+  /**
+   * `session` is what authenticate() or consumeTicket() returned for this connection. A workspace
+   * device shares one session id across credentials, so the socket ends at that credential's own
+   * deadline; revocation still ends everything the device has open.
+   */
+  bindSocket(session: Pick<BrowserSession, 'id' | 'absoluteExpiresAt'>, socket: WebSocket): void {
+    const sessionId = session.id, deadline = sessionId.startsWith('workspace:') ? session.absoluteExpiresAt : undefined;
     let sockets = this.sockets.get(sessionId);
     if (!sockets) { sockets = new Set(); this.sockets.set(sessionId, sockets); }
     sockets.add(socket);
-    // Workspace devices share one session id across credentials; each socket keeps its own deadline.
-    const deadline = sessionId.startsWith('workspace:') ? this.sessions.get(sessionId)?.absoluteExpiresAt : undefined;
-    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || (sessionId.startsWith('workspace:') ? !this.workspaceDevices?.valid(sessionId.slice(10)) : session.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); socket.close(4401, 'authentication expired'); } },1000);
+    const expiry = setInterval(() => { const current=this.sessions.get(sessionId); if (!current || (deadline !== undefined ? !this.workspaceDevices?.valid(sessionId.slice(10)) : current.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); socket.close(4401, 'authentication expired'); } },1000);
     expiry.unref();
     socket.once('close', () => { clearInterval(expiry); sockets?.delete(socket); });
   }
 
   /** Raw service streams share the same logout/revocation boundary as native sockets. */
-  bindTransport(sessionId: string, close: () => void): () => void {
+  bindTransport(session: Pick<BrowserSession, 'id' | 'absoluteExpiresAt'>, close: () => void): () => void {
+    const sessionId = session.id, deadline = sessionId.startsWith('workspace:') ? session.absoluteExpiresAt : undefined;
     let transports = this.transports.get(sessionId);
     if (!transports) { transports = new Set(); this.transports.set(sessionId, transports); }
     transports.add(close);
-    // As for sockets: a newer credential of the same device never extends this transport.
-    const deadline = sessionId.startsWith('workspace:') ? this.sessions.get(sessionId)?.absoluteExpiresAt : undefined;
-    const expiry = setInterval(() => { const session=this.sessions.get(sessionId); if (!session || (sessionId.startsWith('workspace:') ? !this.workspaceDevices?.valid(sessionId.slice(10)) : session.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); transports.delete(close); close(); } },1000);
+    const expiry = setInterval(() => { const current=this.sessions.get(sessionId); if (!current || (deadline !== undefined ? !this.workspaceDevices?.valid(sessionId.slice(10)) : current.absoluteExpiresAt<=this.now())) this.removeSession(sessionId); else if (deadline !== undefined && deadline<=this.now()) { clearInterval(expiry); transports.delete(close); close(); } },1000);
     expiry.unref();
     return () => { clearInterval(expiry); transports.delete(close); if (!transports.size) this.transports.delete(sessionId); };
   }
@@ -286,11 +296,14 @@ export class WebAuth {
     if (id) this.removeSession(`workspace:${id}`);
     return Boolean(id);
   }
-  /** A link code for another browser, on proof of the issuing link's own current refresh credential. */
+  /** A link code for another browser, for the issuing link's own current refresh credential, which it rotates. */
   linkWorkspaceDevice(request: FastifyRequest, refreshToken: string) {
     this.machineOnly(request); this.consumeRate('workspace-link',10,60000);
-    const devices = this.requireWorkspaceDevices();
-    return devices.mint(devices.prove(refreshToken).id);
+    try { return this.requireWorkspaceDevices().link(refreshToken); }
+    catch (error) {
+      if (error instanceof WorkspaceRefreshReuseError) for (const id of error.revoked) this.removeSession(`workspace:${id}`);
+      throw error;
+    }
   }
   listWorkspaceDevices() { return this.requireWorkspaceDevices().list(); }
   revokeWorkspaceDevice(id: string): void {

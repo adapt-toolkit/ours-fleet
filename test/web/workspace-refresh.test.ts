@@ -162,14 +162,10 @@ describe('workspace refresh rotation',()=>{
     expect(store.authenticate(unrelated.accessToken).id).toBe(unrelated.device.id);
     store.close();
   });
-  it('proves a link only with its current credential and revokes by hash of any of its credentials',()=>{
+  it('revokes by the hash of any credential of a link, spent or current',()=>{
     const {store,link}=open();
     const issued=link(),other=link();
-    expect(store.prove(issued.refreshToken).id).toBe(issued.device.id);
     const next=store.refresh(issued.refreshToken);
-    expect(()=>store.prove(issued.refreshToken)).toThrow(WorkspaceDeviceAuthError);
-    expect(()=>store.prove(next.accessToken)).toThrow(WorkspaceDeviceAuthError);
-    expect(store.prove(next.refreshToken).id).toBe(issued.device.id);
     expect(store.revokeByRefreshHash(sha('owr.unknown'))).toBeUndefined();
     expect(store.revokeByRefreshHash(issued.refreshToken)).toBeUndefined();
     // The hash of a spent credential still names its link after rotation.
@@ -177,6 +173,56 @@ describe('workspace refresh rotation',()=>{
     expect(()=>store.authenticate(next.accessToken)).toThrow(WorkspaceDeviceAuthError);
     expect(()=>store.refresh(next.refreshToken)).toThrow(WorkspaceDeviceAuthError);
     expect(store.valid(other.device.id)).toBe(true);
+    store.close();
+  });
+  it('issues a link code only for the current refresh credential, rotating it and counting the successor as used',()=>{
+    const {store,link}=open();
+    const issued=link();
+    expect(()=>store.link(issued.accessToken)).toThrow(WorkspaceDeviceAuthError);
+    const minted=store.link(issued.refreshToken);
+    expect(minted.refreshToken).not.toBe(issued.refreshToken);
+    expect(minted.device.id).toBe(issued.device.id);
+    const child=store.enroll(minted.enrollment,minted.workspaceId,'second browser',true);
+    expect(store.authenticate(child.accessToken).id).toBe(child.device.id);
+    // The link goes on with the successor it was handed.
+    const later=store.refresh(minted.refreshToken);
+    expect(store.authenticate(later.accessToken).id).toBe(issued.device.id);
+    expect(store.valid(child.device.id)).toBe(true);
+    store.close();
+  });
+  it('ends the link and the link made from its code when the credential spent on that code comes back',()=>{
+    // A copied credential was used to make a link for someone else; the owner's browser still holds it.
+    const {store,link}=open();
+    const issued=link(),copied=issued.refreshToken;
+    const minted=store.link(copied),child=store.enroll(minted.enrollment,minted.workspaceId,'not the owner',true);
+    let error: unknown;
+    try {store.refresh(issued.refreshToken);} catch(caught) {error=caught;}
+    expect(error).toBeInstanceOf(WorkspaceRefreshReuseError);
+    expect((error as WorkspaceRefreshReuseError).revoked.sort()).toEqual([issued.device.id,child.device.id].sort());
+    expect(()=>store.authenticate(child.accessToken)).toThrow(WorkspaceDeviceAuthError);
+    expect(()=>store.refresh(child.refreshToken)).toThrow(WorkspaceDeviceAuthError);
+    expect(()=>store.refresh(minted.refreshToken)).toThrow(WorkspaceDeviceAuthError);
+    store.close();
+  });
+  it('ends the link and a pending code when a copied credential is refreshed first and then used for a code',()=>{
+    const {store,link}=open();
+    const issued=link();
+    // The copy is refreshed to T1 and T1 makes a code; the owner then presents T0.
+    const stolen=store.refresh(issued.refreshToken),minted=store.link(stolen.refreshToken);
+    expect(()=>store.refresh(issued.refreshToken)).toThrow(WorkspaceRefreshReuseError);
+    expect(()=>store.enroll(minted.enrollment,minted.workspaceId,'not the owner',true)).toThrow();
+    expect(store.valid(issued.device.id)).toBe(false);
+    store.close();
+  });
+  it('does not repeat a link code for a credential already spent',()=>{
+    const {store,link}=open();
+    const issued=link();
+    store.link(issued.refreshToken);
+    expect(()=>store.link(issued.refreshToken)).toThrow(WorkspaceRefreshReuseError);
+    expect(store.valid(issued.device.id)).toBe(false);
+    // Nor for one whose refresh answer may still be on its way.
+    const other=link();store.refresh(other.refreshToken);
+    expect(()=>store.link(other.refreshToken)).toThrow(WorkspaceRefreshReuseError);
     store.close();
   });
 });
@@ -260,14 +306,14 @@ describe('workspace link authorization',()=>{
       const old=auth.authenticate(browser(issued.accessToken));
       expect(old.absoluteExpiresAt).toBe(issued.accessExpiresAt);
       let oldClosed=0,freshClosed=0,otherClosed=0;
-      auth.bindTransport(old.id,()=>oldClosed++);
+      auth.bindTransport(old,()=>oldClosed++);
       vi.advanceTimersByTime(4*60_000);
       const renewed=store.refresh(issued.refreshToken);
       // A newer credential of the same device, used by the same or another tab.
       const fresh=auth.authenticate(browser(renewed.accessToken));
       expect(fresh.id).toBe(old.id);
-      auth.bindTransport(fresh.id,()=>freshClosed++);
-      auth.bindTransport(auth.authenticate(browser(other.accessToken)).id,()=>otherClosed++);
+      auth.bindTransport(fresh,()=>freshClosed++);
+      auth.bindTransport(auth.authenticate(browser(other.accessToken)),()=>otherClosed++);
       vi.advanceTimersByTime(60_000-1500);
       expect([oldClosed,freshClosed]).toEqual([0,0]);
       vi.advanceTimersByTime(3000);
@@ -283,10 +329,10 @@ describe('workspace link authorization',()=>{
     try {
       const issued=link(),other=link();
       let closed=0,otherClosed=0;
-      auth.bindTransport(auth.authenticate(browser(issued.accessToken)).id,()=>closed++);
-      auth.bindTransport(auth.authenticate(browser(other.accessToken)).id,()=>otherClosed++);
+      auth.bindTransport(auth.authenticate(browser(issued.accessToken)),()=>closed++);
+      auth.bindTransport(auth.authenticate(browser(other.accessToken)),()=>otherClosed++);
       const renewed=auth.refreshWorkspace(machine(),issued.refreshToken);
-      auth.bindTransport(auth.authenticate(browser(renewed.accessToken)).id,()=>closed++);
+      auth.bindTransport(auth.authenticate(browser(renewed.accessToken)),()=>closed++);
       expect(()=>auth.refreshWorkspace(machine(),issued.refreshToken)).toThrow(WorkspaceRefreshReuseError);
       expect([closed,otherClosed]).toEqual([2,0]);
       expect(()=>auth.authenticate(browser(renewed.accessToken))).toThrow(WorkspaceDeviceAuthError);
@@ -297,7 +343,7 @@ describe('workspace link authorization',()=>{
     const {auth,link,browser,machine}=boot();
     try {
       const issued=link();let closed=0;
-      auth.bindTransport(auth.authenticate(browser(issued.accessToken)).id,()=>closed++);
+      auth.bindTransport(auth.authenticate(browser(issued.accessToken)),()=>closed++);
       expect(auth.revokeWorkspaceRefresh(machine(),sha('owr.nothing'))).toBe(false);
       expect(auth.revokeWorkspaceRefresh(machine(),sha(issued.refreshToken))).toBe(true);
       expect(closed).toBe(1);
@@ -314,9 +360,40 @@ describe('workspace link authorization',()=>{
         expect(()=>auth.revokeWorkspaceRefresh(machine(headers),sha(issued.refreshToken))).toThrow(/does not accept browser requests/);
       }
       // A refused request spends nothing.
-      expect(auth.linkWorkspaceDevice(machine(),issued.refreshToken).workspaceId).toBeTruthy();
-      expect(auth.refreshWorkspace(machine(),issued.refreshToken).device.id).toBe(issued.device.id);
+      const minted=auth.linkWorkspaceDevice(machine(),issued.refreshToken);
+      expect(minted.enrollment).toMatch(/^[\w-]{43}$/);
+      expect(auth.refreshWorkspace(machine(),minted.refreshToken).device.id).toBe(issued.device.id);
       expect(()=>auth.refreshWorkspace(machine({host:'attacker.invalid'}),issued.refreshToken)).toThrow();
+    } finally {auth.shutdown();}
+  });
+  it('gives a socket ticket the deadline of the credential that minted it, whatever is refreshed meanwhile',()=>{
+    const {store,auth,link,browser}=boot();
+    const mutation=(token: string)=>({...browser(token),method:'POST',url:'/api/v1/ws-tickets'} as unknown as FastifyRequest);
+    const upgrade={headers:{host,origin:appOrigin},url:'/api/v1/events',method:'GET'} as unknown as FastifyRequest;
+    try {
+      const issued=link();
+      // Own-origin sockets are what consumeTicket admits; the deadline rule is the same for any caller.
+      auth.setBoundary(origin,host,{origins:[appOrigin]});
+      vi.advanceTimersByTime(ACCESS_TTL-10_000);
+      const early=auth.mintTicket(mutation(issued.accessToken),'events'),late=auth.mintTicket(mutation(issued.accessToken),'events');
+      expect(Date.parse(early.expiresAt)).toBe(issued.accessExpiresAt);
+      // Another tab refreshes and uses its new credential: the shared session entry now runs five minutes longer.
+      vi.advanceTimersByTime(5_000);
+      const renewed=store.refresh(issued.refreshToken);
+      expect(auth.authenticate(browser(renewed.accessToken)).absoluteExpiresAt).toBe(renewed.accessExpiresAt);
+      const session=auth.consumeTicket(upgrade,early.ticket,'events');
+      expect(session.absoluteExpiresAt).toBe(issued.accessExpiresAt);
+      let closed: number | undefined;
+      const socket={close:(code: number)=>{closed=code;},once:()=>{}} as unknown as import('ws').WebSocket;
+      auth.bindSocket(session,socket);
+      vi.advanceTimersByTime(4_000);
+      expect(closed).toBeUndefined();
+      vi.advanceTimersByTime(2_000);
+      expect(closed).toBe(4401);
+      // After the minting credential's deadline the other ticket opens nothing.
+      expect(()=>auth.consumeTicket(upgrade,late.ticket,'events')).toThrow(/WebSocket ticket/);
+      const fresh=auth.consumeTicket(upgrade,auth.mintTicket(mutation(renewed.accessToken),'events').ticket,'events');
+      expect(fresh.absoluteExpiresAt).toBe(renewed.accessExpiresAt);
     } finally {auth.shutdown();}
   });
 });

@@ -134,37 +134,50 @@ export class WorkspaceDeviceStore {
    * is in use, the spent credential is a replay and ends the link and the links it issued.
    */
   refresh(refreshToken: string): WorkspaceCredentials {
-    if(!refreshShaped(refreshToken)) throw new WorkspaceDeviceAuthError();
-    const now=this.now(),key=hash(refreshToken);
-    const outcome=this.transaction((): WorkspaceCredentials | string[] => {
-      const row=this.db.prepare('SELECT * FROM refresh_tokens WHERE hash=?').get(key);
-      const device=row && this.live(String(row.deviceId),now);
-      if(!row || !device || device.familyExpiresAt===null) throw new WorkspaceDeviceAuthError();
-      const next=REFRESH_PREFIX+createHmac('sha256',this.rotationKey).update(`ours.fleet.workspace-refresh.v1\0${device.id}\0${refreshToken}`).digest('base64url');
-      if(row.consumedAt===null) {
-        if(Number(row.expiresAt)<=now) throw new WorkspaceDeviceAuthError();
-        const expiresAt=Math.min(now+REFRESH_IDLE_TTL,device.familyExpiresAt);
-        this.db.prepare('UPDATE refresh_tokens SET consumedAt=?,confirmedAt=coalesce(confirmedAt,?) WHERE hash=?').run(now,now,key);
-        this.db.prepare('INSERT INTO refresh_tokens VALUES(?,?,?,?,NULL,NULL,?)').run(hash(next),device.id,now,expiresAt,key);
-        // The link itself lapses with its newest refresh credential.
-        this.db.prepare('UPDATE devices SET expiresAt=?,lastUsedAt=? WHERE id=?').run(expiresAt,now,device.id);
-        return this.grant(this.device(device,{expiresAt,lastUsedAt:now}),device.familyExpiresAt,next,expiresAt,now);
-      }
-      const successor=this.db.prepare('SELECT * FROM refresh_tokens WHERE parent=?').get(key);
-      if(!successor || successor.confirmedAt!==null || successor.consumedAt!==null) return this.revokeRows(device.id,now,true);
-      if(Number(successor.expiresAt)<=now) throw new WorkspaceDeviceAuthError();
-      return this.grant(this.device(device),device.familyExpiresAt,next,Number(successor.expiresAt),now);
+    const outcome=this.transaction(() => this.rotate(refreshToken,false));
+    if(Array.isArray(outcome)) throw new WorkspaceRefreshReuseError(outcome);
+    return outcome;
+  }
+  /**
+   * A link code for another browser, issued by this link. It is a lasting grant, so it takes the
+   * link's current, unspent refresh credential and rotates it in the same step, with the successor
+   * counted as in use at once: whoever else holds the spent credential is a replay on their next
+   * refresh, which also ends the link made from this code. An answer lost here is not retried.
+   */
+  link(refreshToken: string): WorkspaceCredentials & { enrollment: string; enrollmentExpiresAt: number } {
+    const now=this.now(),enrollment=opaque(),enrollmentExpiresAt=now+5*60000;
+    const outcome=this.transaction(() => {
+      const rotated=this.rotate(refreshToken,true);
+      if(Array.isArray(rotated)) return rotated;
+      this.db.prepare('DELETE FROM enrollments WHERE expiresAt<=?').run(now);
+      if(Number(this.db.prepare('SELECT count(*) AS n FROM enrollments').get()!.n)>=32) throw new FleetError('rate_limited','too many pending device links');
+      this.db.prepare('INSERT INTO enrollments VALUES(?,?,?)').run(hash(enrollment),enrollmentExpiresAt,rotated.device.id);
+      return {...rotated,enrollment,enrollmentExpiresAt};
     });
     if(Array.isArray(outcome)) throw new WorkspaceRefreshReuseError(outcome);
     return outcome;
   }
-  /** The device whose current, unspent refresh credential this is. Proof of the link itself, not of one access credential. */
-  prove(refreshToken: string): WorkspaceDevice {
-    const now=this.now();
-    const row=refreshShaped(refreshToken) ? this.db.prepare('SELECT deviceId FROM refresh_tokens WHERE hash=? AND consumedAt IS NULL AND expiresAt>?').get(hash(refreshToken),now) : undefined;
+  /** Inside a transaction. Returns new credentials, or the devices ended by a replay. `strict` allows no repeat and confirms the successor. */
+  private rotate(refreshToken: string, strict: boolean): WorkspaceCredentials | string[] {
+    if(!refreshShaped(refreshToken)) throw new WorkspaceDeviceAuthError();
+    const now=this.now(),key=hash(refreshToken);
+    const row=this.db.prepare('SELECT * FROM refresh_tokens WHERE hash=?').get(key);
     const device=row && this.live(String(row.deviceId),now);
-    if(!device || device.familyExpiresAt===null) throw new WorkspaceDeviceAuthError();
-    return this.device(device);
+    if(!row || !device || device.familyExpiresAt===null) throw new WorkspaceDeviceAuthError();
+    const next=REFRESH_PREFIX+createHmac('sha256',this.rotationKey).update(`ours.fleet.workspace-refresh.v1\0${device.id}\0${refreshToken}`).digest('base64url');
+    if(row.consumedAt===null) {
+      if(Number(row.expiresAt)<=now) throw new WorkspaceDeviceAuthError();
+      const expiresAt=Math.min(now+REFRESH_IDLE_TTL,device.familyExpiresAt);
+      this.db.prepare('UPDATE refresh_tokens SET consumedAt=?,confirmedAt=coalesce(confirmedAt,?) WHERE hash=?').run(now,now,key);
+      this.db.prepare('INSERT INTO refresh_tokens VALUES(?,?,?,?,NULL,?,?)').run(hash(next),device.id,now,expiresAt,strict ? now : null,key);
+      // The link itself lapses with its newest refresh credential.
+      this.db.prepare('UPDATE devices SET expiresAt=?,lastUsedAt=? WHERE id=?').run(expiresAt,now,device.id);
+      return this.grant(this.device(device,{expiresAt,lastUsedAt:now}),device.familyExpiresAt,next,expiresAt,now);
+    }
+    const successor=this.db.prepare('SELECT * FROM refresh_tokens WHERE parent=?').get(key);
+    if(strict || !successor || successor.confirmedAt!==null || successor.consumedAt!==null) return this.revokeRows(device.id,now,true);
+    if(Number(successor.expiresAt)<=now) throw new WorkspaceDeviceAuthError();
+    return this.grant(this.device(device),device.familyExpiresAt,next,Number(successor.expiresAt),now);
   }
   /**
    * One-time move of a fixed bearer to rotating credentials. The device keeps its identity, the

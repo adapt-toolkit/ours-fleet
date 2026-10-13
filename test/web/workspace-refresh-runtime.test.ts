@@ -64,11 +64,14 @@ it('serves rotating workspace credentials to the account server only, through th
   // The link is intact after every refused attempt.
   expect((await call(api+'/devices',{headers:page(link.accessToken)})).body.devices.filter((device:{revokedAt:number|null})=>device.revokedAt===null)).toHaveLength(1);
 
-  // The account server links a second browser with the first link's own refresh credential.
+  // The account server links a second browser with the first link's own refresh credential, which that rotates.
   const minted=await call(api+'/devices/link',{body:{refreshToken:link.refreshToken}});
-  expect(minted.status,minted.text).toBe(200);
-  const child=(await call(api+'/devices/enroll',{body:{enrollment:minted.body.enrollment,workspaceId:minted.body.workspaceId,label:'Second browser',credential:2}})).body as typeof link;
+  expect(minted.status,minted.text).toBe(200);expect(minted.headers.get('cache-control')).toBe('no-store');
+  expect(minted.body.code).toMatchObject({version:1,origin:'https://'+host,workspaceId:first.workspaceId});
+  expect(minted.body.refreshToken).not.toBe(link.refreshToken);expect(minted.body.device.id).toBe(link.device.id);
+  const child=(await call(api+'/devices/enroll',{body:{enrollment:minted.body.code.enrollment,workspaceId:minted.body.code.workspaceId,label:'Second browser',credential:2}})).body as typeof link;
   expect((await call(api+'/devices',{headers:page(child.accessToken)})).status).toBe(200);
+  const previous=link.refreshToken;link.refreshToken=minted.body.refreshToken;
 
   // Rotation: one successor, repeated until it is used; then the spent credential is a replay.
   const rotated=await call(api+'/devices/refresh',{body:{refreshToken:link.refreshToken}});
@@ -77,6 +80,7 @@ it('serves rotating workspace credentials to the account server only, through th
   expect(retried.body.refreshToken).toBe(rotated.body.refreshToken);expect(retried.body.refreshExpiresAt).toBe(rotated.body.refreshExpiresAt);
   // The earlier access credential keeps its own deadline beside the new one.
   for(const token of [link.accessToken,rotated.body.accessToken,retried.body.accessToken])expect((await call(api+'/devices',{headers:page(token)})).status).toBe(200);
+  expect(previous).not.toBe(link.refreshToken);
   const replay=await call(api+'/devices/refresh',{body:{refreshToken:link.refreshToken}});
   expect(replay.status).toBe(401);expect(replay.headers.get('x-ours-workspace-auth')).toBe('rejected');expect(replay.text).not.toContain('owr.');
   for(const token of [link.accessToken,rotated.body.accessToken,child.accessToken]) {
