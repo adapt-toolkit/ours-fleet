@@ -6,7 +6,7 @@ import {
   nativeBatchAdditionalContext, nativePromptAdditionalContext,
 } from '../src/session/codex-app-server.js';
 import {
-  pendingInventory, promptClass, takeBatch, type PendingPrompt,
+  commandName, pendingInventory, promptClass, takeBatch, type PendingPrompt,
 } from '../src/session/prompt-batch.js';
 import type { PromptOrigin } from '../src/session/types.js';
 
@@ -15,7 +15,8 @@ const sources: Record<string, PendingPrompt['source']> = {
   'fleet-monitor': 'fleet_monitor', 'scheduled-loop': 'scheduled_loop', startup: 'startup',
 };
 let n = 0;
-const prompt = (text: string, origin?: PromptOrigin): PendingPrompt => ({
+const prompt = (text: string, origin?: PromptOrigin, command = false): PendingPrompt => ({
+  command,
   promptId: `p${++n}`, text, origin,
   source: sources[origin?.kind ?? ''] ?? 'local_console',
   persistBody: !origin || ['owner-admin-console', 'local-console', 'startup'].includes(origin.kind),
@@ -49,18 +50,26 @@ describe('prompt snapshot release', () => {
     expect(texts(takeBatch(pending, pending[0]!))).toEqual(['boot']);
   });
 
-  it('keeps a session command as its own turn and as a boundary in order', () => {
+  it('keeps a supported session command as its own turn and as a boundary in order', () => {
     const pending = [
-      prompt('before', consoleOrigin), prompt('  /compact now', consoleOrigin),
+      prompt('before', consoleOrigin), prompt('  /compact now', consoleOrigin, true),
       prompt('after', consoleOrigin), prompt('after too', wake),
     ];
     expect(promptClass(pending[1]!)).toBe('command');
     expect(texts(takeBatch(pending, pending[0]!))).toEqual(['before']);
     expect(texts(takeBatch(pending, pending[0]!))).toEqual(['  /compact now']);
     expect(texts(takeBatch(pending, pending[0]!))).toEqual(['after', 'after too']);
-    // A path or a sentence that merely contains a slash is an ordinary message.
-    expect(promptClass(prompt('/home/user/file is broken? no: /1 2'))).toBe('message');
-    expect(promptClass(prompt('see /compact'))).toBe('message');
+  });
+
+  it('treats slash-looking text the session does not support as an ordinary message', () => {
+    const pending = [
+      prompt('a', consoleOrigin), prompt('/not_a_command status explanation', consoleOrigin),
+      prompt('/home/user/file is broken'), prompt('b', consoleOrigin),
+    ];
+    expect(pending.map(promptClass)).toEqual(Array(4).fill('message'));
+    expect(texts(takeBatch(pending, pending[0]!))).toHaveLength(4);
+    expect([commandName(' /compact now'), commandName('/home/user/file'), commandName('see /compact')])
+      .toEqual(['compact', undefined, undefined]);
   });
 
   it('leaves a prompt admitted after the snapshot for the next release', () => {

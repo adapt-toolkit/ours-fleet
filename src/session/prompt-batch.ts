@@ -17,6 +17,8 @@ export interface PendingPrompt {
   /** Whether the ledger already holds this body; an external body is never copied out of the queue. */
   persistBody: boolean;
   admittedAt: string;
+  /** Whether the session recognised the text, at admission, as one of its own control operations. */
+  command?: boolean;
   /** Set when a release takes this prompt; every member of that turn shares it. */
   released?: Promise<TurnResult>;
 }
@@ -35,9 +37,11 @@ const INVENTORY_TEXT_CHARS = 200;
  *    read — the paired console, the owner channel, the local console, a
  *    monitor wake. Every waiting message is delivered at one boundary, in
  *    admission order, whatever its route.
- *  - `command`: a session command (`/compact`, …). It must reach the adapter
- *    as the entire prompt, so it is its own turn and a boundary between the
- *    messages before and after it.
+ *  - `command`: a control operation the session itself supports — the native
+ *    `/compact`, a command the ACP adapter advertised. It must reach the
+ *    adapter as the entire prompt, so it is its own turn and a boundary
+ *    between the messages before and after it. The session decides this at
+ *    admission; text that merely starts with a slash is an ordinary message.
  *  - `internal`: startup, scheduled-loop and stall-watchdog prompts. They own
  *    their turn's lifecycle (and, for a loop, the redaction of its whole
  *    transcript), run alone, and never split the messages around them.
@@ -45,11 +49,15 @@ const INVENTORY_TEXT_CHARS = 200;
 export type PromptClass = 'message' | 'command' | 'internal';
 
 const INTERNAL = new Set<string>(['startup', 'scheduled-loop', 'stall-watchdog']);
-const SESSION_COMMAND = /^\/[a-z][a-z0-9_-]*(\s|$)/i;
 
-export function promptClass(prompt: Pick<PendingPrompt, 'text' | 'origin'>): PromptClass {
+export function promptClass(prompt: Pick<PendingPrompt, 'origin' | 'command'>): PromptClass {
   if (INTERNAL.has(prompt.origin?.kind ?? 'local-console')) return 'internal';
-  return SESSION_COMMAND.test(prompt.text.trim()) ? 'command' : 'message';
+  return prompt.command ? 'command' : 'message';
+}
+
+/** The command name a prompt invokes, when its whole text has the shape of one. */
+export function commandName(text: string): string | undefined {
+  return /^\/([a-z][a-z0-9_-]*)(?:\s|$)/i.exec(text.trim())?.[1];
 }
 
 /**

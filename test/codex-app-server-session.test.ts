@@ -730,7 +730,7 @@ describe('CodexAppServerSession releases every waiting message at one turn bound
       expect(session.snapshot().activePromptSource).toBe('owner-admin-console');
       const c = await session.queuePrompt('c', { origin: { kind: 'owner-admin-console', commandId: 'c3' } });
       const compact = await session.queuePrompt('/compact', { origin: { kind: 'owner-admin-console', commandId: 'c4' } });
-      const d = await session.queuePrompt('d');
+      const d = await session.queuePrompt('/not_a_native_command status explanation');
       expect(session.conversationSnapshot().pendingPrompts!.map(item => item.promptId))
         .toEqual([c.promptId, compact.promptId, d.promptId]);
       // A targeted interrupt naming a non-lead member reaches the shared turn.
@@ -739,7 +739,9 @@ describe('CodexAppServerSession releases every waiting message at one turn bound
       expect((await b.completion).outcome).toBe('cancelled');
       await Promise.all([c, compact, d].map(queued => queued.completion));
       const starts = server!.requests.filter(request => request.method === 'turn/start');
-      expect(starts.map(texts)).toEqual([['permission'], ['permission a', 'b'], ['c'], ['d']]);
+      // Only the native `/compact` is a control operation; other slash-looking text is a message.
+      expect(starts.map(texts)).toEqual([['permission'], ['permission a', 'b'], ['c'],
+        ['/not_a_native_command status explanation']]);
       expect(server!.requests.filter(request => request.method === 'thread/compact/start')).toHaveLength(1);
       expect(server!.requests.filter(request => request.method === 'turn/interrupt')).toHaveLength(2);
       for (const queued of [first, a, b, c, compact, d])

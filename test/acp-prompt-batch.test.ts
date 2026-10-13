@@ -36,8 +36,10 @@ async function start(stateDir = mkdtempSync(join(tmpdir(), 'ours-acp-batch-'))) 
   const prompts = (): Array<Array<Record<string, string>>> => !existsSync(log) ? []
     : readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
       .filter(entry => entry.method === 'session/prompt').map(entry => entry.prompt);
+  const methods = (): string[] => !existsSync(log) ? []
+    : readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line).method);
   return {
-    session, stateDir, prompts,
+    session, stateDir, prompts, methods,
     holdTurns: () => writeFileSync(hold, ''),
     releaseTurns: () => rmSync(hold, { force: true }),
   };
@@ -171,24 +173,57 @@ describe('AcpSession releases every waiting message at one turn boundary', () =>
       .toMatchObject({ outcome: 'cancelled', cancellationSource: 'local-console' });
   });
 
-  it('runs internal turns and session commands alone without splitting the messages', async () => {
+  it('runs internal turns and advertised commands alone without splitting the messages', async () => {
     const { session, prompts, holdTurns, releaseTurns } = await start();
+    // The "rich" turn makes the adapter advertise `fixture_command`.
+    await session.submitPrompt('rich');
     holdTurns();
     const first = await session.queuePrompt('first');
-    await until(() => prompts().length === 1);
+    await until(() => prompts().length === 2);
     const queued = [
       await session.queuePrompt('m1', { origin: consoleOrigin('c1') }),
       await session.queuePrompt('loop', { origin: { kind: 'scheduled-loop', loop: 'l', runId: 'r' } }),
       await session.queuePrompt('m2', { origin: wake }),
-      await session.queuePrompt('/compact', { origin: consoleOrigin('c2') }),
-      await session.queuePrompt('m3', { origin: consoleOrigin('c3') }),
+      // Slash-looking text the adapter does not advertise is an ordinary message.
+      await session.queuePrompt('/compact is not advertised here', { origin: consoleOrigin('c2') }),
+      await session.queuePrompt('/fixture_command topic', { origin: consoleOrigin('c3') }),
+      await session.queuePrompt('m3', { origin: consoleOrigin('c4') }),
     ];
     releaseTurns();
     await Promise.all([first, ...queued].map(item => item.completion));
-    expect(prompts().map(bodies)).toEqual([['first'], ['m1', 'm2'], ['loop'], ['/compact'], ['m3']]);
+    expect(prompts().slice(1).map(bodies)).toEqual([
+      ['first'], ['m1', 'm2', '/compact is not advertised here'], ['loop'],
+      ['/fixture_command topic'], ['m3'],
+    ]);
     // A command and a single message keep the unbatched shape.
-    expect(prompts()[3]!.map(block => block.type)).toEqual(['resource_link', 'text']);
-    expect(prompts()[2]).toEqual([{ type: 'text', text: 'loop' }]);
+    expect(prompts()[4]!.map(block => block.type)).toEqual(['resource_link', 'text']);
+    expect(prompts()[3]).toEqual([{ type: 'text', text: 'loop' }]);
+  });
+
+  it('keeps inbox traffic from steering a shared turn that has a console member but another lead', async () => {
+    const { session, prompts, methods, holdTurns, releaseTurns } = await start();
+    const running = await session.queuePrompt('late first');
+    await until(() => prompts().length === 1);
+    // Lead is a wake; the console prompt is the second member. No tool runs in their turn.
+    const lead = await session.queuePrompt('queued wake', { origin: wake });
+    const member = await session.queuePrompt('console member', { origin: consoleOrigin('c1') });
+    holdTurns();
+    await session.interrupt('local-console');
+    await running.completion;
+    await until(() => prompts().length === 2);
+    expect(session.snapshot().activePromptSource).toBe('owner-admin-console');
+    // A wake delivered now queues behind the human turn; it neither steers nor cancels it.
+    const cancels = methods().filter(method => method === 'session/cancel').length;
+    const wakeResult = session.submitPromptAfterTool('new mail', { origin: wake, steer: true });
+    await until(() => session.conversationSnapshot().pendingPromptCount === 1);
+    expect(session.conversationSnapshot().pendingPrompts![0]!.source).toBe('fleet_monitor');
+    releaseTurns();
+    expect((await lead.completion).outcome).toBe('completed');
+    expect((await member.completion).outcome).toBe('completed');
+    expect((await wakeResult).outcome).toBe('completed');
+    expect(prompts().map(bodies)).toEqual([['late first'], ['queued wake', 'console member'], ['new mail']]);
+    expect(methods()).not.toContain('_session/steering');
+    expect(methods().filter(method => method === 'session/cancel')).toHaveLength(cancels);
   });
 
   it('refuses a live-voice prompt while members of a shared turn or waiting prompts exist', async () => {

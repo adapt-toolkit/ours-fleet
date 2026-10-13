@@ -357,6 +357,8 @@ export class CodexAppServerSession implements AgentSession {
   private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
     const entry: PendingPrompt = {
       promptId, text, origin, ...sourceFor(origin), admittedAt: new Date().toISOString(),
+      // The one text the native session runs as an operation instead of a turn.
+      command: text.trim() === '/compact',
     };
     this.pendingPrompts.push(entry);
     const run = this.promptTail.then(() => this.release(entry));

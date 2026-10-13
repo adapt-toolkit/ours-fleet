@@ -19,6 +19,7 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     promptTail: Promise.resolve(),
     pendingPrompts: [],
     sharedTurns: new Map(),
+    advertisedCommands: new Set(),
     queueDepth: 0,
     steeringSupported: true,
     closing: false,

@@ -20,7 +20,7 @@ import type {
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import {
-  memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+  commandName, memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
 } from './prompt-batch.js';
 import { recordClaudeRateLimit } from '../subscriptions/observed.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
@@ -399,6 +399,8 @@ export class AcpSession implements AgentSession {
   private readonly pendingPrompts: PendingPrompt[] = [];
   /** Admitted prompt → the adapter turn that carries it, while that turn is open. */
   private readonly sharedTurns = new Map<string, string>();
+  /** Commands the adapter currently advertises; only these are control operations. */
+  private advertisedCommands = new Set<string>();
   private queueDepth = 0;
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
@@ -768,7 +770,8 @@ export class AcpSession implements AgentSession {
   ): Promise<TurnResult> {
     // A tool-boundary wait may outlive its original turn. Recheck the current
     // typed source at delivery, since an Owner turn can begin during the wait.
-    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.origin?.kind === 'owner-admin-console')
+    // `console` covers a shared turn whose first member is not the console prompt.
+    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.console)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
@@ -893,6 +896,7 @@ export class AcpSession implements AgentSession {
   private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
     const entry: PendingPrompt = {
       promptId, text, origin, ...conversationSource(origin), admittedAt: new Date().toISOString(),
+      command: this.advertisedCommands.has(commandName(text) ?? ''),
     };
     this.pendingPrompts.push(entry);
     const run = this.promptTail.then(() => this.release(entry));
@@ -2003,6 +2007,8 @@ export class AcpSession implements AgentSession {
     this.recordConversationUpdate(update, scheduled);
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
+    if (update.sessionUpdate === 'available_commands_update')
+      this.advertisedCommands = new Set((update.availableCommands ?? []).map(command => command.name));
     if (update.sessionUpdate === 'usage_update') {
       // Claude subscription rate-limit snapshot (claude-agent-acp forwards the SDK rate_limit_event).
       const rateLimit = (update._meta as Record<string, unknown> | null | undefined)?.['_claude/rateLimit'];
