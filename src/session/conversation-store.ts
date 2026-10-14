@@ -74,6 +74,7 @@ type EventDraft = Omit<ConversationEventV1, 'schemaVersion' | 'roleId' | 'eventI
 
 export class ConversationEventStore {
   private nextSeq = 1;
+  private firstAvailableSeq?: number;
   private segments: string[] = [];
   private tail: ConversationEventV1[] = [];
   private readonly listeners = new Set<(event: ConversationEventV1) => void>();
@@ -124,6 +125,7 @@ export class ConversationEventStore {
     const fd = this.segmentFd(Buffer.byteLength(line));
     writeSync(fd, line);
     fsyncSync(fd);
+    this.firstAvailableSeq ??= event.seq;
     this.nextSeq++;
     this.activeBytes += Buffer.byteLength(line);
     this.tail.push(event);
@@ -152,7 +154,10 @@ export class ConversationEventStore {
     const events = this.eventsAfter(after, limit + 1);
     const hasMore = events.length > limit;
     const pageEvents = hasMore ? events.slice(0, limit) : events;
-    const firstStored = this.firstStoredSeq();
+    // This single-writer store never removes retained segments. Recovery and
+    // append already know the first readable sequence; paging the memory tail
+    // must not parse the first segment again, especially while skipping replay.
+    const firstStored = this.firstAvailableSeq;
     return {
       events: pageEvents,
       ...(firstStored !== undefined ? { firstAvailableCursor: String(firstStored) } : {}),
@@ -213,6 +218,7 @@ export class ConversationEventStore {
     let maxSeq = 0;
     for (const segment of this.segments) {
       for (const event of this.readSegment(segment)) {
+        this.firstAvailableSeq ??= event.seq;
         maxSeq = Math.max(maxSeq, event.seq);
         this.tail.push(event);
         if (this.tail.length > TAIL_EVENTS) this.tail.shift();
@@ -354,15 +360,6 @@ export class ConversationEventStore {
   }
 
   // ── reads ──────────────────────────────────────────────────────────────────
-
-  private firstStoredSeq(): number | undefined {
-    if (this.tail.length && this.tail[0].seq === 1) return 1;
-    for (const segment of this.segments) {
-      const events = this.readSegment(segment);
-      if (events.length) return events[0].seq;
-    }
-    return this.tail[0]?.seq;
-  }
 
   private eventsAfter(after: number, limit: number): ConversationEventV1[] {
     // Serve from the in-memory tail whenever the range allows it.

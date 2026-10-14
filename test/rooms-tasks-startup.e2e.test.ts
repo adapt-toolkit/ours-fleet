@@ -16,7 +16,7 @@ const vocab: BriefingVocab = {
 };
 
 describe('simple room startup contract end to end', () => {
-  it('carries the one-time invite directly from Fleet to the temporary agent briefing', () => {
+  it('keeps the invite supervisor-owned and orders admission, readiness, then room work', () => {
     const briefing = generateBriefing({
       name: 'reviewer-1', identity: 'reviewer-1', harness: 'codex', session: 'acp',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
@@ -32,14 +32,19 @@ describe('simple room startup contract end to end', () => {
       routinesPath: '/state/ROUTINES.md', temporaryIdentity: true,
     });
 
-    const create = briefing.indexOf('create_temporary_identity');
-    const accept = briefing.indexOf('add_contact');
-    const work = briefing.indexOf('Start the Task above now');
-    expect(briefing).toContain('secret-once');
+    expect(briefing).not.toContain('secret-once');
+    expect(briefing).not.toMatch(/create_temporary_identity|choose_identity|add_contact/);
     expect(briefing).toContain('Review the implementation and report evidence.');
-    expect(create).toBeGreaterThan(0);
-    expect(accept).toBeGreaterThan(create);
-    expect(work).toBeGreaterThan(accept);
+    const admission = briefing.indexOf('verified room admission');
+    const readiness = briefing.indexOf('Announce console readiness first');
+    const task = briefing.indexOf('in the separate task turn, start the task above');
+    // Check each phase exists before ordering; a missing phrase must not pass
+    // merely because indexOf returns -1.
+    expect(admission).toBeGreaterThanOrEqual(0);
+    expect(readiness).toBeGreaterThanOrEqual(0);
+    expect(task).toBeGreaterThanOrEqual(0);
+    expect(admission).toBeLessThan(readiness);
+    expect(readiness).toBeLessThan(task);
     expect(briefing).not.toContain('fleet_room_briefing_ack');
     expect(briefing).not.toContain('briefing_sha256');
     expect(briefing).not.toContain('room_role_briefing');
@@ -60,7 +65,7 @@ describe('simple room startup contract end to end', () => {
       routinesPath: '/state/ROUTINES.md', temporaryIdentity: true,
     });
 
-    expect(briefing).toContain('name "reviewer-1" and expose_local=false');
+    expect(briefing).toContain('authenticated Cowork room envelope');
     expect(briefing).not.toContain('local_isolation');
     expect(briefing).not.toContain('local_auto_accept');
   });

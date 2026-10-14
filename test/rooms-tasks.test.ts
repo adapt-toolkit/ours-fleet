@@ -467,12 +467,14 @@ describe('room-state', () => {
     });
 
     it('accepts task_id and template_snapshot', () => {
+      const task = createTask({ title: 'linked', origin: { type: 'cli' } });
       const snap = snapshotTemplate(TEST_TEMPLATE);
       const r = createRoomRecord({
         room_id: 'room-full', room_name: 'Full',
-        task_id: 'task-1', template_snapshot: snap,
+        task_id: task.task_id, template_snapshot: snap,
       });
-      expect(r.task_id).toBe('task-1');
+      expect(r.task_id).toBe(task.task_id);
+      expect(r.workspace).toEqual(task.workspace);
       expect(r.template_snapshot!.content_hash).toBe(snap.content_hash);
     });
   });

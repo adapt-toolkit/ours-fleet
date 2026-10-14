@@ -1,3 +1,4 @@
+import { managedStartupPrompt, managedTaskPrompt } from '../src/startup-prompt.js';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,8 +45,8 @@ function world() {
       async queuePrompt(text, promptOptions) {
         prompts.push({ text, options: promptOptions,
           briefing: readFileSync(join(options.stateDir, 'briefing.md'), 'utf8') });
-        alive = false;
-        return { promptId: 'startup', queuedBehind: 0, completion: Promise.resolve(turnResult(true, 'completed')) };
+        if (!text.startsWith('Fleet readiness check')) alive = false;
+        return { promptId: text.startsWith('Fleet readiness check') ? 'ready' : 'task', queuedBehind: 0, completion: Promise.resolve(turnResult(true, 'completed')) };
       },
       submitPrompt: async () => turnResult(true, 'completed'),
       interrupt: async () => ({ state: 'settled' }), respondPermission: () => false,
@@ -101,36 +102,33 @@ describe('Hermes through the production runner', () => {
     { temporary: false, guarantee: 'created' },
     { temporary: false, guarantee: 'unverified' },
     { temporary: true, guarantee: 'unverified' },
-  ] as const)('uses a full fresh briefing on every restart (%j)', async ({ temporary, guarantee }) => {
+  ] as const)('announces readiness before a separate full task briefing on every restart (%j)', async ({ temporary, guarantee }) => {
     const w = world(); const p = provision(temporary); briefing(w, p, temporary, guarantee);
     const memory = join(p.stateDir, 'harness/hermes/memory.txt'); writeFileSync(memory, 'retained');
     const opts = { temp: temporary, configPath: p.configPath };
     const first = await runOnce('Worker', opts, w.deps);
     writeFileSync(join(p.stateDir, '.booted'), 'previously started');
+    writeFileSync(join(p.stateDir, 'WORKLOG.md'), '- earlier milestone\n');
     writeFileSync(join(p.stateDir, '.acp-session-id'), 'stale-native-id');
     const second = await runOnce('Worker', opts, w.deps);
     expect([first.mode, second.mode]).toEqual(['fresh', 'fresh']);
     expect(w.runnerStarts.map(start => start.mode)).toEqual(['fresh', 'fresh']);
     expect(w.starts.map(start => start.mode)).toEqual(['fresh', 'fresh']);
     expect(w.prompts.map(prompt => prompt.text)).toEqual([
-      `Read and follow ${join(p.stateDir, 'briefing.md')} now.`,
-      `Read and follow ${join(p.stateDir, 'briefing.md')} now.`,
+      managedStartupPrompt(p.stateDir, 'fresh'),
+      managedTaskPrompt(p.stateDir, 'fresh'),
+      managedStartupPrompt(p.stateDir, 'fresh', true),
+      managedTaskPrompt(p.stateDir, 'fresh', true),
     ]);
+    expect(w.prompts[1].text).not.toContain('WORKLOG.md');
+    expect(w.prompts[3].text).toContain('WORKLOG.md once for continuity');
+    expect(w.prompts[3].text).toContain('Read and follow');
     expect(w.prompts.every(prompt => prompt.options?.origin?.kind === 'startup')).toBe(true);
     expect(w.prompts[1].briefing).toContain('Complete the distinctive full mission.');
     expect(readFileSync(memory, 'utf8')).toBe('retained');
-    const expectedIdentityInstruction = temporary ? '**create_temporary_identity**' : '**choose_identity**';
-    expect(w.prompts[1].briefing).toContain(expectedIdentityInstruction);
     expect(w.prompts[1].briefing).toContain('AssignedIdentity');
-    if (temporary) {
-      expect(w.prompts[1].briefing).toContain('never bind, force-adopt, fall back');
-      expect(w.prompts[1].briefing).not.toContain('BIND your ours identity');
-    } else {
-      expect(w.prompts[1].briefing).toContain(guarantee === 'unverified'
-        ? 'NOT verified before launch' : guarantee === 'created' ? 'It was created' : 'verified to exist');
-      expect(w.prompts[1].briefing).not.toContain('force=true');
-      expect(w.prompts[1].briefing).not.toContain('**create_temporary_identity**');
-    }
+    expect(w.prompts[1].briefing).toContain('owned and verified by the Fleet supervisor');
+    expect(w.prompts[1].briefing).not.toMatch(/choose_identity|create_temporary_identity/);
   });
   it('passes final routing and isolation argv through Hermes without restoring ambient credentials', async () => {
     const w = world(); const p = provision(false, { isolation: {} }); briefing(w, p, false);
@@ -141,16 +139,13 @@ describe('Hermes through the production runner', () => {
     expect(launched.argv).toContain(process.execPath);
     expect(launched.cwd).toBe(join(root, 'project'));
     expect(launched.env.HERMES_HOME).toBe(join(p.stateDir, 'harness/hermes'));
-    expect(launched.env.OURS_BIND_IDENTITY).toBe('AssignedIdentity');
+    expect(launched.env.OURS_BIND_IDENTITY).toBeUndefined();
     expect(launched.env.OURS_FLEET_PROXY_CALLER).toBe('Worker');
     expect(launched.env.OURS_FLEET_PROXY_STATE_DIR).toBe(p.stateDir);
     expect(launched.env.OPENAI_API_KEY).toBeUndefined();
     expect(launched.inheritEnvironment).toBe(false);
     const ours = launched.mcpServers!.find(server => server.name === 'ours')!;
-    expect('env' in ours && ours.env).toEqual(expect.arrayContaining([
-      { name: 'OURS_FLEET_PROXY_CALLER', value: 'Worker' },
-      { name: 'OURS_BIND_IDENTITY', value: 'AssignedIdentity' },
-    ]));
+    expect('env' in ours && ours.env).toEqual(expect.arrayContaining([{name:'FLEET_OURS_BRIDGE_DESCRIPTOR',value:expect.any(String)}]));
   });
   it.each([{ model: null }, { effort: 'high' }, { harness_options: { provider: 'other' } }])(
     'rejects unsupported persisted Brain settings before launch: %j', async extra => {
@@ -159,3 +154,10 @@ describe('Hermes through the production runner', () => {
       expect(w.starts).toEqual([]);
     });
 });
+
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+ ...await importOriginal(),
+ preparePermanentAssignment: vi.fn(async () => 'verified'),
+ prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
+ releaseManagedAgent:async()=>{},
+}));

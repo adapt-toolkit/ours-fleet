@@ -1,8 +1,12 @@
-import { readFileSync, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 
-import { resolveEndpoint, type FetchLike } from './monitor.js';
+import { type FetchLike } from './monitor.js';
+import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { replaceFileAtomically } from './atomic-file.js';
 
 export const DAEMON_RECOVERY_MAX_ATTEMPTS = 6;
@@ -45,6 +49,9 @@ interface StartupProgress {
 interface GenerationProbeDeps {
   readText?(path: string): string;
   canonicalize?(path: string): string;
+  attachClient?(
+    options: AttachOursClientOptions,
+  ): Pick<OursClient, 'version' | 'identities' | 'close'> | Promise<Pick<OursClient, 'version' | 'identities' | 'close'>>;
 }
 
 function positiveInteger(value: unknown): value is number {
@@ -71,107 +78,49 @@ function startupProgress(value: unknown): StartupProgress | undefined {
   return row as unknown as StartupProgress;
 }
 
-function canonical(path: string, deps: GenerationProbeDeps): string {
-  const absolute = resolve(path);
-  return deps.canonicalize?.(absolute) ?? realpathSync.native(absolute);
-}
-
-/**
- * Corroborate the loopback daemon's unauthenticated `/info`, its credentialed
- * identity-index readiness route, and its local boot-generation record. The
- * index enforces auth when the daemon visibility requires it; open visibility
- * deliberately does not. No source is sufficient
- * alone: `/info` has no boot id, the identity index has no generation, and a
- * stale `ready` file can outlive the process that wrote it.
- */
+/** Read generation and readiness through the selected gateway. Server paths are opaque. */
 export async function probeDaemonGeneration(
   fetch: FetchLike,
   env: NodeJS.ProcessEnv,
   deps: GenerationProbeDeps = {},
 ): Promise<DaemonGenerationProbe> {
-  const endpoint = resolveEndpoint(env);
-  let response;
-  try {
-    response = await fetch(`${endpoint.origin}/info`, { headers: endpoint.headers });
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_INFO_UNREACHABLE' };
-  }
-  if (!response.ok) return {
-    state: 'unavailable',
-    reason: response.status === 401 ? 'DAEMON_INFO_UNAUTHORIZED' : 'DAEMON_INFO_HTTP_ERROR',
-  };
-  let info: Record<string, unknown>;
-  try {
-    const value = await response.json();
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('shape');
-    info = value as Record<string, unknown>;
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_INFO_INVALID' };
-  }
-  if (info.name !== 'ours' || !positiveInteger(info.pid)
-      || typeof info.stateDir !== 'string' || info.stateDir.length === 0)
-    return { state: 'unavailable', reason: 'DAEMON_INFO_INVALID' };
+  try { return await probeSelectedDaemon(deps, readClientProfile(env)); }
+  catch { return { state: 'unavailable', reason: 'CLIENT_GATEWAY_PROFILE_INVALID' }; }
+}
 
-  let reportedStateDir: string;
-  let expectedStateDir: string;
+/** Container selection uses public SDK reads; daemon paths/PIDs remain opaque metadata. */
+async function probeSelectedDaemon(
+  deps: GenerationProbeDeps,
+  profile: ExplicitClientProfile,
+): Promise<DaemonGenerationProbe> {
+  // Defer credential-file access to SDK selection, which checks the configured
+  // daemon identity/capability before it reads or sends the credential.
+  let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
   try {
-    reportedStateDir = canonical(info.stateDir, deps);
-    expectedStateDir = canonical(endpoint.stateDir, deps);
+    const options: AttachOursClientOptions = {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: randomUUID(), env: {},
+    };
+    client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+    const info = await client.version({startup:true});
+    if (info.name !== 'ours' || !positiveInteger(info.pid)
+        || typeof info.stateDir !== 'string' || !info.stateDir)
+      return {state:'unavailable', reason:'DAEMON_INFO_INVALID'};
+    const progress = startupProgress(info.startup);
+    if (!progress) return {state:'unavailable', reason:'DAEMON_PROGRESS_INVALID'};
+    if (progress.phase !== 'ready') return {state:'unavailable', reason:'DAEMON_PROGRESS_NOT_READY'};
+    if (progress.pid !== info.pid) return {state:'unavailable', reason:'DAEMON_GENERATION_MISMATCH'};
+    const identities = await client.identities();
+    if (!Array.isArray(identities)) return {state:'unavailable', reason:'DAEMON_IDENTITIES_INVALID'};
+    if (!identities.length) return {state:'unavailable', reason:'DAEMON_IDENTITIES_NOT_READY'};
+    return {state:'ready', generation:{
+      bootId:progress.bootId, pid:progress.pid, startedAt:progress.startedAt, stateDir:info.stateDir,
+    }};
   } catch {
-    return { state: 'unavailable', reason: 'DAEMON_STATE_DIR_UNAVAILABLE' };
-  }
-  if (reportedStateDir !== expectedStateDir)
-    return { state: 'unavailable', reason: 'DAEMON_STATE_DIR_MISMATCH' };
-
-  // `/identities` is the daemon's credential-capable readiness route. A
-  // valid-but-empty index is a documented intermediate startup state, never
-  // proof of readiness.
-  let identitiesResponse;
-  try {
-    identitiesResponse = await fetch(`${endpoint.origin}/identities`, { headers: endpoint.headers });
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_UNREACHABLE' };
-  }
-  if (!identitiesResponse.ok) return {
-    state: 'unavailable',
-    reason: identitiesResponse.status === 401
-      ? 'DAEMON_IDENTITIES_UNAUTHORIZED' : 'DAEMON_IDENTITIES_HTTP_ERROR',
-  };
-  try {
-    const body = await identitiesResponse.json();
-    if (!body || typeof body !== 'object' || Array.isArray(body)
-        || !Array.isArray((body as { identities?: unknown }).identities))
-      return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_INVALID' };
-    if ((body as { identities: unknown[] }).identities.length === 0)
-      return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_NOT_READY' };
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_INVALID' };
-  }
-
-  let progress: StartupProgress | undefined;
-  try {
-    const text = deps.readText?.(join(reportedStateDir, 'startup-progress.json'))
-      ?? readFileSync(join(reportedStateDir, 'startup-progress.json'), 'utf8');
-    progress = startupProgress(JSON.parse(text));
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_PROGRESS_UNAVAILABLE' };
-  }
-  if (!progress) return { state: 'unavailable', reason: 'DAEMON_PROGRESS_INVALID' };
-  if (progress.phase !== 'ready')
-    return { state: 'unavailable', reason: 'DAEMON_PROGRESS_NOT_READY' };
-  if (progress.pid !== info.pid)
-    return { state: 'unavailable', reason: 'DAEMON_GENERATION_MISMATCH' };
-  return {
-    state: 'ready',
-    generation: {
-      // Keep bootId opaque. Its current writer uses `${pid}-${startedAt}`, but
-      // equality—not its formatting—is the generation contract Fleet needs.
-      bootId: progress.bootId,
-      pid: progress.pid,
-      startedAt: progress.startedAt,
-      stateDir: reportedStateDir,
-    },
-  };
+    // Failed selection, auth or transport is unavailable, never owner death.
+    return {state:'unavailable', reason:'DAEMON_SELECTED_PROBE_UNAVAILABLE'};
+  } finally { await client?.close().catch(() => undefined); }
 }
 
 export class DaemonGenerationObserver {

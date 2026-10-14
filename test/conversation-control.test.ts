@@ -46,18 +46,123 @@ async function startArbiterServer() {
     permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     log: () => {},
   });
-  const server = new RoleControlServer(stateDir, new RoleTurnArbiter(session), () => {});
+  const arbiter = new RoleTurnArbiter(session);
+  const server = new RoleControlServer(stateDir, arbiter, () => {});
   await server.start();
   cleanups.push(async () => { await server.close(); await session.close(); });
-  return { stateDir };
+  return { stateDir, session, server, arbiter };
 }
 
 describe('role-control conversation v3', () => {
+  it.each(['interrupt', 'after-tool'])('queues a monitor wake during active voice despite a timed-out member spawn: %s', async policy => {
+    const { stateDir, session, server, arbiter } = await startArbiterServer();
+    const generation = session.conversationSnapshot().sessionGeneration;
+    const voice = await controlRequest(stateDir, { command: 'submit_voice_prompt', commandId: 'voice-task-start',
+      text: 'block 600', actor: 'browser', source: 'owner_admin_console', expectedSessionGeneration: generation, requireIdle: true });
+    expect(voice.ok).toBe(true);
+    await expect.poll(() => session.snapshot().activePromptSource).toBe('owner-admin-console');
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    server.setFleetSpawner(async () => { await pending; return {
+      caller: 'A', role: 'TaskWorker', lifetime: 'temporary', statePath: '/fixture/task-worker',
+      creationActionId: 'task-action', inherited: [], harness: 'codex', session: 'acp',
+      monitor: { mode: 'fleet', interrupt: true }, brainSummary: 'fixture', roleSummary: 'worker',
+    }; });
+    try {
+      const spawn = controlRequest(stateDir, { command: 'fleet_spawn', spawn: { name: 'TaskWorker' } }, 30)
+        .catch(error => error);
+      const options = { interrupt: true, steer: true, interruptSource: 'fleet-monitor' as const, origin: { kind: 'fleet-monitor' as const } };
+      const wake = policy === 'after-tool' ? arbiter.submitPromptAfterTool('mail after voice', options) : arbiter.submitPrompt('mail after voice', options);
+      expect((await controlRequest(stateDir, { command: 'snapshot' })).result).toMatchObject({
+        alive: true, readiness: 'running', activePromptSource: 'owner-admin-console',
+      });
+      expect((await spawn).kind).toBe('timeout');
+      expect((await wake).succeeded).toBe(true);
+      const events = session.conversationPage({ limit: 100 }).events;
+      expect(events.filter(event => event.kind === 'prompt.interrupt_requested')).toEqual([]);
+      const voiceId = (voice.result as { promptId: string }).promptId;
+      const stopped = events.findIndex(event => event.kind === 'turn.completed' && event.promptId === voiceId);
+      const mailStarted = events.findIndex(event => event.kind === 'prompt.started' && event.source === 'fleet_monitor');
+      expect(stopped).toBeGreaterThan(-1);
+      expect(mailStarted).toBeGreaterThan(stopped);
+      expect(session.conversationSnapshot().sessionGeneration).toBe(generation);
+    } finally { release(); }
+  });
+
+  it('live voice binds admission and interrupt atomically through the arbiter/control socket', async () => {
+    const { stateDir } = await startArbiterServer();
+    const page = await controlRequest(stateDir, { command: 'conversation_page', limit: 1 });
+    const generation = (page.result as any).snapshot.sessionGeneration;
+    const snapshot = await controlRequest(stateDir, { command: 'snapshot' });
+    expect((snapshot.result as any).features).toContain('targeted_voice_interrupt');
+    const command = { command: 'submit_voice_prompt' as const, commandId: 'live-one', text: 'block 1200', actor: 'browser', source: 'owner_admin_console' as const, expectedSessionGeneration: generation, requireIdle: true };
+    const first = await controlRequest(stateDir, command); expect(first.ok).toBe(true);
+    await new Promise(r => setTimeout(r, 50));
+    expect((await controlRequest(stateDir, command)).result).toEqual(first.result); // lost receipt retry while running
+    const busy = await controlRequest(stateDir, { ...command, commandId: 'live-two' });
+    expect(busy.ok).toBe(false); expect(busy.error).toContain('voice_busy');
+    const cancel = { command: 'interrupt_voice_v2' as const, commandId: 'cancel-one', promptId: (first.result as any).promptId, expectedSessionGeneration: generation };
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'cancel-stale', expectedSessionGeneration: 'old' })).ok).toBe(false);
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'cancel-other', promptId: 'unrelated' })).ok).toBe(true);
+    let events = ((await controlRequest(stateDir, { command: 'conversation_page', limit: 100 })).result as any).events;
+    expect(events.some((e:any) => e.kind === 'prompt.interrupt_requested')).toBe(false);
+    const stopped = await controlRequest(stateDir, cancel); expect(stopped.ok).toBe(true);
+    expect((await controlRequest(stateDir, cancel)).result).toEqual(stopped.result);
+    expect((await controlRequest(stateDir, { ...cancel, promptId: 'different' })).ok).toBe(false);
+    const next = await controlRequest(stateDir, { ...command, commandId: 'live-new', text: 'block 200' }); expect(next.ok).toBe(true);
+    await new Promise(r => setTimeout(r, 40));
+    expect((await controlRequest(stateDir, { ...cancel, commandId: 'late-old-cancel' })).ok).toBe(true);
+    events = ((await controlRequest(stateDir, { command: 'conversation_page', limit: 100 })).result as any).events;
+    expect(events.filter((e:any) => e.kind === 'prompt.interrupt_requested')).toHaveLength(1);
+  });
+
+  it('binds voice input to its recorded session and replays the exact admitted receipt', async () => {
+    const { stateDir, session } = await startServer();
+    const command = { command: 'submit_voice_prompt' as const, commandId: 'voice-once', text: 'Voice message:\n/restart', actor: 'browser', source: 'owner_admin_console' as const };
+    const missing = await controlRequest(stateDir, command);
+    expect(missing.ok).toBe(false);
+    const stale = await controlRequest(stateDir, { ...command, expectedSessionGeneration: 'old' });
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toContain('session_changed');
+    const accepted = await controlRequest(stateDir, { ...command, expectedSessionGeneration: session.conversationSnapshot().sessionGeneration });
+    expect(accepted.ok).toBe(true);
+    const retry = await controlRequest(stateDir, { ...command, expectedSessionGeneration: 'old' });
+    expect(retry.result).toEqual(accepted.result);
+    expect(session.conversationPage({limit:100}).events.filter(e => e.kind === 'prompt.admitted')).toHaveLength(1);
+  });
+
+  it('serves typed read-only correspondence from the selected supervisor',async()=>{
+    const {stateDir,server}=await startServer();const queries:unknown[]=[];
+    server.setCorrespondence({contacts:async()=>({identity:{name:'A'},contacts:[{name:'Peer',container_id:'B'.repeat(64)}]}),history:async query=>{queries.push(query);return {items:[{seq:2,direction:'out',text:'hello'}],next_cursor:2};}});
+    const contacts=await controlRequest(stateDir,{command:'agent_contacts'});
+    expect(contacts.ok).toBe(true);expect(contacts.result).toMatchObject({identity:{name:'A'},contacts:[{name:'Peer'}]});
+    const query={peer_cid:'B'.repeat(64),limit:10,before_seq:4};
+    expect((await controlRequest(stateDir,{command:'agent_history',agentHistory:query})).result).toMatchObject({next_cursor:2});
+    expect(queries).toEqual([query]);
+    expect((await controlRequest(stateDir,{command:'agent_history',agentHistory:{peer_cid:'bad'}})).ok).toBe(false);
+    expect(queries).toHaveLength(1);
+  });
+  it('serializes idle retirement with incoming work and rejects prompts after closing', async()=>{
+    const {session}=await startServer();
+    const arbiter=new RoleTurnArbiter(session);
+    const queued=arbiter.queuePrompt('block 80');
+    const firstRetirement=arbiter.retireIfIdle(()=>true);
+    const admitted=await queued;
+    expect(await firstRetirement).toBe(false);
+    await admitted.completion;
+    const closing=arbiter.retireIfIdle(()=>true);
+    const later=arbiter.queuePrompt('must not be admitted');
+    const rejected=expect(later).rejects.toThrow('Chat is closing');
+    expect(await closing).toBe(true);
+    await rejected;
+    await expect.poll(()=>session.isAlive()).toBe(false);
+  });
+
   it('forwards conversation v3 through the production turn arbiter', async () => {
     const { stateDir } = await startArbiterServer();
     const snapshot = await controlRequest(stateDir, { command: 'snapshot' });
     expect(snapshot.result).toMatchObject({
-      protocolVersion: 3, features: expect.arrayContaining(['conversation_v3']),
+      protocolVersion: 3, features: expect.arrayContaining(['conversation_v3', 'generation_bound_prompts']),
     });
     const submitted = await controlRequest(stateDir, {
       command: 'submit_prompt_v2', commandId: 'arbiter-cmd',
@@ -75,6 +180,7 @@ describe('role-control conversation v3', () => {
     const result = response.result as { protocolVersion: number; features: string[] };
     expect(result.protocolVersion).toBe(3);
     expect(result.features).toContain('conversation_v3');
+    expect(result.features).toContain('generation_bound_prompts');
     // v1/v2 features remain, so old callers keep working.
     expect(result.features).toEqual(expect.arrayContaining(
       ['events_since', 'observer_follow', 'retained_range']));

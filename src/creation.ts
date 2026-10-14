@@ -1,3 +1,4 @@
+import { preparePermanentAssignment } from './agent-ours/service.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -6,6 +7,7 @@ import {
 } from '@ours.network/sdk/client';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
+import { readClientProfile } from './client-profile.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 import type { ResolvedRole } from './config.js';
 
@@ -255,21 +257,8 @@ export async function reconcilePermanentRoleIdentities(
   provisioner: IdentityProvisioner = daemonIdentityProvisioner(),
   log: (line: string) => void = () => {},
   knownRoleGuarantee?: IdentityGuarantee['state'],
-): Promise<'verified' | 'created'> {
-  const roleResult = knownRoleGuarantee
-    ? {
-        state: knownRoleGuarantee,
-        evidence: knownRoleGuarantee === 'verified' ? 'verified' : 'missing',
-        detail: `identity was ${knownRoleGuarantee} by the creation transaction`,
-      } as IdentityGuarantee
-    : await ensureIdentity(role.identity, {
-        bio: role.bio,
-        persona: role.persona,
-        exposeLocal: true,
-        localAutoAccept: true,
-      }, provisioner, log);
-  const roleGuarantee = requireGuaranteedIdentity(role, role.identity, roleResult);
-
+): Promise<'verified' | 'created' | 'unverified'> {
+  const guarantee = await preparePermanentAssignment(role);
   if (role.owner_channel) {
     const channelIdentity = role.owner_channel.identity;
     const channel = await ensureIdentity(channelIdentity, {
@@ -279,7 +268,7 @@ export async function reconcilePermanentRoleIdentities(
     }, provisioner, log);
     requireGuaranteedIdentity(role, channelIdentity, channel);
   }
-  return roleGuarantee.state;
+  return guarantee;
 }
 
 /**
@@ -366,12 +355,17 @@ export function daemonIdentityProvisioner(
   ) => Promise<IdentityInventoryClient> = attachOursClient,
   options: DaemonIdentityProvisionerOptions = {},
 ): IdentityProvisioner {
+  const connect = (leaseToken: string) => {
+    const profile = readClientProfile(env);
+    return attachClient({
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath, sessionMode: 'external', leaseToken, env: {},
+    });
+  };
   const provisioner: IdentityProvisioner = {
     async exists(name: string) {
       try {
-        const client = await attachClient({
-          env, leaseToken: `ours-fleet-identity-preflight-${process.pid}`, clientPid: process.pid,
-        });
+        const client = await connect(`ours-fleet-identity-preflight-${process.pid}`);
         const identities = await client.identities();
         if (!Array.isArray(identities)) return 'unknown';
         const existing = identities.find(identity => identity.name === name);
@@ -389,10 +383,7 @@ export function daemonIdentityProvisioner(
   if (options.createPermanent === false) return provisioner;
 
   provisioner.create = async (name, profile) => {
-    const client = await attachClient({
-      env, leaseToken: `ours-fleet-identity-create-${process.pid}-${randomUUID()}`,
-      clientPid: process.pid,
-    });
+    const client = await connect(`ours-fleet-identity-create-${process.pid}-${randomUUID()}`);
     if (!client.listIdentities || !client.createIdentity || !client.releaseLease)
       throw new Error('the selected ours SDK client cannot create permanent identities');
 
@@ -450,10 +441,10 @@ export function daemonIdentityInventoryProvisioner(
   });
 }
 
-/** Atomically write a bare Agent file, journalling it for rollback. */
+/** Atomically write an owner-private Agent file, journalling it for rollback. */
 export function writeRoleFile(tx: CreationTransaction, file: string, contents: string): void {
   const existed = existsSync(file);
-  replaceFileAtomically(file, contents, 0o644);
+  replaceFileAtomically(file, contents, 0o600);
   tx.record({
     stage: `Agent file ${file}`,
     // Only remove what THIS transaction created; never delete a file the

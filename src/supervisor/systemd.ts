@@ -1,3 +1,5 @@
+import { assertNativeFleetScope } from './scope.js';
+import { clientConfigPath } from '../client-profile.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
@@ -5,7 +7,7 @@ import { home } from '../paths.js';
 import { realExec, type Exec, type ExecResult } from '../exec.js';
 import type { Liveness, LivenessState, SupervisorBackend } from './types.js';
 
-export const UNIT_TEMPLATE = 'ours-fleet-agent@.service';
+export const UNIT_TEMPLATE = 'ours-fleet.service';
 
 /**
  * Actionable hint when systemctl cannot reach the user bus. After the cli.ts
@@ -18,7 +20,7 @@ export const busHint = (stderr: string): string =>
     ? `\nhint: no user runtime dir — enable linger: sudo loginctl enable-linger ${userInfo().username}` +
       `\n      (if linger is already on: export XDG_RUNTIME_DIR=/run/user/$(id -u))`
     : '';
-export const unitFor = (name: string) => `ours-fleet-agent@${name}.service`;
+export const unitFor = (_name: string) => UNIT_TEMPLATE;
 
 /** Quote a systemd unit argument and escape its specifier marker. */
 const unitArg = (value: string): string =>
@@ -62,11 +64,12 @@ async function probeLiveness(
 }
 
 export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
-  const ctl = (...args: string[]) => exec('systemctl', ['--user', ...args]);
+  const ctl = (...args: string[]) => { assertNativeFleetScope(exec); return exec('systemctl', ['--user', ...args]); };
   return {
     id: 'systemd',
 
     async init(binPath: string) {
+      assertNativeFleetScope(exec);
       const msgs: string[] = [];
       const unitDir = join(home(), '.config', 'systemd', 'user');
       // Lingering user units often start before a login shell imports its PATH.
@@ -76,48 +79,31 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
         dirname(process.execPath),
         ...(process.env.PATH ?? '').split(delimiter),
       ].filter(Boolean))].join(delimiter);
-      // Same reason as PATH, for the other thing a lingering unit cannot inherit:
-      // WHICH ours daemon this fleet was set up against.
-      //
-      // ours-fleet resolves its daemon from OURS_CONFIG / OURS_PORT / OURS_STATE_DIR
-      // and otherwise falls back to ~/.ours and port 3050 (src/monitor.ts). A host
-      // set up against a non-default daemon — the installer's multi-daemon profiles
-      // do exactly this — passes that selection to `ours-fleet init` in the
-      // environment, and it died there: nothing persisted it, so every runner
-      // systemd started at boot resolved the default daemon again, and on a host
-      // where only the non-default daemon exists that is a daemon that is not there.
-      //
-      // ONLY OURS_CONFIG is baked, deliberately. It names which daemon, and leaves
-      // that daemon's own config file authoritative for port and state directory, so
-      // a later edit to it still wins. Baking OURS_PORT/OURS_STATE_DIR would freeze
-      // those into a unit file that outranks the config for ever after — the failure
-      // mode @ours.network/cli avoids for the same reason (packages/cli/src/
-      // service.ts: "The port is deliberately NOT baked").
-      //
-      // Absent from init's environment ⇒ no line, and the unit is byte-for-byte what
-      // it has always been. This teaches fleet nothing about installer profiles; it
-      // persists the selection fleet was initialised with.
+      // Persist one profile path, never a URL or service port. Profile updates
+      // are picked up by every fresh process, including lingering user services.
       const unitEnv = ['PATH=' + servicePath];
-      if (process.env.OURS_CONFIG) unitEnv.push('OURS_CONFIG=' + process.env.OURS_CONFIG);
+      unitEnv.push('OURS_CONFIG=' + clientConfigPath(process.env));
+      for (const key of ['OURS_FLEET_HOME', 'OURS_FLEET_SOCKET_ROOT', 'CODEX_HOME', 'CODEX_PATH']) {
+        if (process.env[key] !== undefined) unitEnv.push(key + '=' + process.env[key]);
+      }
       const environmentLines = unitEnv
         .map(value => `Environment="${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`)
         .join('\n');
       mkdirSync(unitDir, { recursive: true });
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
-Description=ours-fleet agent %i
+Description=ours-fleet process manager
 After=default.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ${environmentLines}
-ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
-# The RUNNER owns the child-session restart loop, with a counted, backed-off
-# circuit breaker. systemd must only recover the runner PROCESS crashing —
-# Restart=always here would resume the uncounted two-second relaunch loop, and
-# would also restart a runner that is deliberately holding a failing agent down.
+ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run-fleet
+# Fleet owns agent startup and restart; the OS recovers only the Fleet parent.
+KillMode=control-group
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=15
+TimeoutStopSec=25
 
 [Install]
 WantedBy=default.target

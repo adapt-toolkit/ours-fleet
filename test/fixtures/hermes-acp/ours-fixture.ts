@@ -8,7 +8,7 @@ import { OursClient } from '@ours.network/sdk/client';
 
 /** Separate local daemon, Human fixture root and agent; never selects an operator daemon. */
 export async function createPrivateOursFixture() {
-  const cli = process.env.HERMES_ACP_TEST_OURS_CLI ?? join(homedir(), '.local/lib/node_modules/@ours.network/cli/dist/cli.js');
+  const cli = process.env.HERMES_ACP_TEST_OURS_CLI ?? join(homedir(), '.local/lib/node_modules/@ours.network/daemon/dist/cli.js');
   const mcp = process.env.HERMES_ACP_TEST_OURS_MCP ?? join(homedir(), '.local/lib/node_modules/@ours.network/mcp/dist/cli.js');
   await Promise.all([access(cli), access(mcp)]);
   const root = await mkdtemp(join(tmpdir(), 'fleet-hermes-private-ours-'));

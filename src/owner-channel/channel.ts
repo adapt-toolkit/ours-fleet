@@ -83,6 +83,8 @@ export interface OwnerChannelOptions {
   harness: string;
   config: OwnerChannelConfig;
   session: AgentSession;
+  /** Ordinary owner input must not cancel the initial briefing turn. */
+  startupPending?: () => boolean;
   stateDir: string;
   env?: Record<string, string>;
   log(line: string): void;
@@ -596,7 +598,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.drainTask?.catch(error => this.logError('stale drain shutdown failed', error)),
       ]), deadlineAt);
       if (superseded()) throw new Error('owner recovery epoch superseded');
-      await this.recoveryStage('close', this.client.close(), deadlineAt);
+      // A daemon reconnect is not terminal ownership evidence. Keep the same
+      // owner ID and its temporary/permanent bindings while replacing transport.
+      await this.recoveryStage('close', this.client.close({ releaseLease: false }), deadlineAt);
       if (superseded()) throw new Error('owner recovery epoch superseded');
       try {
         await this.recoveryStage('start', this.client.start(), deadlineAt);
@@ -621,7 +625,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         // its disposal; the recorded quiescence debt gates the next retry.
         if (!this.recoveryQuiescence) {
           try {
-            await this.recoveryStage('close_after_failure', this.client.close(), deadlineAt);
+            await this.recoveryStage('close_after_failure', this.client.close({ releaseLease: false }), deadlineAt);
           } catch (closeError) {
             this.logError('recovery client close failed', closeError);
           }
@@ -1055,8 +1059,15 @@ export class OwnerChannel implements OwnerChannelHandle {
     const recovered: InboundMessage[] = [];
     for (const claim of this.messageRecovery.list()) {
       const item = await this.client.getHistoryItem(claim.wireId);
-      if (!item)
-        throw new Error(`journaled owner message ${claim.wireId} is missing from persistent history`);
+      if (!item) {
+        // The daemon has definitively lost this body. Retrying the claim would
+        // block every later owner message, including after a supervisor restart.
+        // Keep transient lookup errors retryable; only an explicit absence skips.
+        this.messageRecovery.pruneHandled(wireId => wireId === claim.wireId);
+        this.options.log(`[${this.options.role}] skipped journaled owner message ${claim.wireId} `
+          + `(seq=${claim.seq}): missing from persistent history`);
+        continue;
+      }
       recovered.push(this.historyMessage(item, claim));
     }
 
@@ -1289,6 +1300,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
+      // getFiles returns daemon-local paths, which need not exist in Fleet's
+      // filesystem (for example with an HTTP daemon in a container). Fetch
+      // through the bound client and keep the daemon's integrity metadata for
+      // admission below; never trust or remap the returned filesystem path.
+      for (const file of retrieved) {
+        file.path = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
+      }
       for (const file of historyRecovered) {
         if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(
@@ -1304,8 +1323,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
-          interrupt: this.options.config.interrupt,
-          ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+          ...this.ownerPromptPolicy(),
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
@@ -1419,8 +1437,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
-        interrupt: this.options.config.interrupt,
-        ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+        ...this.ownerPromptPolicy(),
         origin: { kind: 'owner', requestId, displayText: text },
       });
     } catch (error) {
@@ -1464,6 +1481,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
     this.completionTasks.add(task);
     return true;
+  }
+
+  private ownerPromptPolicy() {
+    if (this.options.startupPending?.()) return { interrupt: false, steer: true };
+    return {
+      interrupt: this.options.config.interrupt,
+      ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+    };
   }
 
   /**
@@ -1535,6 +1560,8 @@ export class OwnerChannel implements OwnerChannelHandle {
           await this.fleetOps.provisionTask(task.task_id);
         return outcome;
       }),
+      observeTaskReadiness: taskId =>
+        new TaskRoomApplicationService(this.options.configPath).observeTaskReadiness(taskId),
       taskProvisioningOutcome: taskId =>
         new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
@@ -1932,6 +1959,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
+      // getFiles returns daemon-local paths, which need not exist in Fleet's
+      // filesystem (for example with an HTTP daemon in a container). Fetch
+      // through the bound client and keep the daemon's integrity metadata for
+      // admission below; never trust or remap the returned filesystem path.
+      for (const file of retrieved) {
+        file.path = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
+      }
       for (const file of historyRecovered) {
         if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(
@@ -2118,6 +2153,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     const progressMs = this.options.config.progress_interval_ms;
     let lastSeq = activityCursor;
     let startedAt: number | undefined;
+    // When one turn delivers several waiting prompts, its events carry the turn's
+    // id, not this request's: follow the turn that actually carries this request.
+    const inTurn = (turnId: string | undefined): boolean =>
+      turnId === (this.options.session.sharedTurnId?.(queued.promptId) ?? queued.promptId);
     let phase: OwnerProgressPhase = 'starting request';
     let timer: ReturnType<typeof setInterval> | undefined;
 
@@ -2169,7 +2208,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
     const acceptCommentary = (event: SessionEvent) => {
       if (!this.commentsEnabled
-          || active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
+          || active.commentaryDisabled || active.finalizing || !inTurn(event.turnId)
           || event.kind !== 'agent_text' || event.messagePhase !== 'commentary'
           || event.replayed || event.origin?.kind !== 'owner'
           || event.origin.requestId !== active.requestId
@@ -2208,7 +2247,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const reportProgress = () => {
       const events = this.options.session.eventsSince(lastSeq);
       lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
-      const activity = events.filter(event => event.turnId === queued.promptId);
+      const activity = events.filter(event => inTurn(event.turnId));
       if (!activity.length) return;
       startedAt ??= Date.parse(activity[0].at) || Date.now();
       phase = this.progressPhase(activity) ?? phase;
@@ -2234,9 +2273,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     // the interval only after this exact prompt emits its first session event.
     const startProgress = (event?: SessionEvent) => {
       if (timer || progressMs <= 0) return;
-      if (event && event.turnId !== queued.promptId) return;
+      if (event && !inTurn(event.turnId)) return;
       const observed = event ? [event] : this.options.session.eventsSince(activityCursor)
-        .filter(item => item.turnId === queued.promptId);
+        .filter(item => inTurn(item.turnId));
       if (!observed.length) return;
       startedAt = Date.parse(observed[0].at) || Date.now();
       timer = setInterval(reportProgress, progressMs);

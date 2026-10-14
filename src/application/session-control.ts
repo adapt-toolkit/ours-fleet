@@ -1,3 +1,7 @@
+import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {conversationTailPage,resumedConversationPage,type ConversationTailPage} from './conversation-history.js';
+import type { AgentHistoryQuery } from '../agent-ours/correspondence.js';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt,
@@ -32,6 +36,8 @@ export interface InterruptReceipt {
 }
 
 export interface RoleSessionControl {
+  agentContacts?():Promise<unknown>;
+  agentHistory?(request:AgentHistoryQuery):Promise<unknown>;
   describe(): Promise<SessionDescriptor>;
   snapshot(): Promise<SessionSnapshot>;
   recentOutput(request?: { since?: number; limit?: number }): Promise<OutputPage>;
@@ -40,10 +46,13 @@ export interface RoleSessionControl {
   respondPermission?(request: { permissionId: string; optionId: string }): Promise<{ accepted: true }>;
   // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
+  /** The newest visible events (or those before `before`), read backwards from the ledger. */
+  conversationTail?(request: { before?: string; limit?: number }): Promise<ConversationTailPage>;
   submitPromptV2?(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string; requireIdle?: boolean;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
+  interruptPromptV2?(request: { commandId: string; expectedSessionGeneration: string; promptId: string }): Promise<InterruptReceipt>;
   interruptV2?(commandId: string): Promise<InterruptReceipt & { commandId: string }>;
   respondPermissionV2?(request: {
     commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
@@ -68,6 +77,10 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     private readonly stateDir: string,
     private readonly request: typeof controlRequest = controlRequest,
   ) {}
+
+  async agentContacts():Promise<unknown> {await this.requireCorrespondence();return this.call('agent_contacts');}
+  async agentHistory(request:AgentHistoryQuery):Promise<unknown> {await this.requireCorrespondence();return this.call('agent_history',{agentHistory:request});}
+  private async requireCorrespondence(){if(!(await this.describe()).features.includes('agent_correspondence'))throw new FleetError('capability_unavailable','This session needs an updated supervisor to show contacts and history.');}
 
   async describe(): Promise<SessionDescriptor> {
     const response = await this.call('snapshot');
@@ -127,29 +140,81 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
   }
 
   async conversationPage(request: { after?: string; limit?: number } = {}): Promise<ConversationPageView> {
-    return await this.call('conversation_page', {
+    const live = await this.call('conversation_page', {
       after: request.after, limit: request.limit,
     }) as ConversationPageView;
+    const snapshot = await this.snapshot();
+    if(snapshot.backend!=='acp'||!snapshot.sessionId)return live;
+    try{
+      const history=await resumedConversationPage(this.stateDir,request,live,snapshot.sessionId);
+      const check=await this.call('conversation_page',{limit:1}) as ConversationPageView;
+      return check.snapshot.sessionGeneration===live.snapshot.sessionGeneration?history:await this.call('conversation_page',request) as ConversationPageView;
+    }catch{return live;}
+  }
+
+  async conversationTail(request: { before?: string; limit?: number } = {}): Promise<ConversationTailPage> {
+    const live = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+    const snapshot = await this.snapshot();
+    let resumed: string | undefined;
+    if (snapshot.backend === 'acp' && snapshot.sessionId) {
+      try {
+        if ((await readFile(join(this.stateDir, '.acp-session-id'), 'utf8')).trim() === snapshot.sessionId) resumed = snapshot.sessionId;
+      } catch { /* no resumed history: live generation only */ }
+    }
+    try {
+      return await conversationTailPage(this.stateDir, request, live.snapshot, resumed);
+    } catch (error) {
+      throw new FleetError('invalid_request', (error as Error).message);
+    }
   }
 
   async submitPromptV2(request: {
-    commandId: string; text: string; actorBrowserSession: string;
+    commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string; requireIdle?: boolean;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt> {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
     if (Buffer.byteLength(request.text) > 32 * 1024)
       throw new FleetError('invalid_request', 'text exceeds 32 KiB');
+    // A prompt bound to a session generation (voice or attachments) is checked atomically by supervisors that
+    // support it. Older supervisors do not know that command and never answer, so check the generation here
+    // and submit an ordinary prompt; its command id keeps retries idempotent either way.
+    const features = request.requireIdle ? (await this.describe()).features : undefined;
+    if (request.requireIdle && (!request.expectedSessionGeneration || !features?.includes('idle_bound_prompts')))
+      throw new FleetError('capability_unavailable', 'Live voice requires an updated supervisor.');
+    let command: 'submit_voice_prompt' | 'submit_prompt_v2' = 'submit_prompt_v2';
+    if (request.expectedSessionGeneration) {
+      if ((await this.describe()).features.includes('generation_bound_prompts')) command = 'submit_voice_prompt';
+      else {
+        const live = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+        if (live.snapshot?.sessionGeneration !== request.expectedSessionGeneration)
+          throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
+      }
+    }
     try {
-      return await this.call('submit_prompt_v2', {
+      return await this.call(command, {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
-        source: request.source,
+        source: request.source, expectedSessionGeneration: request.expectedSessionGeneration, requireIdle: request.requireIdle,
       }) as PromptReceipt;
     } catch (error) {
       const fleetError = normalizeError(error);
+      if (fleetError.message.includes('session_changed:'))
+        throw new FleetError('stale_state', 'Agent session changed. Record a new voice message.');
+      if (fleetError.message.includes('voice_busy:')) throw new FleetError('conflict', 'Agent is already working. Wait for the current turn.');
       if (fleetError.message.includes('idempotency_conflict'))
         throw new FleetError('idempotency_conflict',
           'this command id was already used with a different prompt body');
       throw fleetError;
+    }
+  }
+
+  async interruptPromptV2(request: { commandId: string; expectedSessionGeneration: string; promptId: string }): Promise<InterruptReceipt> {
+    if (!(await this.describe()).features.includes('targeted_voice_interrupt'))
+      throw new FleetError('capability_unavailable', 'Live voice requires an updated supervisor.');
+    try { return await this.call('interrupt_voice_v2', request) as InterruptReceipt; }
+    catch (error) {
+      const failure = normalizeError(error);
+      if (failure.message.includes('session_changed:')) throw new FleetError('stale_state', 'Agent session changed.');
+      throw failure;
     }
   }
 

@@ -49,6 +49,7 @@ export class RoleTurnArbiter implements AgentSession {
   private tail: Promise<void> = Promise.resolve();
   private unsettled = 0;
   private stopping = false;
+  private retiring = false;
   /** Bumped by `retireStalledAdmission`; every claim carries the one it was made under. */
   private generation = 0;
   /** Resolves the instant the CURRENT generation is retired. */
@@ -111,7 +112,20 @@ export class RoleTurnArbiter implements AgentSession {
   }
 
   queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
-    return this.exclusive(async () => this.track(await this.session.queuePrompt(text, options)));
+    return this.exclusive(async () => {
+      if (this.retiring) throw new Error('Chat is closing');
+      return this.track(await this.session.queuePrompt(text, this.monitorAdmissionOptions(options)));
+    });
+  }
+
+  /** Inbox traffic must not cancel or steer an active human console/voice turn.
+   * Queue it once; the monitor commits its cursor after that turn succeeds.
+   * Other origins retain their configured monitor policy.
+   */
+  private monitorAdmissionOptions(options: SubmitPromptOptions): SubmitPromptOptions {
+    return options.origin?.kind === 'fleet-monitor'
+      && this.session.snapshot().activePromptSource === 'owner-admin-console'
+      ? { ...options, interrupt: false, steer: false } : options;
   }
 
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
@@ -123,6 +137,9 @@ export class RoleTurnArbiter implements AgentSession {
    * answers and explicit interrupts must remain able to pass immediately.
    */
   submitPromptAfterTool(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
+    if(this.retiring) return Promise.reject(new Error('Chat is closing'));
+    if (this.monitorAdmissionOptions(options) !== options)
+      return this.submitPrompt(text, options);
     return this.session.submitPromptAfterTool?.(text, options)
       ?? this.session.submitPrompt(text, { ...options, interrupt: false, steer: false });
   }
@@ -163,6 +180,18 @@ export class RoleTurnArbiter implements AgentSession {
     });
   }
 
+  /** Retire only at the same admission boundary used by all prompt producers. */
+  retireIfIdle(expired: (snapshot: SessionSnapshot, queueDepth: number) => boolean): Promise<boolean> {
+    return this.exclusive(async()=>{
+      const snapshot=this.session.snapshot();
+      const queue=this.session.conversationSnapshot?.().queueDepth ?? -1;
+      if(this.retiring || this.unsettled>0 || snapshot.readiness!=='idle' || !expired(snapshot,queue)) return false;
+      this.retiring=true;this.stopping=true;
+      await this.session.close();
+      return true;
+    });
+  }
+  sharedTurnId(promptId: string): string | undefined { return this.session.sharedTurnId?.(promptId); }
   stopScheduledAdmission(): void { this.stopping = true; }
   isAlive(): boolean { return this.session.isAlive(); }
   snapshot(): SessionSnapshot { return this.session.snapshot(); }
@@ -184,7 +213,14 @@ export class RoleTurnArbiter implements AgentSession {
   submitPromptBrowser(command: SubmitPromptCommand): Promise<PromptReceipt> {
     if (!this.session.submitPromptBrowser)
       return Promise.reject(new Error('browser prompt admission is unavailable'));
-    return this.exclusive(() => this.session.submitPromptBrowser!(command));
+    return this.exclusive(() => {if(this.retiring) throw new Error('Chat is closing');return this.session.submitPromptBrowser!(command);});
+  }
+  get liveVoiceSupported(): boolean { return this.session.liveVoiceSupported === true; }
+  interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
+    return this.exclusive(async () => {
+      if (!this.session.interruptPrompt) throw new Error('targeted voice interrupt is unavailable');
+      return interruptOutcome(await this.session.interruptPrompt(generation, promptId));
+    });
   }
   interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     return this.exclusive(async () => interruptOutcome(await this.session.interrupt(source)));

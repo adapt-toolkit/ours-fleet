@@ -559,6 +559,18 @@ describe('owner-channel task subcommands', () => {
     expect(readTask(task.task_id).list_name).toBe('Owner Work');
   });
 
+
+it('Owner task show awaits health without changing the active lifecycle', async () => {
+  const t = { ...await createTestTask(), state: 'active' as const };
+  const observeTaskReadiness = vi.fn(async () => ({ state: 'unknown' as const, reason: 'control_unavailable' }));
+  const ctx = context({ getTask: () => ({ task: t }), observeTaskReadiness });
+  await dispatchOwnerCommand(`/task show ${t.task_id}`, ctx);
+  expect(observeTaskReadiness).toHaveBeenCalledWith(t.task_id);
+  expect(ctx.replies[0]).toContain('unknown');
+  expect(ctx.replies[0]).toMatch(/control.*unavailable/);
+  expect(ctx.replies[0]).toContain('Active');
+});
+
   it('/task show <id> shows task details', async () => {
     const t = await createTestTask();
     const ctx = context();
@@ -717,6 +729,21 @@ describe('owner-channel task subcommands', () => {
     await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, retry);
     expect(retry.replies[0]).toContain('## 🗑️ Task already absent');
     expect(retry.replies[0]).toContain(t.task_id);
+  });
+
+  it('/task start reports live readiness failure with Coordinator recovery guidance', async () => {
+    const task = await createTestTask();
+    const ctx = context({ startTask: vi.fn(async () => {
+      throw new TaskRoomApplicationError('task_not_ready',
+        'Task readiness is degraded: supervisor_stopped.',
+        { task: task.task_id, readiness: 'degraded', reason: 'supervisor_stopped' });
+    }) });
+    await dispatchOwnerCommand(`/task start ${task.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('supervisor\\_stopped');
+    expect(ctx.replies[0]).toContain('Fleet Coordinator');
+    expect(ctx.replies[0]).not.toContain('Room provisioning complete');
+    expect(ctx.replies[0]).not.toContain('Retry once');
   });
 
   it('/task start without id returns usage', async () => {

@@ -1,3 +1,4 @@
+import type {TaskCreatedNotice} from './task-notice.js';
 import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
@@ -16,6 +17,8 @@ export type ConversationEventKind =
   | 'plan.replace'
   | 'tool.upsert' | 'tool.content_chunk'
   | 'permission.requested' | 'permission.resolved'
+  | 'file.attached'
+  | 'fleet.task_created'
   | 'monitor.delivery'
   | 'usage.updated'
   | 'turn.state' | 'turn.completed'
@@ -27,7 +30,7 @@ export type ConversationEventKind =
 /** Where a conversation record came from. Typed provenance, never prompt text. */
 export type ConversationSource =
   | 'owner_admin_console' | 'owner_channel' | 'fleet_monitor' | 'scheduled_loop' | 'startup'
-  | 'local_console' | 'agent' | 'agent_replay';
+  | 'local_console' | 'agent' | 'agent_replay' | 'fleet_lifecycle';
 
 // ── Normalized content ────────────────────────────────────────────────────────
 // Every text payload is capped; oversized or redacted content keeps its byte
@@ -201,6 +204,8 @@ export interface PromptAdmittedPayload {
 
 export interface PromptStartedPayload {
   queuedBehind?: number;
+  /** Present when one adapter turn carries several admitted prompts; `turnId` is the shared turn. */
+  batch?: { turnId: string; index: number; size: number };
 }
 
 export interface PromptInterruptRequestedPayload {
@@ -260,13 +265,14 @@ export interface BoundedJson {
 }
 
 export type ConversationPayload =
+  | { attachment: import('../file-delivery/types.js').DeliveredFile }
   | MessageChunkPayload | ThoughtChunkPayload | PlanReplacePayload | ToolUpsertPayload
   | UsageUpdatedPayload | SessionStatePayload | SessionInfoPayload
   | CapabilitiesUpdatedPayload | UnsupportedPayload | PromptAdmittedPayload
   | PromptStartedPayload | PromptInterruptRequestedPayload | PermissionRequestedPayload
   | PermissionResolvedPayload | TurnStatePayload | TurnCompletedPayload
   | MonitorDeliveryPayload
-  | SessionLifecyclePayload | ErrorPayload;
+  | SessionLifecyclePayload | ErrorPayload | TaskCreatedNotice;
 
 // ── The durable event ────────────────────────────────────────────────────────
 
@@ -304,6 +310,9 @@ export interface ConversationEventV1 {
 // ── Browser commands and receipt transport contracts ────────────────────────
 
 export interface SubmitPromptCommand {
+  expectedSessionGeneration?: string;
+  /** Live speech must not silently queue behind an unrelated turn. */
+  requireIdle?: boolean;
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */
   commandId: string;
   text: string;
@@ -328,12 +337,26 @@ export interface PermissionDecisionCommand {
   optionId: string;
 }
 
+/** One admitted prompt not yet handed to the agent, as reported by the queue that owns it. */
+export interface PendingPromptSummary {
+  promptId: string;
+  source: ConversationSource;
+  admittedAt: string;
+  bytes: number;
+  /** A bounded preview, present only for a body the ledger already holds. */
+  text?: string;
+  textTruncated?: boolean;
+}
+
 export interface ConversationSnapshot {
   sessionGeneration: string;
   readiness: 'starting' | 'idle' | 'running' | 'awaiting_permission' | 'failed' | 'offline';
   queueDepth: number;
   pendingPermissionIds: string[];
   historyDegraded?: boolean;
+  /** Every waiting prompt, in delivery order; `pendingPromptCount` equals its length. */
+  pendingPrompts?: PendingPromptSummary[];
+  pendingPromptCount?: number;
 }
 
 export interface ConversationPage {

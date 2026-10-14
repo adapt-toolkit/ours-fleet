@@ -1,3 +1,6 @@
+import { writeManagedRecovery, readManagedRecovery } from '../src/managed-recovery.js';
+import { gatewayFixture } from './gateway-fixture.js';
+import { controlRequest } from '../src/session/control.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
@@ -19,12 +22,12 @@ import {
   ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus, turnResult,
   type ExitRecord, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
-import { registerAdapter } from '../src/harness/registry.js';
+import { registerAdapter, getAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
 import type { HarnessAdapter } from '../src/harness/types.js';
-import type { MonitorOpts } from '../src/monitor.js';
+import { formatNotificationLine, type MonitorOpts } from '../src/monitor.js';
 import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
@@ -33,14 +36,30 @@ import type { ResolvedRole } from '../src/config.js';
 import { AcpSession } from '../src/session/acp.js';
 import { writeV2Fixture } from './v2-fixture.js';
 
+vi.mock('../src/agent-ours/service.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/agent-ours/service.js')>(),
+  prepareManagedAgent: async () => ({
+    descriptor: '/test/managed-descriptor.json', privatePaths: [],
+    runtime: { startHarness: async (start: () => Promise<unknown>) => start(), admit: async () => () => {} },
+    close: async () => {},
+  }),
+  releaseManagedAgent: async () => {},
+  preparePermanentAssignment: async () => 'verified',
+}));
+
 let dir: string;
+let savedProfile: string | undefined;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-run-'));
   process.env.OURS_FLEET_HOME = dir;
+  savedProfile = process.env.OURS_CONFIG;
+  process.env.OURS_CONFIG = gatewayFixture(dir).env.OURS_CONFIG;
   registerAdapter(fakeAdapter);
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
+  if (savedProfile === undefined) delete process.env.OURS_CONFIG;
+  else process.env.OURS_CONFIG = savedProfile;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -75,6 +94,8 @@ function monitorRecorder(sessionCreated: () => boolean) {
 function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean; recoveryGate?: Promise<void> } = {}) {
   const paneCommands: string[] = [];
   const recoveryPrompts: string[] = [];
+  const submittedPrompts: string[] = [];
+  const managedRecoveries: string[] = [];
   const starts: Array<{ mode: 'fresh' | 'resume'; argv: string[]; env: Record<string, string> }> = [];
   let clock = 0;
   let checks = 0;
@@ -85,6 +106,16 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
   const deps = {
+    identityProbeDeps: { attachClient: async () => ({
+      identities: async () => (await (await deps.fetch('http://fixture/identities')).json()).identities,
+      close: async () => {},
+    }) },
+    prepareAgentOurs: async () => ({
+      descriptor: '/test/managed-descriptor.json', privatePaths: [],
+      runtime: { startHarness: async (start: () => Promise<unknown>) => start(), admit: async () => { managedRecoveries.push('verify'); await opts.recoveryGate; return () => {}; } },
+      close: async () => {},
+    }) as unknown as Awaited<ReturnType<RunnerDeps['prepareAgentOurs']>>,
+    releaseAgentOurs: async () => {},
     exec,
     cpuDelegated: () => opts.cpuDelegated ?? true,
     probeGeneration: async () => ({ state: 'ready' as const, generation: {
@@ -126,6 +157,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
         },
         snapshot: () => ({ backend: 'acp' as const, alive: !closed, readiness: 'idle' as const }),
         queuePrompt: async (text: string) => {
+          submittedPrompts.push(text);
           const promptId = text.includes('[fleet-recovery]') ? `recovery-${seq}` : 'fake-prompt';
           if (text.includes('[fleet-recovery]')) {
             recoveryPrompts.push(text);
@@ -147,7 +179,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
             completion: Promise.resolve(turnResult(true, 'completed')),
           };
         },
-        submitPrompt: async () => turnResult(true, 'completed'),
+        submitPrompt: async (text: string) => { submittedPrompts.push(text); return turnResult(true, 'completed'); },
         interrupt: async () => ({ state: 'settled' as const }),
         respondPermission: () => true,
         eventsSince: () => [],
@@ -169,13 +201,49 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       };
     },
   };
-  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts };
+  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts, managedRecoveries, submittedPrompts };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
   writeV2Fixture(join(dir, 'fleet.yaml'), { roles });
 
 describe('managed fleet child environment', () => {
+  it('retires a layout worker through one terminal runtime close', async () => {
+    const name = 'LayoutWorker', d = agentDir(name, true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, harness: 'fake', session: 'acp', identity: name, sourceFile: '(temp)' }));
+    const { deps } = fakeWorld({ lifeChecks: 100 });
+    const prepare = deps.prepareAgentOurs, start = deps.startAgentSession, sleep = deps.sleep;
+    const closed: boolean[] = [];
+    let handler: any;
+    deps.prepareAgentOurs = async () => {
+      const service = await prepare();
+      Object.assign(service.runtime, { snapshot: { instance: 'launch', cid: 'cid' } });
+      service.close = async terminal => { closed.push(terminal); if (closed.length > 1) throw Error('double close'); };
+      return service;
+    };
+    deps.startAgentSession = async (...args) => {
+      const session = await start(...args), snapshot = session.snapshot;
+      session.snapshot = () => ({ ...snapshot(), sessionId: 'layout-session' });
+      return session;
+    };
+    let retired = false;
+    deps.sleep = async ms => {
+      await sleep(ms);
+      if (handler && !retired) {
+        retired = true;
+        const instance = await handler({ action: 'inspect' });
+        await handler({ action: 'retire', instance });
+      }
+    };
+    const result = await runOnce(name, { temp: true }, { ...deps, createControlServer: () => ({
+      start: async () => {}, close: async () => {}, setFleetSpawner: () => {}, setFleetAuditor: () => {},
+      setOwnerChannel: () => {}, setConfigReloader: () => {}, setLoopManager: () => {},
+      setLayoutControl: value => { handler = value; },
+    }) });
+    expect(retired).toBe(true); expect(closed).toEqual([true]);
+    expect(result.retirementReason).toBe('operator-stop');
+  });
   it('does not register fleet lifecycle spawning for a room member', async () => {
     const name = 'RoomMember';
     const d = agentDir(name, true); mkdirSync(d, { recursive: true });
@@ -313,6 +381,38 @@ describe('managed fleet child environment', () => {
 });
 
 describe('runOnce isolation', () => {
+  it('preserves resume state when a permanent session is stopped soon after startup', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.booted'), 'previous run\n');
+    writeFileSync(join(d, '.session-id'), 'existing-session\n');
+    const { deps } = fakeWorld({ lifeChecks: 10, exitResult: null });
+    const result = await runOnce('A', {}, { ...deps, shouldStop: () => true });
+    expect(result.mode).toBe('resume');
+    expect(result.rotated).toBe(false);
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('existing-session\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('stops a permanent session and closes its owner channel when shutdown is requested', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ lifeChecks: 10 });
+    let closedAt: number | undefined;
+    const result = await runOnce('A', {}, {
+      ...deps,
+      shouldStop: () => true,
+      createOwnerChannel: () => ({
+        start: async () => {}, drain: async () => {},
+        close: async () => { closedAt = deps.now(); },
+      }),
+    });
+    expect(result.elapsedSecs).toBeLessThan(4);
+    expect(closedAt).toBeDefined();
+    expect(existsSync(join(d, '.control.sock'))).toBe(false);
+  });
+
   it('wraps the agent command under bwrap when the role declares isolation', async () => {
     writeCfg({ A: { harness: 'fake', isolation: {} } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -458,8 +558,8 @@ describe('daemon generation recovery integration', () => {
     let probes = 0;
     world.deps.probeGeneration = async () => generations[Math.min(probes++, generations.length - 1)];
     await runOnce('A', {}, world.deps);
-    expect(world.recoveryPrompts).toHaveLength(1);
-    expect(world.recoveryPrompts[0]).toContain('force false');
+    expect(world.recoveryPrompts).toHaveLength(0);
+    expect(world.managedRecoveries).toHaveLength(1);
     const statusPath = join(d, '.daemon-recovery.json');
     expect(statSync(statusPath).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(statusPath, 'utf8'))).toMatchObject({
@@ -538,6 +638,77 @@ describe('runOnce', () => {
     await runOnce('A', {}, deps);
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
     expect(existsSync(join(d, '.booted'))).toBe(false);
+  });
+
+  it.each(['0', '1'])('retains a durable task conversation after exit %s', async exitCode => {
+    const name = 'TaskMember', d = agentDir(name, true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', roomId: 'room', roomIdentityCid: 'cid', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'stable-runner-id\n');
+    writeFileSync(join(d, '.acp-session-id'), 'stable-acp-id\n');
+    writeFileSync(join(d, '.booted'), 'previous-start');
+    writeManagedRecovery(d, { version: 1, session: 'established', readiness: true, initial: 'completed', active: false });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') });
+    const result = await runOnce(name, { temp: true }, deps);
+    expect(result).toMatchObject({ mode: 'resume', rotated: false });
+    expect(starts[0].mode).toBe('resume');
+    expect(submittedPrompts).toEqual([]);
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('stable-runner-id\n');
+    expect(readFileSync(join(d, '.acp-session-id'), 'utf8')).toBe('stable-acp-id\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it.each([
+    ['pending', false, 'Read and follow'],
+    ['dispatching', true, 'Fleet supervisor restarted.'],
+    ['completed', true, 'Fleet supervisor restarted.'],
+    ['completed', false, undefined],
+  ] as const)('recovers %s task work (active=%s) without replaying a delivered assignment', async (initial, active, expected) => {
+    const name = 'ResumeWork', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp', mission: 'Do the work' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'runner'); writeFileSync(join(d, '.acp-session-id'), 'backend'); writeFileSync(join(d, '.booted'), 'previous');
+    writeManagedRecovery(d, { version: 1, session: 'established', readiness: true, initial, active });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, deps);
+    expect(starts[0].mode).toBe('resume');
+    expect(submittedPrompts.length).toBe(expected ? 1 : 0);
+    if (expected) expect(submittedPrompts[0]).toContain(expected);
+    if (initial === 'dispatching') expect(submittedPrompts[0]).toContain(join(d, 'briefing.md'));
+    if (active || initial === 'dispatching') expect(submittedPrompts[0]).toContain('do not redo completed steps');
+    expect(submittedPrompts.every(prompt => !prompt.includes('Fleet readiness check.'))).toBe(true);
+    expect(readManagedRecovery(d)).toMatchObject({ initial: 'completed', active: false });
+    const successor = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, successor.deps);
+    expect(successor.submittedPrompts).toEqual([]);
+  });
+
+  it.each(['acp', 'codex-app-server'] as const)('retries the first %s session before any task delivery, retaining its logical identity', async session => {
+    const name = 'FirstSessionRetry', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session, mission: 'Do the work' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'unchanged-runner'); writeFileSync(join(d, '.booted'), 'failed-before-session');
+    writeManagedRecovery(d, { version: 1, session: 'pending', readiness: false, initial: 'pending', active: false });
+    const { deps, starts, submittedPrompts } = fakeWorld({ exitFile: join(d, '.exit-status') });
+    await runOnce(name, { temp: true }, deps);
+    expect(starts[0].mode).toBe('fresh');
+    expect(submittedPrompts).toHaveLength(2);
+    expect(submittedPrompts[0]).toContain('Fleet readiness check.');
+    expect(submittedPrompts[1]).toContain('Read and follow');
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('unchanged-runner');
+    expect(readManagedRecovery(d)).toMatchObject({ session: 'established', initial: 'completed' });
+  });
+
+  it('refuses a lost retained task backend id before starting a fresh harness', async () => {
+    const name = 'TaskLostSession', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    writeFileSync(join(d, '.session-id'), 'unchanged-runner-id'); writeFileSync(join(d, '.booted'), 'retained');
+    const { deps, starts, submittedPrompts } = fakeWorld();
+    await expect(runOnce(name, { temp: true }, deps)).rejects.toThrow('TASK_CONTEXT_RESUME_UNAVAILABLE');
+    expect(starts).toEqual([]); expect(submittedPrompts).toEqual([]);
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('unchanged-runner-id');
   });
 
   it('fast-failing resume self-heals to fresh', async () => {
@@ -886,6 +1057,23 @@ describe('runOnce ACP startup outcome', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('closes the already-started owner channel when the first prompt is refused', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_STOP_REASON: 'refusal' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+    const start = vi.fn(async () => {}), close = vi.fn(async () => {});
+    deps.createOwnerChannel = () => ({ start, close, drain: async () => {}, manage: async () => { throw Error('unused'); } });
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt refused/);
+    expect(start).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(existsSync(join(agentDir('A'), '.control.sock'))).toBe(false);
+    expect(logs.some(line => line.includes('[A] up;'))).toBe(false);
+  });
+
   it('a cancelled startup prompt fails the role too', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
@@ -931,14 +1119,25 @@ describe('runOnce ACP startup outcome', () => {
     let controlSession: SessionHandle | undefined;
     let alive = true;
     let startupQueued = false;
+    const completedListeners = new Set<(event: any) => void>();
     let settleStartup!: (result: TurnResult) => void;
     const queuePrompt: SessionHandle['queuePrompt'] = async (text, options = {}) => {
       if (!startupQueued) {
         startupQueued = true;
+        setImmediate(async () => {
+          await controlSession!.interrupt('local-console');
+          await controlSession!.submitPrompt('control recovery');
+        });
         return {
           promptId: 'startup', queuedBehind: 0, origin: options.origin,
           completion: new Promise<TurnResult>(resolve => { settleStartup = resolve; }),
         };
+      }
+      if (text === 'control recovery') {
+        return {promptId:'control-recovery', queuedBehind:0, completion:Promise.resolve().then(() => {
+          for (const listener of completedListeners) listener({kind:'turn.completed',payload:{outcome:'completed'}});
+          return turnResult(true, 'completed');
+        })};
       }
       expect(text).toBe('queued wake after interrupt');
       return {
@@ -959,6 +1158,7 @@ describe('runOnce ACP startup outcome', () => {
       respondPermission: () => false,
       eventsSince: () => [],
       subscribe: () => () => {},
+      subscribeConversation: listener => { completedListeners.add(listener); return () => {completedListeners.delete(listener);}; },
       setControllerAttached: () => {},
       exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test stop' }),
       close: async () => { alive = false; },
@@ -980,11 +1180,7 @@ describe('runOnce ACP startup outcome', () => {
     runnerDeps.createMonitor = opts => ({
       prime: async () => {},
       run: async () => {
-        // The daemon notification remains pending while the independent
-        // control interrupt settles the startup turn. Delivery must still be
-        // possible through the same live session immediately afterwards.
-        const interrupted = await controlSession!.interrupt('local-console');
-        expect(interrupted).toMatchObject({ state: 'settled' });
+        // Independent control recovery has completed before monitor delivery.
         for (let i = 0; i < 100; i++) {
           if (logs.some(line => line.includes('keeping temporary supervisor alive'))) break;
           await new Promise<void>(resolve => setTimeout(resolve, 5));
@@ -1129,7 +1325,7 @@ describe('runOnce ACP startup outcome', () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
     } });
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps } = acpDeps();
@@ -1140,7 +1336,11 @@ describe('runOnce ACP startup outcome', () => {
       expect(options.config.identity).toBe('A-owner');
       expect(options.session.backend).toBe('acp');
       return {
-        start: async () => { started++; },
+        start: async () => {
+          const events = readFileSync(join(agentDir('A'), '.session-events.jsonl'), 'utf8');
+          expect(events).not.toContain('"kind":"turn_stop"');
+          started++;
+        },
         drain: async () => {},
         close: async () => {
           expect(existsSync(join(agentDir('A'), '.control.sock'))).toBe(false);
@@ -1286,68 +1486,223 @@ describe('runOnce ACP startup outcome', () => {
     expect(logs.some(line => line.includes('scheduled loop manager unavailable'))).toBe(true);
   });
 
-  it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
-    writeCfg({ A: {
-      harness: 'fake-acp',
-      session: 'acp',
-      monitor: { mode: 'fleet', interrupt: true },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
-    } });
-    const d = agentDir('A');
-    mkdirSync(d, { recursive: true });
-    const { deps } = acpDeps();
-    let startupWasActive = false;
-    let wakeOutcome: string | undefined;
-    deps.createMonitor = opts => ({
-      prime: async () => {},
-      run: async () => {
-        const before = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-        startupWasActive = !before.includes('"kind":"turn_stop"');
-        const result = await opts.deps.delivery!.submit('wake during startup', { interrupt: true });
-        wakeOutcome = result.outcome;
-      },
-      stop: () => {},
-    });
 
-    await runOnce('A', {}, deps);
-    expect(startupWasActive).toBe(true);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
-    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-    expect(events).not.toContain('"stopReason":"cancelled"');
-    expect(events).toContain('"kind":"turn_stop"');
-  });
-
-  it('steers after_tool directly during ACP startup without waiting or cancelling', async () => {
-    writeCfg({ A: {
-      harness: 'fake-acp',
-      session: 'acp',
-      monitor: { mode: 'fleet', interrupt: 'after_tool' },
-      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
-    } });
-    const d = agentDir('A');
-    mkdirSync(d, { recursive: true });
-    const { deps } = acpDeps();
-    let wakeOutcome: string | undefined;
-    deps.createMonitor = opts => ({
-      prime: async () => {},
-      run: async () => {
-        const result = await opts.deps.delivery!.submit(
-          'after_tool wake during startup', { interrupt: 'after_tool' });
-        wakeOutcome = result.outcome;
-      },
-      stop: () => {},
-    });
-
-    await runOnce('A', {}, deps);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
-    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
-    expect(events).not.toContain('"kind":"monitor_delivery"');
-    expect(events).not.toContain('"cancellationSource":"fleet-monitor"');
-    expect(events).not.toContain('"stopReason":"cancelled"');
-  });
 });
 
 describe('runOnce monitor integration', () => {
+  it.each([
+    [false, false], [true, false], [true, true],
+  ])('starts configured work after readiness without waiting for task completion (prior boot=%s, recorded work=%s)', async (priorBoot, priorWork) => {
+    writeCfg({ A: { harness: 'fake', mission: 'Inspect the assigned fixture patch.' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    if (priorBoot) writeFileSync(join(d, '.booted'), 'earlier run\n');
+    // A restart alone is not continuity: only a worklog with entries is read back.
+    writeFileSync(join(d, 'WORKLOG.md'), priorWork ? '- earlier milestone\n' : '');
+    const world = fakeWorld();
+    const prompts: string[] = [], logs: string[] = [];
+    let completeReady!: (value: TurnResult) => void;
+    const ready = new Promise<TurnResult>(resolve => { completeReady = resolve; });
+    let admitted!: () => void;
+    const admission = new Promise<void>(resolve => { admitted = resolve; });
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args);
+      session.queuePrompt = async text => {
+        prompts.push(text);
+        if (prompts.length === 1) {
+          admitted(); return { promptId: 'ready', queuedBehind: 0, completion: ready };
+        }
+        return { promptId: 'work', queuedBehind: 0, completion: new Promise<TurnResult>(() => {}) };
+      };
+      return session;
+    };
+    const running = runOnce('A', {}, { ...world.deps, log: line => logs.push(line) });
+    await admission;
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('Fleet readiness check');
+    expect(world.monitor.ranPid).toBeNull();
+    completeReady(turnResult(true, 'completed'));
+    await running; // Task turn remains unsettled; supervisor still ran the monitor.
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('Readiness has already been announced');
+    expect(prompts[0].includes('WORKLOG.md')).toBe(priorWork);
+    expect(prompts[1].includes('WORKLOG.md')).toBe(priorWork);
+    // The fake harness resumes: a restored conversation keeps the briefing it already read.
+    expect(prompts[1]).toContain(priorBoot ? 'Your conversation was restored and already holds'
+      : 'This is the one briefing read of this session');
+    expect(world.monitor.ranPid).toBe(4242);
+    expect(logs.some(line => line.includes('stage=readiness_turn_completed'))).toBe(true);
+    expect(logs.some(line => line.includes('] up;'))).toBe(true);
+  });
+
+  it('reads the briefing in the session startup turns only: repeated mail wakes and a restart add no reread', async () => {
+    writeCfg({ A: { harness: 'fake', mission: 'Inspect the assigned fixture patch.' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'WORKLOG.md'), '');
+    const wake = (id: number) => formatNotificationLine([{ event: 'message_received', from: 'Peer', msg_id: id }]);
+    const userTurn = 'Please also update the changelog.';
+    const session = async (wakes: string[], exitCode = '1') => {
+      // A non-zero exit keeps the conversation; a clean exit rotates to a fresh one.
+      const world = fakeWorld({ exitCode, exitFile: join(d, '.exit-status') }), prompts: string[] = [];
+      const start = world.deps.startAgentSession, alive = world.deps.isAlive;
+      // The session outlives its deliveries, so the control socket is still serving the user turn.
+      let delivered = false;
+      world.deps.isAlive = () => !delivered || alive();
+      // The fake clock never yields; socket I/O needs the event loop while the session is held open.
+      const sleep = world.deps.sleep;
+      world.deps.sleep = async ms => { if (!delivered) await new Promise(r => setImmediate(r)); return sleep(ms); };
+      world.deps.startAgentSession = async (...args) => {
+        const live = await start(...args), queue = live.queuePrompt, liveAlive = live.isAlive;
+        live.isAlive = () => !delivered || liveAlive();
+        live.queuePrompt = async text => { prompts.push(text); return queue(text); };
+        live.submitPrompt = async text => (await live.queuePrompt(text)).completion;
+        return live;
+      };
+      world.deps.createMonitor = opts => ({
+        prime: async () => {},
+        run: async () => {
+          for (const text of wakes) await opts.deps.delivery!.submit(text, { interrupt: false });
+          // An ordinary user turn through the production control socket.
+          const sent = await controlRequest(d, { command: 'submit_prompt', text: userTurn });
+          expect(sent.ok).toBe(true);
+          delivered = true;
+        },
+        stop: () => {},
+      });
+      const result = await runOnce('A', {}, world.deps);
+      return { prompts, mode: result.mode };
+    };
+    const reads = (text: string) => /briefing\.md|WORKLOG\.md|ROUTINES\.md|routines|worklog/i.test(text);
+
+    // Initial session: readiness, then the one task turn that reads the briefing.
+    const first = await session([wake(1), wake(2), wake(3)]);
+    expect(first.mode).toBe('fresh');
+    expect(first.prompts).toHaveLength(6);
+    expect(first.prompts[0]).toContain('Fleet readiness check');
+    expect(first.prompts[1]).toContain(`Read and follow ${join(d, 'briefing.md')}`);
+    expect(first.prompts[1]).not.toContain('WORKLOG.md');
+    // Every later arrival is delivered verbatim, with no instruction-file read attached.
+    expect(first.prompts.slice(2)).toEqual([wake(1), wake(2), wake(3), userTurn]);
+    expect(first.prompts.slice(2).some(reads)).toBe(false);
+
+    // Restart with recorded work: the restored conversation keeps its briefing.
+    writeFileSync(join(d, 'WORKLOG.md'), '- opened the PR\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+    const restarted = await session([wake(4)], '0');
+    expect(restarted.mode).toBe('resume');
+    expect(restarted.prompts).toHaveLength(4);
+    expect(restarted.prompts[0]).toContain('Fleet readiness check');
+    for (const prompt of restarted.prompts.slice(0, 2)) {
+      expect(prompt).toContain(`already holds ${join(d, 'briefing.md')}`);
+      expect(prompt).not.toContain('Read and follow');
+      expect(prompt).toContain(`${join(d, 'WORKLOG.md')} only as needed to recover your next action`);
+    }
+    expect(restarted.prompts.slice(2)).toEqual([wake(4), userTurn]);
+    expect(restarted.prompts.slice(2).some(reads)).toBe(false);
+
+    // That clean exit rotated to a fresh conversation: `.booted` is gone, the worklog is not.
+    expect(existsSync(join(d, '.booted'))).toBe(false);
+    const rotated = await session([wake(5)]);
+    expect(rotated.mode).toBe('fresh');
+    expect(rotated.prompts).toHaveLength(4);
+    expect(rotated.prompts[0]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
+    expect(rotated.prompts[1]).toContain(`Read and follow ${join(d, 'briefing.md')}`);
+    expect(rotated.prompts[1]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
+    expect(rotated.prompts.slice(2)).toEqual([wake(5), userTurn]);
+  });
+
+  it('restores continuity in a fresh conversation that has a retained worklog but no configured task', async () => {
+    writeCfg({ A: { harness: 'fake', bio: 'Public charter only' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'WORKLOG.md'), '- earlier milestone\n');
+    const world = fakeWorld(), prompts: string[] = [];
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args), queue = session.queuePrompt;
+      session.queuePrompt = async text => { prompts.push(text); return queue(text); };
+      return session;
+    };
+    const result = await runOnce('A', {}, world.deps);
+    expect(result.mode).toBe('fresh');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain(`read ${join(d, 'WORKLOG.md')} once for continuity`);
+  });
+
+  it('leaves a fresh agent with no configured task idle after readiness', async () => {
+    writeCfg({ A: { harness: 'fake', bio: 'Public charter only', persona: 'Preserve the custom charter.' } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const world = fakeWorld(), prompts: string[] = [];
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await start(...args), queue = session.queuePrompt;
+      session.queuePrompt = async text => { prompts.push(text); return queue(text); };
+      return session;
+    };
+    await runOnce('A', {}, world.deps);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('Fleet readiness check');
+    expect(world.monitor.ranPid).toBe(4242);
+  });
+
+  it.each([false, true, 'after_tool'] as const)('defers %s wakes until startup success while keeping the early baseline', async policy => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet', interrupt: policy } } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const world = fakeWorld();
+    let finish!: (value: TurnResult) => void;
+    const terminal = new Promise<TurnResult>(r => { finish = r; });
+    let admitted!: () => void;
+    const admission = new Promise<void>(r => { admitted = r; });
+    let startupComplete = false, primed = 0, deliveries = 0;
+    const arrivals: string[] = [];
+    const startSession = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await startSession(...args);
+      const queue = session.queuePrompt;
+      session.queuePrompt = async text => {
+        if (text.startsWith('Fleet readiness check')) {
+          arrivals.push('arrived after baseline during startup'); admitted();
+          return { promptId:'startup', queuedBehind:0, completion:terminal };
+        }
+        expect(startupComplete).toBe(true); deliveries++; return queue(text);
+      };
+      session.submitPrompt = async text => (await session.queuePrompt(text)).completion;
+      return session;
+    };
+    world.deps.createMonitor = opts => ({
+      prime: async () => { primed++; },
+      run: async () => {
+        expect(startupComplete).toBe(true);
+        for (const text of arrivals) await opts.deps.delivery!.submit(text, { interrupt:policy });
+      },
+      stop: () => {},
+    });
+    const running = runOnce('A', {}, world.deps);
+    await admission;
+    expect(primed).toBe(1); expect(deliveries).toBe(0);
+    startupComplete = true; finish(turnResult(true, 'completed'));
+    await running;
+    expect(primed).toBe(1); expect(deliveries).toBe(1);
+  });
+
+  it.each(['failed', 'refused', 'cancelled'] as const)('never starts monitor delivery after %s startup', async outcome => {
+    writeCfg({ A: { harness:'fake' } }); mkdirSync(agentDir('A'), { recursive:true });
+    const world = fakeWorld(); const startSession = world.deps.startAgentSession;
+    world.deps.startAgentSession = async (...args) => {
+      const session = await startSession(...args);
+      session.queuePrompt = async () => ({promptId:'startup', queuedBehind:0, completion:Promise.resolve(turnResult(false,outcome))});
+      return session;
+    };
+    await expect(runOnce('A', {}, world.deps)).rejects.toThrow(`startup prompt ${outcome}`);
+    expect(world.monitor.ranPid).toBeNull(); expect(world.monitor.stopped).toBe(true);
+  });
+
+  it('does not start monitor delivery when shutdown was requested during startup', async () => {
+    writeCfg({ A: { harness:'fake' } }); mkdirSync(agentDir('A'), {recursive:true});
+    const world = fakeWorld();
+    await runOnce('A', {}, {...world.deps, shouldStop:()=>true});
+    expect(world.monitor.ranPid).toBeNull(); expect(world.monitor.stopped).toBe(true);
+  });
+
   it('primes the monitor before creating the session and stops it after pid death', async () => {
     writeCfg({ A: { harness: 'fake' } });   // monitor.mode defaults to fleet
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -1359,15 +1714,15 @@ describe('runOnce monitor integration', () => {
     expect(monitor.stopped).toBe(true);               // stopped when the pane pid died
   });
 
-  it('does not construct a fleet monitor when monitor.mode is native', async () => {
+  it('uses supervisor wake delivery even for a legacy native monitor setting', async () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
-    expect(monitor.constructed).toBe(0);
+    expect(monitor.constructed).toBe(1);
   });
 
-  it('re-primes at tip when wake ownership moves from native back to fleet', async () => {
+  it('retains the cursor when a legacy native setting is changed to fleet', async () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     await runOnce('A', {}, fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') }).deps);
@@ -1375,7 +1730,7 @@ describe('runOnce monitor integration', () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet' } } });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
-    expect(monitor.resetCursor).toBe(true);
+    expect(monitor.resetCursor).toBe(false);
   });
 
   it('does not request a cursor reset across fleet-to-fleet restarts', async () => {
@@ -1467,7 +1822,7 @@ describe('temporary identity retirement', () => {
     world.deps.shouldStop = () => true;
     const result = await runOnce('T', { temp: true }, world.deps);
     expect(result.retirementReason).toBe('supervisor-signal');
-    expect(world.recoveryPrompts).toHaveLength(1);
+    expect(world.managedRecoveries).toHaveLength(1);
     const statusPath = join(d, '.daemon-recovery.json');
     const before = readFileSync(statusPath, 'utf8');
     release();
@@ -1638,6 +1993,24 @@ describe('runOnce config-path fallback', () => {
 });
 
 describe('runTemp', () => {
+  it('starts a non-resumable Hermes temporary and archives it on parent stop', async () => {
+    const original = getAdapter('fake');
+    registerAdapter({ ...original, id: 'hermes-finite-fixture', supportsResume: false });
+    const name = 'HermesFinite', d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'hermes-finite-fixture', session: 'acp' }));
+    prepareTempSupervisor(d, name);
+    let stop = false;
+    const world = fakeWorld({ lifeChecks: 30, exitFile: join(d, '.exit-status') });
+    const attempt = async (...args: Parameters<typeof runOnce>) => {
+      const result = await runOnce(...args); stop = true; return result;
+    };
+    const release = vi.fn();
+    await runTemp(name, { ...world.deps, shouldStop: () => stop, suspendOnStop: true, releaseAgentOurs: release }, attempt);
+    expect(world.starts[0].mode).toBe('fresh');
+    expect(world.submittedPrompts[0]).toContain('Fleet readiness check.');
+    expect(release).toHaveBeenCalledTimes(1); expect(existsSync(d)).toBe(false);
+  });
+
   it('runs from the tmp snapshot and archives evidence outside the live roster afterwards', async () => {
     const d = agentDir('T', true);
     mkdirSync(d, { recursive: true });
@@ -1678,7 +2051,7 @@ describe('runTemp', () => {
       .toContain('"reason":"identity-closed"');
   });
 
-  it('archives a distinct recycle reason and rethrows for a fresh supervisor PID', async () => {
+  it('retains the logical agent on supervisor recycle', async () => {
     const d = agentDir('Recycle', true);
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, 'role.yaml'), stringify({
@@ -1688,11 +2061,8 @@ describe('runTemp', () => {
     await expect(runTemp('Recycle', { log: line => logs.push(line) }, async () => {
       throw new SupervisorRecycleRequiredError();
     })).rejects.toBeInstanceOf(SupervisorRecycleRequiredError);
-    const archiveRoot = join(stateRoot(), 'recovery', 'temporary');
-    const archived = readdirSync(archiveRoot).find(name => name.includes('-Recycle-'))!;
-    expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
-      .toContain('"reason":"supervisor-recycle"');
-    expect(logs).toContainEqual(expect.stringContaining('failed: supervisor-recycle'));
+    expect(existsSync(d)).toBe(true);
+    expect(existsSync(join(stateRoot(), 'recovery', 'temporary'))).toBe(false);
   });
 });
 
@@ -1745,6 +2115,32 @@ describe('restart-loop containment', () => {
     mkdirSync(d, { recursive: true });
     return d;
   };
+
+  it.each(['SIGTERM', 'SIGINT'] as const)
+  ('finishes the current attempt without restarting after %s', async signal => {
+    const d = setup();
+    const before = process.listeners(signal);
+    let attempts = 0;
+    let shutdownObserved = false;
+    const sleeps: number[] = [];
+    await runSupervised('A', {}, {
+      shouldStop: () => attempts >= 2,
+      sleep: async ms => { sleeps.push(ms); },
+      log: () => {},
+    }, async (_name, _opts, deps) => {
+      attempts++;
+      process.emit(signal);
+      shutdownObserved = deps.shouldStop?.() ?? false;
+      return { elapsedSecs: 0, rotated: false, mode: 'resume',
+        exit: { version: 1, class: 'program-exit', code: 0, detail: 'stopped' } };
+    });
+    expect(shutdownObserved).toBe(true);
+    expect(attempts).toBe(1);
+    expect(sleeps).toEqual([]);
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(0);
+    expect(existsSync(join(d, RUN_MARKER_FILE))).toBe(false);
+    expect(process.listeners(signal)).toEqual(before);
+  });
 
   it('grows the delay exponentially, bounded', () => {
     expect(backoffFor(0)).toBe(0);

@@ -919,6 +919,9 @@ describe('OwnerChannel live management', () => {
   it('routes multiple authored updates to the originating sender in receipt/update/final order', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_000);
     const { channel, client, queuePrompt, logs, dir } = setup();
+    let releaseFinalSend!: () => void;
+    const finalSendPending = new Promise<void>(resolve => { releaseFinalSend = resolve; });
+    client.sendGate = async args => { if (args.text === 'Final answer') await finalSendPending; };
     let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
     queuePrompt.mockResolvedValueOnce({
       promptId: 'long-turn', queuedBehind: 0,
@@ -959,8 +962,14 @@ describe('OwnerChannel live management', () => {
     expect(client.calls.filter(call => call.name === 'sendMessage')
       .every(call => call.args?.contact === OWNER && call.args?.replyToWireId === wireId)).toBe(true);
     expect(logs.join('\n')).not.toMatch(/implementation is complete|dependency download/);
-    const state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
-    expect(state).toContain(wireId);
+    // Recording the mock send call does not mean final delivery and attachment
+    // cleanup have finished. Wait for the durable completion receipt as well.
+    releaseFinalSend();
+    let state = '';
+    await vi.waitFor(() => {
+      state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+      expect(state).toContain(wireId);
+    });
     expect(state).not.toMatch(/implementation is complete|dependency download|Final answer/);
     await expect(channel.manage({
       action: 'request_update', requestId, phase: 'working', message: 'This update is too late.',

@@ -52,15 +52,28 @@ export interface InitPublishResult {
   rootExisted: boolean;
 }
 
+export interface InitExecutionDeps {
+  hostSetup(): Promise<void>;
+  publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
+  generate?(answers: InitAnswers): GeneratedSetup;
+  preflight?(configuration: string): InitPathState;
+}
+
 const WORK_KINDS: WorkKind[] = ['development', 'review', 'coordination'];
 const ROLE_WORK: Record<string, WorkKind> = {
-  Developer: 'development', Critic: 'review',
+  Developer: 'development', Engineer: 'development', Critic: 'review',
   LocalCoordinator: 'coordination', Coordinator: 'coordination', FleetCoordinator: 'coordination',
 };
 const REASONING_EFFORT: Record<ReasoningPreference, 'low' | 'medium' | 'high'> = {
   quick: 'low', balanced: 'medium', thorough: 'high',
 };
 const MODEL_LABELS: Record<string, string> = {
+  'gpt-6.1-sol': 'GPT-6.1 Sol',
+  'gpt-6-sol': 'GPT-6 Sol',
+  'gpt-6-luna': 'GPT-6 Luna',
+  'claude-fable-5-1': 'Claude Fable 5.1',
+  'claude-opus-5-5': 'Claude Opus 5.5',
+  'claude-haiku-4-5-20251001': 'Claude Haiku 4.5',
   'gpt-6-astra': 'GPT-6 Astra',
   'gpt-5.6-sol': 'GPT-5.6 Sol',
   'gpt-5.6-terra': 'GPT-5.6 Terra',
@@ -81,10 +94,10 @@ export function validateCatalog(value: BrainCatalog, path = 'supported model cat
   for (const model of value.models) {
     if (!['codex', 'claude-code'].includes(model.harness) || model.session !== 'acp'
       || typeof model.model !== 'string' || !MODEL_LABELS[model.model]
-      || !Array.isArray(model.efforts) || model.efforts.length === 0
+      || !Array.isArray(model.efforts)
       || new Set(model.efforts).size !== model.efforts.length
       || model.efforts.some(effort => !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort))
-      || !['low', 'medium', 'high'].every(effort => model.efforts.includes(effort)))
+      || (model.efforts.length > 0 && !['low', 'medium', 'high'].every(effort => model.efforts.includes(effort))))
       throw new Error(`unsupported model state in ${path}`);
     const tuple = `${model.harness}\0${model.session}\0${model.model}`;
     if (tuples.has(tuple)) throw new Error(`duplicate supported model in ${path}: ${model.model}`);
@@ -96,6 +109,34 @@ export function validateCatalog(value: BrainCatalog, path = 'supported model cat
 function catalog(): BrainCatalog {
   const path = join(packagedPresetRoot(), 'brain-catalog.json');
   return validateCatalog(JSON.parse(readFileSync(path, 'utf8')) as BrainCatalog, path);
+}
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+
+/** Read and validate the complete public InitAnswers JSON shape without side effects. */
+export function readInitSettings(path: string): InitAnswers {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(resolve(path), 'utf8')); }
+  catch (error) { throw new Error(`cannot read valid Fleet init settings ${path}: ${(error as Error).message}`, { cause: error }); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !hasExactKeys(value as Record<string, unknown>, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']))
+    throw new Error('Fleet init settings must contain exactly subscriptions, assignmentStrategy, models, and reasoning');
+  const candidate = value as Record<string, unknown>;
+  const models = candidate.models;
+  if (!models || typeof models !== 'object' || Array.isArray(models)
+    || !hasExactKeys(models as Record<string, unknown>, WORK_KINDS))
+    throw new Error('Fleet init settings models must contain exactly development, review, and coordination');
+  for (const work of WORK_KINDS) {
+    const model = (models as Record<string, unknown>)[work];
+    if (!model || typeof model !== 'object' || Array.isArray(model)
+      || !hasExactKeys(model as Record<string, unknown>, ['harness', 'session', 'model', 'efforts']))
+      throw new Error(`Fleet init settings ${work} model must contain exactly harness, session, model, and efforts`);
+  }
+  const answers = value as InitAnswers;
+  // Generation is the single semantic/catalog validator for wizard and file input.
+  generateSetup(answers);
+  return answers;
 }
 
 const subscriptionFor = (model: CatalogModel): Subscription =>
@@ -119,7 +160,9 @@ export async function askInitQuestions(
   if (!subscriptions) return undefined;
   if (subscriptions.length === 0) throw new Error('Select at least one subscription.');
 
-  const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model)));
+  // The wizard assigns low/medium/high; no-effort models remain available as named presets.
+  const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model))
+    && model.efforts.length > 0);
   if (!available.length) throw new Error('None of the selected subscriptions has a supported model.');
   prompter.note([
     'These are exact supported catalog IDs, not recommendations or entitlement claims.',
@@ -198,7 +241,9 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     '  One-agent work: one Developer',
     '  Reviewed pair: Developer + independent Critic',
     '  Team: LocalCoordinator + Developer + Critic',
+    '  Gated engineering: Engineer (gate pipeline) + independent Critic',
     '  FleetCoordinator: coordination model',
+    '  Brains: the packaged presets; each prepared agent references the preset of its chosen model',
     '',
     'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
     'A hard termination after that Yes can leave host integration or private stage/recovery evidence to inspect.',
@@ -207,6 +252,12 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
 
 function preset(relative: string): string {
   return readFileSync(join(packagedPresetRoot(), 'fleet', relative), 'utf8');
+}
+
+/** The packaged Brain preset for a catalog model at one effort; the same naming the presets are generated with. */
+export function brainPresetId(model: Pick<CatalogModel, 'harness' | 'model'>, effort: string): string {
+  return `${model.harness === 'claude-code' ? 'claude' : 'codex'}-${model.model
+    .replace(/^claude-/, '').replace(/\./g, '-').toLowerCase()}-${effort}`;
 }
 
 /** Build the exact, deterministic default experience without writing to disk. */
@@ -228,6 +279,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     '  permissions: { approval: ask, filesystem: workspace, unattended: deny }',
     '',
   ].join('\n'));
+  const assigned = {} as Record<WorkKind, string>;
   for (const work of WORK_KINDS) {
     const proposed = answers.models[work];
     if (!proposed || !answers.subscriptions.includes(subscriptionFor(proposed)))
@@ -239,14 +291,14 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (JSON.stringify(proposed.efforts) !== JSON.stringify(model.efforts))
       throw new Error(`${work} contains tampered model capabilities`);
     if (!model.efforts.includes(effort)) throw new Error(`${MODEL_LABELS[model.model]} does not support ${answers.reasoning} reasoning`);
-    files.set(`brains/${work}.yaml`, [
-      `harness: ${model.harness}`,
-      `session: ${model.session}`,
-      `model: ${model.model}`,
-      `effort: ${effort}`,
-      '',
-    ].join('\n'));
+    // The chosen model is assigned by reference to its packaged Brain preset; setup defines no Brain of its own.
+    const id = brainPresetId(model, effort);
+    if (!existsSync(join(packagedPresetRoot(), 'fleet', 'brains', `${id}.yaml`)))
+      throw new Error(`no packaged Brain preset for ${MODEL_LABELS[model.model]} at ${effort} reasoning`);
+    assigned[work] = id;
   }
+  for (const name of readdirSync(join(packagedPresetRoot(), 'fleet', 'brains')).filter(name => name.endsWith('.yaml')).sort())
+    files.set(`brains/${name}`, preset(`brains/${name}`));
   if (answers.assignmentStrategy === 'one-model') {
     const tuples = new Set(WORK_KINDS.map(work => {
       const model = answers.models[work];
@@ -255,22 +307,25 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (tuples.size !== 1)
       throw new Error('one-model assignment requires the same exact model for development, review, and coordination');
   }
-  for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
+  for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
     files.set(`roles/${role}.yaml`, preset(`roles/${role}.yaml`));
     if (role === 'Coordinator') continue;
     files.set(`agent_templates/${role}.yaml`, [
       `role: { ref: ${role} }`,
-      `brain: { ref: ${ROLE_WORK[role]} }`,
+      `brain: { ref: ${assigned[ROLE_WORK[role]]} }`,
       'coordinator: FleetCoordinator',
-      'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      // Temporary default while the product is being tested: prepared agents work without asking.
+      'permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
       'monitor: { mode: fleet, interrupt: after_tool }',
       '',
     ].join('\n'));
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
-    .replace('brain: { ref: claude-default }', 'brain: { ref: coordination }'));
-  for (const name of ['single', 'pair', 'team'])
+    .replace('brain: { ref: claude-default }', `brain: { ref: ${assigned.coordination} }`));
+  for (const name of ['single', 'pair', 'team', 'engineering']) {
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
+    files.set(`room_layouts/${name}.yaml`, preset(`room_layouts/${name}.yaml`));
+  }
   return { files, answers };
 }
 
@@ -278,15 +333,17 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
 export async function executeInitWizard(
   prompter: InitPrompter,
   configuration: string,
-  deps: {
-    hostSetup(): Promise<void>;
-    publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
-    generate?(answers: InitAnswers): GeneratedSetup;
-    preflight?(configuration: string): InitPathState;
-  },
+  deps: InitExecutionDeps,
 ): Promise<InitPublishResult | undefined> {
   const answers = await askInitQuestions(prompter, configuration);
   if (!answers) return undefined;
+  return executeInitAnswers(answers, configuration, deps);
+}
+
+/** Execute already-collected answers through the same validation and mutation boundary. */
+export async function executeInitAnswers(
+  answers: InitAnswers, configuration: string, deps: InitExecutionDeps,
+): Promise<InitPublishResult> {
   // Resolve every catalog/preset dependency before crossing the first mutation
   // boundary. Production owns this new map; the optional seam forces failures
   // deterministically in tests.
@@ -431,7 +488,7 @@ function writeStaged(stageManifest: string, setup: GeneratedSetup): void {
     replaceFileAtomically(target, contents, 0o600);
     fsyncPath(target);
   }
-  for (const kind of ['agents', 'agent_templates', 'roles', 'brains', 'room_templates'])
+  for (const kind of ['agents', 'agent_templates', 'roles', 'brains', 'room_templates', 'room_layouts'])
     fsyncPath(join(stageRoot, kind));
   fsyncPath(stageRoot);
   fsyncPath(dirname(stageManifest));
@@ -441,8 +498,8 @@ function validateStaged(stageManifest: string): void {
   const config = loadConfig(stageManifest, { yamlMode: 'strict' });
   const templates = listTemplates(config.roomTemplates ?? {});
   const names = new Set(templates.map(template => template.name));
-  if (!['pair', 'single', 'team'].every(name => names.has(name)))
-    throw new Error('generated setup did not resolve the default single, pair, and team experiences');
+  if (!['pair', 'single', 'team', 'engineering'].every(name => names.has(name)))
+    throw new Error('generated setup did not resolve the default single, pair, team, and engineering experiences');
   for (const template of templates) for (const member of template.members)
     if (!config.agentTemplates?.[member.agent_template])
       throw new Error(`generated setup cannot resolve ${template.name} member ${member.agent_template}`);

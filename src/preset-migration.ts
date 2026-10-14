@@ -79,10 +79,30 @@ const V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
   'agent_templates/Critic.yaml': '3e98a28f17876061cfadf984351aa59fdbe19629e514eff52c74546545c64a91',
 });
 
+// The packaged Coordinator role of revisions 8 and 9 addressed a named owner channel that a
+// fresh installation does not have. Untouched copies adopt the current role; edited ones stay.
+const OWNER_CHANNEL_COORDINATOR_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'roles/Coordinator.yaml': [
+    '8c8ad28d9bb9ddf9dba8c5c9c7859f25edd8fa10ebf833e2340124a6e49583ec',
+    'f0d8b169ad0a18051b57e5280b93cf01e05faa5c12f4e12bdf89973edf2ef58a',
+  ],
+});
+
+// The packaged revision-10 LocalCoordinator continuity loop reread ROUTINES.md and the WORKLOG
+// checkpoint on every 15-minute pass. Untouched copies adopt the current template; edited ones stay.
+const REREADING_CONTINUITY_LOOP_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'agent_templates/LocalCoordinator.yaml': [
+    '53889cd3987e25ca42be64ddcfa1cf46a73ab769070db144f5b7d86085734178',
+  ],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
+  'roles/Engineer.yaml',
   'agent_templates/LocalCoordinator.yaml', 'agent_templates/Developer.yaml', 'agent_templates/Critic.yaml',
+  'agent_templates/Engineer.yaml',
   'room_templates/single.yaml', 'room_templates/pair.yaml', 'room_templates/team.yaml',
+  'room_templates/engineering.yaml',
   'agents/FleetCoordinator.yaml',
 ]);
 
@@ -229,6 +249,8 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(V3_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V4_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V5_ROLE_DEFAULT_FINGERPRINTS),
+      ...Object.keys(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS),
+      ...Object.keys(REREADING_CONTINUITY_LOOP_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -240,6 +262,8 @@ export function migratePackagedRoleDefaults(
         V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
         V5_ROLE_DEFAULT_FINGERPRINTS[relative],
         V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
+        ...(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS[relative] ?? []),
+        ...(REREADING_CONTINUITY_LOOP_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
@@ -281,6 +305,19 @@ export function migratePackagedRoleDefaults(
       mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
       if (existsSync(target)) unlinkSync(target);
       copyFileSync(join(source, relative), target, constants.COPYFILE_EXCL); chmodSync(target, 0o600);
+      // New Engineer seats use the existing Developer's selected brain. This
+      // preserves wizard/custom provider choices without copying permissions.
+      if (relative === 'agent_templates/Engineer.yaml' && classified.additions.includes(path)) {
+        const developer = join(root, 'agent_templates/Developer.yaml');
+        if (existsSync(developer)) {
+          const value = parseFleetDocument(developer, readFileSync(developer, 'utf8'), 'strict').value as Record<string, unknown>;
+          if (value.brain !== undefined && JSON.stringify(value.brain) !== JSON.stringify({ ref: 'claude-default' })) {
+            const bytes = readFileSync(target, 'utf8').replace('brain: { ref: claude-default }',
+              () => `brain: ${JSON.stringify(value.brain)}`);
+            writeFileSync(target, bytes, { mode: 0o600 });
+          }
+        }
+      }
       fsyncPath(target);
     }
     for (const kind of ['roles', 'agent_templates', 'room_templates', 'agents'])

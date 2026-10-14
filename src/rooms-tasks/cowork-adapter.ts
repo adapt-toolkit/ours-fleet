@@ -1,20 +1,16 @@
 /**
- * Typed client for the ours-cowork v1 private management-socket protocol.
+ * Typed client for the ours-cowork v1 gateway management protocol.
  *
  * Cowork owns room state. Fleet only invokes the versioned JSON RPC exposed
- * by Cowork's Unix socket and projects the response into orchestration data.
+ * through the shared HTTP gateway and projects the response into orchestration data.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { createConnection } from 'node:net';
 import type { Socket } from 'node:net';
+import { readClientProfile } from '../client-profile.js';
+import { coworkHttpCall } from './cowork-http.js';
 import type { RoomHistoryEvidence } from './types.js';
 
-const RPC_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export interface CoworkRoomCreateResult {
   room_id: string;
@@ -75,6 +71,7 @@ export interface CoworkAdapter {
     briefing: string;
     quiet_membership?: boolean;
     anonymous?: boolean;
+    activation_requirements?: Array<{ role: string; count: number }>;
   }): Promise<CoworkRoomCreateResult>;
   acceptInvite(roomId: string, invite: string, opts: {
     role: string;
@@ -107,7 +104,7 @@ export interface CoworkAdapter {
 }
 
 export class CoworkUnavailableError extends Error {
-  constructor(message = 'Cowork management socket is not reachable', options?: ErrorOptions) {
+  constructor(message = 'Cowork gateway management is not reachable', options?: ErrorOptions) {
     super(message, options);
     this.name = 'CoworkUnavailableError';
   }
@@ -289,119 +286,14 @@ function projectHistoryRecord(value: unknown): RoomHistoryEvidence | undefined {
   return undefined;
 }
 
-/** Resolve the same config/state inputs as ours-cowork and return its Unix socket. */
-export function resolveCoworkSocketPath(options: CoworkAdapterOptions = {}): string {
-  if (options.socketPath) return resolve(options.socketPath);
-  const env = options.env ?? process.env;
-  const home = options.home ?? homedir();
-  const configuredPath = options.configPath ?? env.OURS_COWORK_CONFIG;
-  const configPath = resolve(configuredPath ?? join(home, '.ours-cowork', 'config.json'));
-  let stateDir = resolve(home, '.ours-cowork');
-  if (existsSync(configPath)) {
-    let parsed: unknown;
-    try { parsed = JSON.parse(readFileSync(configPath, 'utf8')); }
-    catch (error) { throw new CoworkProtocolError('config', `malformed config at ${configPath}`, 'invalid_config', { cause: error }); }
-    const config = object(parsed, 'config', 'config');
-    if (config.version !== 1 || typeof config.stateDir !== 'string' || !config.stateDir)
-      throw new CoworkProtocolError('config', `invalid Cowork v1 config at ${configPath}`, 'invalid_config');
-    stateDir = resolve(config.stateDir);
-  } else if (configuredPath !== undefined) {
-    throw new CoworkProtocolError('config', `configured Cowork config does not exist: ${configPath}`, 'invalid_config');
-  }
-  if (env.OURS_COWORK_STATE_DIR) stateDir = resolve(env.OURS_COWORK_STATE_DIR);
-  return join(stateDir, 'management.sock');
-}
-
-function rpcCall(
-  socketPath: string,
-  method: string,
-  params: JsonRecord,
-  timeoutMs: number,
-  connect: (path: string) => Socket,
-): Promise<unknown> {
-  const id = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const request = `${JSON.stringify({ version: RPC_VERSION, id, method, params })}\n`;
-  return new Promise((resolveCall, rejectCall) => {
-    const socket = connect(socketPath);
-    let bytes = '';
-    let size = 0;
-    let settled = false;
-    let connected = false;
-    const finishError = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      rejectCall(error);
-    };
-    const timer = setTimeout(() => finishError(new CoworkUnavailableError(
-      connected ? 'Cowork did not answer the management socket' : 'Cowork management socket is not reachable',
-    )), timeoutMs);
-    socket.setEncoding('utf8');
-    socket.once('connect', () => {
-      connected = true;
-      socket.write(request);
-    });
-    socket.on('data', (chunk: string | Buffer) => {
-      if (settled) return;
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      size += Buffer.byteLength(text);
-      if (size > MAX_RESPONSE_BYTES) {
-        finishError(new CoworkProtocolError(method, 'response exceeded 4 MiB'));
-        return;
-      }
-      bytes += text;
-      const newline = bytes.indexOf('\n');
-      if (newline < 0) return;
-      if (bytes.slice(newline + 1).trim() !== '') {
-        finishError(new CoworkProtocolError(method, 'daemon returned more than one response'));
-        return;
-      }
-      let response: JsonRecord;
-      try { response = object(JSON.parse(bytes.slice(0, newline)), method, 'RPC response'); }
-      catch (error) {
-        finishError(error instanceof CoworkProtocolError
-          ? error : new CoworkProtocolError(method, 'daemon returned malformed JSON', 'protocol_error', { cause: error }));
-        return;
-      }
-      if (response.version !== RPC_VERSION || response.id !== id
-        || (Object.hasOwn(response, 'error') === Object.hasOwn(response, 'result'))) {
-        finishError(new CoworkProtocolError(method, 'daemon returned an invalid RPC response'));
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      if (Object.hasOwn(response, 'error')) {
-        const error = object(response.error, method, 'RPC error');
-        rejectCall(new CoworkProtocolError(
-          method,
-          typeof error.message === 'string' ? error.message : 'unknown RPC error',
-          typeof error.code === 'string' ? error.code : 'rpc_error',
-        ));
-      } else {
-        resolveCall(response.result);
-      }
-    });
-    socket.once('end', () => {
-      if (!settled) finishError(new CoworkProtocolError(method, 'daemon closed without a complete response'));
-    });
-    socket.once('error', (error: NodeJS.ErrnoException) => {
-      if (!settled) finishError(new CoworkUnavailableError(
-        error.code === 'EACCES' || error.code === 'EPERM'
-          ? 'Cowork management socket access denied' : 'Cowork management socket is not reachable',
-        { cause: error },
-      ));
-    });
-  });
-}
-
 export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkAdapter {
-  const socketPath = resolveCoworkSocketPath(options);
+  const env = options.env ?? process.env;
+  if (options.socketPath !== undefined || options.configPath !== undefined)
+    throw new CoworkProtocolError('config', 'Local Cowork selectors are unsupported; configure the shared gateway client profile', 'invalid_config');
+  const profile = readClientProfile({ ...env, HOME: options.home ?? env.HOME });
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const connect = options.connect ?? ((path: string) => createConnection(path));
   const call = (method: string, params: JsonRecord): Promise<unknown> =>
-    rpcCall(socketPath, method, params, timeoutMs, connect);
+    coworkHttpCall(profile, method, params, timeoutMs);
   return {
     async available() {
       try { await call('room.list', {}); return true; } catch { return false; }
@@ -413,6 +305,7 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
         briefing: opts.briefing,
         ...(opts.quiet_membership === undefined ? {} : { quiet_membership: opts.quiet_membership }),
         ...(opts.anonymous === undefined ? {} : { anonymous: opts.anonymous }),
+        ...(opts.activation_requirements === undefined ? {} : { activation_requirements: opts.activation_requirements }),
       }), 'room.create');
       if (!result.identity_cid)
         throw new CoworkProtocolError('room.create', 'created room did not establish an identity CID');

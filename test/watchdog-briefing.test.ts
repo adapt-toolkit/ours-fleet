@@ -30,8 +30,9 @@ it('contains the observe-only contract, vocabulary, schema and completion sentin
     'ONE message per run',
   ]) expect(b).toContain(needle);
 });
-it('tells an unverified identity to mint on first run, a verified one to just bind', () => {
-  expect(gen()).toMatch(/create_identity/);
+it('receives a supervisor-provisioned identity for every previous guarantee', () => {
+  expect(gen()).toContain('supervisor has bound your identity');
+  expect(gen()).not.toMatch(/create_identity|choose_identity/);
   expect(gen({ identityGuarantee: 'verified' })).not.toMatch(/if binding reports no such identity/i);
 });
 it('appends prompt_file focus without touching the contract', () => {

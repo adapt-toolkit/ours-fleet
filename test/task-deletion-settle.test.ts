@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -88,6 +88,36 @@ function makeNoRoomTask(): TaskRecord {
 }
 
 describe('settleTaskDeletion — no-room tasks', () => {
+  it('blocks a missing-room legacy cursor that collides with permanent state before any cleanup', async () => {
+    const t = makeNoRoomTask();
+    updateTaskMembers(t.task_id, [{ name: 'PersonalAssistant', identity_cid: CID, slot: 'dev', cowork_role: 'Developer' }]);
+    const permanent = join(stateRoot(), 'agents', 'PersonalAssistant');
+    mkdirSync(permanent, { recursive: true });
+    writeFileSync(join(permanent, '.identity'), 'PersonalAssistant');
+    writeFileSync(join(permanent, '.session-id'), 'retained-context');
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    const events: string[] = [];
+    await expect(settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached,
+      deps: chainDeps(events) })).rejects.toThrow(/permanent agent/);
+    expect(events).toEqual([]);
+    expect(getDeletingTask(t.task_id).deletion).toMatchObject({ status: 'pending', error: expect.stringMatching(/permanent agent/) });
+    expect(readFileSync(join(permanent, '.session-id'), 'utf8')).toBe('retained-context');
+  });
+
+  it('deletes an owned task while preserving an unrelated permanent agent byte-for-byte', async () => {
+    const t = makeNoRoomTask();
+    updateTaskMembers(t.task_id, [{ name: 'owned-worker', identity_cid: CID, slot: 'dev', cowork_role: 'Developer' }]);
+    const permanent = join(stateRoot(), 'agents', 'PersonalAssistant');
+    mkdirSync(permanent, { recursive: true });
+    writeFileSync(join(permanent, '.identity'), 'PersonalAssistant');
+    writeFileSync(join(permanent, '.session-id'), 'retained-context');
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached, deps: chainDeps([]) });
+    expect(existsSync(taskFile(t.task_id))).toBe(false);
+    expect(readFileSync(join(permanent, '.identity'), 'utf8')).toBe('PersonalAssistant');
+    expect(readFileSync(join(permanent, '.session-id'), 'utf8')).toBe('retained-context');
+  });
+
   it('settles without constructing Cowork or loading rooms config', async () => {
     const t = makeNoRoomTask();
     beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
@@ -367,6 +397,7 @@ describe('deletion vs provisioning linearization', () => {
         roomTemplates: { solo: { name: 'solo', version: 1, description: 'solo', members: [] } },
       }) as never,
       cowork: () => ({
+        getRoom: async () => ({ room_id: 'r-race', identity_cid: 'e'.repeat(64), state: 'active', seats: [] }),
         createRoom: async () => {
           // Deletion accepted mid-window: it must block on the operation lock
           // and land only after the room record + task link publish.
@@ -454,13 +485,12 @@ describe('deletion receipts (durable audit evidence)', () => {
     expect(receipt?.settled_at).toBeUndefined();
   });
 
-  it('completes the receipt on settlement and the receipt outlives the task', async () => {
+  it('erases the receipt on settlement together with the task', async () => {
     const t = makeNoRoomTask();
     beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
     await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached });
     expect(existsSync(taskFile(t.task_id))).toBe(false);
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({ result: 'deleted' });
-    expect(readTaskDeletionReceipt(t.task_id)?.settled_at).toBeDefined();
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
   });
 
   it('backfills a missing acceptance receipt before any cleanup side effect', async () => {
@@ -484,9 +514,7 @@ describe('deletion receipts (durable audit evidence)', () => {
     const result = await settleTaskDeletion({ taskId: t.task_id, cowork: probing });
     expect(result.deleted).toBe(true);
     expect(receiptExistedBeforeCowork).toBe(true); // recreated before Cowork was touched
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({
-      task_id: t.task_id, original_state: 'active', result: 'deleted',
-    });
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
     expect(existsSync(taskFile(t.task_id))).toBe(false);
   });
 
@@ -497,7 +525,7 @@ describe('deletion receipts (durable audit evidence)', () => {
     expect(readTaskDeletionReceipt(t.task_id)?.settled_at).toBeUndefined();
     const result = await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached });
     expect(result).toEqual({ task_id: t.task_id, deleted: false });
-    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({ result: 'deleted' });
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
   });
 });
 
@@ -568,22 +596,16 @@ describe('gated concurrency and stranger safety', () => {
         binPath: '/bin/true',
       }).then(() => 'resolved', error => error as Error);
       void provisioning.then(value => { settledEarly = value; });
-      const deadline = Date.now() + 5_000;
-      while (!inviteIssued && settledEarly === undefined && Date.now() < deadline)
-        await new Promise(resolve => setTimeout(resolve, 20));
-      if (settledEarly !== undefined && !inviteIssued)
-        throw new Error(`provisioning settled before the gated window: ${String(settledEarly)}`);
-      expect(inviteIssued).toBe(true); // provisioning reached the gated window
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(inviteIssued).toBe(false); // entire provisioning waits for the deletion epoch
+      expect(settledEarly).toBeUndefined();
       beginTaskDeletionIntent(t.task_id, CLI_ACTOR); // delete wins the epoch
     });
     const outcome = await provisioning!;
     expect(outcome).toBeInstanceOf(Error);
     expect((outcome as Error).message).toMatch(/pending deletion/);
-    expect(revoked).toBe(true); // issued invite rolled back
-    const seat = getRoomRecord('room-dw')!.member_seats[0];
-    // Spawn count zero: the durable launch record never left its pre-launch state.
-    expect(seat.launch?.state).toBe('pending');
-    expect(seat.launch?.attempt).toBe(0);
+    expect(revoked).toBe(false); // no invite was issued
+    expect(getRoomRecord('room-dw')!.member_seats).toEqual([]);
   }, 20_000);
 
   it('leaves a same-name different-CID stranger identity untouched', async () => {

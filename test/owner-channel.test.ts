@@ -1,3 +1,4 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
@@ -145,7 +146,8 @@ const dirs: string[] = [];
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  // A channel may still be writing into its outbox when a test ends; removal retries instead of failing on a directory that just gained a file.
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 function deferred<T = void>() {
@@ -166,6 +168,7 @@ function setup(messages: unknown[], result = {
 }, options: {
   interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
   configPath?: string;
+  startupPending?: () => boolean;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
   stateDir?: string; client?: FakeClient;
@@ -192,6 +195,7 @@ function setup(messages: unknown[], result = {
       interrupt: options.interrupt ?? false, progress_interval_ms: 0,
     },
     session, stateDir: dir, client, log: () => undefined,
+    startupPending: options.startupPending,
     ...(options.configPath ? { configPath: options.configPath } : {}),
     prepareRestart: options.prepareRestart ?? (async () => undefined),
     ...(options.fleet ? { fleet: options.fleet } : {}),
@@ -563,6 +567,7 @@ describe('owner channel daemon-generation recovery', () => {
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
   comments?: boolean; stateDir?: string; backend?: string;
+  sharedTurnId?: (promptId: string) => string | undefined;
 } = {}) {
   const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   if (!options.stateDir) dirs.push(dir);
@@ -584,6 +589,7 @@ function liveSetup(options: {
     backend: options.backend ?? 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
     queuePrompt, interrupt,
+    ...(options.sharedTurnId ? { sharedTurnId: options.sharedTurnId } : {}),
     eventsSince: (seq: number) => events.filter(event => event.seq > seq),
     subscribe: (listener: (event: SessionEvent) => void) => {
       listeners.add(listener);
@@ -663,15 +669,43 @@ describe('OwnerChannel', () => {
     expect(existsSync(join(dir, '.owner-channel-message-recovery.json'))).toBe(false);
   });
 
-  it('fails closed when a journaled message is absent from persistent history', async () => {
+  it('skips a journaled message absent from history and reads a later owner message', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
     dirs.push(dir);
-    new MessageRecoveryState(join(dir, '.owner-channel-message-recovery.json')).claim([{
+    const journalPath = join(dir, '.owner-channel-message-recovery.json');
+    new MessageRecoveryState(journalPath).claim([{
       wireId: 'missing-history-wire', seq: 12, claimedAt: 1_000,
     }]);
-    const { channel, queuePrompt } = liveSetup({ stateDir: dir });
-    await expect(channel.drain()).rejects.toThrow(/missing from persistent history/);
-    expect(queuePrompt).not.toHaveBeenCalled();
+    const next = ownerMessage(13, 'wire-after-missing-history', 'Please respond');
+    const { channel, client, queuePrompt } = setup([next], undefined, { stateDir: dir });
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(String(queuePrompt.mock.calls[0][0])).toContain('Please respond');
+    expect(new MessageRecoveryState(journalPath).list().some(
+      claim => claim.wireId === 'missing-history-wire')).toBe(false);
+    expect(client.calls).toContainEqual({
+      name: 'getHistoryItem', args: { wireId: 'missing-history-wire' },
+    });
+    const restarted = setup([], undefined, { stateDir: dir });
+    await restarted.channel.drain();
+    expect(restarted.client.calls.some(call => call.name === 'getHistoryItem'
+      && call.args?.wireId === 'missing-history-wire')).toBe(false);
+    expect(queuePrompt).toHaveBeenCalledOnce();
+  });
+
+  it('retains a recovery claim when its history lookup fails transiently', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+    dirs.push(dir);
+    const journalPath = join(dir, '.owner-channel-message-recovery.json');
+    new MessageRecoveryState(journalPath).claim([{
+      wireId: 'temporarily-unavailable-wire', seq: 12, claimedAt: 1_000,
+    }]);
+    const { channel, client } = setup([], undefined, { stateDir: dir });
+    client.getHistoryItem = async () => { throw new Error('daemon unavailable'); };
+    await expect(channel.drain()).rejects.toThrow('daemon unavailable');
+    expect(new MessageRecoveryState(journalPath).list()).toEqual([{
+      wireId: 'temporarily-unavailable-wire', seq: 12, claimedAt: 1_000,
+    }]);
   });
 
   it('claims at most 200 oldest metadata rows per SDK transaction', async () => {
@@ -760,6 +794,19 @@ describe('OwnerChannel', () => {
         + 'The response will arrive in this channel when ready.',
       replyToWireId: 'wire-preempt',
     });
+  });
+
+  it('steers owner input during startup and restores configured interruption after startup', async () => {
+    let pending = true;
+    const { channel, client, queuePrompt } = setup([{
+      msg_id: 14, wire_id: 'startup-owner', from: { id: OWNER_CID }, text: 'Please continue',
+    }], undefined, { interrupt: true, startupPending: () => pending });
+    await channel.drain();
+    expect(queuePrompt.mock.calls[0][1]).toMatchObject({ interrupt: false, steer: true });
+    pending = false;
+    client.batches.push([{ msg_id: 15, wire_id: 'ready-owner', from: { id: OWNER_CID }, text: 'Now prioritize this' }], []);
+    await channel.drain();
+    expect(queuePrompt.mock.calls[1][1]).toMatchObject({ interrupt: true, interruptSource: 'owner' });
   });
 
   it('does not elevate a peer message merely because it reached the channel', async () => {
@@ -1349,6 +1396,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-close-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000aa';
     const configPath = join(fleetHome, 'fleet.yaml');
@@ -1372,6 +1421,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     try {
       await channel.drain();
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1391,6 +1442,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000ab';
     const configPath = join(fleetHome, 'fleet.yaml');
@@ -1405,6 +1458,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     );
     try { await channel.drain(); }
     finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1444,6 +1499,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const task = createTask({
       title: 'Owner terminal', origin: { type: 'owner_channel' }, start: false,
@@ -1476,6 +1533,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       persistedTask = getTask(task.task_id);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1498,6 +1557,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     // Provisioning state — deletion must accept without any terminal transition.
@@ -1521,6 +1582,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: OWNER_CID },
       });
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1539,6 +1602,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-fail-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({ title: 'Owner delete fail', origin: { type: 'owner_channel' }, start: false });
@@ -1553,6 +1618,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       expect(hidden.deletion?.error).toContain('systemd launch failed');
       expect(hidden.deletion?.recovery_hint).toContain(`/task delete ${task.task_id} ${task.task_id}`);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1566,6 +1633,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-no-close-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     const configPath = join(fleetHome, 'fleet.yaml');
     writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: false\n');
@@ -1583,6 +1652,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       expect(getTask(task.task_id).state).toBe('done');
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -1597,6 +1668,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-fail-'));
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
+    const previousProfile = process.env.OURS_CONFIG;
+    process.env.OURS_CONFIG = gatewayFixture(fleetHome).env.OURS_CONFIG;
     process.env.OURS_FLEET_HOME = fleetHome;
     writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({
@@ -1615,6 +1688,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       await channel.drain();
       persistedTask = getTask(task.task_id);
     } finally {
+      if (previousProfile === undefined) delete process.env.OURS_CONFIG;
+      else process.env.OURS_CONFIG = previousProfile;
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
@@ -2020,6 +2095,33 @@ describe('OwnerChannel notice presentation', () => {
     const sentBefore = client.calls.filter(call => call.name === 'sendMessage').length;
     await vi.advanceTimersByTimeAsync(60_000);
     expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(sentBefore);
+  });
+
+  it('follows the shared turn when one turn delivers this request with other waiting prompts', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
+    // The request is prompt-1, but the turn that carries it is another member's.
+    const { channel, client, completions, emit } = liveSetup({
+      progressIntervalMs: 30_000,
+      sharedTurnId: promptId => (promptId === 'prompt-1' ? 'shared-turn' : undefined),
+    });
+    client.batches.push([ownerMessage(1, 'wire-shared', 'Work safely')]);
+    await channel.drain();
+
+    // Activity under the request's own id belongs to no running turn and is not reported.
+    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'stale', title: 'stale', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.calls.filter(call => call.name === 'sendMessage')
+      .some(call => String(call.args?.text).startsWith('⏳'))).toBe(false);
+
+    emit({ kind: 'tool_call', turnId: 'shared-turn', toolCallId: 'ours', title: 'run', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(lastReply(client)).toBe(
+      '⏳ Working for 30s · using tools · 1 tool action started since the last update.');
+
+    completions[0](done('Answer to everything delivered together'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastReply(client)).toBe('Answer to everything delivered together');
   });
 
   it('keeps concurrent request progress isolated and correlated', async () => {

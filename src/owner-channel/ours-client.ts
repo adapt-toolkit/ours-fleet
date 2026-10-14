@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { extname } from 'node:path';
+import { extname, join } from 'node:path';
+import { readClientProfile } from '../client-profile.js';
 
 import {
   OursClient, OursError, attachOursClient, type AttachOursClientOptions,
@@ -161,8 +162,8 @@ export interface OursOps {
   sendFile(
     a: { contact: string; path: string; filename: string; replyToWireId?: string },
   ): Promise<void>;
-  /** Release the daemon lease and stop. Never throws. */
-  close(): Promise<void>;
+  /** Dispose transport; terminal release is default and rejects if cleanup is incomplete. */
+  close(options?: { releaseLease?: boolean }): Promise<void>;
 }
 
 /**
@@ -200,11 +201,15 @@ export interface OursSdkClientDeps {
  * its own and hands it back in `close()`. That replaces the connector proxy's
  * shell-PID fence, which existed because a supervised attempt had to make its
  * lease reclaimable while the supervisor itself stayed alive: an explicit
- * release does that deterministically, and `clientPid` still covers the case
- * where the whole supervisor dies without unwinding.
+ * terminal release does that deterministically. Recovery disposes only the
+ * transport and retains this owner ID and its bindings. Explicit daemon identity selects external
+ * ownership in either layout; PID-based legacy attachment remains temporary.
+ * Failed external release preserves unknown ownership until exact terminal evidence.
  */
 export class OursSdkClient implements OursOps {
   private client?: OursClient;
+  // Disposing a transport does not discharge this owner's terminal cleanup.
+  private terminalReleasePending = false;
   private readonly leaseToken = `ours-fleet-owner-${process.pid}-${randomUUID()}`;
 
   constructor(
@@ -216,19 +221,14 @@ export class OursSdkClient implements OursOps {
   async start(): Promise<void> {
     if (this.client) return;
     const environment = { ...process.env, ...this.env };
-    // SDK 2's supported application path resolves endpoint, state root, and
-    // token as one coherent selection, proves the daemon's state root before
-    // sending credentials, and only then constructs the client.
+    const profile = readClientProfile(environment);
     const options: AttachOursClientOptions = {
-      env: environment,
-      leaseToken: this.leaseToken,
-      clientPid: process.pid,
-      fetch: notificationDeadlineFetch(
-        this.deps.fetch ?? globalThis.fetch,
-        this.deps.notificationRequestDeadlineMs ?? NOTIFICATION_REQUEST_DEADLINE_MS,
-      ),
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: this.leaseToken, env: {},
     };
     this.client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
+    this.terminalReleasePending = true;
   }
 
   async bindIdentity(name: string): Promise<void> {
@@ -269,7 +269,10 @@ export class OursSdkClient implements OursOps {
     identity: string,
     options?: { since?: number | 'tip'; signal?: AbortSignal },
   ): AsyncGenerator<OursNotificationEvent, void, undefined> {
-    return this.ops().watchNotifications(identity, options);
+    return this.ops().watchNotifications(identity, {
+      ...options,
+      requestTimeoutMs: this.deps.notificationRequestDeadlineMs ?? NOTIFICATION_REQUEST_DEADLINE_MS,
+    });
   }
 
   async listIncomingFiles(): Promise<OursIncomingFile[]> {
@@ -329,17 +332,28 @@ export class OursSdkClient implements OursOps {
         + 'session must be re-established after an upgrade; files are not queued');
   }
 
-  async close(): Promise<void> {
+  async close(options: { releaseLease?: boolean } = {}): Promise<void> {
+    const terminal = options.releaseLease !== false;
+    // A failed recovery may have disposed its client before normal shutdown.
+    // Reattach the same owner through ordinary verified selection; no rebind is
+    // needed to release it, and a failed attach must not be reported as closed.
+    if (terminal && !this.client && this.terminalReleasePending) await this.start();
     const client = this.client;
     this.client = undefined;
     if (!client) return;
     // Handing the lease back is what lets a successor bind this identity without
-    // waiting for the supervisor to exit. A failure here is not fatal — the
-    // daemon still reclaims the lease when this process dies.
-    try { await client.releaseLease(); }
-    catch (error) {
+    // waiting for the supervisor to exit. External failure remains unknown;
+    // it is not permission to infer owner death or fall back to daemon PID checks.
+    try {
+      if (terminal) {
+        const result = await client.releaseLease();
+        if (result.failed > 0) throw new OursDaemonError('daemon lease release incomplete');
+        this.terminalReleasePending = false;
+      }
+    } catch (error) {
       this.log(`lease release failed: ${(error as Error)?.message ?? String(error)}`);
-    }
+      throw error;
+    } finally { await client.close(); }
   }
 
   private ops(): OursClient {

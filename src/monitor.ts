@@ -1,7 +1,11 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { attachOursClient, type AttachOursClientOptions } from '@ours.network/sdk/client';
 import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
+import {
+  clientProfileKey, readClientProfile, type ExplicitClientProfile,
+} from './client-profile.js';
 import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 
 // ─── The supervisor-owned message monitor ───────────────────────────────────
@@ -36,6 +40,27 @@ export type FetchLike = (
   url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<FetchResponse>;
 
+export interface MonitorPageClient {
+  /** Body-free snapshot; never consumes messages or changes read status. */
+  unread(): Promise<{ identities: Array<Record<string, unknown>> }>;
+  readNotificationPage(
+    identity: string,
+    options?: { since?: number | 'tip'; signal?: AbortSignal; requestTimeoutMs?: number },
+  ): Promise<{ cursor: number; events: Array<Record<string, unknown>> }>;
+  close(): Promise<void>;
+}
+
+export interface IdentityProbeClient {
+  identities(): Promise<Array<string | { name?: unknown; temporary?: unknown; stale?: unknown }>>;
+  close(): Promise<void>;
+}
+
+export interface IdentityProbeDeps {
+  attachClient?(
+    options: AttachOursClientOptions,
+  ): IdentityProbeClient | Promise<IdentityProbeClient>;
+}
+
 export interface MonitorDeps {
   fetch: FetchLike;
   isAlive(pid: number): boolean;
@@ -47,6 +72,8 @@ export interface MonitorDeps {
     set(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
     clear(t: ReturnType<typeof setTimeout>): void;
   };
+  /** Test seam; production attaches through the SDK's verified selection path. */
+  attachClient?(options: AttachOursClientOptions): MonitorPageClient | Promise<MonitorPageClient>;
   /**
    * Structured prompt delivery used by agent sessions.
    * `succeeded` is the turn's TERMINAL result, not merely that the session took
@@ -118,7 +145,7 @@ export type StatusCause =
   | 'offline'         // the session is gone            → the run loop ends
   | 'turns-failing'   // delivered wakes keep dying     → cleared by a completed turn
   | 'safe-boundary'   // after_tool fell back            → cleared by an exact/direct delivery
-  | 'auth';           // the daemon rejected the token  → fatal
+  | 'auth';           // issued credential rejected; profile retries
 
 interface StatusEntry {
   level: 'degraded' | 'failed';
@@ -126,94 +153,10 @@ interface StatusEntry {
   at: string;
 }
 
-/** Best-effort daemon config (issue #17): the fields the MCP client reads. */
-interface DaemonConfig {
-  apiToken?: string;
-  port?: number;
-  stateDir?: string;
-}
-
-/** Path to the daemon config the MCP client uses: OURS_CONFIG ?? real ~/.ours/config.json. */
-const daemonConfigPath = (env: NodeJS.ProcessEnv): string =>
-  env.OURS_CONFIG ?? join(homedir(), '.ours', 'config.json');
-
-/** Preserve the daemon's legacy env integer semantics: parseInt, invalid → absent. */
-function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
-  const raw = env[name];
-  if (raw === undefined) return undefined;
-  const n = parseInt(raw, 10);
-  return Number.isNaN(n) ? undefined : n;
-}
-
-/**
- * Read the daemon config the way the MCP client does — best-effort. Any missing,
- * malformed, or unreadable config yields `{}` so token resolution falls through
- * (issue #17). Only the well-typed fields we consume are surfaced.
- */
-export function readDaemonConfig(env: NodeJS.ProcessEnv): DaemonConfig {
-  try {
-    const p = JSON.parse(readFileSync(daemonConfigPath(env), 'utf8'));
-    const o: DaemonConfig = {};
-    if (typeof p.apiToken === 'string' && p.apiToken.trim()) o.apiToken = p.apiToken.trim();
-    if (typeof p.port === 'number' && Number.isFinite(p.port)) o.port = p.port;
-    if (typeof p.stateDir === 'string') o.stateDir = p.stateDir;
-    return o;
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Resolve the daemon API token exactly like the MCP client (issue #17), a 3-step
- * chain: `OURS_API_TOKEN` (trimmed) → config `apiToken` (trimmed) → the 0600 owner
- * token at `<stateDir>/daemon-token`. Never generates a token; a failed read of
- * any source (missing/unreadable) silently falls through to the next.
- */
-export function resolveApiToken(
-  env: NodeJS.ProcessEnv, file: DaemonConfig = readDaemonConfig(env),
-): string | undefined {
-  const e = env.OURS_API_TOKEN?.trim();
-  if (e) return e;
-  if (file.apiToken) return file.apiToken;
-  const sd = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
-  try {
-    const t = readFileSync(join(sd, 'daemon-token'), 'utf8').trim();
-    if (t) return t;
-  } catch { /* missing/unreadable (e.g. cross-user 0600) → fall through */ }
-  return undefined;
-}
-
-export interface DaemonEndpoint {
-  origin: string;
-  port: number;
-  configPath: string;
-  stateDir: string;
-  url(name: string): string;
-  headers: Record<string, string>;
-}
-
 export type IdentityPresence =
   | { state: 'present'; temporary: boolean; stale: boolean }
   | { state: 'absent' }
   | { state: 'unknown'; detail: string };
-
-/** Resolve the daemon endpoint + auth header from env → config → defaults. */
-export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
-  const file = readDaemonConfig(env);
-  const port = envInt(env, 'OURS_PORT') ?? file.port ?? DEFAULT_PORT;
-  const configPath = daemonConfigPath(env);
-  const stateDir = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
-  const token = resolveApiToken(env, file);
-  const origin = `http://127.0.0.1:${port}`;
-  return {
-    origin,
-    port,
-    configPath,
-    stateDir,
-    url: (name: string) => `${origin}/identities/${encodeURIComponent(name)}/notifications`,
-    headers: token ? { 'x-ours-api-token': token } : {},
-  };
-}
 
 /**
  * Ask the daemon's authoritative identity index. The notifications endpoint is
@@ -221,47 +164,46 @@ export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
  * valid but missing identity, which made a closed temp identity look healthy.
  */
 export async function probeIdentityPresence(
-  name: string, fetch: FetchLike, env: NodeJS.ProcessEnv,
+  name: string, fetch: FetchLike, env: NodeJS.ProcessEnv, deps: IdentityProbeDeps = {},
 ): Promise<IdentityPresence> {
-  const ep = resolveEndpoint(env);
-  let response: FetchResponse;
+  let client: IdentityProbeClient | undefined;
   try {
-    response = await fetch(`${ep.origin}/identities`, { headers: ep.headers });
-  } catch (error) {
-    return { state: 'unknown', detail: `identity index unreachable (${msg(error)})` };
-  }
-  if (!response.ok) return {
-    state: 'unknown',
-    detail: response.status === 401
-      ? `daemon rejected the API token (401) — ${authResolutionHint(ep)}`
-      : `identity index returned HTTP ${response.status}`,
-  };
-  try {
-    const body = await response.json();
-    if (!Array.isArray(body.identities))
-      return { state: 'unknown', detail: 'identity index response is malformed' };
-    // A healthy daemon normally has at least its Human identity. During daemon
-    // restart, however, the authenticated endpoint can briefly serve a valid
-    // but empty index while state is still loading. Empty is therefore not
-    // enough authority to retire a live temporary role.
-    if (body.identities.length === 0)
-      return { state: 'unknown', detail: 'identity index is temporarily empty' };
-    const found = body.identities.find(identity =>
-      (typeof identity === 'string' ? identity : identity?.name) === name);
-    if (!found) return { state: 'absent' };
-    return typeof found === 'string'
-      ? { state: 'present', temporary: false, stale: false }
-      : { state: 'present', temporary: found.temporary === true, stale: found.stale === true };
-  } catch (error) {
-    return { state: 'unknown', detail: `identity index response is unreadable (${msg(error)})` };
-  }
+    const profile = readClientProfile(env);
+    const options: AttachOursClientOptions = {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: randomUUID(), env: {},
+    };
+    client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+    return classifyIdentityPresence(name, await client.identities());
+  } catch {
+    return { state: 'unknown', detail: 'gateway identity index unavailable; check the shared client profile and issued credential' };
+  } finally { await client?.close().catch(() => undefined); }
 }
 
-/** Actionable, secret-free description of every token source for this profile. */
-export function authResolutionHint(ep: DaemonEndpoint): string {
-  const tokenPath = join(ep.stateDir, 'daemon-token');
-  return `set OURS_API_TOKEN, set apiToken in ${JSON.stringify(ep.configPath)}, or ensure ` +
-    `${JSON.stringify(tokenPath)} is readable by the fleet supervisor`;
+function classifyIdentityPresence(name: string, identities: unknown): IdentityPresence {
+  if (!Array.isArray(identities))
+    return { state: 'unknown', detail: 'identity index response is malformed' };
+  // A healthy daemon normally has at least its Human identity. During daemon
+  // restart, however, the authenticated endpoint can briefly serve a valid
+  // but empty index while state is still loading. Empty is therefore not
+  // enough authority to retire a live temporary role.
+  if (identities.length === 0)
+    return { state: 'unknown', detail: 'identity index is temporarily empty' };
+  const found = identities.find(identity =>
+    (typeof identity === 'string'
+      ? identity
+      : identity && typeof identity === 'object'
+        ? (identity as { name?: unknown }).name
+        : undefined) === name);
+  if (!found) return { state: 'absent' };
+  return typeof found === 'string'
+    ? { state: 'present', temporary: false, stale: false }
+    : {
+      state: 'present',
+      temporary: (found as { temporary?: unknown }).temporary === true,
+      stale: (found as { stale?: unknown }).stale === true,
+    };
 }
 
 /** Keep only the events whose type the role asked to wake on. */
@@ -494,7 +436,10 @@ export class Monitor {
   private readonly identity: string;
   private readonly cfg: MonitorConfig;
   private readonly deps: MonitorDeps;
-  private readonly ep: ReturnType<typeof resolveEndpoint>;
+  private readonly profile: ExplicitClientProfile;
+  private readonly profileKey: string;
+  private readonly monitorLeaseToken = `ours-fleet-monitor-${process.pid}-${randomUUID()}`;
+  private profileClientPromise?: Promise<MonitorPageClient>;
   private readonly statusPath: string;
   private readonly cursorPath: string;
   private readonly statePath: string;
@@ -505,6 +450,7 @@ export class Monitor {
   private stopped = false;
   private bootDeadline = 0;
   private currentAbort: AbortController | null = null;
+  private initialBacklogPending = true;
   // Refusal-wedge detector (issue #19): consecutive delivered wakes whose turn
   // ended in an API error with no completed turn in between.
   private apiErrorStreak = 0;
@@ -517,7 +463,8 @@ export class Monitor {
     this.identity = o.identity ?? o.name;
     this.cfg = o.cfg;
     this.deps = o.deps;
-    this.ep = resolveEndpoint(o.deps.env);
+    this.profile = readClientProfile(o.deps.env);
+    this.profileKey = clientProfileKey(this.profile);
     this.statusPath = join(o.agentDir, '.monitor-status');
     this.cursorPath = join(o.agentDir, '.notify-cursor');
     this.statePath = join(o.agentDir, '.monitor-state.json');
@@ -545,8 +492,8 @@ export class Monitor {
       this.writeStatus();
     } catch (e) {
       if (e instanceof AuthError) {
-        this.fatal = true;
-        this.degrade('auth', e.message, 'failed');
+        this.cursor = null;
+        this.degrade('auth', e.message);
       } else {
         this.cursor = null;
         this.degrade('connectivity', `prime failed (${msg(e)})`);
@@ -556,23 +503,54 @@ export class Monitor {
 
   /** Long-poll → filter → coalesce → inject, until the pane pid dies or stop(). */
   async run(pid: number): Promise<void> {
-    if (this.fatal) return;
+    if (this.fatal) { await this.disposeProfileClient(); return; }
     this.bootDeadline = this.deps.now() + BOOT_GRACE_MS;
     let backoff = 0;
     const pending: NotifyEvent[] = [];
-    while (!this.stopped) {
+    try { while (!this.stopped) {
       if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
+      // The native SessionStart hook is disabled for managed sessions. Check
+      // existing unread work AFTER the ready turn, without a model inbox ritual
+      // or touching read status. Keep retrying a failed probe/delivery before
+      // committing stream cursors, including on supervisor restarts.
+      if (this.initialBacklogPending) {
+        try {
+          const body = await this.readInitialUnread();
+          if (!Array.isArray(body.identities)) throw new Error('unread summary is malformed');
+          const row = body.identities.find(row => row.name === this.identity);
+          if (row && (!Number.isSafeInteger(row.count) || Number(row.count) < 0
+              || !Number.isSafeInteger(row.files) || Number(row.files) < 0))
+            throw new Error('unread identity summary is malformed');
+          const messages = this.cfg.wake_sources.includes('message_received') ? Number(row?.count ?? 0) : 0;
+          const files = this.cfg.wake_sources.includes('file_received') ? Number(row?.files ?? 0) : 0;
+          if ((messages || files) && !await this.deliverLine(
+            `${PREFIX} unread backlog: ${messages} messages, ${files} files — run get_messages; drain remaining unread batches and authorize files before retrieving them`,
+          )) {
+            await this.deps.sleep(BACKOFF_MAX_MS);
+            continue;
+          }
+          this.initialBacklogPending = false;
+          this.recover('connectivity', 'auth');
+        } catch (e) {
+          if (this.stopped) return;
+          if (e instanceof AuthError) this.degrade('auth', e.message);
+          else this.degrade('connectivity', 'initial unread check unavailable; retrying');
+          await this.deps.sleep(BACKOFF_MAX_MS);
+          continue;
+        }
+      }
+      if (this.stopped) return;
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
         body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_STALL_MS, 'stall');
         backoff = 0;
         // A poll that worked proves the stream is healthy — and only that.
-        this.recover('connectivity');
+        this.recover('connectivity', 'auth');
       } catch (e) {
         if (this.stopped) return;
-        if (e instanceof AuthError) { this.fatal = true; this.degrade('auth', e.message, 'failed'); return; }
         backoff = Math.min(backoff + BACKOFF_STEP_MS, BACKOFF_MAX_MS);
-        this.degrade('connectivity', `stream hiccup (${msg(e)})`);
+        if (e instanceof AuthError) this.degrade('auth', e.message);
+        else this.degrade('connectivity', `stream hiccup (${msg(e)})`);
         await this.deps.sleep(backoff);
         continue;
       }
@@ -604,12 +582,13 @@ export class Monitor {
         this.pendingState = null;
         this.persistCursor();
       }
-    }
+    } } finally { await this.disposeProfileClient(); }
   }
 
   stop(): void {
     this.stopped = true;
     this.currentAbort?.abort();
+    void this.disposeProfileClient();
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -627,7 +606,10 @@ export class Monitor {
   }
 
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
-    const line = formatNotificationLine(batch);
+    return this.deliverLine(formatNotificationLine(batch));
+  }
+
+  private async deliverLine(line: string): Promise<boolean> {
     if (!this.deps.delivery) {
       this.degrade('delivery', 'structured agent-session delivery is unavailable');
       return false;
@@ -681,23 +663,78 @@ export class Monitor {
     this.currentAbort = ctrl;
     let timedOut = false;
     const timer = this.deps.timers.set(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
-    let resp: FetchResponse;
     try {
-      resp = await this.deps.fetch(`${this.ep.url(this.identity)}?since=${since}`,
-        { headers: this.ep.headers, signal: ctrl.signal });
+      const client = await this.profileClient();
+        const page = await client.readNotificationPage(this.identity, {
+          since: since === 'tip' ? 'tip' : Number.parseInt(since, 10),
+          signal: ctrl.signal,
+          requestTimeoutMs: timeoutMs,
+        });
+        return { cursor: page.cursor, events: page.events as NotifyEvent[] };
     } catch (error) {
       if (timedOut && timeoutKind === 'stall')
         throw new Error(`notification stream stalled for ${Math.round(timeoutMs / 1000)}s`);
+      if (/(?:HTTP\s*401|unauthori[sz]ed|API token)/i.test(msg(error)))
+        throw new AuthError(
+          `daemon rejected the API token (401) — verify the credential file `
+          + `${JSON.stringify(this.profile.credentialPath)} selected by `
+          + `${JSON.stringify(this.profile.configPath)}`);
       throw error;
     } finally {
       this.deps.timers.clear(timer);
       this.currentAbort = null;
     }
-    if (resp.status === 401)
-      throw new AuthError(
-        `daemon rejected the API token (401) — ${authResolutionHint(this.ep)}`);
-    if (!resp.ok) throw new Error(`daemon returned HTTP ${resp.status}`);
-    return resp.json();
+
+  }
+
+  private profileClient(): Promise<MonitorPageClient> {
+    if (!this.profileClientPromise) {
+      const { endpoint, expectedInstanceId, credentialPath } = this.profile;
+      const options: AttachOursClientOptions = {
+        endpoint, expectedInstanceId, credentialPath,
+        sessionMode: 'external', leaseToken: this.monitorLeaseToken, env: {},
+      };
+      this.profileClientPromise = Promise.resolve(
+        this.deps.attachClient?.(options) ?? attachOursClient(options),
+      ).catch(error => {
+        this.profileClientPromise = undefined;
+        throw error;
+      });
+    }
+    return this.profileClientPromise;
+  }
+
+  private async readInitialUnread(): Promise<{ identities: Array<Record<string, unknown>> }> {
+    const ctrl = new AbortController();
+    this.currentAbort = ctrl;
+    const timer = this.deps.timers.set(() => ctrl.abort(), 5_000);
+    let client: MonitorPageClient | undefined;
+    try {
+      const { endpoint, expectedInstanceId, credentialPath } = this.profile;
+      const options: AttachOursClientOptions = {
+        endpoint, expectedInstanceId, credentialPath,
+        sessionMode: 'external', leaseToken: this.monitorLeaseToken, env: {},
+        requestSignal: ctrl.signal,
+      };
+      client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
+      return await client.unread();
+    } catch (error) {
+      if (/(?:HTTP\s*401|unauthori[sz]ed|API token)/i.test(msg(error)))
+        throw new AuthError('daemon rejected the API token (401); initial unread check unavailable; retrying');
+      throw error;
+    } finally {
+      this.deps.timers.clear(timer);
+      this.currentAbort = null;
+      await client?.close().catch(() => undefined);
+    }
+  }
+
+  private async disposeProfileClient(): Promise<void> {
+    const pending = this.profileClientPromise;
+    this.profileClientPromise = undefined;
+    if (!pending) return;
+    try { await (await pending).close(); }
+    catch { this.deps.log(`[${this.name}] monitor: failed to close daemon client`); }
   }
 
   private advance(cursor: number | undefined, persist = true): void {
@@ -726,7 +763,7 @@ export class Monitor {
           identity?: string; profileKey?: string; deliveredCursor?: number;
         };
         if ((state.identity !== undefined && state.identity !== this.identity)
-            || (state.profileKey !== undefined && state.profileKey !== this.ep.origin))
+            || (state.profileKey !== undefined && state.profileKey !== this.profileKey))
           return null;
         if (typeof state.deliveredCursor === 'number') {
           this.deliveredCursor = state.deliveredCursor;
@@ -747,7 +784,7 @@ export class Monitor {
       writeFileSync(tmp, JSON.stringify({
         version: 1,
         identity: this.identity,
-        profileKey: this.ep.origin,
+        profileKey: this.profileKey,
         observedCursor: this.cursor,
         deliveredCursor: this.deliveredCursor,
         pending: this.pendingState,

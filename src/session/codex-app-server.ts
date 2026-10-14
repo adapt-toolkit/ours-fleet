@@ -1,14 +1,19 @@
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import type { CommonPermissions } from '../config.js';
+import { boundedJson } from './conversation-normalizer.js';
 import { ConversationEventStore } from './conversation-store.js';
 import type {
   ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import {
+  memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+} from './prompt-batch.js';
 import { CodexAppServerTransport } from './codex-app-server-transport.js';
 import type {
   CodexAppServerConnection, CodexAppServerTransportFactory,
@@ -33,7 +38,6 @@ const INTERRUPT_TERMINATE_GRACE_MS = 5_000;
 const TERMINAL_RECONCILE_QUIET_MS = 2_000;
 const TERMINAL_RECONCILE_REQUEST_TIMEOUT_MS = 5_000;
 const SCHEDULED_REDACTION = '[scheduled-loop content redacted]';
-const COMMENTARY_REDACTION = '[assistant commentary redacted]';
 const OWNER_ADMIN_CONTEXT_KEY =
   'ours-fleet://prompt-provenance?source=owner_admin_console';
 const OWNER_CHANNEL_CONTEXT_KEY =
@@ -46,6 +50,7 @@ export interface CodexAppServerSessionOptions {
   env: Record<string, string>;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  requireResume?: boolean;
   permissions: CommonPermissions;
   permissionMode: NonNullable<SessionSnapshot['permissionMode']>;
   model?: string | null;
@@ -66,7 +71,7 @@ export interface CodexAppServerSessionOptions {
 interface PendingPermission {
   requestId: RequestId;
   method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
-    | 'item/permissions/requestApproval';
+    | 'item/permissions/requestApproval' | 'mcpServer/elicitation/request';
   toolCallId: string;
   options: Array<{ optionId: string; name: string; kind: string }>;
   requestedPermissions?: JsonObject;
@@ -75,6 +80,10 @@ interface PendingPermission {
 
 interface ActiveTurn {
   promptId: string;
+  /** Every admitted prompt this turn carries; `promptId` is the first. */
+  promptIds: string[];
+  /** Whether any member came from the paired console. */
+  console: boolean;
   nativeTurnId?: string;
   origin?: PromptOrigin;
   output: string;
@@ -146,6 +155,34 @@ export function nativePromptAdditionalContext(
   return undefined;
 }
 
+const PROMPT_BATCH_CONTEXT_KEY = 'ours-fleet://prompt-batch';
+
+/**
+ * Application context for a turn that carries several admitted prompts.
+ *
+ * The single-prompt context says "the accompanying user text", which would
+ * cover every member. A shared turn therefore carries this one entry instead:
+ * each member is its own user text item, in order, and its route and exact
+ * bytes are stated here by the server. Text imitating this wording is still
+ * only user text; it cannot add an application-context entry.
+ */
+export function nativeBatchAdditionalContext(
+  members: ReadonlyArray<Pick<PendingPrompt, 'text' | 'origin'>>,
+): JsonObject | undefined {
+  if (members.length === 1) return nativePromptAdditionalContext(members[0]!.origin);
+  const bindings = memberBindings(members, origin => sourceFor(origin).source);
+  return {
+    [PROMPT_BATCH_CONTEXT_KEY]: {
+      kind: 'application',
+      value: `Fleet queued prompt batch: ${members.length} separately admitted prompts in submission order, `
+        + 'one user text item each. Server-generated provenance per item, describing only that item: '
+        + bindings.map(binding => `item ${binding.index} of ${binding.of} `
+          + `(source=${binding.source}, bytes=${binding.bytes}, sha256=${binding.sha256}): `
+          + `${memberAuthority(binding.source)}`).join('; ') + '.',
+    },
+  };
+}
+
 function toolItem(item: JsonObject): { title: string; status?: string } | undefined {
   switch (item.type) {
     case 'commandExecution': return {
@@ -195,6 +232,10 @@ export class CodexAppServerSession implements AgentSession {
   private exit: ExitRecord | null = null;
   private queueDepth = 0;
   private promptTail: Promise<unknown> = Promise.resolve();
+  /** Admitted prompts not yet handed to the app-server, in admission order. */
+  private readonly pendingPrompts: PendingPrompt[] = [];
+  /** Admitted prompt → the turn that carries it, while that turn is open. */
+  private readonly sharedTurns = new Map<string, string>();
   private activeTurn?: ActiveTurn;
   private controllerCount = 0;
   private controllerGrace?: ReturnType<typeof setTimeout>;
@@ -253,6 +294,9 @@ export class CodexAppServerSession implements AgentSession {
       alive: this.isAlive(),
       readiness: this.readiness,
       sessionId: this.threadId,
+      // A shared turn is a human console turn if any member is: inbox traffic must not cut it short.
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.console
+        ? 'owner-admin-console' as const : this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -290,8 +334,7 @@ export class CodexAppServerSession implements AgentSession {
     const queuedBehind = this.queueDepth;
     this.admit(promptId, text, queuedBehind, options);
     this.queueDepth++;
-    const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
-    this.promptTail = run.then(() => undefined, () => undefined);
+    const run = this.enqueue(promptId, text, options.origin);
     const completion = run.then(result => {
       this.queueDepth = Math.max(0, this.queueDepth - 1);
       return result;
@@ -305,6 +348,41 @@ export class CodexAppServerSession implements AgentSession {
     };
   }
 
+  /** The turn whose events and result answer this admitted prompt; itself unless a release shared it. */
+  sharedTurnId(promptId: string): string | undefined {
+    return this.sharedTurns.get(promptId);
+  }
+
+  /** Each prompt keeps its own step in the chain; the step it reaches releases a whole snapshot. */
+  private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
+    const entry: PendingPrompt = {
+      promptId, text, origin, ...sourceFor(origin), admittedAt: new Date().toISOString(),
+      // The one text the native session runs as an operation instead of a turn.
+      command: text.trim() === '/compact',
+    };
+    this.pendingPrompts.push(entry);
+    const run = this.promptTail.then(() => this.release(entry));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * The turn boundary: the first waiting prompt to get here synchronously
+   * takes every pending prompt delivered with it into one turn. A prompt
+   * admitted afterwards stays pending for the next boundary, and a step whose
+   * prompt was already taken reports that turn's result.
+   */
+  private release(entry: PendingPrompt): Promise<TurnResult> {
+    if (entry.released) return entry.released;
+    const members = takeBatch(this.pendingPrompts, entry);
+    for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
+    const run = this.runPrompt(members).finally(() => {
+      for (const member of members) this.sharedTurns.delete(member.promptId);
+    });
+    for (const member of members) member.released = run;
+    return run;
+  }
+
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
     try { return await (await this.queuePrompt(text, options)).completion; }
     catch (error) {
@@ -313,9 +391,19 @@ export class CodexAppServerSession implements AgentSession {
     }
   }
 
+  readonly liveVoiceSupported = true;
+
+  async interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
+    if (generation !== this.sessionGeneration) throw new Error('session_changed: Agent session changed.');
+    if (!this.activeTurn?.promptIds.includes(promptId)) return { state: 'settled' };
+    return this.interrupt('local-console');
+  }
+
   async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     const active = this.activeTurn;
-    if (!active || !this.threadId || !active.nativeTurnId) return { state: 'settled' };
+    if (!active || !this.threadId) return { state: 'settled' };
+    if (!active.nativeTurnId) throw new SessionControlError('backend',
+      'The operation is still pending without a native turn ID. Cancellation is not confirmed; inspect or restart the agent if it does not progress.');
     active.cancellationSource ??= source;
     this.events.emit('state', { turnId: active.promptId, status: 'running', origin: active.origin });
     this.conversation.appendSafe({
@@ -420,6 +508,11 @@ export class CodexAppServerSession implements AgentSession {
     await this.transport.close();
   }
 
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.threadId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.threadId,promptId:this.activeTurn.promptId}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
+
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);
     const requested = Number(request.after ?? 0);
@@ -441,6 +534,7 @@ export class CodexAppServerSession implements AgentSession {
       sessionGeneration: this.sessionGeneration,
       readiness: this.isAlive() ? this.readiness : 'offline',
       queueDepth: this.queueDepth,
+      ...pendingInventory(this.pendingPrompts),
       pendingPermissionIds: [...this.pendingPermissions.keys()],
       ...(this.conversation.degraded ? { historyDegraded: true } : {}),
     };
@@ -454,6 +548,10 @@ export class CodexAppServerSession implements AgentSession {
     const bodyDigest = ConversationEventStore.bodyDigest(command.text);
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
+    if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
+      throw new Error('session_changed: Agent session changed. Record a new voice message.');
+    if (command.requireIdle && (this.queueDepth > 0 || this.conversationSnapshot().readiness !== 'idle'))
+      throw new Error('voice_busy: Agent is already working. Wait for the current turn.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },
@@ -475,6 +573,7 @@ export class CodexAppServerSession implements AgentSession {
     this.transport.notify('initialized');
     const persisted = this.options.mode === 'resume' && existsSync(this.threadFile)
       ? readFileSync(this.threadFile, 'utf8').trim() : '';
+    if (this.options.requireResume && !persisted) throw new Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
     const common: JsonObject = {
       cwd: this.options.cwd,
       approvalPolicy: this.options.approvalPolicy,
@@ -494,6 +593,7 @@ export class CodexAppServerSession implements AgentSession {
     const thread = isObject(response.thread) ? response.thread : undefined;
     this.threadId = string(thread?.id);
     if (!this.threadId) throw new Error('Codex app-server did not return a thread id');
+    if (this.options.requireResume && this.threadId !== persisted) throw new Error('TASK_CONTEXT_RESUME_MISMATCH');
     writeFileSync(this.threadFile, this.threadId + '\n', { mode: 0o600 });
     const model = string(response.model) ?? this.options.model ?? undefined;
     if (model) this.runtimeModel = { value: model };
@@ -501,6 +601,10 @@ export class CodexAppServerSession implements AgentSession {
     if (effort) this.reasoningEffort = { value: effort };
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `Codex thread ${this.threadId}` });
+    this.conversation.appendSafe({
+      kind: 'capabilities.updated', sessionGeneration: this.sessionGeneration,
+      payload: { commands: [{ name: 'compact', description: textBlock('Compact session context') }] },
+    });
     this.conversation.appendSafe({
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       payload: { status: 'idle' },
@@ -523,8 +627,7 @@ export class CodexAppServerSession implements AgentSession {
       const origin: PromptOrigin | undefined = open.commandId
         ? { kind: 'owner-admin-console', commandId: open.commandId }
         : undefined;
-      const run = this.promptTail.then(() => this.runPrompt(open.text!, open.promptId, origin));
-      this.promptTail = run.then(() => undefined, () => undefined);
+      const run = this.enqueue(open.promptId, open.text!, origin);
       void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
     }
   }
@@ -557,30 +660,43 @@ export class CodexAppServerSession implements AgentSession {
     } else this.conversation.appendSafe(draft);
   }
 
-  private async runPrompt(text: string, promptId: string, origin?: PromptOrigin): Promise<TurnResult> {
+  private async runPrompt(members: PendingPrompt[]): Promise<TurnResult> {
+    const { text, promptId, origin } = members[0]!;
     if (!this.threadId || !this.transport.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'Codex app-server session is offline');
     let settle!: (result: TurnResult) => void;
     const settled = new Promise<TurnResult>(resolveResult => { settle = resolveResult; });
-    const active: ActiveTurn = { promptId, origin, output: '', settled, settle };
+    const active: ActiveTurn = {
+      promptId, origin, output: '', settled, settle,
+      promptIds: members.map(member => member.promptId),
+      console: members.some(member => member.origin?.kind === 'owner-admin-console'),
+    };
     this.activeTurn = active;
     this.finalAnswerObserved = false;
     this.activeItems.clear();
     this.readiness = 'running';
     this.events.emit('state', { turnId: promptId, status: 'running', origin });
-    this.conversation.appendSafe({
+    members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
-      promptId, turnId: promptId, source: sourceFor(origin).source, payload: {},
-    });
+      promptId: member.promptId, turnId: promptId, source: sourceFor(member.origin).source,
+      payload: members.length > 1 ? { batch: { turnId: promptId, index, size: members.length } } : {},
+    }));
     try {
+      if (text.trim() === '/compact') {
+        // The acknowledgement is not completion. Standard turn notifications
+        // settle the same queued prompt and durable browser receipt.
+        await this.transport.request('thread/compact/start', { threadId: this.threadId });
+        return await settled;
+      }
       const response = await this.transport.request<JsonObject>('turn/start', {
         threadId: this.threadId,
-        input: [{ type: 'text', text, text_elements: [] }],
+        // One unchanged user text item per admitted prompt, in admission order.
+        input: members.map(member => ({ type: 'text', text: member.text, text_elements: [] })),
         approvalPolicy: this.options.approvalPolicy,
         model: this.options.model ?? null,
         effort: this.options.effort ?? null,
-        ...(nativePromptAdditionalContext(origin)
-          ? { additionalContext: nativePromptAdditionalContext(origin) } : {}),
+        ...(nativeBatchAdditionalContext(members)
+          ? { additionalContext: nativeBatchAdditionalContext(members) } : {}),
       });
       const turn = isObject(response.turn) ? response.turn : undefined;
       active.nativeTurnId ??= string(turn?.id);
@@ -775,7 +891,7 @@ export class CodexAppServerSession implements AgentSession {
       messageId: id, source: 'agent',
       payload: {
         role: 'assistant', content: textBlock(delta,
-          scheduled ? SCHEDULED_REDACTION : phase === 'commentary' ? COMMENTARY_REDACTION : undefined),
+          scheduled ? SCHEDULED_REDACTION : undefined),
       },
     });
   }
@@ -823,6 +939,10 @@ export class CodexAppServerSession implements AgentSession {
         toolCallId: scheduled ? 'scheduled-loop-tool' : id, snapshot,
         title: scheduled ? 'scheduled-loop tool' : tool.title, status: tool.status,
         kind: string(item.type),
+        ...(!scheduled && item.arguments !== undefined ? { rawInput: boundedJson(item.arguments) } : {}),
+        ...(!scheduled && item.type === 'commandExecution' ? { rawInput: boundedJson({command:item.command,cwd:item.cwd}), ...(item.aggregatedOutput !== undefined ? { rawOutput: boundedJson({output:item.aggregatedOutput,exitCode:item.exitCode}) } : {}) } : {}),
+        ...(!scheduled && item.type === 'fileChange' && item.changes !== undefined ? { rawOutput: boundedJson(item.changes) } : {}),
+        ...(!scheduled && (item.result !== undefined || item.error !== undefined) ? { rawOutput: boundedJson({result:item.result,error:item.error}) } : {}),
       },
     });
   }
@@ -845,9 +965,10 @@ export class CodexAppServerSession implements AgentSession {
       cancellationSource: active.cancellationSource,
     });
     this.events.emit('state', { status: this.readiness });
-    this.conversation.appendSafe({
+    // Every member closes with the shared outcome, so none is left waiting.
+    for (const member of active.promptIds) this.conversation.appendSafe({
       kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-      promptId: active.promptId, turnId: active.promptId,
+      promptId: member, turnId: active.promptId,
       payload: {
         outcome, ...(detail ? { stopReason: detail } : {}),
         ...(active.cancellationSource ? { cancellationSource: active.cancellationSource } : {}),
@@ -950,6 +1071,21 @@ export class CodexAppServerSession implements AgentSession {
       this.transport.respond(id, { currentTimeAt: Math.floor(Date.now() / 1_000) });
       return;
     }
+    if (method === 'mcpServer/elicitation/request') {
+      const schema = params.requestedSchema;
+      // The permission UI can answer a confirmation, but cannot collect form
+      // fields or perform URL-based verification on the user's behalf.
+      if (params.mode !== 'form' || !isObject(schema) || schema.type !== 'object'
+          || !isObject(schema.properties) || Object.keys(schema.properties).length
+          || (schema.required !== undefined
+            && (!Array.isArray(schema.required) || schema.required.length))) {
+        this.options.log(`[${this.options.name}] codex app-server: unsupported MCP elicitation form`);
+        this.transport.respond(id, { action: 'decline', content: null, _meta: null });
+        return;
+      }
+      this.requestPermission(method, id, params);
+      return;
+    }
     if (method === 'item/tool/requestUserInput') {
       this.options.log(`[${this.options.name}] codex app-server: requestUserInput has no interactive Fleet mapping; returning no answers`);
       this.transport.respond(id, { answers: {} });
@@ -970,7 +1106,9 @@ export class CodexAppServerSession implements AgentSession {
       { optionId: 'allow_session', name: 'Allow for session', kind: 'allow_always', native: 'acceptForSession' },
       { optionId: 'deny_once', name: 'Deny', kind: 'reject_once', native: 'decline' },
       { optionId: 'cancel', name: 'Cancel', kind: 'reject_once', native: 'cancel' },
-    ].filter(option => method === 'item/fileChange/requestApproval'
+    ].filter(option => method === 'mcpServer/elicitation/request'
+      ? option.optionId !== 'allow_session'
+      : method === 'item/fileChange/requestApproval'
       || method === 'item/permissions/requestApproval'
       || !available.length || available.includes(option.native))
       .map(({ native: _native, ...option }) => option);
@@ -984,7 +1122,8 @@ export class CodexAppServerSession implements AgentSession {
     // `approval=allow` covers native operations inside the declared boundary;
     // it must never silently widen filesystem or network authority.
     if (this.options.permissions.approval === 'allow'
-        && method !== 'item/permissions/requestApproval') {
+        && method !== 'item/permissions/requestApproval'
+        && method !== 'mcpServer/elicitation/request') {
       this.transport.respond(requestId, this.permissionResponse(pending, 'accept'));
       this.resolvePermission(permissionId, pending, 'allowed', 'automatic', 'allow_once',
         'permissions.approval=allow', 'the native request is inside the configured Codex boundary');
@@ -1004,7 +1143,9 @@ export class CodexAppServerSession implements AgentSession {
     this.readiness = 'awaiting_permission';
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
-    const title = string(params.command) ?? string(params.reason)
+    const title = (method === 'mcpServer/elicitation/request'
+      ? `${string(params.serverName) ?? 'MCP'}: ${string(params.message) ?? 'Confirmation requested'}`
+      : undefined) ?? string(params.command) ?? string(params.reason)
       ?? (method === 'item/fileChange/requestApproval' ? 'Apply file changes'
         : method === 'item/permissions/requestApproval' ? 'Grant additional permissions'
           : 'Run command');
@@ -1083,6 +1224,11 @@ export class CodexAppServerSession implements AgentSession {
   private permissionResponse(
     pending: PendingPermission, decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel',
   ): JsonObject {
+    if (pending.method === 'mcpServer/elicitation/request') return {
+      action: decision === 'acceptForSession' ? 'accept' : decision,
+      content: decision.startsWith('accept') ? {} : null,
+      _meta: null,
+    };
     if (pending.method !== 'item/permissions/requestApproval') return { decision };
     const requested = pending.requestedPermissions ?? {};
     const permissions: JsonObject = {};

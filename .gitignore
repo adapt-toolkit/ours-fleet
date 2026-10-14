@@ -8,3 +8,5 @@ playwright-report/
 *.tgz
 docs/superpowers/
 .env
+
+.test-artifacts/

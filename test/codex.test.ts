@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities, nativeCodexConfig,
 } from '../src/harness/codex.js';
-import { checkUnattendedFloor } from '../src/permissions.js';
+import { analyzeRolePermissions, checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import type { ResolvedRole } from '../src/config.js';
 import type { Exec } from '../src/exec.js';
@@ -42,6 +42,18 @@ describe('prepareSession', () => {
     }), { env: {} }).argv).toEqual(['native-shim', '--stdio']);
   });
 
+  it('uses the stdio app-server when Fleet owns monitoring, even with ours-codex installed', () => {
+    const launch = makeCodexAdapter(execWith(true)).agentSession.prepareLaunch(role({
+      session: 'codex-app-server',
+      monitor: { mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 0, inject: 'notification', interrupt: false },
+      harness_options: { search: true },
+    }), { env: { OURS_BIND_IDENTITY: 'Alice Dev' } });
+    expect(launch).toEqual({
+      argv: ['codex', '--search', 'app-server'],
+      env: { OURS_BIND_IDENTITY: 'Alice Dev' },
+    });
+  });
+
   it('keeps launcher auto as a signal-safe ours-codex/codex fallback', () => {
     const launch = makeCodexAdapter(okExec).agentSession.prepareLaunch(role({
       session: 'codex-app-server', harness_options: { launcher: 'auto' },
@@ -62,6 +74,12 @@ describe('prepareSession', () => {
     expect(session.sessionConfigSelections(role({ effort: 'low' })))
       .toEqual([{ configId: 'reasoning_effort', value: 'low' }]);
     expect(session.sessionConfigSelections(role())).toEqual([]);
+    expect(session.sessionConfigSelections(role({ harness_options: { config: { model_reasoning_effort: 'high' } } })))
+      .toEqual([{ configId: 'reasoning_effort', value: 'high' }]);
+    expect(session.sessionConfigSelections(role({ effort: 'low', harness_options: { config: { model_reasoning_effort: 'high' } } })))
+      .toEqual([{ configId: 'reasoning_effort', value: 'low' }]);
+    for (const invalid of ['unknown', null, 1, ['high']])
+      expect(session.sessionConfigSelections(role({ harness_options: { config: { model_reasoning_effort: invalid } } }))).toEqual([]);
   });
   it('prepares the same ACP environment when ours-codex is installed', async () => {
     const a = makeCodexAdapter(execWith(true));
@@ -446,4 +464,24 @@ describe('Codex neutral permission mapping and the unattended floor', () => {
       .toEqual(['write-state', 'workspace-edit']);
     expect(checkUnattendedFloor(codexCapabilities('never', 'danger-full-access')).meets).toBe(true);
   });
+
+  it.each(['acp', 'codex-app-server'] as const)(
+    '%s reports startup reads as unproven when approval can block them', session => {
+      for (const approval of ['ask', 'auto'] as const) {
+        for (const unattended of ['wait', 'deny'] as const) {
+          const analysis = analyzeRolePermissions(role({
+            session,
+            permissions: { approval, filesystem: 'workspace', unattended },
+          }));
+          expect(analysis.supported).toBe(true);
+          expect(analysis.capabilities).not.toContain('read-state');
+          expect(analysis.floor?.missing).toContain('read-state');
+          expect(analysis.floorSeverity).toBe(unattended === 'wait' ? 'warn' : 'fail');
+          expect(analysis.floorWarning).toContain('read-state');
+          expect(analysis.floorWarning).toContain(
+            unattended === 'wait' ? 'block the turn' : 'be denied silently');
+        }
+      }
+    },
+  );
 });

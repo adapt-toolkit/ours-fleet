@@ -10,8 +10,9 @@ turns such sessions into **roles**: long-lived agents that
 
 - **run through structured managed sessions** behind one provider-neutral
   agent-session interface, which you can inspect or prompt,
-- are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
-  and brings them back after a reboot,
+- are **supervised** — one Fleet systemd service (Linux) or LaunchAgent (macOS)
+  runs their existing agent runners, restarts them on crash, and restores the
+  desired running roster at boot or login,
 - **resume their context** across restarts (when the harness supports it),
 - **bind an ours.network identity**, so you — and every other agent — can message
   them by name over an end-to-end-encrypted channel
@@ -44,28 +45,27 @@ brain: { inline: { harness: codex, session: codex-app-server } }
 
 ```
 ~/fleet.yaml + ~/fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml   your declaration
-        │  ours-fleet up
+        │  ours-fleet init, then up
         ▼
-briefing.md per role  ──►  agent session adapter  ──►  native app-server or ACP transport
-        ▲                        │
- systemd --user / launchd ───────┘   restart on crash, start at boot/login
+one Fleet OS service  ──►  private member catalog + existing agent runners
+                                               │
+briefing.md per member  ──►  session adapter  ──►  native app-server or ACP transport
 ```
 
 Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing,
-logs, routines, and session markers. On boot the agent reads its briefing: bind
-identity, publish bio/persona, announce to its coordinator, work — while the
+logs, routines, and session markers. Before boot, the supervisor binds the assigned identity and prepares its room.
+The agent then reads its briefing and starts work — while the
 supervisor delivers its mail wakes as `[fleet-monitor]` console lines (see
-[Mail monitor](#mail-monitor)). Set `monitor.mode: native` when the harness
-should own mail wake instead. On crash the supervisor relaunches it and the
+[Mail monitor](#mail-monitor)). Managed ours sessions use supervisor-owned mail wakes. On crash the supervisor relaunches it and the
 harness resumes the same session.
 
 The state dir contract:
 
 | File | Owner | Lifecycle |
 |---|---|---|
-| `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit |
-| `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts |
-| `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
+| `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit; the agent reads it once per model session, not per turn or wake |
+| `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts; read back once only when a new conversation starts after a restart and it records previous work |
+| `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; read once per session for concrete work, hot-editable **without a restart** — tell the agent it changed so it rereads; absence means "no routines" |
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
 | `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
@@ -80,11 +80,12 @@ The state dir contract:
 |---|---|---|
 | Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
-| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
+| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `ours-install client --config /absolute/private/profile.json --integrations fleet --fleet-settings /absolute/fleet-settings.json` |
 
-Linux only: `ours-fleet init` enables *linger* so roles run without a login session
-and survive reboots. macOS: launchd agents start **at login** (no linger
-equivalent); logs land in `~/.ours-fleet/logs/`.
+Linux only: `ours-fleet init` enables *linger* so Fleet runs without a login session
+and restores running members after reboot. On macOS the Fleet LaunchAgent starts
+**at login** (no linger equivalent). Member logs live in each member's state
+directory; use `ours-fleet logs <Name>` to read them.
 
 ## Install
 
@@ -103,6 +104,12 @@ maintained adapters require Node 22 or newer.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
+
+When upgrading from per-agent services, coordinate package installation with
+explicit `ours-fleet init`. Preserve operator readiness hooks on the common
+parent before migration; new task/temporary creation requires that parent.
+See the [migration and rollback runbook](docs/fleet-migration.md)
+for changed stop/restart behaviour and legacy task transfer limits.
 
 ## Quickstart
 
@@ -140,72 +147,57 @@ the caller's owner channel with the caller and spawned-role details. This is an
 honest-actor convenience and attribution path, not a security boundary; host
 shells and deliberately bypassed absolute binaries retain direct behavior.
 
-## Local web console
+## Local HTTP service
 
-The interactive console is packaged with `@ours.network/fleet` and binds to
-IPv4 loopback by default. Remote or proxy exposure is always explicit:
+Fleet is an HTTP backend. It serves no pages, bundles no frontend and opens no
+browser: every screen belongs to the App, which calls this API with a device
+credential. Any address outside `/api/` answers JSON `404`.
 
 ```sh
-npm run build
-ours-fleet web
+ours-fleet setup-tunnel <encoded-v2-grant> # App command; prints QR and connection code
+ours-fleet link-device                 # connect another browser or device
 # choose a free port for an isolated test:
-ours-fleet web serve --port 0 --no-open
-# nginx/TLS terminates at the declared browser origin; fleet remains loopback-bound
+ours-fleet web serve --port 0
+# nginx/TLS terminates at the declared origin; fleet remains loopback-bound
 ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password
-# Intentional no-password mode, for example when nginx already authenticates:
-ours-fleet web install --public-origin https://fleet.example.com --no-password
 ```
 
-The normal `ours-fleet web` command installs or updates an owner-level native
-service, starts it on stable `127.0.0.1:49271`, and opens/re-pairs the browser.
-Linux uses a systemd user unit and macOS uses a LaunchAgent; both restart after
-process failures and send logs to the native supervisor. Service management is
-explicit through `ours-fleet web install|start|stop|restart|status|uninstall`.
-Use `ours-fleet web serve` for a foreground development process. Linux login
-persistence requires linger; the installer reports when it is missing but
+`ours-fleet web` installs or updates an owner-level native service and starts
+it on stable `127.0.0.1:49271`. Linux uses a systemd user unit and macOS uses a
+LaunchAgent; both restart after process failures and send logs to the native
+supervisor. Service management is explicit through
+`ours-fleet web install|start|stop|restart|status|uninstall`. Use
+`ours-fleet web serve` for a foreground development process. `--no-open` is
+still accepted because installed service units pass it; it has no effect. Linux
+login persistence requires linger; the installer reports when it is missing but
 never enables it or requests root privileges.
 
-The normal command opens a one-time five-minute fragment directly in the local
-browser; it does not print a reusable secret. If the browser needs pairing
-again while the server is running, use `ours-fleet web open`. The fragment is
-exchanged once and removed from history. A paired browser receives a rotating,
-30-day `HttpOnly; SameSite=Strict` device credential and can return after a
-session idle timeout or server restart. Use **Sign out** to revoke the current
-browser, or `ours-fleet web revoke-all` to revoke every trusted browser and
-active web session.
-
-Only a domain-separated SHA-256 device-secret hash and bounded timestamps are
-stored in the owner-private fleet state directory (`0700` directory, `0600`
-atomic file). The re-pair and revoke controls use an owner-private Unix socket;
-local processes running as the same OS user are therefore inside the trust
-boundary.
+Use `ours-fleet web revoke-all` to revoke every linked device and active
+session. Only a domain-separated SHA-256 device-secret hash and bounded
+timestamps are stored in the owner-private fleet state directory (`0700`
+directory, `0600` atomic file). App browser links use 5-minute access
+credentials and rotating refresh credentials; see
+[workspace onboarding](docs/workspace-onboarding.md#browser-link-credentials). The link and revoke controls use an
+owner-private Unix socket; local processes running as the same OS user are
+therefore inside the trust boundary.
 
 On first setup, the CLI requires an explicit access choice: `--password-file`
 or `--pairing` for protected access, or `--no-password` for intentional
 unprotected access. `--password-file` stores only a salted scrypt verifier in
-the owner-private web state; the source file remains operator-managed. New
-browsers sign in and then receive the same rotating HttpOnly trusted-device
-credential. `--no-password` is deliberately named and prints a warning: anyone
-who can reach that origin can control the fleet.
+the owner-private web state; the source file remains operator-managed.
+`--no-password` is deliberately named and prints a warning: anyone who can
+reach that origin can control the fleet.
 
 For nginx on a VPS, keep the default loopback bind and set the exact external
 `--public-origin` (scheme, hostname, optional port). nginx should proxy HTTP and
 WebSocket upgrades to `127.0.0.1:49271` and provide TLS; rewriting the upstream
-Host is not required because the declared browser Origin remains authoritative. To listen beyond
+Host is not required because the declared Origin remains authoritative. To listen beyond
 loopback, add an explicit `--bind`; fleet refuses a non-loopback bind without a
 public origin. Host and Origin validation use that declaration rather than
 trusting forwarded headers. `localhost` and `127.0.0.1` both work in normal
-local mode; an unconfigured hostname gets a self-describing HTML page instead
-of raw internal Host-header JSON.
+local mode; an unconfigured hostname is refused with a JSON error.
 
-The console is installable as a standalone PWA. Its service worker caches only
-the data-free offline page and successful content-hashed JavaScript/CSS assets.
-HTML stays network-first and no API, authentication, bootstrap, device,
-WebSocket, terminal, event, audit, log, session, query-bearing, or error response
-is cached. When the local daemon is unavailable, the PWA shows an explicit
-offline shell and no stale fleet state.
-
-The console provides evidence-separated inventory and status, ACP activity and
+The API provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, and transactional permanent/temporary creation. Identity is fixed to
 the role name. Creation uses the authenticated
@@ -231,15 +223,11 @@ from the current runner generation and excludes adapter `session/load` replay;
 those replay events remain in the durable ledger with `agent_replay` provenance
 for diagnosis and recovery rather than appearing as current work.
 
-For every temporary role, the first-boot instructions call ours MCP
-`create_temporary_identity` with the exact assigned name, so the new identity
-is owned and cleaned up by that connector session lifecycle. Temporary roles
-never bind pre-existing identities or fall back to permanent `create_identity`.
-Fleet does not inspect, preserve, or provision an ours identity for temp spawn.
-A collision, missing tool, or creation error stops for operator review; fleet
-never force-adopts or deletes identity state. Permanent roles are
-provisioned by fleet before launch and never delegate normal identity creation
-to the harness.
+The Fleet supervisor creates and binds the assigned identity before the harness
+starts. Temporary identities survive harness reconnects and are released only when
+the logical run ends. Permanent identities remain available after the supervisor
+releases ownership. Agents receive ready tools; no model-owned identity bootstrap
+or onboarding skill is required.
 
 The web console uses structured ACP activity rather than exposing a raw agent terminal.
 
@@ -308,9 +296,32 @@ ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
+ours-fleet managed-cli setup [--enable <Agent>]... | status [--json]   native harness policy for the task workflow
 ours-fleet version [--json]         build identity, capabilities, installs on PATH
 ours-fleet init
 ```
+
+### Fleet task commands from a harness command sandbox
+
+A Codex or Claude command sandbox refuses the supervisor socket, so a managed
+`ours-fleet` call fails with `connect EPERM` before it parses anything. Fleet
+prepares the native harness policy for the packaged Coordinator task workflow;
+you do not write Codex rules or Claude sandbox settings by hand:
+
+```sh
+ours-fleet managed-cli setup --enable FleetCoordinator   # adds managed_cli: [task-workflow] to that Agent
+ours-fleet managed-cli status                            # static setup, session policy, observed commands
+```
+
+The opt-in is an explicit Agent key and changes no permission. Setup starts no
+session or model, is repeated at every agent start, and `ours-install` runs it
+for you. It prepares `task create|start|finish|block|unblock|review|list|show`,
+`room show|members` and template/plan/help inspection for one pinned
+configuration, and nothing else; `task start`/`task finish` are real authority.
+Qualified end to end on Linux with Codex (native and ACP) and Claude ACP; macOS
+is prepared the same way but not yet qualified. Scope, boundaries, unsupported
+combinations and the evidence are in
+[docs/validation/managed-cli-permissions.md](docs/validation/managed-cli-permissions.md).
 
 ### Which build am I running?
 
@@ -330,9 +341,9 @@ Installs predating the stamp are compared by hashing their `dist/`, so two of
 those are still told apart.
 
 A permanent role brought up via `-c custom.yaml` remembers that file (`.config-path`
-in its state dir) across supervisor-triggered restarts — systemd/launchd re-invoke the
-agent process with no arguments, so without this the role would silently fall back to
-the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
+in its state dir and its private member registration) across supervisor-triggered
+restarts. Its runner resolves that original configuration instead of falling back
+to the default `~/fleet.yaml`.
 
 ## split configuration field reference
 
@@ -381,9 +392,9 @@ preserve at most one recent late occurrence. The trusted authoring file and
 private sealed role snapshot retain exact prompt text; resolved launch, task,
 room, provenance, and audit presentation surfaces show only bytes and SHA-256.
 
-Every packaged `Developer`, `Critic`, and `LocalCoordinator` Agent Template uses
+Every packaged `Developer`, `Engineer`, `Critic`, and `LocalCoordinator` Agent Template uses
 `monitor.mode: fleet` with `monitor.interrupt: after_tool`. Consequently every
-member of the standard `single`, `pair`, and `team` Room Templates resolves to
+member of the standard `single`, `pair`, `team`, and `engineering` Room Templates resolves to
 that policy. A custom Agent Template or explicit per-member override remains
 authoritative and is merged key by key without rewriting unrelated values.
 
@@ -510,9 +521,26 @@ obsolete, presence-sensitive `OURS_AUTOSTART` variable from ACP harness
 processes. `ours-mcp proxy` is client-only and never starts a daemon; operators and explicit
 installer/setup flows remain responsible for starting it.
 
+Fleet selects explicit `OURS_CONFIG` first, otherwise the managed
+`~/.ours-client/profile.json` when present. With a managed profile, ordinary
+`ours-fleet doctor` and `ours-fleet up` need no environment override. Invalid or
+unreadable managed profiles fail rather than select another daemon. If neither
+selection exists, the existing unmanaged behavior remains.
+
+The private profile names the daemon endpoint, retained instance UUID and host
+credential path; Fleet does not need the daemon state directory. An explicit
+override selects a new invocation without rewriting already installed service
+definitions. To select another profile explicitly:
+
+```sh
+export OURS_CONFIG=/absolute/private/ours/client.json
+ours-fleet doctor
+ours-fleet up
+```
+
 ### Rooms and tasks
 
-Init installs editable `single`, `pair`, and `team` definitions under
+Init installs editable `single`, `pair`, `team`, and `engineering` definitions under
 `~/fleet/room_templates/`, plus every exact-cased Agent, Role, and Brain they
 reference. Inspect them with `ours-fleet template list` and
 `ours-fleet template show team`. After configuring the authenticated owner below:
@@ -521,7 +549,24 @@ reference. Inspect them with `ours-fleet template list` and
 ours-fleet task create --title "Solo task" --template single
 ours-fleet task create --title "Reviewed change" --template pair
 ours-fleet task create --title "Phased delivery" --template team
+ours-fleet task create --title "Gated feature build" --template engineering
 ```
+
+`engineering` pairs a gate-pipeline `Engineer` with the standard `Critic`. The
+Engineer works every non-trivial task through ordered gates — scope and a numbered
+Definition of Done before code, an over-engineering check, spec before
+implementation, test-first, review, a sized security pass, docs, and evidence-backed
+DoD verification — invoking an installed gate-pipeline skill when one is present and
+walking the same gates by hand otherwise. The seat is labelled `Engineer`, so a
+gated seat is never mistaken for a plain `Developer`. To make it the default for
+development tasks, set `tasks: { default_room_template: engineering }` in
+`fleet.yaml`.
+
+The `engineering` starter expresses a prompt-level workflow mandate; Fleet does not enforce
+the gates at runtime or install pipeline skills. The Engineer label identifies that mandate,
+not a completed review. When migrating an existing install, a newly added Engineer uses
+the existing Developer template's brain selection and keeps the packaged restrictive permissions.
+Existing customized Engineer files are preserved.
 
 The default `team` gives only its LocalCoordinator Agent Template a 15-minute
 continuity loop. Each idle-only pass uses authenticated assigned-room evidence,
@@ -548,7 +593,26 @@ N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, C
 or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
 N is ignored, and an empty subscription selection remains blocked. Every cancellation
 before the final Yes performs no host setup or config publication. Non-TTY use stops with
-the same zero-mutation guarantee. After the final Yes, host integration runs before locked
+the same zero-mutation guarantee unless `--settings PATH` supplies complete JSON answers.
+Prepared settings run without questions and use this strict shape (catalog model capabilities
+must match exactly):
+
+```json
+{
+  "subscriptions": ["codex"],
+  "assignmentStrategy": "one-model",
+  "models": {
+    "development": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    "review": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    "coordination": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] }
+  },
+  "reasoning": "balanced"
+}
+```
+
+Run `ours-fleet init --settings settings.json -c /path/custom.yaml`. Unreadable,
+malformed, incomplete, extra, or unsupported values fail before host setup and publication;
+Fleet never falls back to questions. After the final Yes or validated settings, host integration runs before locked
 publication; a hard kill, power loss, or host crash can therefore leave host integration
 or private stage/recovery evidence to inspect.
 Existing targets and their tree must be owner-private regular files/directories on the
@@ -557,8 +621,9 @@ non-owner-controlled parent fail closed before host setup and are rechecked unde
 per-setup init lock before publication.
 
 The generated task experiences are fixed consequences, not extra questions: `single`
-uses `Developer`; `pair` uses `Developer` with an independent `Critic`; and `team` uses
-task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
+uses `Developer`; `pair` uses `Developer` with an independent `Critic`; `team` uses
+task-local `LocalCoordinator`, `Developer`, and `Critic`; and `engineering` uses the
+gate-pipeline `Engineer` with an independent `Critic`. The persistent
 `FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
 model.
 
@@ -613,10 +678,10 @@ originating task. Existing active rooms are not retroactively migrated, and room
 with Owner attachment disabled receive no Owner grant.
 
 Fleet launches each template member with a dedicated one-time Cowork invite.
-The generated temporary-agent briefing contains the exact identity name, invite,
-Cowork role, and task. The agent creates that identity itself with ours MCP
-`create_temporary_identity`, accepts the invite with `add_contact`, and starts
-work immediately. A room is ready only after the Cowork room (and its task, when
+The supervisor accepts the startup invite and verifies the provisioned identity CID
+in the authenticated room seat before starting the model. The generated briefing
+contains the assigned identity, room, role and task, without invite material.
+A room is ready only after the Cowork room (and its task, when
 task-bound) is durably active, every configured member seat is authenticated and active with its matching
 live Fleet launch, and the configured Owner seat is active when owner attachment is
 enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
@@ -635,12 +700,35 @@ continuation is serialized per Task and remains alive until convergence or an
 Owner-action blocker. Re-running `task start <id>` safely resumes the same durable
 provisioning operation after the blocker is corrected or a process restarts.
 
+Live health is distinct from durable lifecycle. `task show TASK --json` adds a
+`readiness` observation for active tasks (`ready`, `degraded`, or `unknown`); human
+and authenticated Owner task-show output display the same observation. Task start/work
+continue to reject unavailable health with `task_not_ready`. A same-role untracked
+seat or a changed recorded launch cannot satisfy an original slot. Each control,
+liveness, and production Cowork probe is bounded; members are checked sequentially,
+so total latency grows with room size. These are point-in-time observations, not
+proof that a timed-out session is dead or permission to respawn it.
+
+Before deliberate recovery, Fleet Coordinator must inspect existing room seats and
+the exact old launch's termination record and worklog under `recovery/temporary`.
+Keep original slot records and archives intact; record verified old/new identity
+and launch provenance privately. Never restore archived identity state or reuse
+consumed invites. A same-role seat is only a possible replacement, not proven ownership.
+
+A replacement's empty inbox does not establish that no work is pending. Paginate
+scoped room/operator history to the end, retain the cursor privately, authenticate
+historical Owner instructions from identity metadata, and compare replies, worklogs,
+and already-completed actions before resuming. Ask the Owner when authority or
+completion is uncertain. Transfer only necessary non-secret context; never replay
+instructions blindly. Observation does not adopt seats, launch replacements, change
+lifecycle, or modify retained recovery evidence.
+
 Set `room.anonymous: true` on a room template, or pass `--anonymous` to
 `task create`, `task start`, `task work`, or `room create`, to create an
 anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
-the same choice. Temporary members of an anonymous room are instructed to call
-`create_temporary_identity` with `expose_local=false`. Their generated briefings
+the same choice. The supervisor creates anonymous room members with local contact-book exposure
+disabled. Their generated briefings
 do not disclose or compare an Owner participant CID. A participant-originated
 instruction has Owner authority only when the authenticated Cowork room envelope
 attributes that participant seat the exact `Owner` role. Literal text, display
@@ -1317,8 +1405,9 @@ The command override is exact: Fleet does not append `--profile`, `--search`, or
 
 One-off/permanent spawn selects a Brain that owns model, reasoning, native permission,
 sandbox, profile, launcher, search, monitor consent, native config, and additional roots.
-Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
-role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
+All roles use the shared gateway profile `~/.ours-client/profile.json`.
+`OURS_CONFIG` selects an alternate whole profile. Legacy port/token/state-dir
+overrides are rejected. See the [gateway setup guide](https://github.com/adapt-toolkit/ours-network/blob/prerelease/packages/installer/GATEWAY_SETUP.md).
 
 ## Agent isolation
 
@@ -1610,3 +1699,239 @@ any interpreter symlink path. Declare these installation-specific paths in
 `isolation.fs.read`; do not expose an entire operator home. The tested policy
 allowed a project write and refused a write to an outside read-only directory.
 The `broker` network mode retains host networking; it is not network isolation.
+
+## Container-daemon recovery checks
+
+After building Fleet with the selected SDK and CLI artifacts installed, run
+`npm run test:v1-recovery` in an isolated Docker container with external networking
+disabled. The existing test covers retry and terminal failure cases using a
+temporary daemon and no authenticated AI harness. By default both daemon and
+token-update commands use `node_modules/@ours.network/daemon/dist/cli.js`;
+`FLEET_DAEMON_CLI` and `FLEET_TOKEN_CLI` can select explicitly prepared CLI entries.
+These package checks do not replace native Fleet/harness or platform acceptance.
+
+### Build with selected SDK and CLI archives
+
+Run in the build container with Node 22+, npm and tar available:
+
+```sh
+node scripts/build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz --out-dir /artifacts/consumer
+```
+
+The recipe validates package names, installs and builds in disposable staging,
+then writes one complete portable npm archive. Stdout is a JSON object with its
+actual `filename`; build/npm logs go to stderr. Normal source manifests, locks
+and installed dependencies are preserved. The installer must install the same
+selected SDK and CLI archives alongside this package; its final dependency
+versions come from those archives. Existing bundling choices are unchanged.
+
+Focused build/install verification (two real builds, including changed bytes
+under identical input names and versions, plus a missing-vendor negative check):
+
+```sh
+node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
+```
+
+### Remote clients over HTTPS
+
+A client may select an `https://` origin backed by a TLS reverse proxy. Keep the
+daemon listener private and configure the proxy separately with a certificate
+trusted by the client and matching the hostname. Node uses its normal trust
+store; a private CA may be supplied through `NODE_EXTRA_CA_CERTS` before starting
+the client. Certificate verification must remain enabled.
+
+The existing issued client credential works over either transport; changing the
+URL scheme does not require a new credential. Keep the server's master on the
+server. Forward `x-ours-api-token` and the `x-ours-*` session headers unchanged,
+and support streamed request/response bodies and long polling. Client requests
+refuse redirects, including HTTPS-to-HTTP redirects: configure the final HTTPS
+origin directly. UUID/capability checks still precede credential-bearing calls.
+
+This adds client HTTPS support, not an HTTPS daemon listener, certificate
+provisioning or automatic reverse-proxy configuration. Existing local HTTP and
+SSH-tunnel profiles continue to work.
+
+See [supervisor-owned ours and migration](docs/supervisor-ours.md) for the runtime contract and review build instructions.
+
+### One-server gateway profile
+
+A private client profile may include `serverUrl`, for example
+`https://ours.example/base`, together with `endpoint` set to
+`https://ours.example/base/daemon`, the existing `expectedInstanceId`, and the
+absolute private `credentialPath`. Fleet preserves that daemon prefix for doctor
+and monitoring and derives `/cowork/management/rpc` from `serverUrl` for room
+management. Requests use the issued server credential, reject redirects, have
+bounded bodies/deadlines, and never replay mutations. This capability is declared
+as `cowork.http-management-v1` in the built artifact.
+
+Explicit Cowork socket, config or state-directory overrides continue to select
+local Unix management. Profiles without `serverUrl` retain legacy behavior. The
+HTTP API grants operator room authority; use the installer's supported private
+or authenticated external gateway entry, and keep its backend ports private.
+
+### Agent ours tools through the supervisor
+
+Operators can invoke the running agent's ordinary ours MCP tools without sending
+an LLM prompt or binding another session to its identity:
+
+```sh
+ours-fleet ours tools Critic1
+ours-fleet ours call Critic1 current_identity
+ours-fleet ours call Critic1 list_contacts
+ours-fleet ours call Critic1 generate_invite --args-file /private/invite-options.json
+ours-fleet ours call Critic1 add_contact --args-file /private/contact.json
+```
+
+`tools` returns the managed MCP tool names and argument schemas, plus the selected
+agent's identity name, CID, and supervisor generation. `call` returns the same
+identity metadata and the MCP result. The private JSON file contains the tool's
+arguments (for example `{"invite":"…"}` for `add_contact`); omitted arguments mean
+`{}`. Protect files containing invites and protect command output containing a
+new invite. Tool errors set a nonzero CLI exit status.
+
+The authenticated REST equivalents are `GET /api/v1/roles/:id/ours/tools` and
+`POST /api/v1/roles/:id/ours/call`, with the normal Fleet session and CSRF token.
+The POST body is `{"tool":"list_contacts","arguments":{}}`. MCP tool errors
+remain in `result.isError`; transport failures use the normal Fleet error envelope.
+Request arguments and results are excluded from the Fleet audit log.
+
+Both interfaces use the supervisor's existing fixed-identity MCP server and tool
+policy. Identity creation, removal, switching, and binding are not exposed. The
+supervisor must be running. Older descriptors are supported only when a unique
+existing runtime journal, instance record, and identity pin prove the selected
+agent and generation, and the same MCP connection confirms its identity and
+lifetime before the operation. This reads existing state without rewriting the
+descriptor or restarting the agent. Missing, ambiguous, stale, or mismatched
+proofs fail closed. Unknown identity descriptions also fail closed. Closing an operator call
+retains the supervisor's identity. An interrupted mutation can have an unknown
+outcome: inspect state before retrying, because there is no automatic retry or
+exactly-once guarantee. Contact acceptance alone does not prove peer verification
+or message delivery. File tools resolve paths in the invoking CLI process or
+Fleet web server's filesystem context, with that process's access permissions.
+
+Task workspace ownership, retention, safe deletion and legacy migration are documented in [Task workspaces](docs/task-workspaces.md).
+
+### Active task readiness after interruption
+
+Task and room list states, and `taskProvisioningOutcome`, describe durable lifecycle
+and provisioning progress; they are not live health checks. Retrying `task start`
+or `task work` on an active task checks the current Cowork room identity and seats,
+member launch ownership, supervisor liveness, and authenticated session status
+before reporting success. Waiting for provisioning completion also checks live
+readiness. This is a point-in-time observation, not proof of an agent-authored reply.
+
+A `task_not_ready` result distinguishes confirmed degradation from unknown health
+(for example, an unavailable control socket). Ask Fleet Coordinator to inspect room
+and member status and choose supported recovery. These checks do not restart agents,
+recreate identities, redeem invites, or rewrite lifecycle state. Temporary room agents
+remain transient across host reboot; retained launch records do not restore them.
+
+See [predefined Brain models and runtime requirements](presets/README.md) for the verified model/effort matrix and regeneration instructions.
+
+### YAML room layouts
+
+Room layouts describe room composition with shared or fresh participant sessions and independent room closure.
+See [Room layouts](docs/room-layouts.md) for YAML examples and CLI commands.
+
+
+### Dedicated notification service
+
+Configure the web backend with `OURS_NOTIFICATIONS_ORIGIN` and a Fleet-scoped `OURS_NOTIFICATIONS_PRODUCER_TOKEN`. It reads each local supervisor ledger incrementally with persistent checkpoints under web state, correlating owner browser/channel prompts with terminal completion. Monitor/startup turns do not notify. First installation skips existing history; no agent restart or conversation controller is needed. Persist web state across deployment/restarts. Reads are bounded to 256 KiB per role per tick, and oversized model/media records are skipped across chunks. Expose `/notifications` through the generic authenticated prefix gateway with a server-side user token and `stripBrowserContext: true`; producer tokens stay server-side. All browser sessions of this single-owner console map to one stable notification account. See [ours-notifications](https://github.com/adapt-toolkit/ours-notifications) for configuration/API/release details.
+
+New agent notifications and confirmed role retirement use `/fleet/chats/agents/:roleId`, with each ID escaped once and matching message anchors retained. Deploy the app, notification service, and producers together: old query-based conversation links are intentionally unsupported. Existing pending payload URLs are replayed unchanged for idempotency; obsolete cleanup targets remain stored without being sent or treated as proof of absence. Task management notification paths are unchanged.
+
+
+Existing-host enrollment: `ours-fleet workspace-enroll --file <private-file> --preserve-profile` requires Messenger to advertise preservation support before any enrollment POST. It omits Name/Surname and leaves existing/absent profile untouched. Existing Fleet models and agents are retained; the installer must skip init when its configuration exists. Signed root proof, tunnel setup and device QR issuance remain the normal enrollment flow. Older Messenger fails closed and requires its preservation-capable release.
+
+### Connect an installed host to the App
+
+Install Ours network first. In the App's tunnel step, copy the single command and
+paste it on the intended host, including in an SSH session on a VPS:
+
+```sh
+ours-fleet setup-tunnel <encoded-v2-grant>
+```
+
+The base64url argument contains only the existing v2 grant: `version: 2`, allowed
+`appOrigin`, one-use `code`, and `expiresAt`. It names the workspace indirectly
+through a server-held grant; it includes no broad Cloudflare credential or
+installer script. The grant can appear in shell history and process listings:
+keep the command private and remove it from history after use. Base64 is encoding,
+not encryption. The server enforces its short expiry and one-time redemption.
+Fleet never prints the grant; it checks host prerequisites before redeeming it
+over HTTPS POST, with the code in the body rather than a URL. The response supplies
+only the existing scoped connector and signed-root enrollment data; authorization,
+account-origin checks and private connector token-file storage remain enforced.
+
+Optional private transports remain available: `setup-tunnel --file /private/grant`
+requires an owned regular file with mode 600; `setup-tunnel --stdin` reads a secure
+pipe with a 32KiB limit and refuses a terminal. Legacy v1 payloads, which contain
+long-lived scoped credentials, are accepted only through file/stdin, never as
+command arguments. Use only one payload transport.
+
+When this host already has a registration, Fleet inspects the one-use grant without
+consuming it. The same workspace reruns without a deletion prompt or retirement.
+An account-origin change for that workspace requires `--migrate-app-origin`; a
+changed server identity is refused. An older App without inspection support falls
+back to asking before redemption. An unavailable inspection service preserves the
+grant and setup. Fleet verifies the redeemed destination against the inspection.
+
+For another workspace, setup describes the existing workspace, tunnel hostname and
+account origin and asks `[y/N]`. No answer or `no` preserves the setup and grant; a
+noninteractive caller must pass `--replace-registration`, otherwise it exits with
+an error. A legacy binding without a server identity must rerun its own workspace
+first. The original Human root signs retirement. Fleet waits for the account's
+durable cleanup receipt before stopping the old service and revoking its linked
+devices. If a migrated database has no old registration, the signed command confirms
+absence; the service has no old provider resources to delete. Installation identities,
+profile, agents, history, stable host ID and local pairing are preserved.
+
+Replacement recovery is saved in an owned private `workspace/replacement.json`
+after root, host, service and server-contact preconditions pass. The App must
+explicitly support deadline-enforced retirement; an older App without that
+capability preserves the existing setup. `setup-tunnel --resume` retries its nonce
+and saved operation deadline (24 hours less a five-minute clock margin).
+If the enrollment challenge expires, obtain a fresh App command for the same target
+and pass `--replace-registration`; completed retirement is retained. The old server
+identity is pinned: only its own invitation can reconnect it.
+
+`setup-tunnel --abandon-replacement` removes the private recovery payload only when
+a fresh private receipt confirms no deletion and the operation was never dispatched
+or was terminally rejected. A lost transport response remains uncertain. Expired
+operations require a fresh receipt proving the old binding still exists after the
+deadline plus five minutes and an explicit server guarantee that the deadline is enforced;
+older recovery records without that guarantee must be resumed. Abandoning preserves
+the existing binding, connector and installation data. A terminally rejected operation
+requires abandonment and a new App command, rather than reusing its nonce.
+After that deadline, a fresh command for the same target can also resume with a
+new operation nonce after checking the enforced expiry. This confirms signed
+absence if an old successful receipt was lost and later pruned.
+
+If the App accepted the successor proof before Fleet wrote its local binding,
+a fresh command for that target retains the original private connector from the
+recovery record. If that successor cannot be recovered, remove it in the App,
+then use `setup-tunnel --discard-retired-replacement` and a fresh App command.
+Discard is allowed only after retirement and local cleanup, while the old local
+binding remains. It removes only the recovery record. This host has no working
+registration until the new setup completes; the old service was stopped and its
+linked devices revoked.
+
+Renewal commands contain no existing live connector credential. Fleet keeps the
+current private connector byte for byte, and accepts renewal only for its recorded
+workspace, server, origin and tunnel hostname. Restore a missing or unsafe connector,
+or remove and re-create that workspace in the App before setting it up again.
+
+After service and signed tunnel-target confirmation, setup prints both a QR and
+ordinary private single-use connection code. The App checks readiness automatically
+and immediately opens the code field. If setup or code output fails after binding,
+fix the reported problem and run `ours-fleet setup-tunnel --resume`; its private
+pending record remains until the code is printed, including confirmed nondefault
+ports. `ours-fleet link-device` still generates another code for additional browsers
+or expired codes. `--check` checks prerequisites without consuming a grant.
+
+Prerelease rollout requires this Fleet capability to be published first, then the
+installer's normal generated version/integrity lock updated, then installer and
+App released. The currently pinned Fleet nightly.41 does not support v2 grants.
+These source changes do not publish, merge, or deploy any component.
+
+See [ACP file sending](docs/acp-files.md) for the same-chat `send_file` flow, available to every Agent by default, and its supported sessions.

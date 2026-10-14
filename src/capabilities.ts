@@ -15,7 +15,21 @@
 /** `monitor.interrupt: after_tool` — cancel at the next tool boundary (#67). */
 export const CAP_MONITOR_INTERRUPT_AFTER_TOOL = 'monitor.interrupt.after_tool';
 
+export const CAP_HTTP_COWORK = 'cowork.http-management-v1';
+
+export const CAP_WORKSPACE_PRESERVE_PROFILE = 'workspace.enroll.preserve-profile-v1';
+
+/** `ours-fleet managed-cli setup|status` and the `managed_cli` Agent key (#233). */
+export const CAP_MANAGED_CLI_SETUP = 'managed-cli.setup-v1';
+
+/** Managed CLI accepts validated Codex Brain reasoning effort without dropping it (#235). */
+export const CAP_MANAGED_CLI_CODEX_EFFORT = 'managed-cli.codex-reasoning-effort-v1';
+
 export const CAPABILITIES = [
+  CAP_MANAGED_CLI_CODEX_EFFORT,
+  CAP_MANAGED_CLI_SETUP,
+  CAP_WORKSPACE_PRESERVE_PROFILE,
+  CAP_HTTP_COWORK,
   CAP_MONITOR_INTERRUPT_AFTER_TOOL,
 ] as const;
 

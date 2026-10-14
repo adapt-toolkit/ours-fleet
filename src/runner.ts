@@ -1,10 +1,21 @@
+import { readProvenance } from './creation.js';
+import { firstManagedSessionMayStart, managedRecoveryPath, readManagedRecovery, writeManagedRecovery, type ManagedRecovery } from './managed-recovery.js';
+import { StartupTelemetry } from './startup-telemetry.js';
+import { managedStartupPrompt, managedTaskPrompt, worklogRecordsPriorWork } from './startup-prompt.js';
+import { createLayoutControl } from './rooms-tasks/layout-control.js';
+import { TemporaryChatIdle } from './temp-idle.js';
+import { taskSupervisorMayRun, taskMemberRetirementProof } from './task-supervision.js';
+import { prepareManagedAgent, releaseManagedAgent } from './agent-ours/service.js';
+import { prepareManagedHarness } from './agent-ours/harness.js';
+import { prepareManagedCliLaunch } from './managed-cli.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
 import {
-  loadConfig, findRole, isolationContextFor, resolveMonitorConfig, resolvePermissions,
+  loadConfig, findRole, isolationContextFor, resolveSnapshotMonitor, resolvePermissions,
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
@@ -16,9 +27,9 @@ import {
   DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration,
   type DaemonGenerationProbe,
 } from './daemon-recovery.js';
-import { recoverAgentIdentity } from './agent-recovery-gate.js';
 import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
+import { pinSubscriptionForLaunch } from './subscriptions/launch.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
@@ -54,12 +65,14 @@ import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
 import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
 import {
-  archiveTempState, markTempSupervisorActive, requestedTempStopReason,
+  archiveTempState, markTempSupervisorActive, requestedTempStopReason, readTempSupervisor,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
 import { FleetCommandAuditStore } from './fleet-command-audit.js';
 
 export interface RunnerDeps {
+  prepareAgentOurs: typeof prepareManagedAgent;
+  releaseAgentOurs: typeof releaseManagedAgent;
   exec: Exec;
   cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
@@ -68,6 +81,7 @@ export interface RunnerDeps {
   log(line: string): void;
   /** HTTP transport for the monitor's daemon long-poll (injectable for tests). */
   fetch: FetchLike;
+  identityProbeDeps?: Parameters<typeof probeIdentityPresence>[3];
   probeGeneration(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
@@ -82,7 +96,7 @@ export interface RunnerDeps {
   createControlServer(
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'> & Partial<Pick<RoleControlServer, 'setLayoutControl' | 'setCorrespondence'>>;
   /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
   createLoopManager(
     ...args: ConstructorParameters<typeof ScheduledLoopManager>
@@ -93,6 +107,8 @@ export interface RunnerDeps {
   reportOwnerStartupFailure(stateDir: string): Promise<'delivered' | 'duplicate'>;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
+  /** Parent shutdown suspends a managed transient member; explicit stop still retires. */
+  suspendOnStop?: boolean;
 }
 
 export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
@@ -106,6 +122,8 @@ export class SupervisorRecycleRequiredError extends Error {
 }
 
 const defaultDeps = (): RunnerDeps => ({
+  prepareAgentOurs: prepareManagedAgent,
+  releaseAgentOurs: releaseManagedAgent,
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
@@ -138,12 +156,14 @@ const defaultDeps = (): RunnerDeps => ({
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
 
-function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void) {
+export function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void, session:AgentSession) {
+  const bindings=new Map<string,NonNullable<ReturnType<NonNullable<AgentSession["taskNoticeBinding"]>>>>();
   const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
   return {
     async begin(requestId: string, argv: string[]) {
       let attempt = store.begin(requestId, caller, argv);
       if (attempt.invocation === 'sending') {
+        const binding=session.taskNoticeBinding?.();if(binding)bindings.set(attempt.correlationId,binding);
         log(`[${caller}] fleet proxy command ${attempt.correlationId} `
           + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
         attempt = store.invocation(attempt.correlationId, caller, 'delivered');
@@ -157,6 +177,14 @@ function localFleetAuditor(stateDir: string, caller: string, log: (line: string)
         ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
         ...(input.presentations ? { presentations: input.presentations } : {}),
       });
+      const binding=bindings.get(attempt.correlationId);
+      if(binding&&attempt.outcome?.class==='success'&&attempt.outcome.effect==='completed'){
+        for(const p of attempt.outcome.presentations??[])if(p.kind==='task'&&p.operation==='create'){
+          try { session.recordTaskCreated?.(binding,{operationId:p.eventId,taskId:p.id,title:p.title??p.id,state:p.newState}); }
+          catch { log(`[${caller}] task-created conversation notice could not be persisted`); }
+        }
+        bindings.delete(attempt.correlationId);
+      }
       if (attempt.outcome?.delivery === 'sending')
         attempt = store.outcome(attempt.correlationId, caller, 'delivered');
       return attempt;
@@ -513,7 +541,7 @@ export function loadTempRole(name: string): ResolvedRole {
   const role = parse(readFileSync(p, 'utf8')) as ResolvedRole;
   // Upgrade snapshots written before monitor.mode/interrupt existed. A snapshot
   // with no monitor block keeps the historical native/no-supervisor behavior.
-  if (role.monitor) role.monitor = resolveMonitorConfig(undefined, role.monitor);
+  if (role.monitor) role.monitor = resolveSnapshotMonitor(role.monitor);
   (role as ResolvedRole & { __temp?: boolean }).__temp = true;
   return role;
 }
@@ -527,7 +555,7 @@ export function loadTempRole(name: string): ResolvedRole {
  * with "no such role". An empty/missing marker means "use the default", same as
  * no -c was ever given.
  */
-function resolveConfigPath(dir: string, explicit?: string): string | undefined {
+export function resolveConfigPath(dir: string, explicit?: string): string | undefined {
   if (explicit) return explicit;
   const marker = join(dir, '.config-path');
   if (!existsSync(marker)) return undefined;
@@ -543,7 +571,7 @@ export interface AttemptResult {
   mode: 'fresh' | 'resume';
   modelRecovery?: 'advance' | 'hold';
   /** Present only when a temporary-role lifecycle signal ended the session. */
-  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal';
+  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal' | 'idle-timeout';
 }
 
 /** Continuous authoritative absence required after an identity was observed. */
@@ -563,10 +591,12 @@ export function isRecoverableTempStartupCancellation(
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
-  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean } = {},
+  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean; identityLifetime?: 'permanent' | 'temporary' } = {},
   partialDeps: Partial<RunnerDeps> = {},
 ): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
+  const startupTelemetry = new StartupTelemetry(deps.now, line => deps.log(`[${name}] ${line}`));
+  startupTelemetry.mark('supervisor_started');
   const temp = opts.temp === true;
   const dir = agentDir(name, temp);
   const configPath = temp ? opts.configPath : resolveConfigPath(dir, opts.configPath);
@@ -605,13 +635,39 @@ export async function runOnce(
   else if (rotation.rotated)
     deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
 
+  const durableTask = Boolean(readTempSupervisor(dir)?.taskOwner);
+  const retainedManaged = durableTask || Boolean(deps.suspendOnStop && adapter.supportsResume);
   const sidFile = join(dir, '.session-id');
+  const backendSidFile = join(dir, role.session === 'codex-app-server' ? '.session-id' : '.acp-session-id');
+  let recovery = retainedManaged ? readManagedRecovery(dir) : undefined;
+  // Native Codex shares .session-id with the runner's pre-launch UUID, so file
+  // existence alone is not evidence that its first backend thread was created.
+  const firstSessionRetry = retainedManaged && existsSync(join(dir, '.booted'))
+    && (!existsSync(backendSidFile) || (role.session === 'codex-app-server' && recovery?.session === 'pending'))
+    && firstManagedSessionMayStart(dir);
+  if (retainedManaged && existsSync(join(dir, '.booted'))
+      && (!existsSync(sidFile) || !existsSync(backendSidFile)) && !firstSessionRetry)
+    throw Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
   if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
   const sessionId = readFileSync(sidFile, 'utf8').trim();
   const bootedFile = join(dir, '.booted');
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
-  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
+  if (durableTask && !adapter.supportsResume) throw Error('TASK_HARNESS_RESUME_UNSUPPORTED');
+  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume && !firstSessionRetry ? 'resume' : 'fresh';
+  const requireResume = retainedManaged && mode === 'resume';
+  if (retainedManaged && !recovery) {
+    // Older admitted sessions have no cursor. Continue once, without replaying
+    // their assignment; fresh sessions record intent before the first attempt.
+    recovery = { version: 1, session: booted ? 'established' : 'pending', readiness: booted,
+      initial: booted ? 'dispatching' : 'pending', active: booted };
+    writeManagedRecovery(dir, recovery);
+  }
+  const recoveryBefore = recovery ? { ...recovery } : undefined;
+  const saveRecovery = (update: Partial<ManagedRecovery>) => {
+    if (!recovery) return;
+    recovery = { ...recovery, ...update }; writeManagedRecovery(dir, recovery);
+  };
   // Stamp EVERY attempt, not just the first. `.booted` used to be written only
   // on the fresh path, so after a restart — including one the supervisor never
   // saw, like an OOM-kill — its mtime still read the original boot and any
@@ -620,12 +676,24 @@ export async function runOnce(
   writeFileSync(bootedFile, `${new Date(deps.now()).toISOString()} ${mode}\n`);
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
-  const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
+  role = { ...role, monitor: { ...role.monitor, mode: 'fleet' } };
+  // Native policy for Fleet commands run from the harness command sandbox. This
+  // is the same step for configured, spawned and task-room agents alike.
+  const prep = prepareManagedCliLaunch(role, {
+    // A temporary agent has no config path threaded through its detached
+    // supervisor; spawn records the one it was created from beside its snapshot.
+    stateDir: dir, runCwd, configPath: configPath ?? resolveConfigPath(dir), temp,
+    prep: await adapter.prepareSession(role, { stateDir: dir, runCwd }), log: deps.log,
+  });
   const sessionBackend = role.session ?? 'acp';
   const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);
+  // Resolve the fleet-wide active subscription profile once, now: a later switch
+  // never changes this session (the operator restarts agents to move them).
+  const subscription = pinSubscriptionForLaunch(role, dir);
+  if (subscription?.pin.home) deps.log(`[${name}] subscription: ${subscription.pin.provider} profile ${subscription.pin.profileId}`);
 
-  // Isolation is additive: only roles that declare `isolation:` are wrapped.
+  // Preserve the role's existing isolation policy.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
     // Start with the same durable context that config validation and doctor judged,
@@ -635,7 +703,8 @@ export async function runOnce(
     launch = { ...launch, argv: runtime.argv };
     const ctx: WrapContext = {
       ...isolationContextFor(role), stateDir: dir, runCwd,
-      runtimeReadPaths: runtime.readPaths,
+      subscriptionHome: subscription?.writablePath,
+      runtimeReadPaths: [...runtime.readPaths, ...resolveLaunchRuntime([process.execPath, fileURLToPath(new URL('./agent-ours/bridge.js', import.meta.url))]).readPaths],
     };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
@@ -656,6 +725,13 @@ export async function runOnce(
     if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
   }
 
+  startupTelemetry.mark('identity_prepare_started');
+  const managedService = await deps.prepareAgentOurs(role, dir, opts.identityLifetime ? opts.identityLifetime === 'temporary' : temp);
+  startupTelemetry.mark('identity_ready');
+  let layoutRetiring = false;
+  try {
+  const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
+    { ...harnessChildEnv(role, launch.env, dir), ...subscription?.env });
   // Start-stagger: space this launch at least start_stagger_ms after the previous
   // agent launch across the whole host, so a burst of boots (systemd starts every
   // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not
@@ -672,10 +748,9 @@ export async function runOnce(
   }
 
   // Prime the supervisor mail monitor's notification cursor at the
-  // stream tip BEFORE the session launches so no arrival is missed during boot
-  // (backlog before the tip is the SessionStart hook's job). Native-mode roles
-  // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
-  // treated as native (monitor may be undefined on an old role.yaml).
+  // stream tip BEFORE the session launches so no arrival is missed during boot.
+  // Monitor.run checks the body-free initial unread summary after readiness;
+  // managed native hooks do not own backlog delivery.
   let sessionHandle: AgentSession | undefined;
   let modelRecovery: 'advance' | 'hold' | undefined;
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
@@ -719,6 +794,16 @@ export async function runOnce(
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let sessionStartupComplete = false;
+  let startupRecoveryAllowed = false;
+  let successfulTurnObserved = false;
+  let monitorMayStart = false;
+  let monitorStarted = false;
+  const startMonitorAfterStartup = () => {
+    if (!monitorStarted && monitorMayStart && sessionStartupComplete && !deps.shouldStop?.()) {
+      monitorStarted = true;
+      monitorLoop = monitor?.run(pid);
+    }
+  };
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
@@ -737,21 +822,49 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    agentSession = await deps.startAgentSession(adapter.agentSession, {
+    startupTelemetry.mark('harness_starting');
+    agentSession = await managedService.runtime.startHarness(() => deps.startAgentSession(adapter.agentSession, {
+      managedOurs: managedHarness.ours,
       role, prep,
-      launch: { ...launch, argv: wrappedArgv, env: harnessChildEnv(role, launch.env, dir) },
-      cwd: runCwd, stateDir: dir, mode, permissions: perms,
+      launch: { ...launch, argv: wrappedArgv, env: managedHarness.env },
+      cwd: runCwd, stateDir: dir, mode, requireResume, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
-    });
+    }));
+    managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
+    startupTelemetry.mark('harness_ready');
+    saveRecovery({ session: 'established' });
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
-    unsubscribeRecovery = agentSession.subscribe(event => {
+    const unsubscribeFailure = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text || event.origin?.kind === 'stall-watchdog') return;
       const evidence = classifyFailureText(
         event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
+    const unsubscribeTelemetry = agentSession.subscribeConversation?.(event => startupTelemetry.observe(event));
+    const unsubscribeStartup = agentSession.subscribeConversation?.(event => {
+      if (event.kind !== 'turn.completed' || !('outcome' in event.payload) || event.payload.outcome !== 'completed') return;
+      successfulTurnObserved = true;
+      if (startupRecoveryAllowed) {
+        sessionStartupComplete = true;
+        startMonitorAfterStartup();
+      }
+    });
+    const activePrompts = new Set<string>();
+    const unsubscribeContinuity = agentSession.subscribeConversation?.(event => {
+      if (!recovery?.readiness) return;
+      if (event.kind === 'prompt.started') {
+        if (event.promptId) activePrompts.add(event.promptId);
+        saveRecovery({ active: true });
+      } else if (event.kind === 'turn.completed' && 'outcome' in event.payload) {
+        if (event.promptId) activePrompts.delete(event.promptId);
+        // A shutdown/failed turn needs continuation; a successful terminal turn
+        // proves it may stay idle. Never store prompt bodies in this cursor.
+        if (event.payload.outcome === 'completed') saveRecovery({ active: activePrompts.size > 0 });
+      }
+    });
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); unsubscribeContinuity?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
@@ -778,6 +891,7 @@ export async function runOnce(
         harness: role.harness,
         config: role.owner_channel,
         session: arbiter,
+        startupPending: () => !sessionStartupComplete,
         stateDir: dir,
         env: role.env,
         log: deps.log,
@@ -785,11 +899,18 @@ export async function runOnce(
         ...(configPath ? { configPath } : {}),
       });
       control = deps.createControlServer(dir, arbiter, deps.log);
+      control.setCorrespondence?.({contacts:()=>managedService.runtime.readContacts(),history:query=>managedService.runtime.readHistory(query)});
       control.setFleetAuditor(ownerChannel ? {
         begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
         present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
-      } : localFleetAuditor(dir, name, deps.log));
+      } : localFleetAuditor(dir, name, deps.log, agentSession));
+      control.setLayoutControl?.(createLayoutControl({
+        agent: name, temporary: temp, standalone: !role.roomMemberStartup,
+        runtime: managedService.runtime, session: arbiter,
+        stopping: () => Boolean(deps.shouldStop?.()),
+        retire: async () => { layoutRetiring = true; await arbiter!.close(); },
+      }));
       await control.start();
     }
     catch (error) {
@@ -817,10 +938,8 @@ export async function runOnce(
       // refusal or a cancellation reached the agent and was not acted on, so
       // the monitor must keep its cursor and try again.
       submit: async (text, options) => {
-        // Cancelling the runner-owned startup prompt makes startup look failed
-        // and closes the session before the wake turn can run. During startup,
-        // steer into the live turn instead; after it completes, honor the
-        // configured interrupt policy normally.
+        // Delivery starts after the protected startup turn succeeds. Honor the
+        // configured interrupt policy for subsequent turns.
         const policy = options?.interrupt;
         const interrupt = policy === true && sessionStartupComplete;
         const promptOptions = {
@@ -828,8 +947,7 @@ export async function runOnce(
           ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
           origin: { kind: 'fleet-monitor' as const },
         };
-        // Startup is already a protected boundary: as with immediate mode,
-        // steer rather than waiting on/cancelling the runner-owned first turn.
+        // after_tool waits for a safe boundary in subsequent active turns.
         const result = policy === 'after_tool' && sessionStartupComplete
           ? await arbiter!.submitPromptAfterTool(text, promptOptions)
           : await arbiter!.submitPrompt(text, promptOptions);
@@ -858,18 +976,42 @@ export async function runOnce(
         };
       },
     };
-    const firstPrompt = mode === 'fresh'
-      ? `Read and follow ${join(dir, 'briefing.md')} now.`
-      : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
+    // The worklog is continuity input only when it records work. It outlives `.booted`,
+    // which a rotation to a fresh conversation clears, so the log itself is the evidence.
+    const priorWork = worklogRecordsPriorWork(dir);
+    const firstPrompt = managedStartupPrompt(dir, mode, priorWork);
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
-    // up would hide a role that never read its briefing.
-    const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
-    // Monitoring starts immediately. The delivery adapter above downgrades
-    // interruption to steering until this startup turn reaches a terminal
-    // success, so there is neither a deaf gap nor a boot-cancellation loop.
-    monitorLoop = monitor?.run(pid);
+    // up would hide a role that never completed its readiness turn.
+    const retainedResume = retainedManaged && mode === 'resume' && recoveryBefore?.readiness === true;
+    if (!retainedResume) startupTelemetry.mark('startup_submitted');
+    // The backend already verified the saved conversation. Resuming a managed
+    // member admits new wakes/console input without replaying startup or work.
+    const starting: Promise<TurnResult> = retainedResume
+      ? Promise.resolve({ accepted: false, succeeded: true, outcome: 'completed', detail: 'retained backend resumed; no readiness prompt submitted' })
+      : arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
+    // Keep the early cursor baseline; do not deliver wakes into the protected
+    // first turn. Steering can pre-empt startup just like cancellation.
+    // Owner traffic and agent replies must be observed during a long first
+    // turn. Ordinary owner input steers until startup has proved successful.
+    if (ownerChannel) {
+      try {
+        await ownerChannel.start();
+        control.setOwnerChannel(ownerChannel);
+      } catch (error) {
+        monitor?.stop();
+        if (monitorLoop) await monitorLoop;
+        await control.close();
+        await ownerChannel.close().catch(() => undefined);
+        ownerBinder?.release();
+        await agentSession.close();
+        unsubscribeRecovery?.();
+        throw new Error(`[${name}] owner channel failed to start: `
+          + `${(error as Error)?.message ?? String(error)}`);
+      }
+    }
     const started = await starting;
+    startupTelemetry.finish();
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
     // only that turn: the already-live agent session and any queued wake remain
@@ -881,6 +1023,7 @@ export async function runOnce(
     if (!started.succeeded && !interruptedForWake) {
       monitor?.stop();
       await control.close();
+      await ownerChannel?.close().catch(() => undefined);
       ownerBinder?.release();
       await agentSession.close();
       unsubscribeRecovery?.();
@@ -906,24 +1049,33 @@ export async function runOnce(
     else if (interruptedForWake)
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
-    sessionStartupComplete = true;
-    if (ownerChannel) {
-      try { await ownerChannel.start(); }
-      catch (error) {
-        monitor?.stop();
-        if (monitorLoop) await monitorLoop;
-        await ownerChannel.close().catch(() => undefined);
-        await control.close();
-        ownerBinder?.release();
-        await agentSession.close();
-        unsubscribeRecovery?.();
-        throw new Error(`[${name}] owner channel failed to start: `
-          + `${(error as Error)?.message ?? String(error)}`);
-      }
-    }
-    if (ownerChannel) {
-      control.setOwnerChannel(ownerChannel);
-    }
+    startupRecoveryAllowed = interruptedForWake;
+    sessionStartupComplete = started.succeeded || (interruptedForWake && successfulTurnObserved);
+    if (started.succeeded && !retainedResume) startupTelemetry.mark('readiness_turn_completed');
+    if (started.succeeded) saveRecovery({ readiness: true });
+    // Readiness is now complete. Configured work (or retained continuity) is
+    // admitted as a distinct turn; its terminal result must not block console
+    // readiness, mail delivery, or supervisor liveness. Empty fresh agents wait
+    // for authenticated console input or the monitor's unread/arrival wake.
+    const configuredWork = Boolean(role.mission?.trim() || role.roomMemberStartup?.task?.trim() || role.briefing_file?.trim());
+    const initialPending = retainedManaged && recoveryBefore?.initial === 'pending';
+    const interruptedWork = retainedManaged && (recoveryBefore?.active || recoveryBefore?.initial === 'dispatching');
+    const workPrompt = retainedManaged
+      ? initialPending && configuredWork ? managedTaskPrompt(dir, 'fresh', false)
+        : interruptedWork ? 'Fleet supervisor restarted. Continue pending work in the restored conversation; do not redo completed steps. '
+          + (recoveryBefore?.initial === 'dispatching' ? `If you have not yet received your assignment, read ${join(dir, 'briefing.md')} once before acting. ` : '')
+          + 'Read the continuation log only as needed to recover your next action. If no work remains, end this turn and wait for a concrete task or supervisor wake.' : undefined
+      : configuredWork || booted || priorWork ? managedTaskPrompt(dir, mode, priorWork) : undefined;
+    if (started.succeeded && !deps.shouldStop?.() && workPrompt) {
+      saveRecovery({ initial: 'dispatching', active: true });
+      const queued = await arbiter.queuePrompt(workPrompt, {
+        origin: { kind: 'startup' },
+      });
+      void queued.completion.then(result => {
+        if (result.succeeded) saveRecovery({ initial: 'completed', active: activePrompts.size > 0 });
+        deps.log(`[${name}] configured task turn ${result.outcome}`);
+      }, () => deps.log(`[${name}] configured task turn failed`));
+    } else if (started.succeeded && initialPending && !configuredWork) saveRecovery({ initial: 'completed' });
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -978,16 +1130,17 @@ export async function runOnce(
   deps.log(
     `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
 
-  // The monitor loop lives exactly as long as the session: it starts once the
-  // pane pid is known and is stopped when that pid dies (task dies with runner).
-  monitorLoop ??= monitor?.run(pid);
+  // Keep arrivals behind the early prime() cursor; never re-prime at startup.
+  // Recoverable cancellation preserves the supervisor, not monitor readiness.
+  monitorMayStart = true;
+  startMonitorAfterStartup();
 
   recoveryController = new RoleRecoveryController({
     role: name, identity: role.identity, stateDir: dir, now: deps.now, sleep: deps.sleep,
     log: deps.log,
     recoverAgent: async () => {
-      const evidence = await recoverAgentIdentity(arbiter!, role.identity);
-      return evidence.ok ? { ok: true } : { ok: false, reason: evidence.reason };
+      try { const release = await managedService.runtime.admit(); release(); return { ok: true }; }
+      catch { return { ok: false, reason: 'SUPERVISOR_IDENTITY_NOT_READY' }; }
     },
     recoverOwner: async epoch => {
       if (!ownerChannel?.recover) return { ok: true };
@@ -999,6 +1152,9 @@ export async function runOnce(
     },
   });
 
+  let chatIdle: TemporaryChatIdle | undefined;
+  try { if(temp && !role.roomMemberStartup && !readTempSupervisor(dir)?.taskOwner) chatIdle=new TemporaryChatIdle(dir,deps.now()); }
+  catch { deps.log(`[${name}] automatic idle closure disabled: activity state is unreadable`); }
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
   let nextIdentityPollAt = deps.now();
@@ -1023,9 +1179,19 @@ export async function runOnce(
           deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
       }
     }
-    if (temp && deps.shouldStop?.()) {
-      retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
-      deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
+    let idleExpired=false;
+    try { idleExpired=chatIdle?.observe(sessionHandle.snapshot(),sessionHandle.conversationSnapshot?.().queueDepth ?? -1,now) ?? false; }
+    catch { chatIdle=undefined; deps.log(`[${name}] automatic idle closure disabled: activity state could not be saved`); }
+    if (idleExpired && await arbiter!.retireIfIdle((snapshot,queue)=>chatIdle!.observe(snapshot,queue,deps.now()))) {
+      retirementReason = 'idle-timeout';
+      sessionClosed = true;
+      break;
+    }
+    if (deps.shouldStop?.()) {
+      if (temp) {
+        retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
+        deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
+      }
       await sessionHandle.close();
       sessionClosed = true;
       break;
@@ -1033,7 +1199,7 @@ export async function runOnce(
     if (temp && now >= nextIdentityPollAt) {
       nextIdentityPollAt = now + TEMP_IDENTITY_POLL_MS;
       const presence = await probeIdentityPresence(
-        role.identity, deps.fetch, resolvedMonitorDeps.env);
+        role.identity, deps.fetch, resolvedMonitorDeps.env, deps.identityProbeDeps);
       if (presence.state === 'present') {
         identityObserved = true;
         identityAbsentSince = undefined;
@@ -1066,6 +1232,7 @@ export async function runOnce(
       }
     }
   }
+  monitorMayStart = false;
   if (loopManager) {
     control?.setLoopManager(undefined);
     await loopManager.stop();
@@ -1105,10 +1272,13 @@ export async function runOnce(
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
+    rmSync(managedRecoveryPath(dir), { force: true });
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
+  if (readTempSupervisor(dir)?.taskOwner || ((!temp || deps.suspendOnStop) && deps.shouldStop?.()))
+    deps.log(`[${name}] supervisor/context retained -> next start RESUMES context`);
+  else if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
     // is poisoned. Preserve the context even when the resumed generation hits
@@ -1136,8 +1306,11 @@ export async function runOnce(
   if (supervisorRecycleRequired) throw new SupervisorRecycleRequiredError();
   return {
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
-    ...(retirementReason ? { retirementReason } : {}),
+    ...(layoutRetiring ? { retirementReason: 'operator-stop' as const } : retirementReason ? { retirementReason } : {}),
   };
+  } finally {
+    await managedService.close(layoutRetiring);
+  }
 }
 
 /**
@@ -1152,16 +1325,21 @@ export async function runOnce(
  */
 export async function runSupervised(
   name: string,
-  opts: { configPath?: string } = {},
+  opts: { configPath?: string; temp?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
   attempt: (
-    n: string, o: { configPath?: string; allowResumeRotation?: boolean }, d: Partial<RunnerDeps>,
+    n: string, o: { configPath?: string; allowResumeRotation?: boolean; temp?: boolean }, d: Partial<RunnerDeps>,
   ) => Promise<AttemptResult> = runOnce,
 ): Promise<RestartLedger> {
   const deps = { ...defaultDeps(), ...partialDeps };
-  const dir = agentDir(name);
+  const taskMember = opts.temp === true;
+  const dir = agentDir(name, taskMember);
   mkdirSync(dir, { recursive: true });
-  const shouldStop = deps.shouldStop ?? (() => false);
+  let stopping = false;
+  const requestStop = () => { stopping = true; };
+  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false)
+    || (taskMember && requestedTempStopReason(dir) === 'operator-stop');
+  deps.shouldStop = shouldStop;
   const stamp = () => new Date(deps.now()).toISOString();
 
   // Record how the PREVIOUS supervisor process ended before doing anything
@@ -1185,12 +1363,16 @@ export async function runSupervised(
         + `ended abruptly: ${termination.detail}; abrupt terminations recorded: ${abrupt}`);
   }
 
+  // Service-manager stops must run the same cleanup as a completed session.
+  process.on('SIGTERM', requestStop);
+  process.on('SIGINT', requestStop);
   try {
   while (!shouldStop()) {
+    if (taskMember && !taskSupervisorMayRun(name)) break;
     let ledger = readRestartLedger(dir);
     try {
       const configPath = resolveConfigPath(dir, opts.configPath);
-      const role = findRole(loadConfig(configPath), name);
+      const role = taskMember ? loadTempRole(name) : findRole(loadConfig(configPath), name);
       reconcileModelRecovery(dir, role, stamp());
       if (modelRecoveryHeld(dir)) {
         await deps.sleep(HELD_DOWN_POLL_MS);
@@ -1207,19 +1389,26 @@ export async function runSupervised(
       continue;
     }
 
+    if (attempt === runOnce && taskMember) {
+      // Boot-time daemon unavailability must not consume the harness crash budget.
+      const { waitForRoleDaemon } = await import('./startup-readiness.js');
+      await waitForRoleDaemon(name, undefined, {}, true);
+    }
+    if (taskMember && (shouldStop() || !taskSupervisorMayRun(name))) break;
     let result: AttemptResult;
     try {
       // Service-manager boot and automatic retry bypass the operator-facing
       // up/restart commands. Reconcile again immediately before every real
       // permanent harness attempt; the operation is idempotent and releases its
       // provisioning lease before the agent or owner channel binds.
-      if (attempt === runOnce) {
+      if (attempt === runOnce && !taskMember) {
         const configPath = resolveConfigPath(dir, opts.configPath);
         const role = findRole(loadConfig(configPath), name);
         await reconcilePermanentRoleIdentities(role, undefined, deps.log);
       }
       result = await attempt(
-        name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
+        name, { configPath: opts.configPath, ...(taskMember ? { temp: true } : {}),
+          allowResumeRotation: taskMember ? false : !ledger.resumeDiscarded }, deps);
     } catch (e) {
       if (e instanceof SupervisorRecycleRequiredError) {
         writeRestartLedger(dir, {
@@ -1241,6 +1430,8 @@ export async function runSupervised(
       };
     }
 
+    if (stopping || (taskMember && (shouldStop() || result.retirementReason))) break;
+
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
     ledger = readRestartLedger(dir);
@@ -1257,7 +1448,8 @@ export async function runSupervised(
       await deps.sleep(HELD_DOWN_POLL_MS);
       continue;
     }
-    const fastFailSecs = fastFailSecsFor(name, opts.configPath);
+    const fastFailSecs = taskMember ? getAdapter(loadTempRole(name).harness).exitPolicy.fastFailSecs
+      : fastFailSecsFor(name, opts.configPath);
     // The fast-fail boundary starts a recovery episode; it must not also be
     // the boundary that declares recovery successful. Otherwise alternating
     // 19s and 20s deaths erase one another forever. Require the configured
@@ -1296,7 +1488,7 @@ export async function runSupervised(
       next.nextDelayMs = 0;
       writeRestartLedger(dir, next);
       deps.log(`[${name}] HELD DOWN after ${failures} immediate failures at ${next.openedAt} — ` +
-        `${reason}; the agent will not be restarted until: ours-fleet restart ${name}`);
+        `${reason}; recover with: ${taskMember ? `ours-fleet task recover-members ${readTempSupervisor(dir)!.taskOwner!.taskId}` : `ours-fleet restart ${name}`}`);
       continue;
     }
     writeRestartLedger(dir, next);
@@ -1306,8 +1498,11 @@ export async function runSupervised(
   }
   return readRestartLedger(dir);
   } finally {
-    // Only an orderly return through this loop clears the marker; a signal or
-    // an OOM-kill leaves it, which is exactly how the successor detects them.
+    process.off('SIGTERM', requestStop);
+    process.off('SIGINT', requestStop);
+    // An orderly shutdown clears the marker; an unhandled signal or OOM-kill
+    // leaves it so the successor can identify an abrupt termination.
+    if (!taskMember && shouldStop()) await deps.releaseAgentOurs(findRole(loadConfig(opts.configPath), name));
     releaseSupervisorRun(dir);
   }
 }
@@ -1325,11 +1520,54 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
+/** The parent uses the same adapter-relative sustained-uptime reset boundary. */
+export function stableSupervisorWindow(name: string, temp: boolean, configPath?: string): number {
+  try {
+    const role = temp ? loadTempRole(name) : findRole(loadConfig(configPath), name);
+    return getAdapter(role.harness).exitPolicy.fastFailSecs * RESTART_FAIL_THRESHOLD;
+  } catch { return 20 * RESTART_FAIL_THRESHOLD; }
+}
+
 export async function runTemp(
   name: string, deps: Partial<RunnerDeps> = {},
   attempt: typeof runOnce = runOnce,
 ): Promise<void> {
   const dir = agentDir(name, true);
+  const metadata = readTempSupervisor(dir);
+  // Non-resumable standalone temporaries retain their prior finite lifecycle:
+  // a parent stop retires them rather than promising retained conversation.
+  if (!metadata?.taskOwner && deps.suspendOnStop && !getAdapter(loadTempRole(name).harness).supportsResume)
+    deps = { ...deps, suspendOnStop: false };
+  if (!metadata?.taskOwner) {
+    const role = loadTempRole(name);
+    const provenance = readProvenance(dir);
+    if (role.roomMemberStartup?.task_id
+        || (name.startsWith('layout-') && provenance?.creationActionId?.startsWith('task-')))
+      throw Error('TASK_SUPERVISOR_OWNER_MISSING');
+  }
+  if (metadata?.taskOwner) {
+    // Serialize the entire process lifetime before metadata/session writes.
+    const lease = await acquireOwnerBinderLease(join(dir, '.task-supervisor'), 'task-supervisor', name);
+    let ownershipVerified = false;
+    try {
+      const mayRun = taskSupervisorMayRun(name);
+      ownershipVerified = true;
+      if (!mayRun) return;
+      await markTempSupervisorActive(dir);
+      await runSupervised(name, { temp: true }, deps, attempt);
+    } finally {
+      try {
+        if (ownershipVerified && requestedTempStopReason(dir)) {
+          // Parent shutdown suspends; an explicit stop retires the exact saved
+          // owner even when no harness attempt ran (for example held circuits).
+          await (deps.releaseAgentOurs ?? releaseManagedAgent)(loadTempRole(name), taskMemberRetirementProof(name));
+          const archived = archiveTempState(name, 'operator-stop', 'retired', 'explicit task member retirement');
+          deps.log?.(`[${name}] task member retired: operator-stop${archived ? `; evidence archived at ${archived}` : ''}`);
+        }
+      } finally { lease.release(); }
+    }
+    return;
+  }
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
   const onTerm = () => { signal = 'SIGTERM'; };
@@ -1339,15 +1577,22 @@ export async function runTemp(
   let result: AttemptResult | undefined;
   let failure: unknown;
   try {
-    result = await attempt(name, { temp: true }, {
-      ...deps,
-      shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
-    });
+    for(let recoveryAttempt=0;;recoveryAttempt++) {
+      result = await attempt(name, { temp: true }, {
+        ...deps,
+        shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
+      });
+      if(result.exit.class==='clean'||result.retirementReason||signal||deps.shouldStop?.()||recoveryAttempt>=2)break;
+      await (deps.sleep??(ms=>new Promise(resolve=>setTimeout(resolve,ms))))(Math.min(5000,1000*(recoveryAttempt+1)));
+    }
   } catch (error) {
     failure = error;
   } finally {
     process.off('SIGTERM', onTerm);
     process.off('SIGINT', onInt);
+    // A recycle replaces the supervisor process, not the logical temporary agent.
+    if (!((signal || deps.shouldStop?.()) && deps.suspendOnStop && !requestedTempStopReason(dir))
+        && (!(failure instanceof SupervisorRecycleRequiredError) || signal || deps.shouldStop?.())) {
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason
@@ -1362,9 +1607,11 @@ export async function runTemp(
       : result
         ? `${result.exit.detail}; elapsed=${result.elapsedSecs.toFixed(1)}s`
         : 'temporary supervisor ended without an attempt result';
+    await (deps.releaseAgentOurs ?? releaseManagedAgent)(loadTempRole(name));
     const archived = archiveTempState(name, reason, outcome, detail);
     deps.log?.(`[${name}] temporary lifecycle ${outcome}: ${reason}`
       + `${archived ? `; evidence archived at ${archived}` : '; state already archived'}`);
+    }
   }
   if (failure) throw failure;
 }

@@ -1,0 +1,48 @@
+import { mkdtempSync, chmodSync, statSync, rmSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { attachmentPrompt, storeAgentAttachment, MAX_ATTACHMENT_BYTES, prepareAttachmentPresentation, presentAttachmentEvent, readAgentAttachment } from '../../src/web/agent-attachments.js';
+const dirs:string[]=[];const temp=()=>{const dir=mkdtempSync(join(tmpdir(),'fleet-attachments-'));dirs.push(dir);return dir;};
+afterEach(()=>{for(const dir of dirs.splice(0))rmSync(dir,{recursive:true,force:true});});
+const input=(name='hello.txt',data=Buffer.from('exact file bytes'))=>({name,mimeType:'application/octet-stream',data:data.toString('base64')});
+describe('agent attachment storage',()=>{
+ it('preserves bytes, safely names paths, and gives identical IDs and prompts on retry',()=>{
+  const dir=temp(),body=input('../../metadata.json'),a=storeAgentAttachment(dir,'gen1',body),b=storeAgentAttachment(dir,'gen1',body);expect(a).toEqual(b);
+  const prompt=attachmentPrompt(dir,'gen1',[a.id],'Read this');const files=JSON.parse(prompt.slice(prompt.indexOf('[\n')));expect(readFileSync(files[0].path).toString()).toBe('exact file bytes');expect(files[0].path.startsWith(join(dir,'web-attachments',a.id)+'/')).toBe(true);expect(attachmentPrompt(dir,'gen1',[a.id],'Read this')).toBe(prompt);
+  expect(()=>attachmentPrompt(dir,'gen2',[a.id],'')).toThrow(/different agent session/);expect(()=>attachmentPrompt(temp(),'gen1',[a.id],'')).toThrow();
+ });
+ it.each([0o755,0o775])('accepts normal runtime parent mode %i but keeps upload storage private',(parentMode)=>{
+  const dir=temp();chmodSync(dir,parentMode);const a=storeAgentAttachment(dir,'gen1',input());
+  expect(attachmentPrompt(dir,'gen1',[a.id],'')).toContain('hello.txt');expect(statSync(dir).mode&0o777).toBe(parentMode);
+  const root=join(dir,'web-attachments');expect(statSync(root).mode&0o777).toBe(0o700);expect(statSync(join(root,a.id)).mode&0o777).toBe(0o700);
+  chmodSync(root,0o775);expect(()=>attachmentPrompt(dir,'gen1',[a.id],'')).toThrow(/directory/);expect(()=>storeAgentAttachment(dir,'gen1',input())).toThrow(/directory/);
+  chmodSync(root,0o700);chmodSync(dir,0o777);expect(()=>storeAgentAttachment(dir,'gen1',input())).toThrow(/directory/);
+ });
+ it('rejects malformed/oversize data and invalid IDs without guessing a file',()=>{
+  const dir=temp();expect(()=>storeAgentAttachment(dir,'gen1',{...input(),data:'a=='})).toThrow();expect(()=>storeAgentAttachment(dir,'gen1',input('large',Buffer.alloc(MAX_ATTACHMENT_BYTES+1)))).toThrow(/20 MiB/);expect(() => attachmentPrompt(dir, 'gen1', ['../outside'], '')).toThrow();
+ });
+ it('detects symlink replacement and changed bytes before a prompt is sent',()=>{
+  const dir=temp(),a=storeAgentAttachment(dir,'gen1',input());const file=join(dir,'web-attachments',a.id,'content-hello.txt');const other=join(dir,'other');writeFileSync(other,'private');unlinkSync(file);symlinkSync(other,file);expect(()=>attachmentPrompt(dir,'gen1',[a.id],'')).toThrow();expect(()=>storeAgentAttachment(dir,'gen1',input())).toThrow();expect(readFileSync(other,'utf8')).toBe('private');unlinkSync(file);writeFileSync(file,'changed');expect(()=>attachmentPrompt(dir,'gen1',[a.id],'')).toThrow(/changed/);
+ });
+ it('allows empty files and refuses symlink storage roots',()=>{
+  const dir=temp(),a=storeAgentAttachment(dir,'gen1',input('empty',Buffer.alloc(0)));expect(a.size).toBe(0);expect(attachmentPrompt(dir,'gen1',[a.id],'')).toContain('empty');const other=temp();symlinkSync(dir,join(other,'web-attachments'));expect(()=>storeAgentAttachment(other,'gen1',input())).toThrow(/directory/);
+ });
+});
+
+describe('attachment presentation',()=>{
+ it('binds persisted display to exact admitted command and transport; never guesses markers',()=>{
+  const dir=temp(),a=storeAgentAttachment(dir,'gen1',input());
+  const text='Attached files is ordinary user text',transport=attachmentPrompt(dir,'gen1',[a.id],text);
+  const event={kind:'prompt.admitted',source:'owner_admin_console',commandId:'cmd',sessionGeneration:'gen1',payload:{text:{type:'text',text:transport}}};
+  expect(presentAttachmentEvent(dir,'agent',event)).toEqual(event);
+  prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],text,transport);
+  const visible:any=presentAttachmentEvent(dir,'agent',event);
+  expect(visible.payload.text.text).toBe(text);expect(visible.payload.attachments[0].url).toBe('/api/v1/roles/agent/attachments/'+a.id);
+  expect(JSON.stringify(visible)).not.toContain(dir);expect(readAgentAttachment(dir,a.id).bytes.toString()).toBe('exact file bytes');
+  expect(presentAttachmentEvent(dir,'agent',{...event,commandId:'other'})).toEqual({...event,commandId:'other'});
+  expect(presentAttachmentEvent(dir,'agent',{...event,payload:{text:{type:'text',text:'different'}}})).toEqual({...event,payload:{text:{type:'text',text:'different'}}});
+  expect(()=>prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],'conflict',transport)).toThrow();
+  prepareAttachmentPresentation(dir,'gen1','cmd',[a.id],text,transport);
+ });
+});

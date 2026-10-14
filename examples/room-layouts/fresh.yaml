@@ -1,0 +1,27 @@
+version: 1
+description: Separate participant keys create independent agent sessions for each room
+participants:
+  productArchitect:
+    agent_template: Architect
+  productReviewer:
+    agent_template: Reviewer
+  designArchitect:
+    agent_template: Architect
+  designDeveloper:
+    agent_template: Developer
+  designReviewer:
+    agent_template: Reviewer
+  deliveryDeveloper:
+    agent_template: Developer
+  deliveryReviewer:
+    agent_template: Reviewer
+rooms:
+  product:
+    goal: Agree on the problem and acceptance criteria
+    members: [productArchitect, productReviewer]
+  design:
+    goal: Design the accepted solution
+    members: [designArchitect, designDeveloper, designReviewer]
+  delivery:
+    goal: Implement and verify the accepted design
+    members: [deliveryDeveloper, deliveryReviewer]

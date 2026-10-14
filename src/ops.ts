@@ -1,3 +1,4 @@
+import { retireNotificationTarget } from './notifications/target-cleanup.js';
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, unlinkSync,
 } from 'node:fs';
@@ -9,10 +10,11 @@ import { findRole } from './config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
-import { resetRestartLedger } from './runner.js';
+import { managedCliBriefing } from './managed-cli.js';
+import { resetRestartLedger, loadTempRole } from './runner.js';
 import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
 import {
-  archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
+  archiveTempState, stopTempSupervisor, tempSupervisorLiveness, readTempSupervisor,
 } from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
 import {
@@ -84,7 +86,7 @@ export function applyRole(
   // brought up from so the supervised process can reload the SAME file instead of
   // silently falling back to the default ~/fleet.yaml. Temp roles snapshot their
   // whole resolved role into role.yaml instead and don't need this.
-  if (!opts.temp) writeFileSync(join(dir, '.config-path'), (opts.configPath ?? '') + '\n');
+  if (!opts.temp || opts.configPath) writeFileSync(join(dir, '.config-path'), (opts.configPath ?? '') + '\n');
   writeFileSync(join(dir, '.identity'), role.identity + '\n');
   if (role.cwd) writeFileSync(join(dir, '.cwd'), role.cwd + '\n');
   if (!existsSync(join(dir, '.session-id'))) writeFileSync(join(dir, '.session-id'), randomUUID() + '\n');
@@ -95,6 +97,7 @@ export function applyRole(
     routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
     identityGuarantee: opts.identityGuarantee,
     temporaryIdentity: opts.temp === true,
+    managedCli: managedCliBriefing(role, opts.configPath, opts.temp === true),
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });
@@ -274,8 +277,19 @@ export async function restartRoles(
   }
 }
 
+/** Read-only admission check shared by CLI removal and web preview, before any archive. */
+export function assertStandaloneRoleRemoval(cfg: FleetConfig, name: string): void {
+  if (cfg.roles.some(role => role.name === name) || !/^[A-Za-z0-9_-]+$/.test(name)) return;
+  const dir = agentDir(name, true);
+  if (!existsSync(dir)) return;
+  const taskId = readTempSupervisor(dir)?.taskOwner?.taskId
+    ?? (existsSync(join(dir, 'role.yaml')) ? loadTempRole(name).roomMemberStartup?.task_id : undefined);
+  if (taskId) throw Error(`TASK_MEMBER_IS_TASK_OWNED: ${name} belongs to task ${taskId}; use the owning task lifecycle; if its record is missing or corrupt, preserve evidence and restore the original records before retrying task delete`);
+}
+
 /** Stop + forget a role: unit, state dir, and its fleet.d file when spawned. */
 export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Promise<void> {
+  assertStandaloneRoleRemoval(cfg, name);
   const temporaryDir = /^[A-Za-z0-9_-]+$/.test(name) ? agentDir(name, true) : '';
   const configured = cfg.roles.find(role => role.name === name);
   if (!configured && temporaryDir && existsSync(temporaryDir)) {
@@ -312,6 +326,7 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
   rmSync(agentDir(name), { recursive: true, force: true });
   if (generatedSource && existsSync(role.sourceFile)) {
     unlinkSync(role.sourceFile);
+    await retireNotificationTarget(`/fleet/chats/agents/${encodeURIComponent(name)}`).catch(()=>{});
     deps.log(`removed ${role.sourceFile}`);
   }
   deps.log(`removed '${name}' (its ours identity is left intact)`);

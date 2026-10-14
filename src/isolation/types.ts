@@ -65,6 +65,11 @@ export interface WrapContext {
    * them for itself or for its peers.
    */
   harnessSharedPaths?: string[];
+  /**
+   * The pinned subscription profile home (CLAUDE_CONFIG_DIR / CODEX_HOME), mounted
+   * read-write so the CLI can refresh that profile's login. Absent for the default.
+   */
+  subscriptionHome?: string;
   /** Exact launcher/interpreter/module closure required by the selected command. */
   runtimeReadPaths?: string[];
   brokerEndpoint?: string;

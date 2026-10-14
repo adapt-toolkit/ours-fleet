@@ -1,3 +1,4 @@
+import type {TaskCreatedNotice,TaskNoticeBinding} from './task-notice.js';
 import type { SessionBackendId } from '../config.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
@@ -239,6 +240,8 @@ export interface SessionSnapshot {
   backend: SessionBackendId;
   alive: boolean;
   readiness: SessionReadiness;
+  /** Typed source of the active prompt; excludes prompt bodies and command IDs. */
+  activePromptSource?: PromptOrigin['kind'];
   sessionId?: string;
   lastError?: string;
   pendingPermissionId?: string;
@@ -377,12 +380,15 @@ export interface ConversationHandlePage {
  * on any concrete transport which implements it.
  */
 export interface AgentSession {
+  sendFileToChat?: (input: import('../file-delivery/types.js').FileDeliveryInput, signal: AbortSignal, copy: import('../file-delivery/types.js').CopyChatFile, policy: import('../config.js').CommonPermissions) => Promise<import('../file-delivery/types.js').DeliveredFile>;
   readonly backend: SessionBackendId;
   readonly pid: number;
   /** Live capabilities; optional only for source compatibility with external adapters. */
   readonly capabilities?: AgentSessionCapabilities;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  taskNoticeBinding?():TaskNoticeBinding|undefined;
+  recordTaskCreated?(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void;
   // ── durable conversation ledger ────────────────────────────────────────────
   conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
   conversationSnapshot?(): ConversationSnapshot;
@@ -393,6 +399,11 @@ export interface AgentSession {
    * Hand the session a prompt and return as soon as it has accepted
    * responsibility for it. Throws `SessionControlError` if it cannot.
    */
+  /**
+   * The turn that carries an admitted prompt when one adapter turn delivered
+   * several; absent means the prompt's own id is its turn id.
+   */
+  sharedTurnId?(promptId: string): string | undefined;
   queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
@@ -408,6 +419,9 @@ export interface AgentSession {
    * keep compiling. Read it through `interruptOutcome`, never directly.
    */
   interrupt(source?: TurnCancellationSource): Promise<InterruptResult>;
+  /** Atomically bind cancellation to one voice-owned turn. */
+  readonly liveVoiceSupported?: boolean;
+  interruptPrompt?(generation: string, promptId: string): Promise<InterruptResult>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(

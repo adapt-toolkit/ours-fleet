@@ -1,13 +1,24 @@
+import { gatewayFixture } from './gateway-fixture.js';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  resolveEndpoint, resolveApiToken, readDaemonConfig, filterEvents, formatNotificationLine,
-  looksModal, looksApiError, looksRunning, createMonitor, probeIdentityPresence,
+  filterEvents, formatNotificationLine,
+  looksModal, looksApiError, looksRunning, createMonitor, probeIdentityPresence as probeIdentityPresenceImpl,
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
+import { readClientProfile } from '../src/client-profile.js';
+
+const probeIdentityPresence: typeof probeIdentityPresenceImpl = (name, fetch, env, deps) =>
+  probeIdentityPresenceImpl(name, fetch, deps ? env : gatewayFixture(dir).env, deps ?? {
+    attachClient: async () => ({ identities: async () => {
+      const response = await fetch('https://gateway.test/daemon/identities');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return (await response.json()).identities;
+    }, close: async () => {} }),
+  });
 
 const CFG = (over: Partial<MonitorConfig> = {}): MonitorConfig => ({
   mode: 'fleet',
@@ -56,36 +67,71 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
     sleep: async (ms: number) => { clock += ms; await new Promise(r => setImmediate(r)); },
     now: () => clock,
     log: () => {},
-    env: {},
+    env: gatewayFixture(dir).env,
+    attachClient: async options => ({
+      unread: async () => ({ identities: [] }),
+      readNotificationPage: async (identity, optionsPage) => {
+        const response = await fetch(`${options.endpoint}/identities/${encodeURIComponent(identity)}/notifications?since=${optionsPage.since}`, { signal: optionsPage.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      }, close: async () => {},
+    }),
     timers: { set: () => 0 as unknown as ReturnType<typeof setTimeout>, clear: () => {} },
     ...over,
   };
 }
 
-// Hermetic base env: OURS_CONFIG points at a nonexistent path so no test ever
-// reads the real ~/.ours/config.json, and OURS_STATE_DIR isolates daemon-token.
-const NO_CONFIG = join(tmpdir(), 'ours-fleet-no-such-config-xyz.json');
-const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
-  OURS_CONFIG: NO_CONFIG, OURS_STATE_DIR: join(tmpdir(), 'ours-fleet-no-such-state-xyz'), ...over,
-});
+// Hermetic legacy config: an explicitly named missing config now fails closed,
+// so use a real empty legacy object while isolating daemon-token resolution.
+const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => {
+  const configPath = join(dir, 'legacy-config.json');
+  writeFileSync(configPath, '{}', { mode: 0o600 });
+  return {
+    OURS_CONFIG: configPath, OURS_STATE_DIR: join(dir, 'legacy-state'), ...over,
+  };
+};
 
-describe('resolveEndpoint', () => {
-  it('defaults to port 3050 and sends no token header when unset', () => {
-    const ep = resolveEndpoint(hermetic());
-    expect(ep.url('Alice')).toBe('http://127.0.0.1:3050/identities/Alice/notifications');
-    expect(ep.headers).toEqual({});
-  });
-  it('honors OURS_PORT and sends the token header when set', () => {
-    const ep = resolveEndpoint(hermetic({ OURS_PORT: '4000', OURS_API_TOKEN: 'sek' }));
-    expect(ep.url('A')).toContain(':4000/');
-    expect(ep.headers).toEqual({ 'x-ours-api-token': 'sek' });
-  });
-  it('url-encodes the identity name', () => {
-    expect(resolveEndpoint(hermetic()).url('a b')).toContain('/identities/a%20b/');
+describe('explicit gateway profile', () => {
+  it('requires shared gateway metadata and rejects missing, malformed or local selections', () => {
+    const { profile, env } = gatewayFixture(dir);
+    expect(readClientProfile(env)).toEqual({ ...profile, configPath: env.OURS_CONFIG });
+    for (const value of ['{}', '{broken', JSON.stringify({ endpoint: profile.endpoint })]) {
+      writeFileSync(env.OURS_CONFIG, value);
+      expect(() => readClientProfile(env)).toThrow(/gateway client profile/);
+    }
+    rmSync(env.OURS_CONFIG);
+    expect(() => readClientProfile(env)).toThrow(/selected profile is missing/);
   });
 });
 
 describe('probeIdentityPresence', () => {
+  it('reads identity presence from the explicitly selected SDK client', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    const expectedInstanceId = '80947c72-c514-46e8-94e9-c2847bf6e971';
+    writeFileSync(profilePath, JSON.stringify({
+      serverUrl: 'http://127.0.0.1:43117/base', endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
+    }), { mode: 0o600 });
+    const attached: Array<Record<string, unknown>> = [];
+    const result = await probeIdentityPresence(
+      'Temp', async () => { throw new Error('legacy/default probe must not run'); },
+      { OURS_CONFIG: profilePath },
+      { attachClient: async options => {
+        attached.push(options);
+        return {
+          identities: async () => [{ name: 'Temp', temporary: true, stale: false }],
+          close: async () => undefined,
+        };
+      } },
+    );
+
+    expect(result).toEqual({ state: 'present', temporary: true, stale: false });
+    expect(attached).toEqual([{
+      endpoint: 'http://127.0.0.1:43117/base/daemon', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.any(String), env: {},
+    }]);
+  });
+
   it('distinguishes an authoritative present identity from an authoritative absence', async () => {
     const present = await probeIdentityPresence('Temp', async () => ({
       status: 200, ok: true,
@@ -126,111 +172,6 @@ describe('probeIdentityPresence', () => {
     expect(transport.state).toBe('unknown');
     expect(auth.state).toBe('unknown');
     expect(malformed.state).toBe('unknown');
-  });
-});
-
-describe('token resolution (issue #17)', () => {
-  // Precedence chain: env OURS_API_TOKEN (trimmed) > config apiToken (trimmed)
-  // > <stateDir>/daemon-token. Config & daemon-token live under the temp `dir`.
-  const cfgPath = () => join(dir, 'config.json');
-  const writeCfg = (o: unknown) => writeFileSync(cfgPath(), JSON.stringify(o));
-  const writeToken = (sd: string, t: string) => { mkdirSync(sd, { recursive: true }); writeFileSync(join(sd, 'daemon-token'), t); };
-  const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv =>
-    ({ OURS_CONFIG: cfgPath(), OURS_STATE_DIR: join(dir, 'state'), ...over });
-  const tokenOf = (env: NodeJS.ProcessEnv) =>
-    resolveEndpoint(env).headers['x-ours-api-token'];
-
-  it('env token present → header uses env token', () => {
-    writeCfg({ apiToken: 'from-config' });
-    writeToken(join(dir, 'state'), 'from-file');
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: 'from-env' }))).toBe('from-env');
-  });
-
-  it('env token whitespace-only → falls through to config', () => {
-    writeCfg({ apiToken: 'from-config' });
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '   ' }))).toBe('from-config');
-  });
-
-  it('env token trimmed of surrounding whitespace', () => {
-    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '  padded  ' }))).toBe('padded');
-  });
-
-  it('no env → config apiToken (trimmed) wins over daemon-token', () => {
-    writeCfg({ apiToken: '  cfg-token  ' });
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('cfg-token');
-  });
-
-  it('config apiToken whitespace-only → ignored → falls through to daemon-token', () => {
-    writeCfg({ apiToken: '   ' });
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('file-token');
-  });
-
-  it('no env, no config → reads <stateDir>/daemon-token (trimmed)', () => {
-    writeToken(join(dir, 'state'), '  daemon-tok\n');
-    expect(tokenOf(baseEnv())).toBe('daemon-tok');
-  });
-
-  it('malformed config JSON → treated as absent → daemon-token', () => {
-    writeFileSync(cfgPath(), '{ this is not json ');
-    writeToken(join(dir, 'state'), 'file-token');
-    expect(tokenOf(baseEnv())).toBe('file-token');
-  });
-
-  it('nothing present anywhere → no token header', () => {
-    expect(resolveEndpoint(baseEnv()).headers).toEqual({});
-    expect(resolveApiToken(baseEnv())).toBeUndefined();
-  });
-
-  it('stateDir precedence: OURS_STATE_DIR wins over config.stateDir for daemon-token', () => {
-    const envSd = join(dir, 'env-state');
-    const cfgSd = join(dir, 'cfg-state');
-    writeCfg({ stateDir: cfgSd });
-    writeToken(envSd, 'from-env-statedir');
-    writeToken(cfgSd, 'from-cfg-statedir');
-    expect(tokenOf(baseEnv({ OURS_STATE_DIR: envSd }))).toBe('from-env-statedir');
-  });
-
-  it('stateDir precedence: config.stateDir used when OURS_STATE_DIR unset', () => {
-    const cfgSd = join(dir, 'cfg-state2');
-    writeCfg({ stateDir: cfgSd });
-    writeToken(cfgSd, 'from-cfg-statedir');
-    expect(tokenOf({ OURS_CONFIG: cfgPath() })).toBe('from-cfg-statedir');
-  });
-
-  it('port precedence: OURS_PORT > config.port > 3050', () => {
-    writeCfg({ port: 4100 });
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200' })).url('A')).toContain(':4200/');
-    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':4100/');
-    writeCfg({});
-    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
-  });
-
-  it('matches the daemon parseInt + nullish port semantics', () => {
-    writeCfg({ port: 4100 });
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200suffix' })).port).toBe(4200);
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: 'not-a-port' })).port).toBe(4100);
-    writeCfg({ port: 0 });
-    expect(resolveEndpoint(baseEnv()).port).toBe(0);
-    expect(resolveEndpoint(baseEnv({ OURS_PORT: '0' })).port).toBe(0);
-  });
-
-  it('unreadable daemon-token (chmod 000) → no throw, no token', () => {
-    const sd = join(dir, 'locked-state');
-    writeToken(sd, 'secret');
-    chmodSync(join(sd, 'daemon-token'), 0o000);
-    try {
-      expect(() => resolveApiToken(baseEnv({ OURS_STATE_DIR: sd }))).not.toThrow();
-      // On most CI runners chmod 000 blocks the read → undefined; if root can still
-      // read it, the token comes back — either way the call must not throw.
-    } finally {
-      chmodSync(join(sd, 'daemon-token'), 0o600);
-    }
-  });
-
-  it('readDaemonConfig returns {} on a missing file', () => {
-    expect(readDaemonConfig({ OURS_CONFIG: join(dir, 'nope.json') })).toEqual({});
   });
 });
 
@@ -403,6 +344,110 @@ describe('looksApiError / looksRunning (issue #19 turn-outcome heuristics)', () 
 });
 
 describe('Monitor.prime', () => {
+  it('retries an explicit profile after transient credential replacement auth failure', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    writeFileSync(profilePath, JSON.stringify({
+      serverUrl: 'http://127.0.0.1:43116', endpoint: 'http://127.0.0.1:43116/daemon',
+      expectedInstanceId: '7f970f0d-0d93-49c7-b6b5-b6cd94415187', credentialPath,
+    }), { mode: 0o600 });
+    let pageCalls = 0;
+    let attachments = 0;
+    let mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(async () => { throw new Error('legacy/default probe must not run'); }, {
+      env: { OURS_CONFIG: profilePath },
+      attachClient: async () => {
+        attachments++;
+        return {
+          unread: async () => ({ identities: [] }),
+          readNotificationPage: async () => {
+            if (++pageCalls === 1) throw new Error('readNotificationPage: HTTP 401');
+            mon.stop();
+            return { cursor: 19, events: [] };
+          },
+          close: async () => undefined,
+        };
+      },
+    });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(pageCalls).toBe(2);
+    expect(attachments).toBe(2);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed at /);
+  });
+
+  it('keeps one file-backed SDK page client across credential replacement', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    const expectedInstanceId = '1b8c7fce-f39d-4a78-b72c-e0a772889988';
+    writeFileSync(profilePath, JSON.stringify({
+      serverUrl: 'http://127.0.0.1:43119', endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
+    }), { mode: 0o600 });
+    writeFileSync(credentialPath, 'first-credential\n', { mode: 0o600 });
+
+    const attached: Array<Record<string, unknown>> = [];
+    const pages: Array<{ identity: string; since: number | 'tip'; credential: string }> = [];
+    const delivered: string[] = [];
+    let mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(async () => {
+      mon.stop();
+      return { status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) };
+    }, {
+      env: { OURS_CONFIG: profilePath },
+      attachClient: async options => {
+        attached.push(options);
+        return {
+          unread: async () => ({ identities: [] }),
+          readNotificationPage: async (identity, options = {}) => {
+            const credential = readFileSync(credentialPath, 'utf8').trim();
+            const since = options.since ?? 'tip';
+            pages.push({ identity, since, credential });
+            if (since === 'tip') return { cursor: 41, events: [] };
+            mon.stop();
+            return {
+              cursor: 72,
+              events: [{ event: 'message_received', from: 'Peer', msg_id: 9 }],
+            };
+          },
+          close: async () => undefined,
+        };
+      },
+      delivery: {
+        submit: async text => {
+          delivered.push(text);
+          return { succeeded: true, outcome: 'completed' };
+        },
+      },
+    });
+    mon = createMonitor({
+      name: 'Reviewer', identity: 'ProfileIdentity', agentDir: dir,
+      cfg: CFG({ batch_ms: 0 }), deps,
+    });
+
+    await mon.prime();
+    writeFileSync(credentialPath, 'rotated-credential\n', { mode: 0o600 });
+    await mon.run(1);
+
+    expect(attached).toEqual([{
+      endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
+    }, {
+      endpoint: 'http://127.0.0.1:43119/daemon', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
+      requestSignal: expect.any(AbortSignal),
+    }]);
+    expect(pages).toEqual([
+      { identity: 'ProfileIdentity', since: 'tip', credential: 'first-credential' },
+      { identity: 'ProfileIdentity', since: 41, credential: 'rotated-credential' },
+    ]);
+    expect(delivered).toEqual([
+      '[fleet-monitor] 1 new message from Peer (#9) — run get_messages',
+    ]);
+  });
+
   it('reports its stall detector explicitly instead of mislabeling its own abort', async () => {
     let timeout: (() => void) | undefined;
     const fetch: MonitorDeps['fetch'] = async (_url, init) => new Promise((_resolve, reject) => {
@@ -416,6 +461,7 @@ describe('Monitor.prime', () => {
     });
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
     const priming = mon.prime();
+    await new Promise(resolve => setImmediate(resolve));
     timeout?.();
     await priming;
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
@@ -467,18 +513,19 @@ describe('Monitor.prime', () => {
       .toMatchObject({ observedCursor: 128, deliveredCursor: 128, pending: null });
   });
 
-  it('marks failed and never injects on a 401', async () => {
+  it('marks gateway auth degraded so a repaired credential can recover', async () => {
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await mon.prime();
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/failed/);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded: auth/);
+    mon.stop();
     await mon.run(1);                       // must return immediately, no throw
   });
 
   it('names the selected config and token-file paths on a 401 without exposing the token', async () => {
     const configPath = join(dir, 'selected-profile.json');
     const stateDir = join(dir, 'selected-state');
-    writeFileSync(configPath, JSON.stringify({ apiToken: 'super-secret', stateDir }));
+    writeFileSync(configPath, JSON.stringify({ ...gatewayFixture(dir).profile, credentialPath: join(stateDir, 'daemon-token') }), { mode: 0o600 });
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const deps = makeDeps(fetch, { env: { OURS_CONFIG: configPath } });
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
@@ -495,6 +542,119 @@ describe('Monitor.prime', () => {
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await expect(mon.prime()).resolves.toBeUndefined();
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded/);
+  });
+});
+
+describe('Monitor initial unread work', () => {
+  it.each(['attach', 'unread'])('reports and recovers an initial %s authentication gap without exposing error bodies', async phase => {
+    const { fetch, calls } = scriptedFetch([{ cursor: 12, events: [] }]);
+    let attempts = 0, retries = 0, deliveries = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      sleep: async () => {
+        retries++;
+        const status = readFileSync(join(dir, '.monitor-status'), 'utf8');
+        expect(status).toMatch(/degraded: auth/);
+        expect(status).not.toContain('private-error-body');
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        expect(calls()).toHaveLength(1);
+      },
+      delivery: { submit: async () => {
+        deliveries++;
+        mon.stop();
+        return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => {
+      const fail = options.requestSignal && ++attempts === 1;
+      if (fail && phase === 'attach') throw new Error('attach: HTTP 401 private-error-body');
+      return { ...await attach(options), unread: async () => {
+        if (fail) throw new Error('unread: HTTP 401 private-error-body');
+        return { identities: [{ name: 'A', count: 1, files: 0 }] };
+      } };
+    };
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(attempts).toBe(2); expect(retries).toBe(1); expect(deliveries).toBe(1);
+    expect(calls()).toHaveLength(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed/);
+  });
+
+  it.each([false, true])('delivers a body-free backlog without consuming it (persisted cursor=%s)', async persisted => {
+    if (persisted) writeFileSync(join(dir, '.notify-cursor'), '12\n');
+    const { fetch } = scriptedFetch([{ cursor: 12, events: [] }]);
+    const delivered: string[] = [];
+    let probes = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      delivery: { submit: async text => {
+        delivered.push(text);
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        mon.stop();
+        return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => ({ ...await attach(options), unread: async () => {
+      probes++;
+      return { identities: [
+        { name: 'OtherIdentity', count: 99, files: 99 },
+        { name: 'A', count: 201, files: 2, recent: [{ from: 'private-name', text: 'private-body' }] },
+      ] };
+    } });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    expect(probes).toBe(0); // No pre-read on the protected readiness path.
+    await mon.run(1);
+    expect(probes).toBe(1);
+    expect(delivered).toEqual([
+      '[fleet-monitor] unread backlog: 201 messages, 2 files — run get_messages; drain remaining unread batches and authorize files before retrieving them',
+    ]);
+  });
+
+  it('retries a failed unread probe and a refused wake before polling/committing the stream', async () => {
+    const { fetch, calls } = scriptedFetch([{ cursor: 12, events: [] }]);
+    let probes = 0, deliveries = 0, mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, {
+      delivery: { submit: async () => {
+        expect(calls()).toHaveLength(1);
+        expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('12');
+        if (++deliveries === 1) return { succeeded: false, outcome: 'refused' };
+        mon.stop(); return { succeeded: true, outcome: 'completed' };
+      } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => ({ ...await attach(options), unread: async () => {
+      if (++probes === 1) throw new Error('private-error');
+      return { identities: [{ name: 'A', count: 1, files: 0 }] };
+    } });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(probes).toBe(3); expect(deliveries).toBe(2);
+    expect(calls()).toHaveLength(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed/);
+  });
+
+  it('leaves empty or other-identity inboxes idle and bounds the read-only probe', async () => {
+    let mon: ReturnType<typeof createMonitor>, signal: AbortSignal | undefined;
+    const { fetch } = scriptedFetch([{ cursor: 12, events: [] }, { cursor: 12, events: [] }], (_, n) => {
+      if (n === 1) mon.stop();
+    });
+    const delivered: string[] = [];
+    const deadlines: number[] = [];
+    const deps = makeDeps(fetch, {
+      timers: { set: (_, ms) => { deadlines.push(ms); return 0 as never; }, clear: () => {} },
+      delivery: { submit: async text => { delivered.push(text); return { succeeded: true, outcome: 'completed' }; } },
+    });
+    const attach = deps.attachClient!;
+    deps.attachClient = async options => {
+      if (options.requestSignal) signal = options.requestSignal;
+      return { ...await attach(options), unread: async () => ({ identities: [{ name: 'Other', count: 1, files: 0 }] }) };
+    };
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime(); await mon.run(1);
+    expect(delivered).toEqual([]);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(deadlines).toContain(5_000);
   });
 });
 

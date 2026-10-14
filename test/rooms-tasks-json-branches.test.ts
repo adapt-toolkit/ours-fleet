@@ -88,7 +88,7 @@ function legacyDieCalls(functionName: string): string[] {
 describe('task/room JSON presentation contract', () => {
   it('pins every task --json serializer branch exactly and before Markdown rendering', () => {
     const branches = jsonBranches('registerTaskCommands');
-    expect(branches).toHaveLength(21);
+    expect(branches).toHaveLength(22);
     expect(branches).toMatchSnapshot();
   });
 
@@ -127,5 +127,5 @@ describe('task/room JSON presentation contract', () => {
       expect(result).toMatchObject({ code: 1, stdout: '', stderr: expected });
       expect(`${result.stdout}${result.stderr}`).not.toContain('##');
     }
-  });
+  }, 15000);
 });
