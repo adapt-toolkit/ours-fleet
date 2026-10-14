@@ -238,7 +238,7 @@ describe('subscription service', () => {
     const svc = service();
     const first = await svc.startLogin('claude', 'b');
     svc.login(first.loginId, 'b').submitCode('good-code#state123');
-    await svc.login(first.loginId, 'b').done;
+    expect(await svc.login(first.loginId, 'b').done).toBe(true);
     const second = await svc.startLogin('claude', 'b');
     svc.login(second.loginId, 'b').submitCode('good-code#state123');
     await svc.login(second.loginId, 'b').done;

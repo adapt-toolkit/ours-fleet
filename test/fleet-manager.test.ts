@@ -97,7 +97,7 @@ describe('Fleet parent lifecycle', () => {
   }, 15000);
   it('registering permanent, temporary and task members keeps the installed unit and existing process unchanged', async () => {
     const calls: string[][] = [];
-    const exec = async (cmd: string, args: string[]) => { calls.push([cmd, ...args]); return { code: 0, stdout: 'active\nrunning\n', stderr: '' }; };
+    const exec = async (cmd: string, args: string[]) => { if (cmd === 'ps') return realExec(cmd, args); calls.push([cmd, ...args]); return { code: 0, stdout: 'active\nrunning\n', stderr: '' }; };
     await fleetHostBackend(exec, 'linux').init('/installed/release/cli.js');
     const path = join(root, '.config/systemd/user/ours-fleet.service');
     const bytes = readFileSync(path), mtime = statSync(path).mtimeMs; calls.length = 0;
@@ -125,6 +125,7 @@ describe('Fleet parent lifecycle', () => {
   it('up of one permanent leaves another legacy role and its native plist untouched', async () => {
     const calls: string[][] = [];
     const exec = async (cmd: string, args: string[]) => {
+      if (cmd === 'ps') return realExec(cmd, args);
       calls.push([cmd, ...args]);
       if (args.some(arg => arg.includes('network.ours.fleet.Other'))) throw Error('other role must not be inspected');
       return { code: 0, stdout: 'state = running', stderr: '' };
