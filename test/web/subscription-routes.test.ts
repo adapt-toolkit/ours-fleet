@@ -75,7 +75,7 @@ describe('subscription routes', () => {
       await new Promise(r => setTimeout(r, 50));
       view = (await server.app.inject({ method: 'GET', url: `/api/v1/subscriptions/claude/logins/${loginId}`, headers: h })).json();
     }
-    expect(view.state).toBe('succeeded');
+    expect(view.state, view.error).toBe('succeeded');
     const list = await server.app.inject({ method: 'GET', url: '/api/v1/subscriptions', headers: h });
     const bodies = [start.body, submitted.body, JSON.stringify(view), list.body].join('\n');
     expect(bodies).not.toContain(code);

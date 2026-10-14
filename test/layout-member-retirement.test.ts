@@ -2,6 +2,15 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// Erasure rechecks the archived supervisor through the default OS adapter.
+// This synthetic unit never exists on the host (including non-systemd hosts).
+vi.mock('../src/exec.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/exec.js')>();
+  return { ...actual, realExec: (...args: Parameters<typeof actual.realExec>) =>
+    args[0] === 'systemctl' && args[1].includes('isolated-layout.service')
+      ? Promise.resolve({ code: 0, stdout: 'inactive\n', stderr: '' })
+      : actual.realExec(...args) };
+});
 const releaseOwned = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('../src/agent-ours/service.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/agent-ours/service.js')>(), releaseManagedAgent: releaseOwned,
