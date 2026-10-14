@@ -17,6 +17,7 @@ CLI_PKG=package.json
 PLUGIN_PKG=integrations/claude-code/package.json
 CODEX_PLUGIN_PKG=integrations/codex/ours-fleet/package.json
 CODEX_MANIFEST=integrations/codex/ours-fleet/.codex-plugin/plugin.json
+CLAUDE_MANIFEST=integrations/claude-code/.claude-plugin/plugin.json
 CLI_NAME="@ours.network/fleet"
 PLUGIN_NAME="@ours.network/fleet-claude-code"
 CODEX_PLUGIN_NAME="@ours.network/fleet-codex"
@@ -90,12 +91,16 @@ patch_version "$CLI_PKG" "$cli_old" "$cli_new"
 patch_version "$PLUGIN_PKG" "$plug_old" "$plug_new"
 patch_version "$CODEX_PLUGIN_PKG" "$codex_old" "$codex_new"
 patch_version "$CODEX_MANIFEST" "$codex_old" "$codex_new"
+# The Claude native manifest ships inside @ours.network/fleet-claude-code and
+# follows that package's version.
+claude_manifest_old=$(jq -r .version "$CLAUDE_MANIFEST")
+patch_version "$CLAUDE_MANIFEST" "$claude_manifest_old" "$plug_new"
 
 npm install --package-lock-only --ignore-scripts >/dev/null
 
 git config user.name  "ours-ci-version-bump[bot]"
 git config user.email "ours-ci-version-bump[bot]@users.noreply.github.com"
-git add "$CLI_PKG" "$PLUGIN_PKG" "$CODEX_PLUGIN_PKG" "$CODEX_MANIFEST" package-lock.json
+git add "$CLI_PKG" "$PLUGIN_PKG" "$CODEX_PLUGIN_PKG" "$CODEX_MANIFEST" "$CLAUDE_MANIFEST" package-lock.json
 git diff --cached --quiet && no_bump "no changes after patch"
 
 git commit -m "chore(release): fleet v${cli_new}, fleet-claude-code v${plug_new}, fleet-codex v${codex_new} [skip ci]
