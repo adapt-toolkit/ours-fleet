@@ -42,6 +42,7 @@ versions the upstream `main` bump jobs are expected to produce.
 
 ## Features
 
+- Adopt canonical conversation notification routes.
 - renew the live-voice stream across access credentials
 - rotate App browser link credentials
 - deliver every waiting message in one turn at a boundary
