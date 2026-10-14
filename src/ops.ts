@@ -326,7 +326,7 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
   rmSync(agentDir(name), { recursive: true, force: true });
   if (generatedSource && existsSync(role.sourceFile)) {
     unlinkSync(role.sourceFile);
-    await retireNotificationTarget(`/fleet/chats?chat=${encodeURIComponent(name)}`).catch(()=>{});
+    await retireNotificationTarget(`/fleet/chats/agents/${encodeURIComponent(name)}`).catch(()=>{});
     deps.log(`removed ${role.sourceFile}`);
   }
   deps.log(`removed '${name}' (its ours identity is left intact)`);

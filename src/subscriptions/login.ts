@@ -107,14 +107,27 @@ export class ClaudeLogin extends BaseLogin {
   private child?: ChildProcessWithoutNullStreams;
   private output = '';
   private submitted = false;
+  private continued = false;
   /** Resolves with the CLI exit status once it exits. */
   exited: Promise<number | null>;
 
   constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string) {
     super('claude', owner, 'paste_code');
-    const child = spawn(bins.script, ['-qefc', `${shellQuote(bins.claude)} auth login`, '/dev/null'], {
-      env: profileEnv('CLAUDE_CONFIG_DIR', profileId, home), stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const darwin = process.platform === 'darwin';
+    const args = darwin
+      ? ['-q', '/dev/null', bins.claude, 'auth', 'login']
+      : ['-qefc', `${shellQuote(bins.claude)} auth login`, '/dev/null'];
+    // BSD script accepts a real pipe, but rejects Node's socket-backed stdin.
+    // Own the pipeline as one process group so cancellation also stops cat.
+    const child = spawn(darwin ? '/bin/sh' : bins.script, darwin
+      ? ['-c', '/bin/cat 3>&- | { "$@" 3>&-; result=$?; printf "%s\\n" "$result" >&3; exit "$result"; }', 'fleet-claude-login', bins.script, ...args] : args, {
+      detached: darwin,
+      env: profileEnv('CLAUDE_CONFIG_DIR', profileId, home),
+      stdio: darwin ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+    }) as ChildProcessWithoutNullStreams;
+    // The terminal has exited; release cat's input so the shell can finish.
+    // Only the shell owns fd 3. Final close remains the authoritative status.
+    if (darwin) child.stdio[3]?.once('data', () => child.stdin.end());
     this.child = child;
     child.stdin.on('error', () => { /* CLI exited; handled by 'close' */ });
     const onData = (chunk: Buffer) => {
@@ -129,13 +142,16 @@ export class ClaudeLogin extends BaseLogin {
         }
       }
       // Claude asks for Enter after success; the answer carries no secret.
-      if (this.submitted && /press enter/i.test(this.output)) child.stdin.write('\r');
+      if (this.submitted && !this.continued && /press enter/i.test(this.output)) {
+        this.continued = true;
+        child.stdin.write('\r');
+      }
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
     this.exited = new Promise(resolve => {
       child.once('error', () => { this.end('failed', 'could not start the sign-in'); resolve(null); });
-      child.once('close', code => resolve(code));
+      child.once('close', code => { this.child = undefined; resolve(code); });
     });
   }
 
@@ -149,7 +165,11 @@ export class ClaudeLogin extends BaseLogin {
     this.child?.stdin.write(`${code}\r`);
   }
 
-  protected stop(): void { this.child?.kill('SIGTERM'); }
+  protected stop(): void {
+    if (process.platform === 'darwin' && this.child?.pid) {
+      try { process.kill(-this.child.pid, 'SIGTERM'); } catch { /* already exited */ }
+    } else this.child?.kill('SIGTERM');
+  }
 }
 
 /** Codex device-code login through the app-server's supported account API. */

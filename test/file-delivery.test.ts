@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, rmSync, appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { Duplex } from 'node:stream';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -13,15 +14,16 @@ import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { conversationEventVisible, conversationHasAttachment } from '../src/application/conversation-history.js';
 import { ArtifactStore, readDeliveredFile } from '../src/file-delivery/store.js';
 import { AcpSession } from '../src/session/acp.js';
+const linuxIt = it.skipIf(process.platform !== 'linux');
 const dirs: string[]=[]; const sessions: AcpSession[]=[];
 afterEach(async()=>{for(const s of sessions.splice(0))await s.close();for(const p of dirs.splice(0))rmSync(p,{recursive:true,force:true});delete process.env.OURS_FLEET_HOME;});
-function temp(){mkdirSync(resolve('test-output'),{recursive:true});const p=mkdtempSync(resolve('test-output/file-delivery-'));dirs.push(p);return p;}
+function temp(){const p=mkdtempSync(join(tmpdir(),'file-delivery-'));dirs.push(p);return p;}
 const signal=()=>new AbortController().signal;
 const binding={sessionGeneration:'g',acpSessionId:'actual',turnId:'t'};
 const policy={approval:'allow',filesystem:'workspace',unattended:'deny'} as const;
 async function live(){const dir=temp(); const s=await AcpSession.start({name:'A',argv:[process.execPath,resolve('test/fixtures/acp-agent.mjs')],cwd:dir,env:{},stateDir:dir,mode:'fresh',permissions:policy,log:()=>{}});sessions.push(s);return {dir,s};}
 async function running(s:AcpSession){const task=s.submitPrompt('block 20000');await new Promise<void>((r,j)=>{const stop=setTimeout(()=>j(Error('no turn')),2000);const check=()=>{if(s.snapshot().readiness==='running'){clearTimeout(stop);r();}else setTimeout(check,5);};check();});return {task};}
-it('reader accepts the provided path anywhere: relative, parent-relative, absolute, hidden and through a symlinked ancestor',async()=>{
+linuxIt('reader accepts the provided path anywhere: relative, parent-relative, absolute, hidden and through a symlinked ancestor',async()=>{
  const base=temp(),cwd=join(base,'work'),outside=join(base,'.hidden','elsewhere');mkdirSync(cwd);mkdirSync(outside,{recursive:true});
  writeFileSync(join(cwd,'in.bin'),'in');writeFileSync(join(outside,'out.bin'),'out');writeFileSync(join(outside,'.env'),'dot');symlinkSync(outside,join(cwd,'linked-dir'));
  for(const [path,bytes] of [['in.bin','in'],['./in.bin','in'],['../.hidden/elsewhere/out.bin','out'],[join(outside,'out.bin'),'out'],[join(outside,'.env'),'dot'],['linked-dir/out.bin','out']]){
@@ -29,7 +31,7 @@ it('reader accepts the provided path anywhere: relative, parent-relative, absolu
   try{expect((await opened.file.readFile()).toString()).toBe(bytes);expect(opened.path).toBe(path.startsWith('linked-dir')?join(outside,'out.bin'):resolve(cwd,path));}finally{await opened.file.close();}
  }
 });
-it('reader keeps ordinary file integrity checks and names each refusal',async()=>{
+linuxIt('reader keeps ordinary file integrity checks and names each refusal',async()=>{
  const cwd=temp();writeFileSync(join(cwd,'file.bin'),'abc');symlinkSync(join(cwd,'file.bin'),join(cwd,'link'));linkSync(join(cwd,'file.bin'),join(cwd,'hard'));mkdirSync(join(cwd,'dir'));
  execFileSync('mkfifo',[join(cwd,'fifo')]);writeFileSync(join(cwd,'single.bin'),'abc');
  const big=join(cwd,'big.bin');fs.closeSync(fs.openSync(big,'w'));fs.truncateSync(big,MAX_FILE_BYTES+1);
@@ -58,7 +60,7 @@ function chatFiles(cwd:string){
  return files;
 }
 const extra=()=>({requestId:randomUUID(),signal:signal()}) as never;
-it('default handler needs no Agent setting: sends an out-of-tree absolute path on the live ACP turn with exact bytes',async()=>{
+linuxIt('default handler needs no Agent setting: sends an out-of-tree absolute path on the live ACP turn with exact bytes',async()=>{
  const base=temp();process.env.OURS_FLEET_HOME=base;mkdirSync(join(base,'.ours-fleet'));const {dir,s}=await live();writeFileSync(join(dir,'.session-id'),randomUUID());
  const outside=join(base,'.elsewhere');mkdirSync(outside);const bytes=Buffer.from([0,255,128,42,10,0,64]);writeFileSync(join(outside,'report.pdf'),bytes);
  // A role as resolved from a manifest with no file_delivery block at all.
@@ -82,7 +84,7 @@ it('default handler needs no Agent setting: sends an out-of-tree absolute path o
  expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(3);
  await s.interrupt();await task;
 });
-it('a source changed while it is read is refused and never published',async()=>{
+linuxIt('a source changed while it is read is refused and never published',async()=>{
  const base=temp();process.env.OURS_FLEET_HOME=base;mkdirSync(join(base,'.ours-fleet'));const {dir,s}=await live();writeFileSync(join(dir,'.session-id'),randomUUID());
  const path=join(dir,'growing.txt');writeFileSync(path,'abc');const files=chatFiles(dir);
  const store=new ArtifactStore(dir);const copy=store.copy.bind(store);
@@ -92,7 +94,7 @@ it('a source changed while it is read is refused and never published',async()=>{
  await expect(handler({path:'growing.txt'},extra(),files)).rejects.toThrow(/CHAT_FILE_CHANGED|SOURCE_SIZE_CHANGED/);
  expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);await s.interrupt();await task;
 });
-it('Fleet private state is refused by provided path before approval and by real path after open',async()=>{
+linuxIt('Fleet private state is refused by provided path before approval and by real path after open',async()=>{
  const base=temp(),secret=join(base,'private-ours');mkdirSync(secret);writeFileSync(join(secret,'token'),'secret');symlinkSync(secret,join(base,'alias'));
  let approvals=0,copies=0;const sender=async(_i:any,_s:any,copy:any)=>{approvals++;return copy(binding);};
  const handler=currentChatFileHandler({role:{harness:'codex',session:'acp',permissions:policy},cwd:base,sender:()=>sender as never,privateState:[secret],
@@ -112,7 +114,7 @@ it('a supported role whose session exposes no chat sender reports that precisely
  const handler=currentChatFileHandler({role:{harness:'codex',session:'acp',permissions:policy},cwd:'/work',sender:()=>undefined,privateState:[],store:{copy:async()=>{throw Error('unexpected');}}});
  await expect(handler({path:'x'},extra(),{} as never)).rejects.toThrow('CURRENT_CHAT_DELIVERY_UNAVAILABLE: this session has no ACP chat to attach to');
 });
-it('private immutable copy retains original bytes, rejects short/oversized input, and manual repetition is independent',async()=>{
+linuxIt('private immutable copy retains original bytes, rejects short/oversized input, and manual repetition is independent',async()=>{
  const dir=temp();process.env.OURS_FLEET_HOME=dir;mkdirSync(join(dir,'.ours-fleet'));const state=join(dir,'role');mkdirSync(state);writeFileSync(join(state,'.session-id'),randomUUID());const store=new ArtifactStore(state);let closed=0;
  const source=(size=3)=>({size,body:new Blob(['abc']).stream(),close:async()=>{closed++;}});
  const a=await store.copy(source(),'file.html','text/html',binding,signal()), b=await store.copy(source(),'file.html','text/html',binding,signal());
@@ -169,7 +171,7 @@ it('injected steering revokes both later sends and publication of a copy already
  const next=await running(s);await s.sendFileToChat({path:'deliverables/x'},signal(),async b=>({id:randomUUID(),name:'x',mimeType:'text/plain',size:1,sha256:'x',...b}),policy);await s.interrupt();await next.task;
 });
 
-it('metadata sync failure returns failure without a receipt, publication or automatic second attempt',async()=>{
+linuxIt('metadata sync failure returns failure without a receipt, publication or automatic second attempt',async()=>{
  const {dir,s}=await live();process.env.OURS_FLEET_HOME=dir;mkdirSync(join(dir,'.ours-fleet'));writeFileSync(join(dir,'.session-id'),randomUUID());
  const store=new ArtifactStore(dir);const {task}=await running(s);let attempts=0,metadataSyncs=0;
  const original=fs.fsyncSync;const sync=vi.spyOn(fs,'fsyncSync').mockImplementation(fd=>{
@@ -185,7 +187,7 @@ it('metadata sync failure returns failure without a receipt, publication or auto
  }finally{sync.mockRestore();await s.interrupt();await task;}
 });
 
-it.each(['private-file-delivery','state root'])('%s directory sync failure prevents first attachment publication',async level=>{
+linuxIt.each(['private-file-delivery','state root'])('%s directory sync failure prevents first attachment publication',async level=>{
  const {dir,s}=await live();process.env.OURS_FLEET_HOME=dir;const stateRoot=join(dir,'.ours-fleet');mkdirSync(stateRoot,{mode:0o700});writeFileSync(join(dir,'.session-id'),randomUUID());
  const store=new ArtifactStore(dir);const {task}=await running(s);let attempts=0,parentSyncs=0;
  const probe=await openDirectory(dir);const prototype=Object.getPrototypeOf(probe);const original=prototype.sync;await probe.close();
@@ -201,4 +203,11 @@ it.each(['private-file-delivery','state root'])('%s directory sync failure preve
   expect(parentSyncs).toBe(1);expect(attempts).toBe(1);
   expect(s.conversationPage({}).events.filter(e=>e.kind==='file.attached')).toHaveLength(0);
  }finally{sync.mockRestore();await s.interrupt();await task;}
+});
+
+it.runIf(process.platform !== 'linux')('refuses kernel file reads on unsupported hosts', async () => {
+ await expect(openChatFile(temp(), 'file')).rejects.toThrow('CHAT_FILE_REQUIRES_LINUX');
+});
+it.runIf(process.platform !== 'linux')('refuses rooted directory access on unsupported hosts', async () => {
+ await expect(openDirectory(temp())).rejects.toThrow('FILE_DELIVERY_REQUIRES_LINUX_ROOT');
 });

@@ -1,5 +1,5 @@
 import { roomsDir } from '../rooms-tasks/room-state.js';
-import { drainNotificationTargetCleanup } from './target-cleanup.js';
+import { drainNotificationTargetCleanup, notificationAgentId } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -46,7 +46,7 @@ export class FleetNotificationProducer {
   }
   poll(): void {
     this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(url)=>{
-      const name=new URL(url,'https://ours.invalid').searchParams.get('chat');
+      const name=notificationAgentId(url);
       if(!name || !/^[A-Za-z0-9_-]+$/.test(name))return false;
       // A recreated or retained role still has a valid target. Filesystem errors cannot prove removal.
       for(const root of this.roots){try{lstatSync(join(root,name));return false;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}
@@ -77,7 +77,7 @@ export class FleetNotificationProducer {
           const key = createHash('sha256').update(roleDir).digest('hex');
           outbox = new NotificationOutbox(join(this.stateDir, key + '.json'), this.config,
             async (value, eventId) => ({ eventId, title: `${roleId}: agent completed`, body: 'Your agent finished responding. Open the chat to view the result.',
-              url: `/fleet/chats?chat=${encodeURIComponent(roleId)}&detail=1`, ...(value as object) }), this.warn);
+              url: `/fleet/chats/agents/${encodeURIComponent(roleId)}`, ...(value as object) }), this.warn);
           if (!outbox.checkpoint) {
             const segment = this.existing.has(roleDir) ? segments.at(-1)! : segments[0];
             outbox.saveCheckpoint({ segment, offset: this.existing.has(roleDir) ? statSync(join(dir, segment)).size : 0, prompts: [] });
@@ -119,7 +119,7 @@ export class FleetNotificationProducer {
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats?chat=${encodeURIComponent(roleId)}&detail=1#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats/agents/${encodeURIComponent(roleId)}#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;

@@ -1,10 +1,10 @@
 import { fleetHostBackend } from '../../src/supervisor/fleet.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RoleRemovalService } from '../../src/application/role-removal-service.js';
-import { agentDir } from '../../src/paths.js';
+import { agentDir, stateRoot } from '../../src/paths.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../../src/temp-lifecycle.js';
 import { writeV2Fixture } from '../v2-fixture.js';
 import {
@@ -85,7 +85,8 @@ describe('safe web role removal', () => {
   });
 
   it('fails closed on case-fold collisions and cleans orphaned failed-start state', async () => {
-    const collision = fixture('  Coordinator: {}\n  coordinator: {}\n');
+    const collision = fixture('  Coordinator: {}\n');
+    mkdirSync(agentDir('coordinator'), { recursive: true });
     expect(() => collision.service.previewWeb('coordinator')).toThrow(/case-fold collision/);
     const orphan = fixture('  Stable: {}\n');
     mkdirSync(agentDir('dangling'), { recursive: true });
@@ -129,4 +130,21 @@ describe('safe web role removal', () => {
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
     expect(existsSync(join(root, '.ours-fleet', 'recovery', 'temporary'))).toBe(true);
   });
+});
+
+it.each(['direct','web'])('queues canonical notification retirement only after authorized %s removal',async(surface)=>{
+ const oldOrigin=process.env.OURS_NOTIFICATIONS_ORIGIN,oldToken=process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;
+ process.env.OURS_NOTIFICATIONS_ORIGIN='http://127.0.0.1:1';process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN='t'.repeat(40);
+ try{
+  const {root,service}=fixture(surface==='direct'?'  Worker: {}\n':'  Stable: {}\n');mkdirSync(agentDir('Worker'),{recursive:true});
+  if(surface==='direct')recordGeneratedAgentSource(agentDir('Worker'),join(root,'fleet.yaml'),join(root,'fleet','agents','Worker.yaml'));
+  if(surface==='direct')await service.removeDirect({actor:{kind:'local_control',surface:'cli'},role:'Worker'});
+  else await service.removeWeb({role:'Worker',confirmation:'Worker'});
+  const dir=join(stateRoot(),'notifications','removed-targets');
+  expect(readdirSync(dir)).toHaveLength(1);
+  expect(JSON.parse(readFileSync(join(dir,readdirSync(dir)[0]),'utf8'))).toEqual({url:'/fleet/chats/agents/Worker'});
+ }finally{
+  if(oldOrigin===undefined)delete process.env.OURS_NOTIFICATIONS_ORIGIN;else process.env.OURS_NOTIFICATIONS_ORIGIN=oldOrigin;
+  if(oldToken===undefined)delete process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;else process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN=oldToken;
+ }
 });

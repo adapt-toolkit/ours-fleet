@@ -8,7 +8,7 @@
  * instant MODULE_NOT_FOUND exit (or a server that never starts). Building
  * once here — before any test file runs — removes the race entirely.
  */
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { realExec } from '../src/exec.js';
 
@@ -44,7 +44,23 @@ function distIsFresh(): boolean {
   }
 }
 
-export default async function setup(): Promise<void> {
+export default async function setup(): Promise<() => void> {
+  // Keep socket paths short and fixtures outside this package's ESM/module tree.
+  // A private home also prevents tests from reading the operator's credentials.
+  const root = mkdtempSync(join(realpathSync('/tmp'), 'fleet-'));
+  const original = { ...process.env };
+  for (const [key, name] of Object.entries({ TMPDIR: 't', TMP: 't', TEMP: 't', HOME: 'h',
+    XDG_CONFIG_HOME: 'c', XDG_CACHE_HOME: 'c', XDG_RUNTIME_DIR: 'r' })) {
+    const path = join(root, name);
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+    process.env[key] = path;
+  }
+  for (const key of ['OURS_FLEET_HOME', 'OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'OURS_FLEET_SOCKET_ROOT']) delete process.env[key];
+  const cleanup = () => {
+    for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key];
+    Object.assign(process.env, original);
+    rmSync(root, { recursive: true, force: true });
+  };
   // The test runner itself may be launched from a managed Agent. Child CLI
   // fixtures exercise direct/operator behavior unless a test explicitly sets
   // the proxy pair, so do not accidentally audit the test harness as commands.
@@ -52,9 +68,10 @@ export default async function setup(): Promise<void> {
   delete process.env.OURS_FLEET_PROXY_CALLER;
   if (distIsFresh()) {
     console.log('[global-setup] dist fresh — skipping build');
-    return;
+    return cleanup;
   }
   console.log('[global-setup] building…');
   const r = await realExec('npm', ['run', 'build']);
-  if (r.code !== 0) throw new Error(`build failed: ${r.stderr}`);
+  if (r.code !== 0) { cleanup(); throw new Error(`build failed: ${r.stdout}\n${r.stderr}`); }
+  return cleanup;
 }

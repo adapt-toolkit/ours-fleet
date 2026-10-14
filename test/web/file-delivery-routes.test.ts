@@ -9,7 +9,7 @@ import { buildWebServer } from '../../src/web/server.js';
 import { ArtifactStore,artifactDirectory } from '../../src/file-delivery/store.js';
 import { ConversationEventStore } from '../../src/session/conversation-store.js';
 const boundary={origin:'http://127.0.0.1:49271',host:'127.0.0.1:49271'};
-it('only authenticated published files in this role incarnation download as safe attachments; original bytes survive restart',async()=>{
+it.skipIf(process.platform !== 'linux')('only authenticated published files in this role incarnation download as safe attachments; original bytes survive restart',async()=>{
  mkdirSync(resolve('test-output'),{recursive:true});const dir=mkdtempSync(resolve('test-output/file-http-'));process.env.OURS_FLEET_HOME=dir;mkdirSync(join(dir,'.ours-fleet'));
  const state=join(dir,'Alpha'),other=join(dir,'Beta');for(const p of[state,other]){mkdirSync(p);writeFileSync(join(p,'.session-id'),randomUUID());}
  const bytes=Buffer.from([0,255,128,10,60,115,99,114,105,112,116,62]);

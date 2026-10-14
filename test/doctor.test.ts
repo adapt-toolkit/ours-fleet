@@ -30,12 +30,14 @@ const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike
 };
 
 let dir: string;
-const PROFILE_ENV_KEYS = ['OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN'] as const;
+const PROFILE_ENV_KEYS = ['OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN', 'XDG_RUNTIME_DIR'] as const;
 let savedProfileEnv: Partial<Record<(typeof PROFILE_ENV_KEYS)[number], string | undefined>>;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-'));
   process.env.OURS_FLEET_HOME = dir;   // empty config → no harness checks unless --harness
   savedProfileEnv = Object.fromEntries(PROFILE_ENV_KEYS.map(k => [k, process.env[k]]));
+  process.env.XDG_RUNTIME_DIR = join(dir, 'runtime');
+  mkdirSync(process.env.XDG_RUNTIME_DIR, { mode: 0o700 });
   process.env.OURS_CONFIG = gatewayFixture(dir).env.OURS_CONFIG;
   delete process.env.OURS_STATE_DIR;
   delete process.env.OURS_PORT;
