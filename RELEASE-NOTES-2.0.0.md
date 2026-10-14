@@ -12,9 +12,10 @@ hand.
 
 ## Breaking changes
 
-- Requires the SDK 4 line (standalone `@ours.network/daemon`, external host
-  history storage with no migration of old daemon state, explicit shared-gateway
-  client selection). See ours-sdk `RELEASE-NOTES-4.0.0.md`.
+- Requires the SDK 4 line: default client attach goes through a saved shared
+  gateway client profile, legacy environment daemon selection is rejected, and
+  the daemon runtime ships separately as `@ours.network/daemon`. See ours-sdk
+  `RELEASE-NOTES-4.0.0.md`.
 - One OS-managed Fleet parent service (`ours-fleet.service` / `network.ours.fleet`)
   supervises permanent and task agents; per-agent boot and intermediate task
   services are retired. Existing installations migrate proven permanent services
