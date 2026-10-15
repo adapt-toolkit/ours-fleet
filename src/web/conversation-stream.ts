@@ -123,7 +123,7 @@ export function registerConversationStream(app: FastifyInstance, services: WebSe
       const replaced=lifetime!==undefined && lifetime!==state.roleLifetime;
       const nextAvailable=state.availability==='available' && state.health==='healthy';
       if(replaced || !nextAvailable)stopFollow();
-      if(state.health!=='healthy')resync(state.failure ?? 'role-observation-unavailable',false);
+      if(state.health!=='healthy')resync(state.failure ?? 'role-observation-unavailable',state.health !== 'unsupported');
       else if(replaced)resync('role-replaced');
       const shouldOpen=nextAvailable && (!available || replaced);
       lifetime=state.roleLifetime;available=nextAvailable;
@@ -140,6 +140,6 @@ export function registerConversationStream(app: FastifyInstance, services: WebSe
       if(ended){owner.dispose();return;}
       changed(owner.snapshot());
       timer=setInterval(()=>{if(valid())writer.send('keepalive',{at:Date.now()});},1_000);timer.unref();
-    } catch {resync('role-observation-unavailable',false);close();}
+    } catch {resync('role-observation-unavailable');close();}
   });
 }
