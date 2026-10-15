@@ -1,3 +1,4 @@
+import { ConversationObservation } from './conversation-observation.js';
 import type { FileDeliveryInput, CopyChatFile, DeliveredFile } from '../file-delivery/types.js';
 import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -15,7 +16,8 @@ import type { AcpMcpServer } from '../harness/types.js';
 import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
-  ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
+  ConversationEventV1, ConversationObservationState, ConversationSnapshot, ConversationSource,
+  PermissionRequestedPayload, PromptOrigin, PromptReceipt,
   SubmitPromptCommand, TurnCompletedPayload,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
@@ -39,6 +41,7 @@ import type {
 } from './types.js';
 
 interface PendingPermission {
+  presented?: PermissionRequestedPayload;
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
   /** Real ACP ID used only for lifecycle tracking; never emit this for scheduled loops. */
@@ -401,7 +404,9 @@ export class AcpSession implements AgentSession {
   private readonly sharedTurns = new Map<string, string>();
   /** Commands the adapter currently advertises; only these are control operations. */
   private advertisedCommands = new Set<string>();
+  private presentedCommands: ConversationObservationState['commands'] = [];
   private queueDepth = 0;
+  private readonly observation = new ConversationObservation(() => this.captureObservation());
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
   private agentCapabilities?: acp.AgentCapabilities;
@@ -475,6 +480,9 @@ export class AcpSession implements AgentSession {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
     this.conversationStartCursor = this.conversation.lastCursor();
+    // A durable append can precede its inventory mutation. Capture only after
+    // the synchronous owner checkpoint, never the state at append notification.
+    this.conversation.subscribe(() => this.observation.scheduleCapture());
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
     // Nothing awaits this promise until a request races it; an unobserved
@@ -506,6 +514,7 @@ export class AcpSession implements AgentSession {
         acpSessionId: this.sessionId,
         payload: { status: 'failed', detail: this.lastError },
       });
+      this.observation.publish();
     });
   }
 
@@ -595,7 +604,8 @@ export class AcpSession implements AgentSession {
       const promptId = open.promptId;
       this.queueDepth++;
       const run = this.enqueue(promptId, text, undefined);
-      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
+      this.observation.publish();
+      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
     }
   }
 
@@ -615,6 +625,7 @@ export class AcpSession implements AgentSession {
     if (this.closing || !this.isAlive()) return;
     this.steeringOccupied = true;
     this.refreshSteeringOccupancy();
+    this.observation.publish();
   }
 
   private refreshSteeringOccupancy(): void {
@@ -637,6 +648,7 @@ export class AcpSession implements AgentSession {
     this.steeringRelease = undefined;
     if (!this.steeringOccupied) return;
     this.steeringOccupied = false;
+    this.observation.publish();
     this.options.log(
       `[${this.options.name}] steering-started turn no longer holds the adapter (${reason})`);
   }
@@ -867,13 +879,20 @@ export class AcpSession implements AgentSession {
     }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth;
-    this.admitToLedger(promptId, text, queuedBehind, options);
-    this.queueDepth++;
-    const run = this.enqueue(promptId, text, options.origin);
+    const run = this.observation.checkpoint(() => {
+      this.admitToLedger(promptId, text, queuedBehind, options);
+      this.queueDepth++;
+      return this.enqueue(promptId, text, options.origin);
+    });
     const completion = run.then(
-      result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
+      result => {
+        this.queueDepth = Math.max(0, this.queueDepth - 1);
+        this.observation.publish();
+        return result;
+      },
       error => {
         this.queueDepth = Math.max(0, this.queueDepth - 1);
+        this.observation.publish();
         return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
       },
     );
@@ -1013,6 +1032,7 @@ export class AcpSession implements AgentSession {
       actor: { browserSession: command.actorBrowserSession },
     });
     const receipt: PromptReceipt = {
+      sessionGeneration: this.sessionGeneration,
       commandId: command.commandId,
       promptId: queued.promptId,
       state: queued.queuedBehind > 0 ? 'queued' : 'starting',
@@ -1155,6 +1175,7 @@ export class AcpSession implements AgentSession {
     const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
     if (decision === 'allowed') this.allowPermission(pending.toolCallId, permissionId);
     else this.releasePermission(pending.toolCallId, permissionId);
+    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -1171,7 +1192,7 @@ export class AcpSession implements AgentSession {
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
       payload: { decision, decisionSource: 'manual', optionId },
     });
-    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
+    this.observation.publish();
     return true;
   }
 
@@ -1244,6 +1265,8 @@ export class AcpSession implements AgentSession {
       : { outcome: { outcome: 'cancelled' } });
     const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
     this.releasePermission(pending.toolCallId, permissionId);
+    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
+      this.readiness = 'running';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -1267,8 +1290,7 @@ export class AcpSession implements AgentSession {
         ...(rejectOption ? { optionId: rejectOption.optionId } : {}),
       },
     });
-    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
-      this.readiness = 'running';
+    this.observation.publish();
   }
 
   exitResult(): ExitRecord | null {
@@ -1469,6 +1491,7 @@ export class AcpSession implements AgentSession {
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId, payload: { status: 'idle' },
     });
+    this.observation.publish();
   }
 
   private captureRuntimeMetadata(
@@ -1593,8 +1616,11 @@ export class AcpSession implements AgentSession {
       attempt.recoveryStartedAt = Date.now();
       const recoveryOrigin: PromptOrigin = origin?.kind === 'scheduled-loop'
         ? origin : { kind: 'stall-watchdog' };
-      this.admitToLedger(attempt.recoveryId, STALL_RECOVERY_PROMPT, 0, { origin: recoveryOrigin });
-      const recovered = await this.runSinglePrompt(STALL_RECOVERY_PROMPT, attempt.recoveryId, recoveryOrigin);
+      const recovery = this.observation.checkpoint(() => {
+        this.admitToLedger(attempt.recoveryId, STALL_RECOVERY_PROMPT, 0, { origin: recoveryOrigin });
+        return this.runSinglePrompt(STALL_RECOVERY_PROMPT, attempt.recoveryId, recoveryOrigin);
+      });
+      const recovered = await recovery;
       attempt.report(attempt.superseded ? 'superseded'
         : recovered.succeeded && attempt.resumed ? 'recovery_completed' : 'blocked_recovery');
       // A failed diagnostic turn must not make startup tear down the session.
@@ -1615,6 +1641,7 @@ export class AcpSession implements AgentSession {
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
     members: Array<Pick<PendingPrompt, 'promptId' | 'text' | 'origin'>> = [{ promptId: turnId, text, origin }],
   ): Promise<TurnResult> {
+    let completionPayload: TurnCompletedPayload | undefined;
     const closeMembers = (payload: TurnCompletedPayload): void => {
       for (const member of members) this.conversation.appendSafe({
         kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
@@ -1631,6 +1658,7 @@ export class AcpSession implements AgentSession {
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
     this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle, promptIds: members.map(member => member.promptId), console: members.some(member => member.origin?.kind === 'owner-admin-console') };
+    this.observation.publish();
     this.events.emit('state', { turnId, status: 'running', origin });
     members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
@@ -1653,11 +1681,11 @@ export class AcpSession implements AgentSession {
         turnId, stopReason: response.stopReason, origin, cancellationSource,
       });
       this.events.emit('state', { status: 'idle' });
-      closeMembers({
+      completionPayload = {
         outcome: classifyStopReason(response.stopReason),
         stopReason: response.stopReason,
         ...(cancellationSource ? { cancellationSource } : {}),
-      });
+      };
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
       return turnResult(
@@ -1678,7 +1706,7 @@ export class AcpSession implements AgentSession {
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      closeMembers({ outcome: 'failed', stopReason: this.lastError });
+      completionPayload = { outcome: 'failed', stopReason: this.lastError };
       return turnResult(
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
@@ -1694,6 +1722,8 @@ export class AcpSession implements AgentSession {
         this.cancelEscalation = undefined;
         this.activeTurn = undefined;
       }
+      if (completionPayload) closeMembers(completionPayload);
+      this.observation.publish();
     }
   }
 
@@ -1787,42 +1817,20 @@ export class AcpSession implements AgentSession {
 
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
-    this.readiness = 'awaiting_permission';
-    this.events.emit('permission', {
-      turnId: this.activeTurn?.id,
-      origin: this.activeTurn?.origin,
-      permissionId,
-      toolCallId: this.activeTurn?.origin?.kind === 'scheduled-loop'
-        ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-      title: this.activeTurn?.origin?.kind === 'scheduled-loop'
+    const presented: PermissionRequestedPayload = {
+      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
+      title: scheduledTurn(this.activeTurn)
         ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
-      status: 'pending',
       options: params.options.map(option => ({
         optionId: option.optionId,
-        name: this.activeTurn?.origin?.kind === 'scheduled-loop' ? option.kind : option.name,
+        name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
         kind: option.kind,
       })),
-    });
-    this.conversation.appendSafe({
-      kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
-      acpSessionId: this.sessionId, permissionId,
-      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
-      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-      payload: {
-        toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-        title: scheduledTurn(this.activeTurn)
-          ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
-        options: params.options.map(option => ({
-          optionId: option.optionId,
-          name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
-          kind: option.kind,
-        })),
-        expiresAt,
-      },
-    });
+      expiresAt,
+    };
     return new Promise(resolve => {
       const pending: PendingPermission = {
-        options: params.options, resolve,
+        options: params.options, resolve, presented,
         toolCallId,
         eventToolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
       };
@@ -1832,6 +1840,18 @@ export class AcpSession implements AgentSession {
       }, timeoutMs);
       pending.expiry.unref?.();
       this.pendingPermissions.set(permissionId, pending);
+      this.readiness = 'awaiting_permission';
+      this.events.emit('permission', {
+        turnId: this.activeTurn?.id, origin: this.activeTurn?.origin,
+        permissionId, ...presented, status: 'pending',
+      });
+      this.conversation.appendSafe({
+        kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, permissionId,
+        promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+        toolCallId: presented.toolCallId, payload: presented,
+      });
+      this.observation.publish();
     });
   }
 
@@ -2004,11 +2024,13 @@ export class AcpSession implements AgentSession {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;
-    this.recordConversationUpdate(update, scheduled);
+    // Install live capability state before the durable append can synchronously
+    // notify a subscriber that reenters observation at the new ledger barrier.
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
     if (update.sessionUpdate === 'available_commands_update')
       this.advertisedCommands = new Set((update.availableCommands ?? []).map(command => command.name));
+    this.recordConversationUpdate(update, scheduled);
     if (update.sessionUpdate === 'usage_update') {
       // Claude subscription rate-limit snapshot (claude-agent-acp forwards the SDK rate_limit_event).
       const rateLimit = (update._meta as Record<string, unknown> | null | undefined)?.['_claude/rateLimit'];
@@ -2067,6 +2089,7 @@ export class AcpSession implements AgentSession {
       default:
         break;
     }
+    this.observation.publish();
   }
 
   /**
@@ -2095,6 +2118,8 @@ export class AcpSession implements AgentSession {
         redactText: SCHEDULED_LOOP_REDACTION,
         redactToolCallId: 'scheduled-loop-tool',
       } : {});
+    if (normalized.kind === 'capabilities.updated' && 'commands' in normalized.payload)
+      this.presentedCommands = normalized.payload.commands ?? [];
     this.conversation.appendSafe({
       kind: normalized.kind,
       sessionGeneration: this.sessionGeneration,
@@ -2137,6 +2162,41 @@ export class AcpSession implements AgentSession {
       ...page,
       events: visible,
       snapshot: this.conversationSnapshot(),
+    };
+  }
+
+  subscribeConversationFailure(listener: (generation: string) => void) {
+    return this.conversation.subscribeFailure(listener);
+  }
+
+  conversationReplayAvailable(expectedGeneration: string): boolean {
+    return expectedGeneration === this.sessionGeneration && this.conversation.generationDurable(expectedGeneration);
+  }
+
+  replayConversation(request: import('./conversation-replay.js').ConversationReplayRequest) {
+    if (request.expectedGeneration !== this.sessionGeneration) throw new Error('session generation changed');
+    return this.conversation.replay(request);
+  }
+
+  observeConversation(listener: (state: ConversationObservationState) => void) {
+    return this.observation.observe(listener);
+  }
+
+  private captureObservation(): Omit<ConversationObservationState, 'stateRevision'> {
+    const snapshot = this.snapshot();
+    return {
+      ...this.conversationSnapshot(),
+      ...pendingInventory(this.pendingPrompts),
+      ledgerBarrier: Number(this.conversation.lastCursor() ?? 0),
+      alive: snapshot.alive,
+      readiness: snapshot.alive ? snapshot.readiness : 'offline',
+      activePromptIds: [...(this.activeTurn?.promptIds ?? [])],
+      pendingPermissions: [...this.pendingPermissions].flatMap(([permissionId, pending]) =>
+        pending.presented ? [{ permissionId, ...pending.presented }] : []),
+      commands: this.presentedCommands,
+      runtimeModel: snapshot.runtimeModel,
+      reasoningEffort: snapshot.reasoningEffort,
+      permissionMode: snapshot.permissionMode,
     };
   }
 

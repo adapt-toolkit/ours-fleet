@@ -1,5 +1,5 @@
 import type {TaskCreatedNotice} from './task-notice.js';
-import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
+import type { PromptOrigin, SessionSnapshot, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
  * Durable conversation domain schema for managed-session consoles.
@@ -322,6 +322,8 @@ export interface SubmitPromptCommand {
 
 export interface PromptReceipt {
   commandId: string;
+  /** Original durable admission generation; absent when historical provenance is unknown. */
+  sessionGeneration?: string;
   promptId: string;
   state: 'queued' | 'starting';
   queuedBehind: number;
@@ -354,9 +356,36 @@ export interface ConversationSnapshot {
   queueDepth: number;
   pendingPermissionIds: string[];
   historyDegraded?: boolean;
+  /** Live observation is unavailable; REST may still serve canonical durable data. */
+  observationFailure?: 'capture_failed';
   /** Every waiting prompt, in delivery order; `pendingPromptCount` equals its length. */
   pendingPrompts?: PendingPromptSummary[];
   pendingPromptCount?: number;
+}
+
+/** Position captured synchronously with the owning backend's complete live state. */
+export interface ObservationPosition {
+  sessionGeneration: string;
+  stateRevision: number;
+  ledgerBarrier: number;
+}
+
+export interface ConversationObservationState extends ConversationSnapshot, ObservationPosition {
+  alive: boolean;
+  activePromptIds: string[];
+  pendingPrompts: PendingPromptSummary[];
+  pendingPromptCount: number;
+  /** Already presented and sanitized by the backend; never reconstructed from raw options. */
+  pendingPermissions: Array<PermissionRequestedPayload & { permissionId: string }>;
+  commands: NonNullable<CapabilitiesUpdatedPayload['commands']>;
+  runtimeModel?: SessionSnapshot['runtimeModel'];
+  reasoningEffort?: SessionSnapshot['reasoningEffort'];
+  permissionMode?: SessionSnapshot['permissionMode'];
+}
+
+export interface ConversationObservation {
+  snapshot: ConversationObservationState;
+  unsubscribe(): void;
 }
 
 export interface ConversationPage {

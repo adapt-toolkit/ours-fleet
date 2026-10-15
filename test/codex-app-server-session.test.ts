@@ -11,146 +11,7 @@ import type {
   CodexAppServerConnection, CodexAppServerTransportFactory, CodexAppServerTransportOptions,
 } from '../src/session/codex-app-server-transport.js';
 
-class FakeAppServer implements CodexAppServerConnection {
-  readonly pid = 4242;
-  readonly signals: Array<NodeJS.Signals | number | undefined> = [];
-  readonly requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-  readonly child = { kill: (signal?: NodeJS.Signals | number) => {
-    this.signals.push(signal);
-    if (this.ignoreSigterm && signal === 'SIGTERM') return true;
-    this.alive = false;
-    this.options.onExit?.({
-      version: 1, class: 'program-exit', detail: `fixture exited via ${String(signal)}`,
-    });
-    return true;
-  } };
-  private alive = true;
-  private turn = 0;
-  private ignoreSigterm = false;
-  private threadStatus = 'idle';
-  private readonly turns = new Map<string, Record<string, unknown>>();
-  private approvalTurn?: { requestId: number; turnId: string; kind: 'operation' | 'permissions' };
-  constructor(private readonly options: CodexAppServerTransportOptions) {}
-
-  isAlive() { return this.alive; }
-  exitResult() { return null; }
-  notify() {}
-  respondError() {}
-  async close() { this.alive = false; }
-
-  async request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-    this.requests.push({ method, params });
-    if (method === 'initialize') return { userAgent: 'fixture' } as T;
-    if (method === 'thread/start' || method === 'thread/resume') return {
-      thread: { id: method === 'thread/resume' ? params.threadId : 'thread-native-1' },
-      model: params.model ?? 'fixture-model', reasoningEffort: 'medium', cwd: params.cwd,
-    } as T;
-    if (method === 'turn/start') {
-      const turnId = `turn-${++this.turn}`;
-      const input = params.input as Array<{ text?: string }>;
-      this.turns.set(turnId, { id: turnId, status: 'inProgress', items: [], error: null });
-      queueMicrotask(() => {
-        this.options.onNotification?.('turn/started', {
-          threadId: 'thread-native-1', turn: { id: turnId, status: 'inProgress' },
-        });
-        if (input[0]?.text?.includes('additional permission')) {
-          const requestId = 900 + this.turn;
-          this.approvalTurn = { requestId, turnId, kind: 'permissions' };
-          this.options.onRequest?.('item/permissions/requestApproval', requestId, {
-            threadId: 'thread-native-1', turnId, itemId: `permissions-${turnId}`,
-            reason: 'network access', permissions: {
-              network: { enabled: true }, fileSystem: null,
-            },
-          });
-        } else if (input[0]?.text?.includes('permission')) {
-          const requestId = 900 + this.turn;
-          this.approvalTurn = { requestId, turnId, kind: 'operation' };
-          this.options.onRequest?.('item/commandExecution/requestApproval', requestId, {
-            threadId: 'thread-native-1', turnId, itemId: `command-${turnId}`,
-            command: 'echo approved', availableDecisions: ['accept', 'decline', 'cancel'],
-          });
-        } else if (input[0]?.text?.includes('system error')) {
-          this.options.onNotification?.('thread/status/changed', {
-            threadId: 'thread-native-1', status: { type: 'systemError' },
-          });
-        } else if (input[0]?.text?.includes('ignore interrupt')) {
-          this.ignoreSigterm = true;
-        } else {
-          const missingTerminal = input[0]?.text?.includes('missing terminal');
-          if (input[0]?.text?.includes('with commentary')) {
-            const note = { type: 'agentMessage', id: `commentary-${turnId}`, text: 'Reading the file first.',
-              phase: 'commentary', memoryCitation: null, delivery: null };
-            this.options.onNotification?.('item/started', { threadId: 'thread-native-1', turnId, item: { ...note, text: '' } });
-            this.options.onNotification?.('item/agentMessage/delta', { threadId: 'thread-native-1', turnId, itemId: note.id, delta: note.text });
-            this.options.onNotification?.('item/completed', { threadId: 'thread-native-1', turnId, item: note });
-          }
-          this.complete(turnId, 'native final', missingTerminal);
-          if (input[0]?.text?.includes('stale idle')) {
-            this.threadStatus = 'active';
-            this.turns.set(turnId, {
-              id: turnId, status: 'inProgress', items: [], error: null,
-            });
-          }
-        }
-      });
-      return { turn: { id: turnId, status: 'inProgress' } } as T;
-    }
-    if (method === 'turn/steer') return { turnId: params.expectedTurnId } as T;
-    if (method === 'turn/interrupt') {
-      if (this.ignoreSigterm) return {} as T;
-      queueMicrotask(() => this.options.onNotification?.('turn/completed', {
-        threadId: 'thread-native-1', turn: { id: params.turnId, status: 'interrupted', error: null },
-      }));
-      return {} as T;
-    }
-    if (method === 'thread/read') return {
-      thread: {
-        id: 'thread-native-1', status: { type: this.threadStatus },
-        turns: [...this.turns.values()],
-      },
-    } as T;
-    throw new Error(`unexpected method ${method}`);
-  }
-
-  respond(id: string | number, result: unknown) {
-    if (!this.approvalTurn || this.approvalTurn.requestId !== id) return;
-    const { turnId, kind } = this.approvalTurn;
-    const decision = kind === 'permissions'
-      ? `scope:${(result as { scope?: string }).scope ?? 'unknown'}`
-      : (result as { decision?: string }).decision ?? 'unknown';
-    this.approvalTurn = undefined;
-    queueMicrotask(() => this.complete(turnId, `permission:${decision}`));
-  }
-
-  resolveServerRequest(threadId = 'thread-native-1', requestId = this.approvalTurn?.requestId) {
-    if (requestId === undefined) return;
-    this.options.onNotification?.('serverRequest/resolved', { threadId, requestId });
-  }
-
-  private complete(turnId: string, text: string, omitTerminal = false) {
-    const item = { type: 'agentMessage', id: `message-${turnId}`, text,
-      phase: 'final_answer', memoryCitation: null, delivery: null };
-    this.options.onNotification?.('item/started', {
-      threadId: 'thread-native-1', turnId, item: { ...item, text: '' },
-    });
-    this.options.onNotification?.('item/agentMessage/delta', {
-      threadId: 'thread-native-1', turnId, itemId: item.id, delta: text,
-    });
-    this.options.onNotification?.('item/completed', {
-      threadId: 'thread-native-1', turnId, item,
-    });
-    this.turns.set(turnId, { id: turnId, status: 'completed', items: [item], error: null });
-    if (omitTerminal) {
-      this.options.onNotification?.('thread/status/changed', {
-        threadId: 'thread-native-1', status: { type: 'idle' },
-      });
-      return;
-    }
-    this.options.onNotification?.('turn/completed', {
-      threadId: 'thread-native-1', turn: { id: turnId, status: 'completed', error: null },
-    });
-  }
-}
+import { FakeAppServer } from './fixtures/codex-app-server.js';
 
 const fakeTransport: CodexAppServerTransportFactory = async options => new FakeAppServer(options);
 
@@ -227,6 +88,7 @@ describe('CodexAppServerSession', () => {
       const generation = session.conversationSnapshot().sessionGeneration;
       const command = { commandId: 'live', text: 'permission', source: 'owner_admin_console' as const, actorBrowserSession: 'browser', expectedSessionGeneration: generation, requireIdle: true };
       const receipt = await session.submitPromptBrowser(command);
+      expect(receipt.sessionGeneration).toBe(generation);
       await waitFor(() => session.snapshot().readiness === 'awaiting_permission');
       expect(await session.submitPromptBrowser(command)).toEqual(receipt);
       await expect(session.submitPromptBrowser({ ...command, commandId: 'second' })).rejects.toThrow('voice_busy');
@@ -615,6 +477,12 @@ describe('CodexAppServerSession', () => {
       store.close();
       const session = await start(dir, 'fresh', 'allow', transport);
       await waitFor(() => server!.requests.some(request => request.method === 'turn/start'));
+      const restoredObserver = session.observeConversation(() => {});
+      await waitFor(() => session.conversationSnapshot().queueDepth === 0);
+      const settledObserver = session.observeConversation(() => {});
+      expect(settledObserver.snapshot).toMatchObject({ queueDepth: 0, pendingPrompts: [], activePromptIds: [] });
+      expect(settledObserver.snapshot.stateRevision).toBeGreaterThanOrEqual(restoredObserver.snapshot.stateRevision);
+      restoredObserver.unsubscribe(); settledObserver.unsubscribe();
       const recovered = server!.requests.find(request => request.method === 'turn/start')!;
       expect(recovered.params.additionalContext).toEqual({
         'ours-fleet://prompt-provenance?source=owner_admin_console': expect.objectContaining({
@@ -747,5 +615,197 @@ describe('CodexAppServerSession releases every waiting message at one turn bound
       for (const queued of [first, a, b, c, compact, d])
         expect(completed(session, queued.promptId)).toHaveLength(1);
     } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('native Codex passive observation', () => {
+  it('captures stable admission, atomic full batch membership, permission presentation and final depth', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observe-'));
+    const session = await start(dir, 'fresh', 'ask');
+    try {
+      const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+      const observer = session.observeConversation(state => states.push(state));
+      expect(observer.snapshot.runtimeModel?.value).toBe('gpt-fixture');
+      const a = session.queuePrompt('permission'), b = session.queuePrompt('second');
+      const first = await a, second = await b;
+      await waitFor(() => session.conversationSnapshot().pendingPermissionIds.length > 0);
+      expect(states[0]).toMatchObject({ queueDepth: 1, activePromptIds: [],
+        pendingPrompts: [expect.objectContaining({ promptId: first.promptId })] });
+      expect(states.find(state => state.pendingPrompts.length === 0)?.activePromptIds).toEqual([first.promptId, second.promptId]);
+      expect(states.some(state => state.activePromptIds.join() === [first.promptId, second.promptId].join()
+        && state.pendingPrompts?.length === 0)).toBe(true);
+      const requested = session.conversationPage({ limit: 1000 }).events.findLast(event => event.kind === 'permission.requested')!;
+      const reconnect = session.observeConversation(() => {});
+      expect(reconnect.snapshot.pendingPermissions).toEqual([{ permissionId: requested.permissionId, ...requested.payload }]);
+      const pending = reconnect.snapshot.pendingPermissions[0]!;
+      await session.respondPermission(pending.permissionId, pending.options[0]!.optionId);
+      await Promise.all([first.completion, second.completion]);
+      expect(states.at(-1)).toMatchObject({ queueDepth: 0, activePromptIds: [], pendingPermissions: [] });
+      expect(states.at(-1)!.ledgerBarrier).toBeGreaterThanOrEqual(Number(requested.seq));
+      expect(reconnect.snapshot.stateRevision).toBeGreaterThanOrEqual(observer.snapshot.stateRevision);
+      observer.unsubscribe(); reconnect.unsubscribe();
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps native scheduled permissions unmasked, expires them and observes death passively', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observe-expiry-'));
+    let server: FakeAppServer | undefined;
+    const session = await start(dir, 'fresh', 'ask', async options => (server = new FakeAppServer(options)), {
+      permissionTimeoutMs: 200,
+    });
+    try {
+      const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+      const observer = session.observeConversation(state => states.push(state));
+      const queued = await session.queuePrompt('permission', {
+        origin: { kind: 'scheduled-loop', loop: 'observe', runId: 'scheduled-observe' },
+      });
+      await waitFor(() => session.conversationSnapshot().pendingPermissionIds.length > 0);
+      expect(states.at(-1)!.pendingPermissions[0]).toMatchObject({
+        title: 'echo approved', toolCallId: 'command-turn-1', expiresAt: expect.any(String),
+        options: expect.arrayContaining([expect.objectContaining({ name: 'Allow once' })]),
+      });
+      await queued.completion;
+      expect(states.at(-1)).toMatchObject({ pendingPermissions: [], queueDepth: 0 });
+      server!.child.kill('SIGTERM');
+      await Promise.resolve();
+      expect(states.at(-1)).toMatchObject({ alive: false, readiness: 'offline' });
+      observer.unsubscribe();
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('publishes final depth when the native adapter dies between admission and release', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observe-dead-'));
+    let server: FakeAppServer | undefined;
+    const session = await start(dir, 'fresh', 'ask', async options => (server = new FakeAppServer(options)));
+    try {
+      const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+      const observer = session.observeConversation(state => states.push(state));
+      const admission = session.queuePrompt('not delivered');
+      server!.child.kill('SIGTERM');
+      const queued = await admission;
+      await expect(queued.completion).resolves.toMatchObject({ accepted: false, outcome: 'failed' });
+      expect(states.at(-1)).toMatchObject({ queueDepth: 0, pendingPrompts: [], activePromptIds: [], alive: false });
+      observer.unsubscribe();
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not make a native observer an attended controller', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observe-passive-'));
+    const session = await start(dir, 'fresh', 'ask', fakeTransport, {
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+    });
+    try {
+      const observer = session.observeConversation(() => {});
+      await session.submitPrompt('permission');
+      expect(session.conversationPage({ limit: 1000 }).events.some(event => event.kind === 'permission.requested')).toBe(false);
+      expect(session.observeConversation(() => {}).snapshot.pendingPermissions).toEqual([]);
+      observer.unsubscribe();
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps reentrant admission registration and existing notifications at coherent checkpoints', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-reentrant-observe-'));
+    const session = await start(dir);
+    try {
+      type State = import('../src/session/conversation-types.js').ConversationObservationState;
+      const existingStates: State[] = [], reentrantStates: State[] = [];
+      const existing = session.observeConversation(state => existingStates.push(state));
+      let reentrant: ReturnType<typeof session.observeConversation> | undefined;
+      let admissionSeq = 0, admittedId = '';
+      const stopLedger = session.subscribeConversation(event => {
+        if (event.kind !== 'prompt.admitted') return;
+        admissionSeq = event.seq;
+        admittedId = event.promptId!;
+        session.conversationPage({ limit: 1 });
+        reentrant = session.observeConversation(state => reentrantStates.push(state));
+      });
+      const queued = await session.queuePrompt('checkpoint admission');
+      expect(reentrant).toBeDefined();
+      const coherent = (state: State) => state.ledgerBarrier < admissionSeq
+        || state.pendingPrompts.some(prompt => prompt.promptId === admittedId)
+        || state.activePromptIds.includes(admittedId);
+      // At registration the durable append exists, but queue insertion has not
+      // happened. The only truthful initial snapshot is the prior checkpoint.
+      expect(coherent(reentrant!.snapshot)).toBe(true);
+      expect(reentrant!.snapshot.ledgerBarrier).toBe(existing.snapshot.ledgerBarrier);
+      expect(existingStates.every(coherent)).toBe(true);
+      expect(reentrantStates.every(coherent)).toBe(true);
+      expect(reentrantStates.some(state => state.ledgerBarrier >= admissionSeq
+        && (state.pendingPrompts.some(prompt => prompt.promptId === queued.promptId)
+          || state.activePromptIds.includes(queued.promptId)))).toBe(true);
+      stopLedger(); existing.unsubscribe(); reentrant!.unsubscribe();
+      await queued.completion;
+    } finally { await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('preserves browser receipt and idempotency after a post-admission capture fault', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observation-fault-'));
+    const session = await start(dir);
+    type State = import('../src/session/conversation-types.js').ConversationObservationState;
+    const states: State[] = [];
+    const observer = session.observeConversation(state => states.push(state));
+    const owner = session as unknown as { captureObservation(): Omit<State, 'stateRevision'> };
+    const originalCapture = owner.captureObservation.bind(session);
+    let faulted = false;
+    const stop = session.subscribeConversation(event => {
+      if (event.kind === 'prompt.admitted' && !faulted) {
+        faulted = true;
+        owner.captureObservation = () => { owner.captureObservation = originalCapture; throw new Error('injected capture fault'); };
+      }
+    });
+    try {
+      const command = { commandId: 'capture-fault-command', text: 'capture fault work' };
+      const receipt = await session.submitPromptBrowser(command);
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      for (let i = 0; i < 100 && session.conversationSnapshot().queueDepth > 0; i++)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      const events = session.conversationPage({ limit: 1000 }).events;
+      expect(events.filter(event => event.kind === 'prompt.admitted' && event.commandId === command.commandId)).toHaveLength(1);
+      expect(events.filter(event => event.kind === 'turn.completed' && event.promptId === receipt.promptId)).toHaveLength(1);
+      const failure = states.find(state => state.observationFailure);
+      expect(failure).toMatchObject({ observationFailure: 'capture_failed', ledgerBarrier: observer.snapshot.ledgerBarrier });
+      expect(states.every(state => state.ledgerBarrier <= observer.snapshot.ledgerBarrier)).toBe(true);
+      const reconnect = session.observeConversation(() => {});
+      expect(reconnect.snapshot.observationFailure).toBe('capture_failed');
+      reconnect.unsubscribe();
+    } finally { owner.captureObservation = originalCapture; stop(); observer.unsubscribe(); await session.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['manual', 'expiry'] as const)('keeps %s permission resolution and terminal membership coherent', async answer => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-observe-boundary-'));
+    const session = await start(dir, 'fresh', 'ask', fakeTransport, { permissionTimeoutMs: 120 });
+    session.setControllerAttached(true);
+    type State = import('../src/session/conversation-types.js').ConversationObservationState;
+    const states: State[] = [], registrations: Array<{ kind: string; seq: number; promptId?: string; snapshot: State }> = [];
+    const follows: Array<ReturnType<typeof session.observeConversation>> = [];
+    const existing = session.observeConversation(state => states.push(state));
+    const stop = session.subscribeConversation(event => {
+      if (event.kind !== 'permission.resolved' && event.kind !== 'turn.completed') return;
+      session.conversationPage({ limit: 1 });
+      const registration = session.observeConversation(state => states.push(state));
+      registrations.push({ kind: event.kind, seq: event.seq, promptId: event.promptId, snapshot: registration.snapshot });
+      follows.push(registration);
+    });
+    try {
+      const queued = await session.queuePrompt('permission');
+      for (let i = 0; i < 100 && !session.conversationSnapshot().pendingPermissionIds.length; i++)
+        await new Promise(resolve => setTimeout(resolve, 5));
+      const pending = session.observeConversation(() => {});
+      if (answer === 'manual') session.respondPermission(pending.snapshot.pendingPermissions[0]!.permissionId,
+        pending.snapshot.pendingPermissions[0]!.options[0]!.optionId);
+      pending.unsubscribe();
+
+      await queued.completion;
+      expect(registrations.some(item => item.kind === 'permission.resolved')).toBe(true);
+      expect(registrations.some(item => item.kind === 'turn.completed')).toBe(true);
+      for (const item of registrations) {
+        const coherent = (state: State) => state.ledgerBarrier < item.seq || (item.kind === 'permission.resolved'
+          ? state.readiness !== 'awaiting_permission' || state.pendingPermissions.length > 0
+          : !state.activePromptIds.includes(item.promptId!));
+        expect(coherent(item.snapshot)).toBe(true);
+        expect(states.every(coherent)).toBe(true);
+      }
+      expect(states.at(-1)).toMatchObject({ queueDepth: 0, pendingPermissions: [], activePromptIds: [] });
+    } finally { stop(); existing.unsubscribe(); follows.forEach(follow => follow.unsubscribe()); await session.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

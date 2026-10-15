@@ -1,3 +1,4 @@
+import { ConversationRoleObserver, type ConversationRoleState } from '../application/conversation-role-observer.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import {validateAccountOrigin} from '../account-origin.js';
 import { startWorkspaceTunnel } from './workspace-tunnel.js';
@@ -125,6 +126,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
   });
   const events = new FleetEventBus();
+  const roleMutations = new Set<() => void>();
+  const signalRoleMutation = () => { for (const listener of roleMutations) listener(); };
+  const observeRole = (roleId: string, listener: (state: ConversationRoleState) => void) => new ConversationRoleObserver({
+    roleId, configPath: options.configPath,
+    subscribeMutations: changed => { roleMutations.add(changed); return () => { roleMutations.delete(changed); }; },
+  }, listener);
   const audit = new AuditSink();
   const watchdogConfigProvider = cachedConfigProvider(options.configPath);
   const log = options.log ?? (() => {});
@@ -163,6 +170,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         ? 'ready' : detail?.status.overall === 'attention' ? 'attention' : 'unknown';
     },
     onProgress: action => {
+      signalRoleMutation();
       events.publish('creation.changed', action, action.roleId);
       void audit.record({
         roleId: action.roleId, action: `creation.${action.state}`,
@@ -178,6 +186,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     repository, ops, configPath: options.configPath,
     status: async roleId => (await query.detail(roleId)).status,
     onProgress: receipt => {
+      signalRoleMutation();
       events.publish('action.changed', receipt, receipt.roleId);
       void audit.record({
         roleId: receipt.roleId, action: `lifecycle.${receipt.action}`,
@@ -200,7 +209,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
+    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration, observeRole,
     taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
     roomLayouts: new RoomLayoutDefinitions(options.configPath),
     layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),
@@ -230,7 +239,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
           || role.configuredBackend === 'codex-app-server') {
         const dir = repository.stateDir(role);
         if (!dir) throw new FleetError('control_unavailable', 'role state directory is unavailable');
-        return new RoleSessionControlAdapter(dir);
+        return new RoleSessionControlAdapter(dir, undefined, undefined, listener => observeRole(roleId, listener));
       }
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },

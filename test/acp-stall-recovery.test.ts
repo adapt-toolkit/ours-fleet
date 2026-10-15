@@ -249,3 +249,32 @@ describe('ACP-local stall recovery', () => {
     expect(statuses(session)).toEqual([]);
   });
 });
+
+it('keeps reentrant diagnostic recovery admission at a stable observation checkpoint', async () => {
+  const { session } = await fixture();
+  const original = session.submitPrompt('startup', { origin: { kind: 'startup' } });
+  await running(session);
+  type State = import('../src/session/conversation-types.js').ConversationObservationState;
+  const states: State[] = [], recoveryStates: State[] = [];
+  const existing = session.observeConversation(state => states.push(state));
+  let reentrant: ReturnType<typeof session.observeConversation> | undefined;
+  let admissionSeq = 0, recoveryId = '';
+  let registrationNotifications: State[] = [];
+  const stopLedger = session.subscribeConversation(event => {
+    if (event.kind !== 'prompt.admitted') return;
+    admissionSeq = event.seq; recoveryId = event.promptId!;
+    const before = states.length;
+    session.conversationPage({ limit: 1 });
+    reentrant = session.observeConversation(state => recoveryStates.push(state));
+    registrationNotifications = states.slice(before);
+  });
+  clock(session, 501);
+  await internal(session).stallWatchdog!.tick();
+  expect((await original).succeeded).toBe(true);
+  expect(reentrant).toBeDefined();
+  expect(reentrant!.snapshot.ledgerBarrier).toBeLessThan(admissionSeq);
+  expect(registrationNotifications).toEqual([]);
+  expect(recoveryStates.some(state => state.activePromptIds.includes(recoveryId)
+    && state.ledgerBarrier >= admissionSeq)).toBe(true);
+  stopLedger(); existing.unsubscribe(); reentrant!.unsubscribe();
+});

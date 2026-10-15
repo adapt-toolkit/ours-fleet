@@ -287,3 +287,16 @@ describe('ConversationEventStore', () => {
     }).seq).toBe(2);
   });
 });
+
+
+it('rebuilds cached receipt generation from original admission across a replacement', () => {
+  const { dir, store } = open();
+  admit(store, 'old');
+  store.append({ kind: 'session.state', sessionGeneration: 'gen-2', payload: {} });
+  store.close();
+  const reopened = new ConversationEventStore(join(dir, '.conversation'), { roleId: 'role-a' });
+  expect(reopened.receiptFor('old', ConversationEventStore.bodyDigest('hello'))).toMatchObject({
+    commandId: 'old', sessionGeneration: 'gen-1', promptId: 'prompt-old', eventCursor: '1',
+  });
+  reopened.close();
+});

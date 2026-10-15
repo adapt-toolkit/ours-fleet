@@ -2,9 +2,10 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AcpSession, promptContentBlocks, runtimeSelector } from '../src/session/acp.js';
+import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import type {
   ConversationEventV1, MessageChunkPayload, PermissionResolvedPayload,
@@ -23,7 +24,7 @@ afterEach(async () => {
 
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
-  extra: { stateDir?: string; mode?: 'fresh' | 'resume'; env?: Record<string, string> } = {},
+  extra: { stateDir?: string; mode?: 'fresh' | 'resume'; env?: Record<string, string>; permissionTimeoutMs?: number } = {},
 ) {
   const stateDir = extra.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-acp-conv-'));
   if (!extra.stateDir) dirs.push(stateDir);
@@ -37,6 +38,7 @@ async function start(
     permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
     log: () => {},
     cancelGraceMs: 2_000,
+    permissionTimeoutMs: extra.permissionTimeoutMs,
   });
   sessions.push(session);
   return { session, stateDir };
@@ -154,6 +156,7 @@ describe('AcpSession conversation ledger', () => {
     expect(receipt).toMatchObject({ commandId: 'cmd-1', state: 'starting', queuedBehind: 0 });
     const admitted = events(session).find(event => event.kind === 'prompt.admitted')!;
     expect(admitted.commandId).toBe('cmd-1');
+    expect(receipt.sessionGeneration).toBe(admitted.sessionGeneration);
     expect(admitted.source).toBe('owner_admin_console');
     expect(admitted.actor?.browserSession).toBe('session-digest-1');
     expect((admitted.payload as PromptAdmittedPayload).text?.text).toBe('from the browser');
@@ -349,11 +352,15 @@ describe('AcpSession conversation ledger', () => {
     store.close();
 
     const { session } = await start('allow', { stateDir });
+    const restoredStates: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+    const restoredObserver = session.observeConversation(state => restoredStates.push(state));
     // Wait for the restored prompt's turn to finish.
     for (let i = 0; i < 200 && !events(session).some(e =>
       e.kind === 'turn.completed' && e.promptId === 'p-queued'); i++)
       await new Promise(resolve => setTimeout(resolve, 10));
 
+    expect(restoredStates.at(-1)).toMatchObject({ queueDepth: 0, activePromptIds: [], pendingPrompts: [] });
+    restoredObserver.unsubscribe();
     const all = events(session);
     const unknown = all.find(e =>
       e.kind === 'turn.completed' && e.promptId === 'p-started')!;
@@ -380,5 +387,294 @@ describe('AcpSession conversation ledger', () => {
     expect(snapshot.readiness).toBe('idle');
     expect(snapshot.queueDepth).toBe(0);
     expect(snapshot.pendingPermissionIds).toEqual([]);
+  });
+});
+
+describe('ACP passive observation', () => {
+  it('publishes admitted inventory, full batch membership and final asynchronous depth', async () => {
+    const { session } = await start();
+    const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+    const observation = new RoleTurnArbiter(session).observeConversation(state => states.push(state));
+    expect(observation.snapshot.alive).toBe(true);
+    expect(observation.snapshot.runtimeModel).toEqual(session.snapshot().runtimeModel);
+    const firstPromise = session.queuePrompt('block 80');
+    const secondPromise = session.queuePrompt('second');
+    const first = await firstPromise, second = await secondPromise;
+    expect(states[0]).toMatchObject({ queueDepth: 1, activePromptIds: [],
+      pendingPrompts: [expect.objectContaining({ promptId: first.promptId })] });
+    expect(states.find(state => state.pendingPrompts.length === 0)?.activePromptIds).toEqual([first.promptId, second.promptId]);
+    expect(states.some(state => state.activePromptIds.join() === [first.promptId, second.promptId].join()
+      && state.pendingPrompts?.length === 0)).toBe(true);
+    await Promise.all([first.completion, second.completion]);
+    expect(states.at(-1)).toMatchObject({ queueDepth: 0, activePromptIds: [], pendingPrompts: [] });
+    const reconnect = session.observeConversation(() => {});
+    expect(reconnect.snapshot.stateRevision).toBeGreaterThanOrEqual(states.at(-1)!.stateRevision);
+    observation.unsubscribe(); reconnect.unsubscribe();
+  });
+
+  it('retains the presented permission payload across history reads without attaching a controller', async () => {
+    const { session } = await start('ask');
+    const observation = session.observeConversation(() => {});
+    // unattended=deny proves an observer does not count as a controller.
+    await session.submitPrompt('permission');
+    expect(events(session).filter(event => event.kind === 'permission.requested')).toHaveLength(0);
+    session.setControllerAttached(true);
+    let raced: import('../src/session/conversation-types.js').ConversationObservationState | undefined;
+    const stopRace = session.subscribeConversation(event => {
+      if (event.kind !== 'permission.requested') return;
+      session.conversationPage({ limit: 1 });
+      const raceObserver = session.observeConversation(() => {});
+      raced = raceObserver.snapshot;
+      raceObserver.unsubscribe();
+    });
+    const queued = await session.queuePrompt('permission');
+    for (let i = 0; i < 100 && !session.conversationSnapshot().pendingPermissionIds.length; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const requested = events(session).findLast(event => event.kind === 'permission.requested')!;
+    const reconnect = session.observeConversation(() => {});
+    expect(reconnect.snapshot.pendingPermissions).toEqual([{ permissionId: requested.permissionId, ...requested.payload }]);
+    expect(raced?.pendingPermissions).toEqual(reconnect.snapshot.pendingPermissions);
+    stopRace();
+    const pending = reconnect.snapshot.pendingPermissions[0]!;
+    await session.respondPermission(pending.permissionId, pending.options[0]!.optionId);
+    await queued.completion;
+    expect(session.observeConversation(() => {}).snapshot.pendingPermissions).toEqual([]);
+    observation.unsubscribe(); reconnect.unsubscribe();
+  });
+
+  it('publishes ACP scheduled masking, exact expiry, runtime/commands and offline state', async () => {
+    const { session } = await start('ask', { permissionTimeoutMs: 200, env: {
+      ACP_FIXTURE_CONFIG_OPTIONS: JSON.stringify([{
+        id: 'model', category: 'model', name: 'Model', type: 'select', currentValue: 'fixture-start', options: [],
+      }]),
+    } });
+    session.setControllerAttached(true);
+    const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+    const observer = session.observeConversation(state => states.push(state));
+    expect(observer.snapshot.runtimeModel?.value).toBe('fixture-start');
+    const queued = await session.queuePrompt('permission', {
+      origin: { kind: 'scheduled-loop', loop: 'observe', runId: 'scheduled-observe' },
+    });
+    for (let i = 0; i < 100 && !session.conversationSnapshot().pendingPermissionIds.length; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const requested = events(session).findLast(event => event.kind === 'permission.requested')!;
+    const current = states.at(-1)!;
+    expect(current.pendingPermissions).toEqual([{ permissionId: requested.permissionId, ...requested.payload }]);
+    expect(current.pendingPermissions[0]).toMatchObject({
+      toolCallId: 'scheduled-loop-tool', title: 'Scheduled-loop permission requested',
+      expiresAt: expect.any(String),
+    });
+    expect(current.pendingPermissions[0]!.options.every(option => option.name === option.kind)).toBe(true);
+    for (let i = 0; i < 100 && session.conversationSnapshot().pendingPermissionIds.length; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    expect(states.at(-1)!.pendingPermissions).toEqual([]);
+    // The fixture intentionally leaves a cancelled permission turn open.
+    await session.interrupt();
+    await queued.completion;
+    await session.submitPrompt('rich');
+    expect(states.at(-1)!.runtimeModel).toBeUndefined();
+    expect(states.some(state => state.runtimeModel?.value === 'fixture-start')).toBe(true);
+    expect(states.at(-1)!.commands).toEqual([{
+      name: 'fixture_command', description: expect.objectContaining({ text: 'A fixture command' }), inputHint: 'topic',
+    }]);
+    await session.close();
+    for (let i = 0; i < 100 && session.isAlive(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(states.at(-1)).toMatchObject({ alive: false, readiness: 'offline' });
+    observer.unsubscribe();
+  });
+
+  it('publishes final depth on the ACP dead-adapter return before release', async () => {
+    const { session } = await start();
+    const states: import('../src/session/conversation-types.js').ConversationObservationState[] = [];
+    const observer = session.observeConversation(state => states.push(state));
+    const admission = session.queuePrompt('not delivered');
+    // The real backend's release guard sees the peer vanish after synchronous
+    // admission, before its promise-chain release checkpoint can run.
+    const liveness = vi.spyOn(session, 'isAlive').mockReturnValue(false);
+    try {
+      const queued = await admission;
+      await expect(queued.completion).resolves.toMatchObject({ accepted: false, outcome: 'failed' });
+      expect(states.at(-1)).toMatchObject({ queueDepth: 0, pendingPrompts: [], activePromptIds: [], alive: false });
+    } finally { liveness.mockRestore(); observer.unsubscribe(); }
+  });
+
+  it('keeps reentrant admission registration and existing notifications at coherent checkpoints', async () => {
+    const { session } = await start();
+    {
+      type State = import('../src/session/conversation-types.js').ConversationObservationState;
+      const existingStates: State[] = [], reentrantStates: State[] = [];
+      const existing = session.observeConversation(state => existingStates.push(state));
+      let reentrant: ReturnType<typeof session.observeConversation> | undefined;
+      let admissionSeq = 0, admittedId = '';
+      const stopLedger = session.subscribeConversation(event => {
+        if (event.kind !== 'prompt.admitted') return;
+        admissionSeq = event.seq;
+        admittedId = event.promptId!;
+        session.conversationPage({ limit: 1 });
+        reentrant = session.observeConversation(state => reentrantStates.push(state));
+      });
+      const queued = await session.queuePrompt('checkpoint admission');
+      expect(reentrant).toBeDefined();
+      const coherent = (state: State) => state.ledgerBarrier < admissionSeq
+        || state.pendingPrompts.some(prompt => prompt.promptId === admittedId)
+        || state.activePromptIds.includes(admittedId);
+      // At registration the durable append exists, but queue insertion has not
+      // happened. The only truthful initial snapshot is the prior checkpoint.
+      expect(coherent(reentrant!.snapshot)).toBe(true);
+      expect(reentrant!.snapshot.ledgerBarrier).toBe(existing.snapshot.ledgerBarrier);
+      expect(existingStates.every(coherent)).toBe(true);
+      expect(reentrantStates.every(coherent)).toBe(true);
+      expect(reentrantStates.some(state => state.ledgerBarrier >= admissionSeq
+        && (state.pendingPrompts.some(prompt => prompt.promptId === queued.promptId)
+          || state.activePromptIds.includes(queued.promptId)))).toBe(true);
+      stopLedger(); existing.unsubscribe(); reentrant!.unsubscribe();
+      await queued.completion;
+    }
+  });
+
+  it.each(['config_option_update', 'available_commands_update', 'current_mode_update'] as const)(
+    'keeps %s callback registration consistent with its durable barrier', async kind => {
+      const initialOptions = [{ id: 'model', category: 'model', name: 'Model', type: 'select',
+        currentValue: 'model-before', options: [{ value: 'model-before', name: 'Before model' }] }];
+      const { session } = await start('allow', { env: {
+        ACP_FIXTURE_CONFIG_OPTIONS: JSON.stringify(initialOptions),
+      } });
+      type State = import('../src/session/conversation-types.js').ConversationObservationState;
+      const states: State[] = [], newStates: State[] = [];
+      const existing = session.observeConversation(state => states.push(state));
+      let registered: ReturnType<typeof session.observeConversation> | undefined;
+      let updateSeq = 0;
+      const stop = session.subscribeConversation(event => {
+        if (event.seq <= existing.snapshot.ledgerBarrier) return;
+        updateSeq = event.seq;
+        session.conversationPage({ limit: 1 });
+        registered = session.observeConversation(state => newStates.push(state));
+      });
+      const expectedModel = kind === 'config_option_update'
+        ? { value: 'model-after', label: 'After model' } : existing.snapshot.runtimeModel;
+      const update = kind === 'config_option_update' ? {
+        sessionUpdate: kind, configOptions: [
+          { id: 'model', category: 'model', name: 'Model', type: 'select', currentValue: 'model-after',
+            options: [{ value: 'model-before', name: 'Before model' }, { value: 'model-after', name: 'After model' }] },
+          { id: 'effort', category: 'thought_level', name: 'Reasoning', type: 'select', currentValue: 'high',
+            options: [{ value: 'high', name: 'High reasoning' }] },
+        ],
+      } : kind === 'available_commands_update' ? {
+        sessionUpdate: kind, availableCommands: [{ name: 'fresh_command', description: 'Fresh command', input: { hint: 'topic' } }],
+      } : { sessionUpdate: kind, currentModeId: 'fixture-mode-after' };
+      // Exercise the actual ACP update owner and its synchronous durable callback.
+      (session as unknown as { recordUpdate(update: unknown): void }).recordUpdate(update);
+      expect(registered).toBeDefined();
+      const expectedCommands = kind === 'available_commands_update'
+        ? [{ name: 'fresh_command', description: { text: 'Fresh command', bytes: 13 }, inputHint: 'topic' }]
+        : existing.snapshot.commands;
+      const coherent = (state: State) => state.ledgerBarrier < updateSeq
+        || (JSON.stringify(state.runtimeModel) === JSON.stringify(expectedModel)
+          && JSON.stringify(state.commands) === JSON.stringify(expectedCommands)
+          && (kind !== 'config_option_update' || state.reasoningEffort?.value === 'high'));
+      expect(coherent(registered!.snapshot)).toBe(true);
+      expect(states.every(coherent)).toBe(true);
+      expect(newStates.every(coherent)).toBe(true);
+      expect(states.at(-1)).toMatchObject({ ledgerBarrier: updateSeq,
+        runtimeModel: expectedModel, commands: expectedCommands });
+      const final = session.observeConversation(() => {});
+      expect(final.snapshot).toMatchObject({ ledgerBarrier: updateSeq, runtimeModel: expectedModel,
+        commands: expectedCommands });
+      if (kind === 'config_option_update')
+        expect(final.snapshot.reasoningEffort).toEqual({ value: 'high', label: 'High reasoning' });
+      stop(); existing.unsubscribe(); registered!.unsubscribe(); final.unsubscribe();
+    },
+  );
+
+  it('preserves browser receipt and idempotency after a post-admission capture fault', async () => {
+    const { session } = await start();
+    type State = import('../src/session/conversation-types.js').ConversationObservationState;
+    const states: State[] = [];
+    const observer = session.observeConversation(state => states.push(state));
+    const owner = session as unknown as { captureObservation(): Omit<State, 'stateRevision'> };
+    const originalCapture = owner.captureObservation.bind(session);
+    let faulted = false;
+    const stop = session.subscribeConversation(event => {
+      if (event.kind === 'prompt.admitted' && !faulted) {
+        faulted = true;
+        owner.captureObservation = () => { owner.captureObservation = originalCapture; throw new Error('injected capture fault'); };
+      }
+    });
+    try {
+      const command = { commandId: 'capture-fault-command', text: 'capture fault work' };
+      const receipt = await session.submitPromptBrowser(command);
+      expect(await session.submitPromptBrowser(command)).toEqual(receipt);
+      for (let i = 0; i < 100 && session.conversationSnapshot().queueDepth > 0; i++)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      const events = session.conversationPage({ limit: 1000 }).events;
+      expect(events.filter(event => event.kind === 'prompt.admitted' && event.commandId === command.commandId)).toHaveLength(1);
+      expect(events.filter(event => event.kind === 'turn.completed' && event.promptId === receipt.promptId)).toHaveLength(1);
+      const failure = states.find(state => state.observationFailure);
+      expect(failure).toMatchObject({ observationFailure: 'capture_failed', ledgerBarrier: observer.snapshot.ledgerBarrier });
+      expect(states.every(state => state.ledgerBarrier <= observer.snapshot.ledgerBarrier)).toBe(true);
+      const reconnect = session.observeConversation(() => {});
+      expect(reconnect.snapshot.observationFailure).toBe('capture_failed');
+      reconnect.unsubscribe();
+    } finally { owner.captureObservation = originalCapture; stop(); observer.unsubscribe();  }
+  });
+
+  it.each(['manual', 'expiry'] as const)('keeps %s permission resolution and terminal membership coherent', async answer => {
+    const { session } = await start('ask', { permissionTimeoutMs: 120 });
+    session.setControllerAttached(true);
+    type State = import('../src/session/conversation-types.js').ConversationObservationState;
+    const states: State[] = [], registrations: Array<{ kind: string; seq: number; promptId?: string; snapshot: State }> = [];
+    const follows: Array<ReturnType<typeof session.observeConversation>> = [];
+    const existing = session.observeConversation(state => states.push(state));
+    const stop = session.subscribeConversation(event => {
+      if (event.kind !== 'permission.resolved' && event.kind !== 'turn.completed') return;
+      session.conversationPage({ limit: 1 });
+      const registration = session.observeConversation(state => states.push(state));
+      registrations.push({ kind: event.kind, seq: event.seq, promptId: event.promptId, snapshot: registration.snapshot });
+      follows.push(registration);
+    });
+    try {
+      const queued = await session.queuePrompt('permission');
+      for (let i = 0; i < 100 && !session.conversationSnapshot().pendingPermissionIds.length; i++)
+        await new Promise(resolve => setTimeout(resolve, 5));
+      const pending = session.observeConversation(() => {});
+      if (answer === 'manual') session.respondPermission(pending.snapshot.pendingPermissions[0]!.permissionId,
+        pending.snapshot.pendingPermissions[0]!.options[0]!.optionId);
+      pending.unsubscribe();
+      if (answer === 'expiry') {
+        for (let i = 0; i < 100 && session.conversationSnapshot().pendingPermissionIds.length; i++)
+          await new Promise(resolve => setTimeout(resolve, 5));
+        await session.interrupt();
+      }
+
+      await queued.completion;
+      expect(registrations.some(item => item.kind === 'permission.resolved')).toBe(true);
+      expect(registrations.some(item => item.kind === 'turn.completed')).toBe(true);
+      for (const item of registrations) {
+        const coherent = (state: State) => state.ledgerBarrier < item.seq || (item.kind === 'permission.resolved'
+          ? state.readiness !== 'awaiting_permission' || state.pendingPermissions.length > 0
+          : !state.activePromptIds.includes(item.promptId!));
+        expect(coherent(item.snapshot)).toBe(true);
+        expect(states.every(coherent)).toBe(true);
+      }
+      expect(states.at(-1)).toMatchObject({ queueDepth: 0, pendingPermissions: [], activePromptIds: [] });
+    } finally { stop(); existing.unsubscribe(); follows.forEach(follow => follow.unsubscribe());  }
+  });
+
+  it('observes current owner commands from load replay even though replay records are excluded from history', async () => {
+    const { session } = await start();
+    const owner = session as unknown as { replaying: boolean; recordUpdate(update: unknown): void; advertisedCommands: Set<string> };
+    owner.replaying = true;
+    try {
+      owner.recordUpdate({ sessionUpdate: 'available_commands_update', availableCommands: [
+        { name: 'resumed_command', description: 'Current resumed command', input: { hint: 'topic' } },
+      ] });
+    } finally { owner.replaying = false; }
+    const observation = session.observeConversation(() => {});
+    expect(owner.advertisedCommands.has('resumed_command')).toBe(true);
+    expect(observation.snapshot.commands).toEqual([{
+      name: 'resumed_command', description: { text: 'Current resumed command', bytes: 23 }, inputHint: 'topic',
+    }]);
+    expect(events(session).some(event => event.source === 'agent_replay')).toBe(false);
+    observation.unsubscribe();
   });
 });

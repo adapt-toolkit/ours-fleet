@@ -1,85 +1,21 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { AcpSession } from '../../src/session/acp.js';
-import { RoleControlServer } from '../../src/session/control.js';
-import { AcpRoleSessionAdapter } from '../../src/application/session-control.js';
-import { AuditSink } from '../../src/web/audit.js';
-import { TrustedDeviceStore } from '../../src/web/device-store.js';
-import { WebAuth } from '../../src/web/auth.js';
-import { buildWebServer } from '../../src/web/server.js';
 import type { ConversationEventV1 } from '../../src/session/conversation-types.js';
 
-const fixture = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'acp-agent.mjs');
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-/**
- * The full Phase-1 stack, no stubs: browser HTTP/WS -> web service ->
- * AcpRoleSessionAdapter -> private control socket -> AcpSession -> fixture
- * adapter, with the durable ledger in between.
- */
+import { startConversationStack } from './fixtures/conversation-stack.js';
 async function startStack(env: Record<string, string> = {}) {
-  const stateDir = mkdtempSync(join(tmpdir(), 'ours-conv-real-'));
-  cleanups.push(() => rmSync(stateDir, { recursive: true, force: true }));
-  const session = await AcpSession.start({
-    name: 'Alpha', argv: [process.execPath, fixture], cwd: stateDir, env,
-    stateDir, mode: 'fresh',
-    permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
-    log: () => {},
-  });
-  cleanups.push(() => session.close());
-  const control = new RoleControlServer(stateDir, session, () => {});
-  await control.start();
-  cleanups.push(() => control.close());
-
-  const role = {
-    id: 'Alpha', lifetime: 'permanent', configured: true, stateHealth: 'present',
-    configuredBackend: 'acp', detectedBackend: 'acp',
-    compatibility: { compatible: true }, problems: [],
-  };
-  const webDir = mkdtempSync(join(tmpdir(), 'ours-conv-real-web-'));
-  cleanups.push(() => rmSync(webDir, { recursive: true, force: true }));
-  const auth = new WebAuth('http://placeholder', 'placeholder', Date.now, new TrustedDeviceStore(webDir));
-  const server = await buildWebServer({
-    query: {
-      async list() { return []; },
-      async detail() { return { role, status: {}, capabilities: {} }; },
-    },
-    repository: { async get() { return role; }, stateDir: () => stateDir },
-    async session() { return new AcpRoleSessionAdapter(stateDir); },
-    logs: { source: () => ({ tail: async () => ({ records: [], truncated: false }) }) },
-    commands: { async execute() { return {}; }, get() { return undefined; } },
-    creation: {
-      async capabilities() { return {}; },
-      async preview() { return {}; },
-      async create() { return {}; },
-      get() { return undefined; },
-    },
-    audit: new AuditSink(join(webDir, 'audit')),
-  } as never, { origin: 'http://placeholder', host: 'placeholder' }, { auth });
-  cleanups.push(() => server.close());
-  const address = await server.app.listen({ host: '127.0.0.1', port: 0 });
-  const port = new URL(address).port;
-  const origin = `http://127.0.0.1:${port}`;
-  auth.setBoundary(origin, `127.0.0.1:${port}`);
-
-  const exchange = await fetch(`${origin}/api/v1/auth/exchange`, {
-    method: 'POST',
-    headers: { origin, authorization: `Bootstrap ${server.auth.bootstrapSecret}` },
-  });
-  expect(exchange.ok).toBe(true);
-  const cookie = (exchange.headers.getSetCookie?.() ?? [])
-    .map(value => value.split(';')[0]).join('; ');
-  const csrf = (await exchange.json() as { csrfToken: string }).csrfToken;
-  const jsonHeaders = { origin, cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' };
-  return { origin, cookie, csrf, jsonHeaders, session, stateDir };
+  const stack = await startConversationStack(env);
+  cleanups.push(stack.dispose);
+  return stack;
 }
 
 interface StreamMessage { type: string; [key: string]: unknown }

@@ -205,6 +205,21 @@ export class RoleTurnArbiter implements AgentSession {
       throw new Error('conversation snapshot is unavailable');
     return this.session.conversationSnapshot();
   }
+  subscribeConversationFailure(listener: (generation: string) => void) {
+    if (!this.session.subscribeConversationFailure) throw new Error('conversation durability observation is unavailable');
+    return this.session.subscribeConversationFailure(listener);
+  }
+  conversationReplayAvailable(expectedGeneration: string): boolean {
+    return this.session.conversationReplayAvailable?.(expectedGeneration) ?? false;
+  }
+  replayConversation(request: import('./conversation-replay.js').ConversationReplayRequest) {
+    if (!this.session.replayConversation) throw new Error('conversation replay is unavailable');
+    return this.session.replayConversation(request);
+  }
+  observeConversation(listener: (state: import('./conversation-types.js').ConversationObservationState) => void): import('./conversation-types.js').ConversationObservation {
+    if (!this.session.observeConversation) throw new Error('conversation observation is unavailable');
+    return this.session.observeConversation(listener);
+  }
   subscribeConversation(listener: (event: ConversationEventV1) => void): () => void {
     if (!this.session.subscribeConversation)
       throw new Error('conversation subscription is unavailable');
