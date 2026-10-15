@@ -1,3 +1,6 @@
+import { EventEmitter } from 'node:events';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { ConversationRoleObserver } from '../../../src/application/conversation-role-observer.js';
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,14 +29,30 @@ export async function startConversationStack(
   env: Record<string, string> = {},
   backend: "acp" | "codex" = "acp",
   approval: "ask" | "allow" = "allow",
+  observation: { realRoleObserver?: boolean; nativeWatch?: boolean } = {},
 ) {
   const cleanups: Array<() => Promise<void> | void> = [];
   const dispose = async () => {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   };
   try {
-    const stateDir = mkdtempSync(join(tmpdir(), "ours-conv-real-"));
-    cleanups.push(() => rmSync(stateDir, { recursive: true, force: true }));
+    const home = mkdtempSync(join(tmpdir(), "ours-conv-real-"));
+    cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+    const stateDir = observation.realRoleObserver ? join(home, '.ours-fleet/tmp/Alpha') : home;
+    const mutations = new Set<() => void>();
+    if (observation.realRoleObserver) {
+      const previousHome = process.env.OURS_FLEET_HOME;
+      process.env.OURS_FLEET_HOME = home;
+      cleanups.push(() => {
+        if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+        else process.env.OURS_FLEET_HOME = previousHome;
+      });
+      // Fleet refuses group/world-writable configuration, so do not inherit the host umask.
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, 'fleet/agents'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(home, 'fleet.yaml'), 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
+      writeFileSync(join(stateDir, 'role.yaml'), `session: ${backend === 'codex' ? 'codex-app-server' : 'acp'}\n`, { mode: 0o600 });
+    }
     const common = {
       name: "Alpha",
       argv: [process.execPath, fixture],
@@ -105,6 +124,21 @@ export async function startConversationStack(
           listener: (state: ConversationRoleState) => void,
         ) {
           observers.add(listener);
+          if (observation.realRoleObserver) {
+            const owner = new ConversationRoleObserver({
+              roleId: _id,
+              ...(observation.nativeWatch ? {} : { watch: () => {
+                const handle = new EventEmitter();
+                return Object.assign(handle, { close() {} });
+              }}),
+              subscribeMutations(notify) { mutations.add(notify); return () => { mutations.delete(notify); }; },
+            }, listener);
+            return {
+              snapshot: () => owner.snapshot(),
+              subscribe: (next: (state: ConversationRoleState) => void) => owner.subscribe(next),
+              dispose() { observers.delete(listener); owner.dispose(); },
+            };
+          }
           return {
             snapshot: () => ({ ...roleState }),
             subscribe(next: (state: ConversationRoleState) => void) {
@@ -205,6 +239,13 @@ export async function startConversationStack(
       server,
       changeRole,
       observers,
+      setMalformedRole(malformed: boolean) {
+        if (!observation.realRoleObserver) throw Error('Real role observation was not enabled');
+        const path = join(home, 'fleet/agents/Unrelated.yaml');
+        if (malformed) writeFileSync(path, 'role: [\n', { mode: 0o600 });
+        else rmSync(path, { force: true });
+        if (!observation.nativeWatch) for (const notify of mutations) notify();
+      },
       dispose,
       async replaceGeneration() {
         changeRole({ availability: "unavailable" });
