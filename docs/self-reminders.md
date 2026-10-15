@@ -158,8 +158,11 @@ old service.
 
 - The agent runs a Fleet release with built-in reminders:
   `ours-fleet ours tools Name` lists `fleet_reminder_create`.
-- `fleet_reminder_list {"state": "all"}` shows no reminder whose key starts with
-  `legacy:` from an earlier, abandoned attempt (otherwise reconcile it first).
+- `fleet_reminder_list {"state": "all"}` (every page) shows each reminder's
+  `request_key`. Any key starting with `legacy:` belongs to an earlier attempt:
+  reconcile it with the rollback table below before starting again. Keys map
+  back to old ids (`legacy:<old id>:r<old revision>`), so an interrupted run
+  is always resumable from the two lists.
 
 ### 2. Fence the old producer persistently
 
@@ -180,29 +183,41 @@ restarts, until someone deliberately re-enables the unit. Do not run the old
 
 ### 3. Classify every old reminder
 
-The agent lists all old reminders (`list` with each `state`, every page). The
-old CLI cannot list events, so the operator supplies their states with a
-read-only query that touches no reminder text (the events table holds only ids,
-revisions and states):
+The old CLI lists reminders but not events, and its `cancel` leaves earlier
+events in whatever state they had. Classification therefore uses the old
+system's own eligibility rule, not raw event states: an event is **live** only
+if its reminder is still `active`, the event's revision equals the reminder's
+current revision, and its state is `submitting`, `queued` or `uncertain`.
+Anything else is historical: superseded by an update or cancellation, or
+belonging to a reminder that is already `handled`, `cancelled` or `expired`.
+
+The operator supplies the metadata with a read-only query that selects no
+title or context:
 
 ```sh
-sqlite3 -readonly /path/to/old/ledger.sqlite \
-  "SELECT reminder_id, revision, id, state FROM self_events ORDER BY reminder_id, revision"
+sqlite3 -readonly /path/to/old/ledger.sqlite "
+  SELECT r.id, r.revision, r.state,
+         datetime(r.due, 'unixepoch'), datetime(r.expires, 'unixepoch'),
+         e.id, e.revision, e.state
+  FROM self_reminders r LEFT JOIN self_events e
+    ON e.reminder_id = r.id AND e.revision = r.revision
+  ORDER BY r.due, r.id"
 ```
 
-The agent can `inspect` any event id from that list. Each old reminder falls
-into exactly one row:
+Each old reminder falls into exactly one row:
 
-| Old reminder / latest event for its current revision | Meaning | Action |
+| Old reminder (current revision) | Meaning | Action |
 | --- | --- | --- |
-| `active`, no event, due in the future | not yet fired | **migrate** (step 4), then cancel the old one (step 5) |
-| `active`, event `pending`, or no event and already due | due but never submitted | **decide**: migrate to a new future time, or cancel the old one; never both |
-| event `submitting`, `queued` or `uncertain` | may already have reached the agent | **hold**: check the conversation and your own records. If handled, `complete` it in the old system. If not, cancel the old reminder and, only if still useful, create a new one at a new future time. Never re-create the old event as-is |
-| `handled`, `cancelled`, `expired`, or event `failed`/`invalidated` | finished | nothing to migrate |
+| `handled`, `cancelled` or `expired` | finished; its events are historical | nothing |
+| `active`, `expires` already passed | lapsed while fenced; the old worker would expire it | old `cancel`, nothing to migrate |
+| `active`, due in the future, no event | not yet fired | **migrate** (step 4), then old `cancel` (step 5) |
+| `active`, already due, no event or event `pending` | due, never submitted | **decide**: migrate to a new future time, or old `cancel`; never both |
+| `active`, event `submitting`, `queued` or `uncertain` | live: may already have reached the agent | **hold**: check the conversation and your own records. If handled and still inside its window, old `complete`. Otherwise old `cancel`, which makes the event historical, and create a new reminder only if one is still useful. Never re-create the old event as-is |
+| `active`, event `handled`, `failed` or `invalidated` | finished for this revision | old `cancel` |
 
-**Stop condition:** the cutover does not proceed to step 6 while any old
-reminder is unclassified, or while any old event is still `submitting`,
-`queued` or `uncertain`.
+**Stop condition:** do not continue to step 6 while any old reminder is still
+`active`. When every row above has been applied, nothing is active and no
+event is live.
 
 ### 4. Re-create the reminders that migrate
 
@@ -238,7 +253,7 @@ the agent goes through each `legacy:` Fleet reminder:
 
 | Fleet reminder state | Action before the old producer may run again |
 | --- | --- |
-| open, no event or event `pending` | `fleet_reminder_cancel` it; the old reminder remains the only copy (it must still be `active` in the old system, otherwise re-create it there) |
+| open, no event or event `pending` | `fleet_reminder_cancel` it. The old reminder (`legacy:<old id>:…`) must still be `active` in the old system; if it was already cancelled there, keep the Fleet one instead and do not re-enable that copy |
 | event `dispatched` or `uncertain`, or `acknowledged` | the wake already happened in Fleet: **cancel the old reminder** so it cannot fire again, and keep the Fleet record |
 | `cancelled` or `expired` | nothing; make sure the old reminder is not active either unless that is intended |
 

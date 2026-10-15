@@ -156,6 +156,8 @@ export interface ScheduleInput {
 
 export interface ReminderView {
   id: string;
+  /** The caller's own idempotency key, so a retried or interrupted run can find its work. */
+  request_key: string;
   revision: number;
   state: ReminderState;
   title: string;
@@ -631,7 +633,8 @@ export class ReminderStore {
       .filter(item => item.reminderId === record.id && item.revision === record.revision)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     return {
-      id: record.id, revision: record.revision, state: record.state, title: record.title, note: record.note,
+      id: record.id, request_key: record.requestKey, revision: record.revision, state: record.state,
+      title: record.title, note: record.note,
       local_time: record.localTime, time_zone: record.timeZone,
       ...(record.fold === undefined ? {} : { fold: record.fold }),
       due_at: record.dueAt, late_window_seconds: record.lateWindowSeconds, expires_at: record.expiresAt,
