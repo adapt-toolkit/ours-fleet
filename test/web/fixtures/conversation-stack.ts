@@ -47,10 +47,11 @@ export async function startConversationStack(
         if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
         else process.env.OURS_FLEET_HOME = previousHome;
       });
-      mkdirSync(stateDir, { recursive: true });
-      mkdirSync(join(home, 'fleet/agents'), { recursive: true });
-      writeFileSync(join(home, 'fleet.yaml'), 'api_version: ours.network/fleet/v2\n');
-      writeFileSync(join(stateDir, 'role.yaml'), `session: ${backend === 'codex' ? 'codex-app-server' : 'acp'}\n`);
+      // Fleet refuses group/world-writable configuration, so do not inherit the host umask.
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, 'fleet/agents'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(home, 'fleet.yaml'), 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
+      writeFileSync(join(stateDir, 'role.yaml'), `session: ${backend === 'codex' ? 'codex-app-server' : 'acp'}\n`, { mode: 0o600 });
     }
     const common = {
       name: "Alpha",
@@ -241,7 +242,7 @@ export async function startConversationStack(
       setMalformedRole(malformed: boolean) {
         if (!observation.realRoleObserver) throw Error('Real role observation was not enabled');
         const path = join(home, 'fleet/agents/Unrelated.yaml');
-        if (malformed) writeFileSync(path, 'role: [\n');
+        if (malformed) writeFileSync(path, 'role: [\n', { mode: 0o600 });
         else rmSync(path, { force: true });
         if (!observation.nativeWatch) for (const notify of mutations) notify();
       },
