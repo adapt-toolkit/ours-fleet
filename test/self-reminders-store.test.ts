@@ -241,6 +241,25 @@ describe('ReminderStore', () => {
     expect(restarted.ack(eb!.id, 1)).toMatchObject({ acknowledged: true });
   });
 
+  it('never dispatches before the due time, even if the wall clock steps back after admission', () => {
+    const h = harness();
+    const { reminder } = create(h.store);
+    h.clock.now = Date.parse(reminder.due_at);
+    const [event] = h.store.sweep();
+    expect(h.store.markAdmitting(event!.id)).toBe(true);
+    h.clock.now -= 60_000;
+    expect(h.store.claimDispatch(event!.id, false)).toEqual({ dispatch: false, reason: 'not_due' });
+    expect(h.store.list().reminders[0]).toMatchObject({ state: 'active' });
+    // The same event returns to pending and is not re-admitted until it is due.
+    h.store.releaseUndispatched(event!.id, h.clock.now);
+    expect(h.store.sweep()).toEqual([]);
+    expect(h.store.markAdmitting(event!.id)).toBe(false);
+    h.clock.now = Date.parse(reminder.due_at);
+    expect(h.store.sweep().map(item => item.id)).toEqual([event!.id]);
+    expect(h.store.markAdmitting(event!.id)).toBe(true);
+    expect(h.store.claimDispatch(event!.id, false)).toEqual({ dispatch: true });
+  });
+
   it('never lets a late receipt or completion move an event backwards', () => {
     const h = harness();
     const { reminder } = create(h.store);
