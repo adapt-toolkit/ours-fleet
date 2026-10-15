@@ -39,7 +39,9 @@ import {
   ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
   classifyShellStatus,
 } from './session/types.js';
-import type { AgentSession, ExitRecord, TurnResult } from './session/types.js';
+import { sessionBackendCapabilities, type AgentSession, type ExitRecord, type TurnResult } from './session/types.js';
+import { bindRoleReminders } from './reminders/runtime.js';
+import type { ReminderManager } from './reminders/manager.js';
 import type {
   AgentSessionAdapter, AgentSessionStartOptions,
 } from './harness/agent-session.js';
@@ -729,6 +731,9 @@ export async function runOnce(
   const managedService = await deps.prepareAgentOurs(role, dir, opts.identityLifetime ? opts.identityLifetime === 'temporary' : temp);
   startupTelemetry.mark('identity_ready');
   let layoutRetiring = false;
+  // Self-reminders live and die with this attempt's runtime binding: every exit
+  // path below stops the dispatcher before that binding is released.
+  let reminderManager: ReminderManager | undefined;
   try {
   const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
     { ...harnessChildEnv(role, launch.env, dir), ...subscription?.env });
@@ -803,6 +808,9 @@ export async function runOnce(
       monitorStarted = true;
       monitorLoop = monitor?.run(pid);
     }
+    // Reminder wakes follow the same gate as mail wakes: never into a role
+    // whose protected startup turn has not succeeded.
+    if (monitorMayStart && sessionStartupComplete && !deps.shouldStop?.()) reminderManager?.start();
   };
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
@@ -836,6 +844,16 @@ export async function runOnce(
     pid = agentSession.pid;
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
+    reminderManager = bindRoleReminders({
+      role: name, stateDir: dir, runtime: managedService.setReminders ? managedService.runtime.snapshot : {},
+      promptInput: sessionBackendCapabilities(sessionBackend, role.harness).promptInput,
+      admitter: arbiter, service: managedService,
+      deps: {
+        now: deps.now, log: deps.log,
+        setTimer: (callback, ms) => setTimeout(callback, ms),
+        clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+      },
+    });
     const unsubscribeFailure = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text || event.origin?.kind === 'stall-watchdog') return;
       const evidence = classifyFailureText(
@@ -1188,6 +1206,7 @@ export async function runOnce(
       break;
     }
     if (deps.shouldStop?.()) {
+      reminderManager?.stop();
       if (temp) {
         retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
         deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
@@ -1213,6 +1232,7 @@ export async function runOnce(
         if (now - identityAbsentSince >= TEMP_IDENTITY_CLOSE_DEBOUNCE_MS) {
           retirementReason = 'identity-closed';
           deps.log(`[${name}] temporary identity '${role.identity}' closed; retiring session and supervisor`);
+          reminderManager?.stop();
           await sessionHandle.close();
           sessionClosed = true;
           break;
@@ -1233,6 +1253,7 @@ export async function runOnce(
     }
   }
   monitorMayStart = false;
+  reminderManager?.stop();
   if (loopManager) {
     control?.setLoopManager(undefined);
     await loopManager.stop();
@@ -1309,6 +1330,8 @@ export async function runOnce(
     ...(layoutRetiring ? { retirementReason: 'operator-stop' as const } : retirementReason ? { retirementReason } : {}),
   };
   } finally {
+    reminderManager?.stop();
+    managedService.setReminders?.(undefined);
     await managedService.close(layoutRetiring);
   }
 }

@@ -23,6 +23,7 @@ import type {
 import { SessionEvents } from './events.js';
 import {
   commandName, memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+  refuseAtRelease, RELEASE_GUARD_REFUSED,
 } from './prompt-batch.js';
 import { recordClaudeRateLimit } from '../subscriptions/observed.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
@@ -216,6 +217,9 @@ function conversationSource(origin: PromptOrigin | undefined): {
     case 'owner': return { source: 'owner_channel', persistBody: false };
     case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
     case 'scheduled-loop': return { source: 'scheduled_loop', persistBody: false };
+    // A supervisor wake like a monitor notice; the body is never retained, so
+    // restart recovery can never replay a reminder past its dispatch fence.
+    case 'self-reminder': return { source: 'fleet_monitor', persistBody: false };
     case 'local-console':
     default:
       return { source: 'local_console', persistBody: true };
@@ -853,6 +857,8 @@ export class AcpSession implements AgentSession {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
+    // A guarded prompt must reach the model only through the release fence.
+    if (options.releaseGuard) options = { ...options, interrupt: false, steer: false };
     if (this.stallRecoveryClaimed && options.origin?.kind === 'fleet-monitor')
       options = { ...options, interrupt: false, steer: false };
     if (this.cancelRecoveryReason)
@@ -882,7 +888,7 @@ export class AcpSession implements AgentSession {
     const run = this.observation.checkpoint(() => {
       this.admitToLedger(promptId, text, queuedBehind, options);
       this.queueDepth++;
-      return this.enqueue(promptId, text, options.origin);
+      return this.enqueue(promptId, text, options.origin, options.releaseGuard);
     });
     const completion = run.then(
       result => {
@@ -912,10 +918,13 @@ export class AcpSession implements AgentSession {
    * own step in the chain, so its place in line is unchanged; what the step
    * does when it is reached is release a whole snapshot, not one prompt.
    */
-  private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
+  private enqueue(
+    promptId: string, text: string, origin: PromptOrigin | undefined, releaseGuard?: () => boolean,
+  ): Promise<TurnResult> {
     const entry: PendingPrompt = {
       promptId, text, origin, ...conversationSource(origin), admittedAt: new Date().toISOString(),
       command: this.advertisedCommands.has(commandName(text) ?? ''),
+      ...(releaseGuard ? { releaseGuard } : {}),
     };
     this.pendingPrompts.push(entry);
     const run = this.promptTail.then(() => this.release(entry));
@@ -932,6 +941,16 @@ export class AcpSession implements AgentSession {
    */
   private release(entry: PendingPrompt): Promise<TurnResult> {
     if (entry.released) return entry.released;
+    const refused = refuseAtRelease(this.pendingPrompts, entry, Boolean(this.sessionId && this.isAlive()));
+    if (refused) {
+      this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration, acpSessionId: this.sessionId,
+        promptId: entry.promptId, turnId: entry.promptId,
+        payload: { outcome: 'cancelled', stopReason: RELEASE_GUARD_REFUSED },
+      });
+      entry.released = Promise.resolve(refused);
+      return entry.released;
+    }
     const members = takeBatch(this.pendingPrompts, entry);
     for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
     const run = this.runPrompt(members).finally(() => {

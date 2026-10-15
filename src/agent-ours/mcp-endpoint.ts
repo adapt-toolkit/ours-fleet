@@ -12,6 +12,7 @@ import { JSONRPCMessageSchema, type JSONRPCMessage } from '@modelcontextprotocol
 import { FileCallbacks } from './file-rpc.js';
 import { Wire } from './wire.js';
 import type { AgentOursRuntime } from './runtime.js';
+import { registerReminderTools, type ReminderToolBackend } from '../reminders/tools.js';
 
 export interface EndpointOptions {
   socket: string;
@@ -22,6 +23,8 @@ export interface EndpointOptions {
   identities: ApplicationIdentityStore;
   remoteDaemonFiles: boolean;
   currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
+  /** Fleet self-reminders, bound later by the runner; tools refuse until then. */
+  reminders?: () => ReminderToolBackend | undefined;
 }
 export async function startMcpEndpoint(
   options: EndpointOptions,
@@ -75,6 +78,7 @@ export async function startMcpEndpoint(
         }
       },
     });
+    if (options.reminders) registerReminderTools(mcp, options.reminders);
     wire.onClose = () => {
       clearTimeout(deadline);
       sockets.delete(wire);
