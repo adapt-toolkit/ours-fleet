@@ -358,6 +358,26 @@ describe('managed fleet child environment', () => {
     expect(order.filter(step => step === 'activate')).toHaveLength(1);
   });
 
+  it('leaves recovered prompts unstarted when a stop arrives while control is starting', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const activated = vi.fn();
+    let stopping = false;
+    const startSession = deps.startAgentSession;
+    deps.startAgentSession = async (...args: Parameters<typeof startSession>) => {
+      const session = await startSession(...args);
+      session.activateRecoveredPrompts = activated;
+      return session;
+    };
+    await runOnce('A', {}, { ...deps, shouldStop: () => stopping, createControlServer: () => ({
+      start: async () => { stopping = true; }, close: async () => {},
+      setFleetSpawner: () => {}, setFleetAuditor: () => {}, setOwnerChannel: () => {},
+      setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    expect(activated).not.toHaveBeenCalled();
+  });
+
   it('never activates recovered prompts when the control socket fails to listen', async () => {
     writeCfg({ A: { harness: 'fake', session: 'acp' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });

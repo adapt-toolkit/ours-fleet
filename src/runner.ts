@@ -934,8 +934,9 @@ export async function runOnce(
       return event;
     });
     // Recovered prompts may run the managed Fleet CLI immediately. Start them
-    // only now that the control socket, audit and spawn handlers are live.
-    agentSession.activateRecoveredPrompts?.();
+    // only now that the control socket, audit and spawn handlers are live, and
+    // never for a role being stopped: they stay durable for its next start.
+    if (!deps.shouldStop?.()) agentSession.activateRecoveredPrompts?.();
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
       // refusal or a cancellation reached the agent and was not acted on, so

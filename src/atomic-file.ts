@@ -1,9 +1,12 @@
 import {
-  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import {
+  incarnationEnded, procIncarnationProbe, processIncarnation, type IncarnationProbe, type ProcessIncarnation,
+} from './process-incarnation.js';
 
 /**
  * Cross-process file protection: a lock, and a replace that cannot leave a
@@ -20,6 +23,12 @@ export interface LockDeps {
   sleep?(ms: number): Promise<void>;
   /** Test hook after a complete private claim is prepared, before atomic publication. */
   beforePublish?(): void | Promise<void>;
+  /** Test seam for PID liveness; defaults to signal 0. */
+  alive?(pid: number): boolean;
+  /** Test seam for boot id and process start markers. */
+  incarnation?: IncarnationProbe;
+  /** Test hook after a dead holder is observed, before its lock is removed. */
+  beforeReclaim?(): void | Promise<void>;
 }
 
 /** The syscalls a replace depends on, injectable so faults can be forced deterministically. */
@@ -48,23 +57,36 @@ export async function withFileLock<T>(
 ): Promise<T> {
   const now = deps.now ?? (() => Date.now());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => { setTimeout(r, ms); }));
+  const probe = deps.incarnation ?? procIncarnationProbe;
+  const alive = deps.alive ?? ((pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } });
   const stampPath = join(lockPath, 'ts');
   const ownerPath = join(lockPath, 'owner.json');
+  const reclaimPath = `${lockPath}.reclaim`;
   const token = randomUUID();
   mkdirSync(dirname(lockPath), { recursive: true });
+  /** The exact bytes that identify one holder, so a reclaim never removes its successor. */
+  const holder = (): string | null => {
+    let owner = '', stamp = '';
+    try { owner = readFileSync(ownerPath, 'utf8'); } catch { /* legacy or incomplete lock */ }
+    try { stamp = readFileSync(stampPath, 'utf8'); } catch { /* holder died between mkdir and stamp */ }
+    return owner || stamp ? `${stamp}\0${owner}` : null;
+  };
 
   for (let waited = 0; ;) {
     const claimPath = `${lockPath}.claim.${process.pid}.${randomUUID()}`;
     try {
       mkdirSync(claimPath);
       writeFileSync(join(claimPath, 'ts'), String(now()));
-      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
+      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({
+        token, pid: process.pid, ...processIncarnation(process.pid, probe),
+      }));
       await deps.beforePublish?.();
       renameSync(claimPath, lockPath);
       break;
     } catch (e) {
       rmSync(claimPath, { recursive: true, force: true });
       if (!['EEXIST', 'ENOTEMPTY'].includes((e as NodeJS.ErrnoException).code ?? '')) throw e;
+      const observed = holder();
       let held: number | null = null;
       try {
         const n = parseInt(readFileSync(stampPath, 'utf8').trim(), 10);
@@ -72,13 +94,14 @@ export async function withFileLock<T>(
       } catch { /* holder died between mkdir and stamp */ }
       let ownerAlive = false;
       try {
-        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
-        if (typeof owner.pid === 'number') {
-          try { process.kill(owner.pid, 0); ownerAlive = true; } catch { /* dead owner */ }
-        }
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number } & ProcessIncarnation;
+        // A reused PID is not the holder: a lock written before a reboot, or by
+        // a process that has since exited, must not block every later caller.
+        if (typeof owner.pid === 'number')
+          ownerAlive = alive(owner.pid) && !incarnationEnded(owner.pid, owner, probe);
       } catch { /* legacy or incomplete lock */ }
       if (!ownerAlive && ((held !== null && now() - held > staleMs) || waited > staleMs * 2)) {
-        rmSync(lockPath, { recursive: true, force: true });   // break a dead holder's lock
+        await reclaimDeadHolder(reclaimPath, lockPath, observed, holder, staleMs, deps);
         continue;
       }
       await sleep(POLL_MS);
@@ -93,6 +116,34 @@ export async function withFileLock<T>(
       const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
       if (owner.token === token) rmSync(lockPath, { recursive: true, force: true });
     } catch { /* never remove a lock whose ownership cannot be proved */ }
+  }
+}
+
+/**
+ * Remove a dead holder's lock only while it is still that holder's. Contenders
+ * that observed the same dead holder serialize through a short reclaim gate
+ * and re-read the holder inside it, so a late reclaimer cannot delete the lock
+ * a faster contender has already claimed.
+ */
+async function reclaimDeadHolder(
+  reclaimPath: string, lockPath: string, observed: string | null,
+  holder: () => string | null, staleMs: number, deps: LockDeps,
+): Promise<void> {
+  try { mkdirSync(reclaimPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    // A reclaimer that died inside the gate leaves it behind; the section is a
+    // few syscalls long, so a gate older than the stale interval is abandoned.
+    try { if (Date.now() - statSync(reclaimPath).mtimeMs > staleMs) rmSync(reclaimPath, { recursive: true, force: true }); }
+    catch { /* already released */ }
+    await (deps.sleep ?? ((ms: number) => new Promise<void>(r => { setTimeout(r, ms); })))(POLL_MS);
+    return;
+  }
+  try {
+    await deps.beforeReclaim?.();
+    if (holder() === observed) rmSync(lockPath, { recursive: true, force: true });
+  } finally {
+    rmSync(reclaimPath, { recursive: true, force: true });
   }
 }
 
@@ -155,7 +206,8 @@ export function withSynchronousFileLock<T>(path: string, work: () => T): T {
   const token = `${process.pid}-${randomUUID()}.json`;
   const own = join(path, token);
   const deadline = Date.now() + 10_000;
-  type Claim = { pid: number; choosing: boolean; ticket: number };
+  type Claim = { pid: number; choosing: boolean; ticket: number } & ProcessIncarnation;
+  const incarnation = processIncarnation(process.pid);
   const claims = (): Array<{ name: string; value: Claim }> => {
     const result: Array<{ name: string; value: Claim }> = [];
     for (const name of readdirSync(path).filter(name => /^[0-9]+-[a-f0-9-]{36}\.json$/.test(name))) {
@@ -166,24 +218,26 @@ export function withSynchronousFileLock<T>(path: string, work: () => T): T {
       if (!Number.isSafeInteger(value.pid) || value.pid <= 0 || !Number.isSafeInteger(value.ticket) || value.ticket < 0)
         throw new Error('Invalid synchronous lock claim');
       if (name !== token) {
+        let dead = false;
         try { process.kill(value.pid, 0); }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
-            // This dead contender alone owned this UUID path. Never remove
-            // the namespace or a successor's differently named claim.
-            rmSync(file, { force: true }); continue;
-          }
+        catch (error) { dead = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+        // A claim from before a reboot, or whose PID now names a later process,
+        // is as dead as an exited one.
+        if (dead || incarnationEnded(value.pid, value)) {
+          // This dead contender alone owned this UUID path. Never remove
+          // the namespace or a successor's differently named claim.
+          rmSync(file, { force: true }); continue;
         }
       }
       result.push({ name, value });
     }
     return result;
   };
-  replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: true, ticket: 0 }));
+  replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: true, ticket: 0, ...incarnation }));
   try {
     const ticket = Math.max(0, ...claims().map(claim => claim.value.ticket)) + 1;
     if (!Number.isSafeInteger(ticket)) throw new Error('Synchronous lock ticket overflow');
-    replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: false, ticket }));
+    replaceFileAtomically(own, JSON.stringify({ pid: process.pid, choosing: false, ticket, ...incarnation }));
     for (;;) {
       const preceding = claims().some(claim => claim.name !== token && (claim.value.choosing
         || claim.value.ticket < ticket || (claim.value.ticket === ticket && claim.name < token)));
