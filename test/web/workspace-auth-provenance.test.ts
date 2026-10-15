@@ -94,3 +94,52 @@ it('marks only device validation failure, strips forged service provenance and r
     await gateway.close(); await web.close(); upstream.closeAllConnections(); await new Promise<void>(resolve => upstream.close(() => resolve())); rmSync(dir, { recursive: true, force: true });
   }
 });
+
+it('authenticates conversation events with local/frame cookies and hosted workspace bearers, never cursor credentials',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'conversation-auth-'));
+  const store=new WorkspaceDeviceStore(dir), foreignStore=new WorkspaceDeviceStore(join(dir,'foreign'));
+  const origin='https://fleet.example',appOrigin='https://app.ours.network';
+  const auth=new WebAuth(origin,'fleet.example',Date.now,new TrustedDeviceStore(join(dir,'trusted')), {version:1,mode:'none'},store,appOrigin);
+  const session=auth.anonymous({headers:{host:'fleet.example',origin}} as any);
+  const link=store.mint(),device=store.enroll(link.enrollment,link.workspaceId,'hosted');
+  const foreignLink=foreignStore.mint(),foreign=foreignStore.enroll(foreignLink.enrollment,foreignLink.workspaceId,'foreign');
+  // Missing observer deliberately distinguishes authenticated admission (409) from rejection (401).
+  const web=await buildWebServer({audit:new AuditSink(join(dir,'audit'))} as any,{origin,host:'fleet.example'},{auth});
+  const url='/api/v1/roles/A/conversation/events?expectedGeneration=g&after=0';
+  try {
+    for(const headers of [
+      {host:'fleet.example',cookie:`ofs_session=${session.id}`},
+      {host:'fleet.example',origin,cookie:`ofs_session=${session.id}`,'sec-fetch-site':'same-origin'},
+      {host:'fleet.example',origin:appOrigin,authorization:`Bearer ${device.token}`,'sec-fetch-site':'cross-site'},
+    ])expect((await web.app.inject({url,headers})).statusCode).toBe(409);
+    const rejected=await web.app.inject({url,headers:{host:'fleet.example',origin:appOrigin,authorization:`Bearer ${foreign.token}`}});
+    expect(rejected.statusCode).toBe(401);expect(rejected.headers['x-ours-workspace-auth']).toBe('rejected');
+    expect((await web.app.inject({url:url+'&token='+device.token,headers:{host:'fleet.example'}})).statusCode).toBe(401);
+    store.revoke(device.device.id);
+    expect((await web.app.inject({url,headers:{host:'fleet.example',origin:appOrigin,authorization:`Bearer ${device.token}`}})).statusCode).toBe(401);
+  } finally {await web.close();foreignStore.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+it('streams hosted conversation role events through the existing Fleet prefix with readable CORS',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'conversation-prefix-')),store=new WorkspaceDeviceStore(dir);
+  const auth=new WebAuth('http://localhost','localhost',Date.now,new TrustedDeviceStore(join(dir,'trusted')),undefined,store);
+  const link=store.mint(),device=store.enroll(link.enrollment,link.workspaceId,'hosted');
+  let disposed=0;
+  const role={roleId:'A',roleRevision:1,roleLifetime:'missing',availability:'missing',health:'healthy'};
+  const web=await buildWebServer({audit:new AuditSink(join(dir,'audit')),observeRole:()=>({snapshot:()=>role,subscribe:()=>({snapshot:role,unsubscribe(){}}),dispose(){disposed++;}})} as any,{origin:'http://localhost',host:'localhost'},{auth});
+  await web.app.listen({host:'127.0.0.1',port:0});const upstream=web.app.listeningOrigin;
+  const gateway=createPrefixGateway({auth,fleetOrigin:upstream,services:[]});
+  gateway.server.listen(0,'127.0.0.1');await once(gateway.server,'listening');
+  const origin=`http://127.0.0.1:${(gateway.server.address() as {port:number}).port}`;
+  auth.setBoundary(origin,new URL(origin).host,{hosts:[new URL(upstream).host]});
+  const abort=new AbortController();
+  try {
+    const response=await fetch(origin+'/fleet/api/v1/roles/A/conversation/events?expectedGeneration=g',{headers:{origin:auth.appOrigin,authorization:`Bearer ${device.token}`},signal:abort.signal});
+    expect(response.status).toBe(200);expect(response.headers.get('content-type')).toContain('text/event-stream');
+    expect(response.headers.get('access-control-allow-origin')).toBe(auth.appOrigin);
+    const reader=response.body!.getReader(),first=await reader.read();
+    expect(new TextDecoder().decode(first.value)).toContain('"type":"role"');
+    auth.revokeWorkspaceDevice(device.device.id);
+    await expect.poll(()=>disposed).toBe(1);
+  } finally {abort.abort();await gateway.close();web.app.server.closeAllConnections();await web.close();rmSync(dir,{recursive:true,force:true});}
+});

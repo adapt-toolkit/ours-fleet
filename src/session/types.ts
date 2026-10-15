@@ -392,6 +392,12 @@ export interface AgentSession {
   // ── durable conversation ledger ────────────────────────────────────────────
   conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
   conversationSnapshot?(): ConversationSnapshot;
+  /** Side-effect-free current-generation durability eligibility; does not certify a historical range. */
+  conversationReplayAvailable?(expectedGeneration: string): boolean;
+  replayConversation?(request: import('./conversation-replay.js').ConversationReplayRequest): AsyncIterable<import('./conversation-replay.js').ConversationReplayPage>;
+  /** Passive: registering never attaches a controller or acknowledges activity. */
+  observeConversation?(listener: (state: import('./conversation-types.js').ConversationObservationState) => void): import('./conversation-types.js').ConversationObservation;
+  subscribeConversationFailure?(listener: (generation: string) => void): () => void;
   subscribeConversation?(listener: (event: ConversationEventV1) => void): () => void;
   /** Durably admit an idempotent browser prompt; resolves on admission. */
   submitPromptBrowser?(command: SubmitPromptCommand): Promise<PromptReceipt>;

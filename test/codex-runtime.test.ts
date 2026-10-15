@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { probeCodexRuntime, codexVersionAtLeast, hostCodex } from '../src/harness/codex-runtime.js';
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { makeCodexAdapter, codexAcpLaunchForResolution } from '../src/harness/codex.js';
@@ -16,6 +16,8 @@ import type { ResolvedRole } from '../src/config.js';
 
 const roots: string[] = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'fleet-codex-runtime-')); roots.push(dir); return dir; };
+// Runtime-selection fixtures own their environment; individual override tests opt in below.
+beforeEach(() => { vi.stubEnv('CODEX_PATH', undefined); });
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const adapter = () => resolveBundledAcpAgent('@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
 function binary(version: string): string {
