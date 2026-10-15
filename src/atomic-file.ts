@@ -38,9 +38,10 @@ export interface LockDeps {
  */
 export class FileLockOwnerUnverifiableError extends Error {
   constructor(readonly lockPath: string, readonly pid: number) {
-    super(`lock ${lockPath} is held by PID ${pid}, recorded without a boot or start marker, so it cannot be `
-      + 'proved stale; it was left in place. If no Fleet process started before the last update or reboot '
-      + `is still running, remove ${lockPath} and retry.`);
+    super(`lock ${lockPath} is held by PID ${pid}, recorded without a boot or start marker by an older `
+      + 'release, so it can be neither trusted nor proved stale; it was left in place. Inspect PID '
+      + `${pid}: the lock may be removed only once that process is proved not to be the Fleet process `
+      + 'that wrote it.');
   }
 }
 

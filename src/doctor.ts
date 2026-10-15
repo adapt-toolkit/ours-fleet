@@ -1,3 +1,4 @@
+import { describeRegistration, refreshServiceRegistrations, type RefreshOptions } from './supervisor/registration-refresh.js';
 import { join } from 'node:path';
 import { userInfo, homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
@@ -114,6 +115,8 @@ export async function doctor(
     installScan?: { path?: string; argv1?: string };
     /** Override the local Codex model cache path (tests). */
     codexCatalogPath?: string;
+    /** Compare installed service definitions with this release (read-only). */
+    serviceRegistration?: Pick<RefreshOptions, 'binPath' | 'homeDir' | 'exists' | 'processArgv'>;
   } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
@@ -126,6 +129,22 @@ export async function doctor(
   // trustworthy as the answer, and a second install with the same semver and
   // different behaviour is invisible to `--version`.
   checks.push(...installChecks(opts.installScan));
+  if (opts.serviceRegistration) {
+    try {
+      const reports = await refreshServiceRegistrations({
+        ...opts.serviceRegistration, write: false, exec, platform,
+      });
+      for (const report of reports.filter(report => report.state !== 'absent')) checks.push({
+        name: `service: ${report.service}`,
+        ok: report.state !== 'stale' && report.running !== 'stale',
+        detail: describeRegistration(report).replace(/^\S+\s+/, '')
+          + (report.state === 'stale' ? '; run: ours-fleet service refresh' : ''),
+      });
+    } catch (error) {
+      checks.push({ name: 'service definitions', ok: false,
+        detail: `could not inspect: ${(error as Error)?.message ?? String(error)}` });
+    }
+  }
 
   const major = Number(process.versions.node.split('.')[0]);
   checks.push({
