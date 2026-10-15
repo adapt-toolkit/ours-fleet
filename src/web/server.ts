@@ -1,3 +1,5 @@
+import { registerConversationStream } from './conversation-stream.js';
+import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
 import { conversationHasAttachment } from '../application/conversation-history.js';
 import { readDeliveredFile } from '../file-delivery/store.js';
 import { WorkspaceDeviceAuthError } from './workspace-devices.js';
@@ -49,6 +51,7 @@ import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.j
 const ONBOARDING_WORK = ['coordination', 'development', 'review'] as const;
 
 export interface WebServices {
+  observeRole?(roleId: string, listener: (state: ConversationRoleState) => void): ConversationRoleObservation;
   layoutBindings?: Pick<LayoutBindingGrants, 'control'>;
   query: FleetQueryService;
   repository: RoleRepository;
@@ -150,6 +153,8 @@ export async function buildWebServer(
     if (fleetError.code === 'unauthorized') reply.header('X-Ours-Request-Id', request.id);
     reply.code(statusFor(fleetError.code)).send({ error: fleetError.toJSON() });
   });
+
+  registerConversationStream(app, services, auth);
 
   app.post('/api/v1/auth/exchange', async (request, reply) => {
     const { session, device } = auth.exchange(request);

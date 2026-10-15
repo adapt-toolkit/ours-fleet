@@ -112,3 +112,28 @@ it('waits for a running child to close and never retries after shutdown', async 
   expect(launch).toHaveBeenCalledTimes(1);
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it('keeps an SSE opening access deadline despite a renewed credential, and honors fixed-device expiry',async()=>{
+  const {WebAuth}=await import('../../src/web/auth.js');
+  const {WorkspaceDeviceStore}=await import('../../src/web/workspace-devices.js');
+  const {TrustedDeviceStore}=await import('../../src/web/device-store.js');
+  const devices=new WorkspaceDeviceStore(join(dir,'devices'),()=>Date.now());
+  const auth=new WebAuth('http://localhost','localhost',()=>Date.now(),new TrustedDeviceStore(join(dir,'trusted')),undefined,devices);
+  const link=devices.mint(), issued=devices.enroll(link.enrollment,link.workspaceId,'rotating',true);
+  const request=(token:string)=>({headers:{host:'localhost',authorization:`Bearer ${token}`}} as any);
+  const opening=auth.authenticate(request(issued.accessToken));
+  const closed=vi.fn(),unbind=auth.bindTransport(opening,closed);
+  try {
+    await vi.advanceTimersByTimeAsync(240_000);
+    const fresh=devices.refresh(issued.refreshToken);
+    const renewed=auth.authenticate(request(fresh.accessToken));
+    expect(renewed.absoluteExpiresAt).toBeGreaterThan(opening.absoluteExpiresAt);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(auth.sessionValid(opening)).toBe(false);expect(auth.sessionValid(renewed)).toBe(true);expect(closed).toHaveBeenCalledOnce();
+    const fixedLink=devices.mint(),fixed=devices.enroll(fixedLink.enrollment,fixedLink.workspaceId,'fixed');
+    const fixedSession=auth.authenticate(request(fixed.token));
+    expect(auth.sessionValid(fixedSession)).toBe(true);
+    vi.setSystemTime(fixedSession.absoluteExpiresAt);
+    expect(auth.sessionValid(fixedSession)).toBe(false);
+  }finally{unbind();auth.shutdown();}
+});

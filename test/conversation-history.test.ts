@@ -83,3 +83,48 @@ describe('conversationTailPage',()=>{
   await withLedger({'events-000001.jsonl':[ev(1)]},async dir=>{await expect(conversationTailPage(dir,{before:'abc'},snap())).rejects.toThrow(/cursor/);});
  });
 });
+
+it('rechecks generation after asynchronous latest-tail work and limits unstable baselines to three attempts', async()=>{
+ const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+ const dir=mkdtempSync(join(tmpdir(),'fleet-tail-generation-'));
+ try {
+  mkdirSync(join(dir,'.conversation'));
+  let calls=0;
+  const adapter=new RoleSessionControlAdapter(dir,async(_dir,request)=>{
+   if(request.command==='snapshot')return {version:1,id:'x',ok:true,result:{backend:'acp'}};
+   calls++;return {version:1,id:'x',ok:true,result:{events:[],hasMore:false,snapshot:{sessionGeneration:`g${calls}`,readiness:'idle',pendingPermissionIds:[],queueDepth:0}}};
+  });
+  await expect(adapter.conversationTail()).rejects.toThrow(/changed|generation/);
+  expect(calls).toBe(6);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+it('keeps latest-tail cursor at the captured barrier when a permission is created during the REST load',async()=>{
+ const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+ const dir=mkdtempSync(join(tmpdir(),'fleet-tail-permission-'));
+ try{
+  mkdirSync(join(dir,'.conversation'));let calls=0;
+  const ev=(seq:number,kind:string)=>({schemaVersion:1,seq,eventId:`e${seq}`,roleId:'A',at:'now',sessionGeneration:'g',source:'agent',kind,permissionId:kind==='permission.requested'?'p':undefined,payload:{}});
+  writeFileSync(join(dir,'.conversation/events-000001.jsonl'),JSON.stringify(ev(1,'message.chunk'))+'\n');
+  const adapter=new RoleSessionControlAdapter(dir,async(_dir,request)=>{
+   if(request.command==='snapshot'){
+    writeFileSync(join(dir,'.conversation/events-000001.jsonl'),[ev(1,'message.chunk'),ev(2,'permission.requested')].map(JSON.stringify).join('\n')+'\n');
+    return {version:1,id:'x',ok:true,result:{backend:'acp'}};
+   }
+   calls++;return {version:1,id:'x',ok:true,result:{events:[],hasMore:false,snapshot:{sessionGeneration:'g',ledgerBarrier:calls===1?1:2,readiness:'idle',pendingPermissionIds:calls===1?[]:['p'],queueDepth:0}}};
+  });
+  const page=await adapter.conversationTail();expect(page.nextCursor).toBe('1');expect(page.events.map(e=>e.seq)).toEqual([1]);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+it('closes a private follow handle that arrives after cancellation exactly once',async()=>{
+ const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+ const {Socket}=await import('node:net');const abort=new AbortController();
+ let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});let closes=0;let finished=0;let options:any;
+ const adapter=new RoleSessionControlAdapter('/unused',undefined,async(_dir,request)=>{
+  options=request;await gate;return {socket:new Socket(),close:()=>{closes++;}};
+ });
+ const pending=adapter.followConversation({expectedGeneration:'g',after:0,controller:false,signal:abort.signal,onReplay:()=>{},onReady:()=>{},onEvent:()=>{},onState:()=>{},onClose:()=>{finished++;}});
+ abort.abort();release();const handle=await pending;handle.close();handle.close();
+ expect(options).toMatchObject({expectedGeneration:'g',after:0,controller:false});expect(closes).toBe(1);expect(finished).toBe(1);
+});

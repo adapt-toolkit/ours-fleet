@@ -7,6 +7,7 @@ import { createConnection, createServer, type Server, type Socket } from 'node:n
 import { join } from 'node:path';
 
 import { SessionControlError } from './types.js';
+import { MAX_CONVERSATION_RECORD_BYTES, startConversationReplay, type PassiveConversationFollowRequest } from './conversation-replay.js';
 import type { AgentSession, ControlFailureKind, SessionEvent, SessionSnapshot } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
@@ -47,7 +48,8 @@ export interface ControlRequest {
   loop?: string;
   // ── conversation v3 fields ──────────────────────────────────────────────────
   /** Conversation cursor: replay strictly after this durable seq. */
-  after?: string;
+  after?: string | number;
+  expectedGeneration?: string;
   limit?: number;
   /** Idempotency key for v3 mutations. */
   commandId?: string;
@@ -322,6 +324,7 @@ export class RoleControlServer {
         if (!line.trim()) continue;
         void this.handle(line, socket).then(follow => {
           if (follow) {
+            if (socket.destroyed) { follow.stop(); if (follow.controller) this.session.setControllerAttached(false); return; }
             if (unsubscribe) {
               unsubscribe();
               if (controllerAttached) this.session.setControllerAttached(false);
@@ -369,6 +372,7 @@ export class RoleControlServer {
                 'events_since', 'observer_follow', 'retained_range',
                 ...(this.correspondence ? ['agent_correspondence'] : []),
                 ...(this.session.conversationPage ? ['conversation_v3'] : []),
+                ...this.observationFeatures(),
                 ...(this.session.submitPromptBrowser ? ['generation_bound_prompts'] : []),
                 ...(this.session.liveVoiceSupported ? ['idle_bound_prompts', 'targeted_voice_interrupt'] : []),
                 ...(this.session.capabilities?.steering ? ['steering'] : []),
@@ -532,20 +536,84 @@ export class RoleControlServer {
         }
         case 'conversation_page': {
           this.requireConversation(request);
-          this.write(socket, {
-            version: 1, id: request.id, ok: true,
-            result: this.session.conversationPage!({
-              after: request.after, limit: request.limit,
-            }),
+          const page = this.session.conversationPage!({
+            after: request.after === undefined ? undefined : String(request.after), limit: request.limit,
           });
+          if (this.session.observeConversation) {
+            try {
+              const observation = this.session.observeConversation(() => {});
+              try {
+                if (observation.snapshot.observationFailure) {
+                  page.snapshot = { ...page.snapshot, historyDegraded: true, observationFailure: 'capture_failed' };
+                } else page.snapshot = observation.snapshot;
+              } finally { observation.unsubscribe(); }
+            } catch {
+              // Canonical REST recovery remains usable without a live observation.
+              // Never substitute a frozen capture/barrier for the current store page.
+              page.snapshot = { ...page.snapshot, historyDegraded: true, observationFailure: 'capture_failed' };
+            }
+          }
+          this.write(socket, { version: 1, id: request.id, ok: true, result: page });
           return;
         }
         case 'conversation_follow': {
           this.requireConversation(request);
+          if (request.controller === false && request.expectedGeneration !== undefined) {
+            let stopped = false;
+            let heartbeat: ReturnType<typeof setInterval> | undefined;
+            let writing: Promise<void> = Promise.resolve();
+            const send = (message: Record<string, unknown>): Promise<void> => {
+              const result = writing.then(() => writeMessage(message));
+              writing = result.catch(() => {});
+              return result;
+            };
+            const writeMessage = async (message: Record<string, unknown>) => {
+              // Stream one replay record progressively; don't queue a valid 16 MiB record
+              // into the 8 MiB pending-output budget. Framing is owned by the transport.
+              const bytes = Buffer.from(JSON.stringify({ version: 1, ...message }) + '\n');
+              for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+                if (stopped || socket.destroyed) throw new Error('conversation socket closed');
+                if (!socket.write(bytes.subarray(offset, offset + 64 * 1024))) {
+                  await new Promise<void>((resolve, reject) => {
+                    const cleanup = () => { socket.off('drain', drained); socket.off('close', ended); socket.off('error', failed); };
+                    const drained = () => { cleanup(); resolve(); };
+                    const ended = () => { cleanup(); reject(new Error('conversation socket closed')); };
+                    const failed = (error: Error) => { cleanup(); reject(error); };
+                    socket.once('drain', drained); socket.once('close', ended); socket.once('error', failed);
+                  });
+                }
+              }
+            };
+            const follow = startConversationReplay(this.session, {
+              expectedGeneration: request.expectedGeneration, after: request.after === undefined ? 0 : Number(request.after), controller: false,
+            }, {
+              replay: page => send({ conversationReplay: page }),
+              ready: ready => send({ conversationReady: ready }),
+              event: event => send({ conversationEvent: event }),
+              state: state => send({ conversationState: state }),
+              close: reason => {
+                stopped = true; if (heartbeat) clearInterval(heartbeat);
+                if (reason && !socket.destroyed) socket.end(JSON.stringify({ version: 1, id: request.id, ok: false, error: reason }) + '\n');
+              },
+            });
+            const stop = () => { stopped = true; if (heartbeat) clearInterval(heartbeat); follow.close(); };
+            let heartbeatPending = false;
+            if (!stopped) {
+              heartbeat = setInterval(() => {
+                if (heartbeatPending || stopped) return;
+                heartbeatPending = true;
+                void send({ controlHeartbeat: true }).catch(() => { stop(); socket.destroy(); })
+                  .finally(() => { heartbeatPending = false; });
+              }, 2_000);
+              heartbeat.unref();
+            }
+            socket.once('close', stop);
+            return { controller: false, stop: () => { socket.off('close', stop); stop(); } };
+          }
           this.write(socket, {
             version: 1, id: request.id, ok: true,
             result: this.session.conversationPage!({
-              after: request.after, limit: request.limit,
+              after: request.after === undefined ? undefined : String(request.after), limit: request.limit,
             }),
           });
           // A live conversation view is an attached controller: permission
@@ -667,6 +735,16 @@ export class RoleControlServer {
       throw new SessionControlError('rejected', 'this role has no conversation ledger');
   }
 
+  private observationFeatures(): string[] {
+    if (!this.session.observeConversation || !this.session.replayConversation || !this.session.subscribeConversation || !this.session.subscribeConversationFailure) return [];
+    try {
+      const observation = this.session.observeConversation(() => {});
+      try { return observation.snapshot.observationFailure || !this.session.conversationReplayAvailable?.(observation.snapshot.sessionGeneration)
+        ? [] : ['conversation_observation', 'control_heartbeat']; }
+      finally { observation.unsubscribe(); }
+    } catch { return []; }
+  }
+
   private write(socket: Socket, response: ControlResponse): void {
     if (!socket.destroyed) socket.write(JSON.stringify(response) + '\n');
   }
@@ -768,31 +846,49 @@ export async function followControl(
  */
 export async function followConversation(
   stateDir: string,
-  after: string | undefined,
+  after: string | undefined | PassiveConversationFollowRequest,
   onMessage: (message: Record<string, unknown>) => void,
 ): Promise<{ socket: Socket; close(): void }> {
+  const options = typeof after === 'object' ? after : undefined;
+  options?.signal?.throwIfAborted();
   const token = readFileSync(controlTokenPath(stateDir), 'utf8').trim();
   const socket = createConnection(controlSocketPath(stateDir));
   socket.setEncoding('utf8');
-  let buffer = '';
+  // Admit one maximum-size logical record plus its actual private wrapper.
+  // coveredThrough is a safe integer. JSON brackets/envelope are outside the record budget.
+  const privateEnvelopeBytes = Math.max(
+    Buffer.byteLength(JSON.stringify({version:1,conversationReplay:{events:[],coveredThrough:Number.MAX_SAFE_INTEGER}})),
+    Buffer.byteLength(JSON.stringify({version:1,conversationReady:{snapshot:null,coveredThrough:Number.MAX_SAFE_INTEGER}})) - 4,
+    Buffer.byteLength(JSON.stringify({version:1,conversationState:null})) - 4,
+    Buffer.byteLength(JSON.stringify({version:1,conversationEvent:null})) - 4,
+  );
+  const limit = MAX_CONVERSATION_RECORD_BYTES + privateEnvelopeBytes;
+  let parts: string[] = [], bytes = 0;
   socket.on('data', chunk => {
-    buffer += chunk;
-    for (;;) {
-      const newline = buffer.indexOf('\n');
-      if (newline < 0) break;
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      if (!line.trim()) continue;
-      try { onMessage(JSON.parse(line) as Record<string, unknown>); }
-      catch { /* a torn frame ends this stream; the client resyncs over HTTP */ }
+    for (const [index, part] of String(chunk).split('\n').entries()) {
+      if (index) {
+        const line=parts.join(''); parts=[]; bytes=0;
+        if (line.trim()) {
+          try { onMessage(JSON.parse(line) as Record<string, unknown>); }
+          catch { if (options) { socket.destroy(new Error('invalid conversation private frame')); return; } }
+        }
+      }
+      bytes+=Buffer.byteLength(part);
+      if (options && bytes>limit) { socket.destroy(new Error('conversation private frame exceeds assembly limit')); return; }
+      parts.push(part);
     }
   });
   await new Promise<void>((resolve, reject) => {
+    const onAbort = () => { socket.destroy(); reject(new Error('conversation follow aborted')); };
+    options?.signal?.addEventListener('abort', onAbort, { once: true });
+    socket.once('close', () => options?.signal?.removeEventListener('abort', onAbort));
     socket.once('connect', resolve);
     socket.once('error', reject);
+    if (options?.signal?.aborted) onAbort();
   });
   socket.write(JSON.stringify({
-    version: 3, id: randomUUID(), token, command: 'conversation_follow', after,
+    version: 3, id: randomUUID(), token, command: 'conversation_follow',
+    ...(options ? {expectedGeneration:options.expectedGeneration,after:options.after ?? 0,controller:false} : {after}),
   }) + '\n');
   return { socket, close: () => socket.destroy() };
 }

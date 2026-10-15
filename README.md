@@ -181,6 +181,9 @@ credentials and rotating refresh credentials; see
 owner-private Unix socket; local processes running as the same OS user are
 therefore inside the trust boundary.
 
+The read-only [conversation event stream](docs/conversation-stream.md) documents
+authentication deadlines, replay coverage, bounded framing and filesystem support.
+
 On first setup, the CLI requires an explicit access choice: `--password-file`
 or `--pairing` for protected access, or `--no-password` for intentional
 unprotected access. `--password-file` stores only a salted scrypt verifier in

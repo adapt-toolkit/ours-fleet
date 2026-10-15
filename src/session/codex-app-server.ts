@@ -1,3 +1,4 @@
+import { ConversationObservation } from './conversation-observation.js';
 import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -7,7 +8,8 @@ import type { CommonPermissions } from '../config.js';
 import { boundedJson } from './conversation-normalizer.js';
 import { ConversationEventStore } from './conversation-store.js';
 import type {
-  ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
+  ConversationEventV1, ConversationObservationState, ConversationSnapshot, ConversationSource,
+  PermissionRequestedPayload, PromptOrigin, PromptReceipt,
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
@@ -69,6 +71,7 @@ export interface CodexAppServerSessionOptions {
 }
 
 interface PendingPermission {
+  presented?: PermissionRequestedPayload;
   requestId: RequestId;
   method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
     | 'item/permissions/requestApproval' | 'mcpServer/elicitation/request';
@@ -231,6 +234,7 @@ export class CodexAppServerSession implements AgentSession {
   private lastError?: string;
   private exit: ExitRecord | null = null;
   private queueDepth = 0;
+  private readonly observation = new ConversationObservation(() => this.captureObservation());
   private promptTail: Promise<unknown> = Promise.resolve();
   /** Admitted prompts not yet handed to the app-server, in admission order. */
   private readonly pendingPrompts: PendingPrompt[] = [];
@@ -256,6 +260,9 @@ export class CodexAppServerSession implements AgentSession {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
     this.conversationStartCursor = this.conversation.lastCursor();
+    // A durable append can precede its inventory mutation. Capture only after
+    // the synchronous owner checkpoint, never the state at append notification.
+    this.conversation.subscribe(() => this.observation.scheduleCapture());
     // Use Fleet's provider-neutral resume marker so runner recovery rotates the
     // exact native thread id after a poisoned fast resume.
     this.threadFile = join(options.stateDir, '.session-id');
@@ -332,14 +339,18 @@ export class CodexAppServerSession implements AgentSession {
 
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth;
-    this.admit(promptId, text, queuedBehind, options);
-    this.queueDepth++;
-    const run = this.enqueue(promptId, text, options.origin);
+    const run = this.observation.checkpoint(() => {
+      this.admit(promptId, text, queuedBehind, options);
+      this.queueDepth++;
+      return this.enqueue(promptId, text, options.origin);
+    });
     const completion = run.then(result => {
       this.queueDepth = Math.max(0, this.queueDepth - 1);
+      this.observation.publish();
       return result;
     }, error => {
       this.queueDepth = Math.max(0, this.queueDepth - 1);
+      this.observation.publish();
       return turnResult(false, 'failed', error instanceof Error ? error.message : String(error));
     });
     return {
@@ -506,6 +517,7 @@ export class CodexAppServerSession implements AgentSession {
     });
     this.conversation.close();
     await this.transport.close();
+    this.observation.publish();
   }
 
   taskNoticeBinding():TaskNoticeBinding|undefined {
@@ -527,6 +539,41 @@ export class CodexAppServerSession implements AgentSession {
       visible = page.events.filter(event => this.currentEvent(event));
     }
     return { ...page, events: visible, snapshot: this.conversationSnapshot() };
+  }
+
+  subscribeConversationFailure(listener: (generation: string) => void) {
+    return this.conversation.subscribeFailure(listener);
+  }
+
+  conversationReplayAvailable(expectedGeneration: string): boolean {
+    return expectedGeneration === this.sessionGeneration && this.conversation.generationDurable(expectedGeneration);
+  }
+
+  replayConversation(request: import('./conversation-replay.js').ConversationReplayRequest) {
+    if (request.expectedGeneration !== this.sessionGeneration) throw new Error('session generation changed');
+    return this.conversation.replay(request);
+  }
+
+  observeConversation(listener: (state: ConversationObservationState) => void) {
+    return this.observation.observe(listener);
+  }
+
+  private captureObservation(): Omit<ConversationObservationState, 'stateRevision'> {
+    const snapshot = this.snapshot();
+    return {
+      ...this.conversationSnapshot(),
+      ...pendingInventory(this.pendingPrompts),
+      ledgerBarrier: Number(this.conversation.lastCursor() ?? 0),
+      alive: snapshot.alive,
+      readiness: snapshot.alive ? snapshot.readiness : 'offline',
+      activePromptIds: [...(this.activeTurn?.promptIds ?? [])],
+      pendingPermissions: [...this.pendingPermissions].flatMap(([permissionId, pending]) =>
+        pending.presented ? [{ permissionId, ...pending.presented }] : []),
+      commands: [{ name: 'compact', description: textBlock('Compact session context') }],
+      runtimeModel: snapshot.runtimeModel,
+      reasoningEffort: snapshot.reasoningEffort,
+      permissionMode: snapshot.permissionMode,
+    };
   }
 
   conversationSnapshot(): ConversationSnapshot {
@@ -557,6 +604,7 @@ export class CodexAppServerSession implements AgentSession {
       actor: { browserSession: command.actorBrowserSession },
     });
     const receipt: PromptReceipt = {
+      sessionGeneration: this.sessionGeneration,
       commandId: command.commandId, promptId: queued.promptId,
       state: queued.queuedBehind ? 'queued' : 'starting', queuedBehind: queued.queuedBehind,
       acceptedAt: new Date().toISOString(), eventCursor: this.conversation.lastCursor() ?? '0',
@@ -609,6 +657,7 @@ export class CodexAppServerSession implements AgentSession {
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       payload: { status: 'idle' },
     });
+    this.observation.publish();
   }
 
   private recoverOpenPrompts(): void {
@@ -628,7 +677,8 @@ export class CodexAppServerSession implements AgentSession {
         ? { kind: 'owner-admin-console', commandId: open.commandId }
         : undefined;
       const run = this.enqueue(open.promptId, open.text!, origin);
-      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
+      this.observation.publish();
+      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
     }
   }
 
@@ -675,6 +725,7 @@ export class CodexAppServerSession implements AgentSession {
     this.finalAnswerObserved = false;
     this.activeItems.clear();
     this.readiness = 'running';
+    this.observation.publish();
     this.events.emit('state', { turnId: promptId, status: 'running', origin });
     members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
@@ -974,6 +1025,7 @@ export class CodexAppServerSession implements AgentSession {
         ...(active.cancellationSource ? { cancellationSource: active.cancellationSource } : {}),
       },
     });
+    this.observation.publish();
     active.settle(result);
   }
 
@@ -1139,7 +1191,6 @@ export class CodexAppServerSession implements AgentSession {
       return;
     }
 
-    this.pendingPermissions.set(permissionId, pending);
     this.readiness = 'awaiting_permission';
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
@@ -1149,20 +1200,24 @@ export class CodexAppServerSession implements AgentSession {
       ?? (method === 'item/fileChange/requestApproval' ? 'Apply file changes'
         : method === 'item/permissions/requestApproval' ? 'Grant additional permissions'
           : 'Run command');
+    const presented: PermissionRequestedPayload = { toolCallId, title, options, expiresAt };
+    pending.presented = presented;
+    this.pendingPermissions.set(permissionId, pending);
     this.events.emit('permission', {
       turnId: this.activeTurn?.promptId, origin: this.activeTurn?.origin,
-      permissionId, toolCallId, title, status: 'pending', options,
+      permissionId, ...presented, status: 'pending',
     });
     this.conversation.appendSafe({
       kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
       permissionId, promptId: this.activeTurn?.promptId, turnId: this.activeTurn?.promptId,
-      toolCallId, payload: { toolCallId, title, options, expiresAt },
+      toolCallId, payload: presented,
     });
     pending.expiry = setTimeout(() => {
       this.autoResolvePermission(permissionId, pending, undefined,
         `no decision arrived within ${Math.round(timeoutMs / 1000)}s`);
     }, timeoutMs);
     pending.expiry.unref?.();
+    this.observation.publish();
   }
 
   private serverRequestResolved(params: JsonObject): void {
@@ -1194,6 +1249,8 @@ export class CodexAppServerSession implements AgentSession {
     permissionId: string, pending: PendingPermission, decision: PermissionDecision,
     decisionSource: 'automatic' | 'manual', optionId?: string, policy?: string, reason?: string,
   ): void {
+    if (!this.pendingPermissions.size && this.readiness === 'awaiting_permission')
+      this.readiness = 'running';
     this.events.emit('permission', {
       turnId: this.activeTurn?.promptId, origin: this.activeTurn?.origin,
       permissionId, toolCallId: pending.toolCallId, status: 'completed', decision,
@@ -1206,8 +1263,7 @@ export class CodexAppServerSession implements AgentSession {
       payload: { decision, decisionSource, ...(optionId ? { optionId } : {}),
         ...(policy ? { policy } : {}), ...(reason ? { reason } : {}) },
     });
-    if (!this.pendingPermissions.size && this.readiness === 'awaiting_permission')
-      this.readiness = 'running';
+    this.observation.publish();
     this.scheduleTerminalReconciliation();
   }
 
@@ -1255,11 +1311,13 @@ export class CodexAppServerSession implements AgentSession {
       });
       if (this.activeTurn) this.finishTurn('failed', this.lastError);
     }
+    this.observation.publish();
   }
 
   private fail(error: unknown): void {
     this.lastError = error instanceof Error ? error.message : String(error);
     this.readiness = 'failed';
     this.events.emit('error', { text: this.lastError });
+    this.observation.publish();
   }
 }

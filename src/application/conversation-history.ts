@@ -60,6 +60,7 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
   let files:string[]=[];
   try{files=(await readdir(join(stateDir,'.conversation'))).filter(n=>/^events-\d{6}\.jsonl$/.test(n)).sort().reverse();}catch{}
   const events:ConversationEventV1[]=[];let newest:number|undefined;let hasOlder=false;
+  const barrier = (snapshot as Partial<import('../session/conversation-types.js').ObservationPosition>).ledgerBarrier;
   const pending=new Set(snapshot.pendingPermissionIds);let capabilities:ConversationEventV1|undefined;const context:ConversationEventV1[]=[];
   // Context only accompanies the newest page; older pages stop as soon as they are full.
   const wantsContext=()=>before===Infinity&&(!capabilities||pending.size>0);
@@ -74,6 +75,7 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
       }
       let event:ConversationEventV1;try{event=JSON.parse(line);}catch{return true;}
       const seq=Number(event.seq);if(!Number.isSafeInteger(seq))return true;
+      if(barrier!==undefined&&seq>barrier)return true;
       newest??=seq;
       if(seq<before&&conversationEventVisible(event,snapshot.sessionGeneration,resumedSessionId)){
         const inPage=!hasOlder&&events.length<limit;
@@ -90,7 +92,7 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
   events.reverse();context.reverse();
   return {events,snapshot,hasOlder,context,hasMore:false,
     ...(events.length?{olderCursor:String(events[0].seq)}:{}),
-    ...(before===Infinity&&newest!==undefined?{nextCursor:String(newest)}:{})};
+    ...(before===Infinity&&(barrier!==undefined||newest!==undefined)?{nextCursor:String(barrier??newest)}:{})};
 }
 
 /** Read the existing ACP session ledger without opening its writer/recovery store. */

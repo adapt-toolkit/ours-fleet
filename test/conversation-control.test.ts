@@ -3,7 +3,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
 import { RoleTurnArbiter } from '../src/session/arbiter.js';
@@ -320,4 +320,195 @@ describe('role-control conversation v3', () => {
     const all = [...page.events.map(e => e.seq), ...streamed.map(e => e.seq)];
     expect(new Set(all).size).toBe(all.length);
   });
+});
+
+describe('passive generation-bound follow', () => {
+  it('replays every page before ready and never attaches a controller through the arbiter', async () => {
+    const {stateDir,session,arbiter}=await startArbiterServer();
+    await session.submitPrompt('warmup');
+    const generation=session.conversationSnapshot().sessionGeneration;
+    const messages: Record<string,unknown>[]=[];
+    const attached:boolean[]=[];
+    const original=arbiter.setControllerAttached.bind(arbiter);
+    arbiter.setControllerAttached=(value:boolean)=>{attached.push(value);original(value);};
+    const follow=await followConversation(stateDir,{expectedGeneration:generation,after:0,controller:false},m=>messages.push(m));
+    cleanups.push(()=>follow.close());
+    await expect.poll(()=>messages.some(m=>m.conversationReady)).toBe(true);
+    const ready=messages.find(m=>m.conversationReady)!.conversationReady as any;
+    const replay=messages.flatMap(m=>(m.conversationReplay as any)?.events??[]);
+    expect(replay.map((e:any)=>e.seq)).toEqual(session.conversationPage({limit:1000}).events.map(e=>e.seq));
+    expect(ready.snapshot).toMatchObject({sessionGeneration:generation,queueDepth:0,pendingPrompts:[],pendingPermissions:[],alive:true});
+    expect(ready.coveredThrough).toBe(ready.snapshot.ledgerBarrier);
+    expect(attached).toEqual([]);
+    follow.close();follow.close();
+    expect(session.conversationSnapshot().sessionGeneration).toBe(generation);
+  });
+  it('rejects a mismatched expected generation instead of silently switching baselines',async()=>{
+    const {stateDir}=await startArbiterServer();const messages:Record<string,unknown>[]=[];
+    const follow=await followConversation(stateDir,{expectedGeneration:'stale',after:0,controller:false},m=>messages.push(m));
+    cleanups.push(()=>follow.close());
+    await expect.poll(()=>messages.length).toBeGreaterThan(0);
+    expect(messages[0]).toMatchObject({ok:false,error:expect.stringMatching(/generation/)});
+    expect(messages.some(m=>m.conversationReady)).toBe(false);
+  });
+});
+
+
+describe('canonical recovery when live observation fails',()=>{
+ it('keeps post-admission durable events visible through the REST adapter after capture failure',async()=>{
+  const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+  const {stateDir,session}=await startServer();
+  const baseline=session.observeConversation(()=>{});const frozen=baseline.snapshot.ledgerBarrier;baseline.unsubscribe();
+  const owner=session as unknown as {captureObservation():unknown};const capture=owner.captureObservation.bind(session);
+  const stop=session.subscribeConversation(event=>{
+   if(event.kind==='prompt.admitted')owner.captureObservation=()=>{owner.captureObservation=capture;throw new Error('post-admission capture fault');};
+  });
+  try{
+   await session.submitPrompt('after capture fault');stop();
+   await session.submitPrompt('later durable turn');
+   const failed=session.observeConversation(()=>{});expect(failed.snapshot).toMatchObject({observationFailure:'capture_failed',ledgerBarrier:frozen});failed.unsubscribe();
+   const canonical=session.conversationPage({limit:1000});const last=canonical.events.at(-1)!;
+   expect(last.seq).toBeGreaterThan(frozen);
+   const adapter=new RoleSessionControlAdapter(stateDir);const page=await adapter.conversationTail({limit:1000});
+   expect(page.events.map(e=>e.seq)).toEqual(canonical.events.map(e=>e.seq));
+   expect(page.nextCursor).toBe(String(last.seq));
+   expect(page.snapshot).toMatchObject({observationFailure:'capture_failed',historyDegraded:true});
+   expect(page.snapshot).not.toHaveProperty('ledgerBarrier');
+   const messages:Record<string,unknown>[]=[];
+   const follow=await followConversation(stateDir,{expectedGeneration:canonical.snapshot.sessionGeneration,after:last.seq,controller:false},m=>messages.push(m));
+   cleanups.push(()=>follow.close());
+   await expect.poll(()=>messages.some(m=>m.ok===false)).toBe(true);
+   expect(messages.some(m=>m.conversationReady)).toBe(false);
+  }finally{stop();owner.captureObservation=capture;}
+ });
+ it('serves canonical REST data when no coherent observation was ever available',async()=>{
+  const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+  const capture=vi.spyOn(AcpSession.prototype as any,'captureObservation').mockImplementation(()=>{throw new Error('initial capture fault');});
+  let started:Awaited<ReturnType<typeof startServer>>;
+  try{started=await startServer();}finally{capture.mockRestore();}
+  const {session,stateDir}=started!;
+  await session.submitPrompt('durable despite unavailable observation');
+  expect(()=>session.observeConversation(()=>{})).toThrow(/unavailable/);
+  const canonical=session.conversationPage({limit:1000});
+  const response=await controlRequest(stateDir,{command:'conversation_page',limit:1000});
+  expect(response.ok).toBe(true);
+  expect((response.result as any).events.map((e:any)=>e.seq)).toEqual(canonical.events.map(e=>e.seq));
+  expect((response.result as any).snapshot).toMatchObject({observationFailure:'capture_failed',historyDegraded:true});
+  const page=await new RoleSessionControlAdapter(stateDir).conversationTail({limit:1000});
+  expect(page.nextCursor).toBe(String(canonical.events.at(-1)!.seq));
+  expect(page.events.map(e=>e.seq)).toEqual(canonical.events.map(e=>e.seq));
+ });
+});
+
+// Fake time covers the exact deadline independently of a still-open consumer socket.
+import { vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { RoleSessionControlAdapter } from '../src/application/session-control.js';
+
+describe('private observation health', () => {
+  afterEach(() => vi.useRealTimers());
+  function adapterFixture(roleHealth = 'healthy') {
+    const socket = new EventEmitter() as any; socket.destroyed = false;
+    const close = vi.fn(() => { socket.destroyed = true; socket.emit('close'); });
+    let deliver!: (message: Record<string, unknown>) => void;
+    let changed!: (state: any) => void;
+    const dispose = vi.fn();
+    let state: any = { roleId: 'A', roleRevision: 1, roleLifetime: 'one', availability: 'available', health: roleHealth, stateDir: '/role' };
+    const observe = (_listener: (state: any) => void) => ({ snapshot: () => state, dispose, subscribe: (listener: (state: any) => void) => { changed = value => { state = value; listener(value); }; return { snapshot: state, unsubscribe: () => {} }; } });
+    const request = vi.fn(async () => ({ ok: true, result: { backend: 'acp', features: ['conversation_observation', 'control_heartbeat'] } }));
+    const adapter = new RoleSessionControlAdapter('/role', request as any, (async (_dir: string, _request: unknown, listener: typeof deliver) => { deliver = listener; return { socket, close }; }) as any, observe);
+    const onClose = vi.fn(), onRole = vi.fn(), onState = vi.fn();
+    const followRequest = { controller: false as const, expectedGeneration: 'g', onReplay: vi.fn(), onReady: vi.fn(), onEvent: vi.fn(), onState, onRole, onClose };
+    return { adapter, followRequest, onClose, onRole, onState, close, dispose, request, socket, deliver: (message: Record<string, unknown>) => deliver(message), change: (value: any) => changed({ ...state, ...value }) };
+  }
+  it('ends at six seconds of private silence even while state and web traffic remain active', async () => {
+    vi.useFakeTimers();
+    const f = adapterFixture(); await f.adapter.followConversation(f.followRequest);
+    await vi.advanceTimersByTimeAsync(5_999);
+    f.deliver({ conversationState: { sessionGeneration: 'g' } });
+    expect(f.onClose).not.toHaveBeenCalled(); expect(f.socket.destroyed).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.onClose).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledWith('control-silent');
+    expect(f.close).toHaveBeenCalledOnce(); expect(f.dispose).toHaveBeenCalledOnce();
+    expect(f.request).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  });
+  it('only a private heartbeat renews liveness and owner close clears its timer', async () => {
+    vi.useFakeTimers(); const f = adapterFixture(); const handle = await f.adapter.followConversation(f.followRequest);
+    await vi.advanceTimersByTimeAsync(4_000); f.deliver({ controlHeartbeat: true });
+    await vi.advanceTimersByTimeAsync(5_999); expect(f.onClose).not.toHaveBeenCalled();
+    handle.close(); expect(f.dispose).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+  });
+  it('orders role replacement before closing the old session and drops later session data', async () => {
+    const f = adapterFixture(); await f.adapter.followConversation(f.followRequest);
+    f.change({ roleRevision: 2, roleLifetime: 'two' });
+    expect(f.onRole).toHaveBeenLastCalledWith(expect.objectContaining({ roleRevision: 2, roleLifetime: 'two' }));
+    expect(f.onClose).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledWith('role-replaced');
+    expect(f.onRole.mock.invocationCallOrder.at(-1)).toBeLessThan(f.onClose.mock.invocationCallOrder[0]);
+    f.deliver({ conversationState: {} }); expect(f.onState).not.toHaveBeenCalled();
+  });
+  it('advertises complete delivery only for healthy session and role support, disposing describe probes', async () => {
+    const f = adapterFixture(); expect((await f.adapter.describe()).features).toContain('conversation_live_complete');
+    expect(f.dispose).toHaveBeenCalledOnce();
+    const unsupported = adapterFixture('unsupported');
+    expect((await unsupported.adapter.describe()).features).not.toContain('conversation_live_complete');
+    f.request.mockResolvedValueOnce({ ok: true, result: { backend: 'acp', features: ['control_heartbeat'] } });
+    expect((await f.adapter.describe()).features).not.toContain('conversation_live_complete');
+  });
+  it('withdraws complete capability and closes on mid-stream watcher failure', async () => {
+    const f = adapterFixture(); await f.adapter.followConversation(f.followRequest);
+    f.change({ roleRevision: 2, health: 'failed', failure: 'watch-error' });
+    expect(f.onClose).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledWith('watch-error');
+    expect((await f.adapter.describe()).features).not.toContain('conversation_live_complete');
+  });
+  it('borrows one role owner across describe and follows without disposing it on replacement', async () => {
+    const f = adapterFixture();
+    let current: any = { roleId: 'A', roleRevision: 1, roleLifetime: 'one', availability: 'available', health: 'healthy', stateDir: '/role' };
+    const listeners = new Set<(state: any) => void>();
+    const borrowed = { snapshot: () => current, dispose: vi.fn(), subscribe: (listener: (state: any) => void) => { listeners.add(listener); return { snapshot: current, unsubscribe: () => { listeners.delete(listener); } }; } };
+    expect((await f.adapter.describe(borrowed)).features).toContain('conversation_live_complete');
+    const handle = await f.adapter.followConversation({ ...f.followRequest, roleObservation: borrowed });
+    expect(f.dispose).not.toHaveBeenCalled();
+    current = { ...current, roleRevision: 2, roleLifetime: 'two', availability: 'missing' };
+    for (const listener of listeners) listener(current);
+    expect(f.onClose).toHaveBeenCalledWith('role-replaced');
+    handle.close(); expect(borrowed.dispose).not.toHaveBeenCalled(); expect(listeners.size).toBe(0);
+  });
+  it('withdraws complete delivery for latched current-generation append failure but preserves an old history warning', async () => {
+    const { stateDir, session, arbiter } = await startArbiterServer();
+    const generation = session.conversationSnapshot().sessionGeneration;
+    const observation = { snapshot: () => ({ health: 'healthy', availability: 'available' }), dispose: () => {}, subscribe: () => { throw new Error('not needed for describe'); } } as any;
+    const adapter = new RoleSessionControlAdapter(stateDir);
+    const cyclic: any = {}; cyclic.self = cyclic;
+    const fail = (sessionGeneration: string) => (session as any).conversation.appendSafe({ kind: 'session.started', source: 'system', sessionGeneration, payload: cyclic });
+    fail('older-generation');
+    expect(session.conversationSnapshot().historyDegraded).toBe(true);
+    expect((await adapter.describe(observation)).features).toContain('conversation_live_complete');
+    fail(generation);
+    expect((await adapter.describe(observation)).features).not.toContain('conversation_live_complete');
+    expect(arbiter.conversationReplayAvailable(generation)).toBe(false);
+    expect(arbiter.conversationReplayAvailable('not-current')).toBe(false);
+  });
+  it('withdraws supervisor observation support after capture failure without breaking snapshot reads', async () => {
+    const { stateDir, session } = await startServer();
+    const original = session.observeConversation.bind(session);
+    session.observeConversation = listener => {
+      const observation = original(listener);
+      return { ...observation, snapshot: { ...observation.snapshot, observationFailure: 'capture_failed' } };
+    };
+    const response = await controlRequest(stateDir, { command: 'snapshot' });
+    expect(response.ok).toBe(true);
+    expect((response.result as any).features).not.toContain('conversation_observation');
+    session.observeConversation = () => { throw new Error('unavailable initial capture'); };
+    expect((await controlRequest(stateDir, { command: 'snapshot' })).ok).toBe(true);
+  });
+  it('emits supervisor heartbeats every two seconds without attaching a controller', async () => {
+    const { stateDir, session } = await startArbiterServer();
+    const messages: any[] = [];
+    const follow = await followConversation(stateDir, { controller: false, expectedGeneration: session.conversationSnapshot().sessionGeneration }, m => messages.push(m));
+    cleanups.push(() => follow.close());
+    await expect.poll(() => messages.some(m => m.conversationReady)).toBe(true);
+    await expect.poll(() => messages.filter(m => m.controlHeartbeat).length, { timeout: 4_800 }).toBeGreaterThanOrEqual(2);
+    const descriptor = await controlRequest(stateDir, { command: 'snapshot' });
+    expect((descriptor.result as any).features).toEqual(expect.arrayContaining(['conversation_observation', 'control_heartbeat']));
+  }, 8_000);
 });
