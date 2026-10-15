@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { execFile, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { replaceFileAtomically, withFileLock, type WriteDeps } from '../src/atomic-file.js';
+import { replaceFileAtomically, withFileLock, type LockDeps, type WriteDeps } from '../src/atomic-file.js';
+import { procIncarnationProbe } from '../src/process-incarnation.js';
 
 // dist/cli.js et al are built once by vitest's globalSetup
 // (test/global-setup.ts), before any test file runs — the pretrust-child.mjs
@@ -68,6 +70,128 @@ describe('withFileLock', () => {
     expect(entered).toBe(false);
     release(); await held; await waiter;
     expect(entered).toBe(true);
+  });
+
+  describe('after a reboot or PID reuse', () => {
+    /** A lock left by a holder that recorded these markers, still stamped long ago. */
+    const leftover = (lock: string, owner: Record<string, unknown>) => {
+      mkdirSync(lock, { recursive: true });
+      writeFileSync(join(lock, 'ts'), '0');
+      writeFileSync(join(lock, 'owner.json'), JSON.stringify({ token: 'old-holder', ...owner }));
+    };
+    const probe = (boot: string, start: string): LockDeps['incarnation'] =>
+      ({ bootId: () => boot, startTime: () => start });
+    /** Poll a bounded number of times, then abort: the lock must still be held. */
+    const bounded = (): LockDeps => {
+      let clock = 0, polls = 0;
+      return { now: () => 1_000_000 + clock, sleep: async () => {
+        clock += 25;
+        if (++polls > 12) throw new Error('still waiting');
+      } };
+    };
+
+    it('reclaims a lock whose live PID belongs to a different boot', async () => {
+      const lock = join(home, 'boot.lock');
+      leftover(lock, { pid: 4242, boot: 'previous-boot', start: '100' });
+      await expect(withFileLock(lock, () => 'entered', {
+        alive: () => true, incarnation: probe('current-boot', '100'),
+      })).resolves.toBe('entered');
+    });
+
+    it('reclaims a lock whose live PID was reused by a later process in the same boot', async () => {
+      const lock = join(home, 'reuse.lock');
+      leftover(lock, { pid: 4242, boot: 'current-boot', start: '100' });
+      await expect(withFileLock(lock, () => 'entered', {
+        alive: () => true, incarnation: probe('current-boot', '9000'),
+      })).resolves.toBe('entered');
+    });
+
+    it('never reclaims a live holder of the same incarnation, however old its stamp', async () => {
+      const lock = join(home, 'same.lock');
+      leftover(lock, { pid: 4242, boot: 'current-boot', start: '100' });
+      let entered = false;
+      await expect(withFileLock(lock, () => { entered = true; }, {
+        ...bounded(), alive: () => true, incarnation: probe('current-boot', '100'),
+      }, 50)).rejects.toThrow('still waiting');
+      expect(entered).toBe(false);
+      expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('old-holder');
+    });
+
+    it('keeps a live legacy holder without markers conservative', async () => {
+      const lock = join(home, 'legacy.lock');
+      leftover(lock, { pid: 4242 });
+      let entered = false;
+      await expect(withFileLock(lock, () => { entered = true; }, {
+        ...bounded(), alive: () => true, incarnation: probe('current-boot', '9000'),
+      }, 50)).rejects.toThrow('still waiting');
+      expect(entered).toBe(false);
+      expect(existsSync(join(lock, 'owner.json'))).toBe(true);
+    });
+
+    it('records the holder incarnation so a later boot can prove it ended', async () => {
+      const lock = join(home, 'record.lock');
+      const owner = await withFileLock(lock, () => JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')),
+        { incarnation: probe('current-boot', '777') });
+      expect(owner).toMatchObject({ pid: process.pid, boot: 'current-boot', start: '777' });
+    });
+
+    it('does not let a late reclaimer remove the lock its successor already claimed', async () => {
+      const lock = join(home, 'successor.lock');
+      leftover(lock, { pid: 4242, boot: 'previous-boot', start: '100' });
+      const deps = { alive: () => true, incarnation: probe('current-boot', '100') };
+      let releaseSuccessor!: () => void;
+      let successorEntered!: () => void;
+      const entered = new Promise<void>(resolve => { successorEntered = resolve; });
+      let successor: Promise<void> | undefined;
+      const inside: string[] = [];
+      // The late reclaimer observed the dead holder, then stalls inside its
+      // reclaim; meanwhile the dead lock disappears and a successor claims it.
+      const late = withFileLock(lock, () => { inside.push('late'); }, {
+        ...deps,
+        beforeReclaim: async () => {
+          rmSync(lock, { recursive: true, force: true });
+          successor = withFileLock(lock, () => new Promise<void>(resolve => {
+            inside.push('successor'); successorEntered(); releaseSuccessor = resolve;
+          }), deps);
+          await entered;
+        },
+      });
+      await entered;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(inside).toEqual(['successor']);
+      expect(existsSync(join(lock, 'owner.json'))).toBe(true);
+      releaseSuccessor();
+      await successor; await late;
+      expect(inside).toEqual(['successor', 'late']);
+    });
+
+    it('serializes many processes that find the same pre-reboot lock', async () => {
+      const lock = join(home, 'many.lock');
+      const count = join(home, 'count');
+      writeFileSync(count, '0');
+      const boot = procIncarnationProbe.bootId();
+      if (!boot) return; // boot ids are Linux-only; other platforms stay PID-only
+      // The recorded PID is alive (this test process) but from another boot.
+      leftover(lock, { pid: process.pid, boot: `not-${boot}`, start: '1' });
+      const moduleUrl = pathToFileURL(resolve('dist/atomic-file.js')).href;
+      const code = `import {withFileLock as lock} from ${JSON.stringify(moduleUrl)}; import fs from 'node:fs';
+        for (let i = 0; i < 5; i++) await lock(${JSON.stringify(lock)}, async () => {
+          const inside = ${JSON.stringify(join(home, 'inside'))};
+          if (fs.existsSync(inside)) throw Error('overlap');
+          fs.writeFileSync(inside, 'yes');
+          const n = Number(fs.readFileSync(${JSON.stringify(count)}, 'utf8'));
+          await new Promise(r => setTimeout(r, 2));
+          fs.writeFileSync(${JSON.stringify(count)}, String(n + 1));
+          fs.unlinkSync(inside);
+        });`;
+      await Promise.all(Array.from({ length: 8 }, () => new Promise<void>((done, fail) => {
+        const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'ignore', 'pipe'] });
+        let error = ''; child.stderr.on('data', chunk => { error += chunk; });
+        child.on('exit', code => code === 0 ? done() : fail(new Error(error || `exit ${code}`)));
+      })));
+      expect(readFileSync(count, 'utf8')).toBe('40');
+      expect(existsSync(lock)).toBe(false);
+    }, 30_000);
   });
 
   it('publishes only fully populated claims when preparation is stalled', async () => {

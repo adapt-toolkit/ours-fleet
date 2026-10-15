@@ -31,3 +31,15 @@ it('recovers a killed holder without allowing contenders into a live successor',
   holder.child.kill('SIGKILL'); await holder.done; await Promise.all(contenders.map(c => c.done));
   expect(readFileSync(join(root, 'count'), 'utf8')).toBe('5');
 });
+it('reaps a claim whose live PID belongs to a previous boot instead of timing out', async () => {
+  const boot = (() => { try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch { return ''; } })();
+  if (!boot) return; // boot ids are Linux-only
+  mkdirSync(join(root, 'lock')); writeFileSync(join(root, 'count'), '0');
+  // This test process is alive, so only the recorded boot can prove the claim is gone.
+  writeFileSync(join(root, 'lock', `${process.pid}-${randomUUID()}.json`),
+    JSON.stringify({ pid: process.pid, choosing: false, ticket: 1, boot: `not-${boot}`, start: '1' }));
+  const started = Date.now();
+  await worker(`lock(root+'/lock',()=>{fs.writeFileSync(root+'/count','1');});`).done;
+  expect(readFileSync(join(root, 'count'), 'utf8')).toBe('1');
+  expect(Date.now() - started).toBeLessThan(9_000);
+});
