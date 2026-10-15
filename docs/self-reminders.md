@@ -147,44 +147,109 @@ ours-fleet ours call DeveloperA fleet_reminder_list
 The standalone skill ran one Python worker, its own SQLite ledger and a user
 service per agent. Built-in reminders replace it; the worker is deprecated.
 Personal-assistant reminder, source and outbound messaging stores are separate
-systems and are not touched by this procedure.
+systems and are not touched by this procedure. Migration is a deliberate,
+separately authorized operation per agent; nothing migrates automatically.
 
-Each step is a separate, deliberate action. Data steps are done **by the agent
-itself** with both tool sets, so reminder text never passes through an operator.
+Reminder data is handled **by the agent itself** with both tool sets, so its text
+never passes through an operator. The operator only fences and later removes the
+old service.
 
-1. **Prerequisite.** The agent runs a Fleet version with built-in reminders:
-   `ours-fleet ours tools Name` lists `fleet_reminder_create`.
-2. **Fence the old producer.** The operator stops (does not yet disable or
-   remove) the agent's worker, e.g.
-   `systemctl --user stop self-reminders-Name.service`, and confirms it is
-   inactive. From now on the old system cannot issue wakes, so nothing can fire
-   twice.
-3. **Settle in-flight legacy events without replaying them.** Old events in
-   `queued`, `uncertain` or `submitting` state may already be in the agent's
-   conversation. The agent inspects each with the old `inspect` and, if handled,
-   `complete`s it there. They are never re-created as new wakes.
-4. **Re-create active reminders.** For each old reminder in `list` (state
-   `active`, all pages), the agent calls `fleet_reminder_create` with
-   `request_key` `legacy:<old id>:r<old revision>`, the same title, the old
-   `context` as `note`, the same `local_time`, `timezone` and `fold`, and the old
-   window (`expires − due`) as `late_window_seconds`. The key makes this step
-   safe to repeat. A reminder whose time passed while the worker was stopped is
-   refused as not in the future; the agent decides whether to schedule a new
-   time or let it lapse.
-5. **Verify.** `fleet_reminder_list` shows one reminder for every migrated old id.
-6. **Retire the old entries.** The agent cancels each migrated old reminder with
-   the old `cancel` (`id`, `expected_revision`). The old `list` must then show no
-   active reminders and no unhandled queued/uncertain events.
-7. **Remove the old service.** Only after step 6 is verified, the operator
-   disables and removes the user unit and the worker's config. Keep or delete the
-   old ledger according to the owner's retention policy; never point the new
-   system at it.
+### 1. Preconditions
 
-**Rollback.** Until step 6, the old reminders remain active. To roll back, the
-agent cancels the `legacy:` reminders it created with `fleet_reminder_cancel`,
-and only then the operator restarts the old worker.
+- The agent runs a Fleet release with built-in reminders:
+  `ours-fleet ours tools Name` lists `fleet_reminder_create`.
+- `fleet_reminder_list {"state": "all"}` shows no reminder whose key starts with
+  `legacy:` from an earlier, abandoned attempt (otherwise reconcile it first).
 
-Remove instructions that told the agent to run the worker script, and replace
+### 2. Fence the old producer persistently
+
+A `stop` alone is not a fence: an enabled unit starts again at the next login or
+boot. The operator records the unit's prior state and then disables it:
+
+```sh
+systemctl --user is-enabled self-reminders-Name.service   # record: enabled/linked/...
+systemctl --user is-active  self-reminders-Name.service   # record: active/inactive
+systemctl --user disable --now self-reminders-Name.service
+systemctl --user is-enabled self-reminders-Name.service   # must not be enabled
+systemctl --user is-active  self-reminders-Name.service   # must be inactive
+```
+
+From here on no old wake can be produced, across worker, Fleet or host
+restarts, until someone deliberately re-enables the unit. Do not run the old
+`tick` or `serve` commands during the cutover.
+
+### 3. Classify every old reminder
+
+The agent lists all old reminders (`list` with each `state`, every page). The
+old CLI cannot list events, so the operator supplies their states with a
+read-only query that touches no reminder text (the events table holds only ids,
+revisions and states):
+
+```sh
+sqlite3 -readonly /path/to/old/ledger.sqlite \
+  "SELECT reminder_id, revision, id, state FROM self_events ORDER BY reminder_id, revision"
+```
+
+The agent can `inspect` any event id from that list. Each old reminder falls
+into exactly one row:
+
+| Old reminder / latest event for its current revision | Meaning | Action |
+| --- | --- | --- |
+| `active`, no event, due in the future | not yet fired | **migrate** (step 4), then cancel the old one (step 5) |
+| `active`, event `pending`, or no event and already due | due but never submitted | **decide**: migrate to a new future time, or cancel the old one; never both |
+| event `submitting`, `queued` or `uncertain` | may already have reached the agent | **hold**: check the conversation and your own records. If handled, `complete` it in the old system. If not, cancel the old reminder and, only if still useful, create a new one at a new future time. Never re-create the old event as-is |
+| `handled`, `cancelled`, `expired`, or event `failed`/`invalidated` | finished | nothing to migrate |
+
+**Stop condition:** the cutover does not proceed to step 6 while any old
+reminder is unclassified, or while any old event is still `submitting`,
+`queued` or `uncertain`.
+
+### 4. Re-create the reminders that migrate
+
+For each reminder marked *migrate*, the agent calls `fleet_reminder_create` with:
+
+- `request_key` `legacy:<old id>:r<old revision>`;
+- the same title, with the old `context` as `note`;
+- the same `local_time`, `timezone` and `fold`;
+- the old window (`expires − due`) as `late_window_seconds`.
+
+The key makes this step safe to repeat. A reminder whose time has meanwhile
+passed is refused as not in the future. It is then a *decide* row: pick a new
+time, using `request_key` `legacy:<old id>:r<old revision>:retimed`, or let it
+lapse.
+
+### 5. Verify, then retire the old entries
+
+`fleet_reminder_list` shows exactly one `legacy:` reminder per migrated old id.
+The agent then cancels each migrated old reminder with the old `cancel` (`id`,
+`expected_revision`). Afterwards the old `list` shows no `active` reminders and
+no unsettled events.
+
+### 6. Remove the old service
+
+Only after step 5 is verified, the operator removes the user unit and the
+worker's config (it is already disabled and stopped). Keep or delete the old
+ledger according to the owner's retention policy; never point Fleet at it.
+
+### Rollback
+
+Rollback is a reconciliation, not a restart. While the old unit stays disabled,
+the agent goes through each `legacy:` Fleet reminder:
+
+| Fleet reminder state | Action before the old producer may run again |
+| --- | --- |
+| open, no event or event `pending` | `fleet_reminder_cancel` it; the old reminder remains the only copy (it must still be `active` in the old system, otherwise re-create it there) |
+| event `dispatched` or `uncertain`, or `acknowledged` | the wake already happened in Fleet: **cancel the old reminder** so it cannot fire again, and keep the Fleet record |
+| `cancelled` or `expired` | nothing; make sure the old reminder is not active either unless that is intended |
+
+Only when every `legacy:` reminder has been reconciled may the operator restore
+the unit to its recorded prior state, for example
+`systemctl --user enable --now self-reminders-Name.service` if it was enabled
+and active. Never have both producers active for the same reminder.
+
+### Instructions to update
+
+Remove instructions that tell the agent to run the worker script, and replace
 them with: "Use the `fleet_reminder_*` tools to schedule wakes for yourself. A
 due wake is an internal event: inspect it, decide, then acknowledge it. Message
 anyone only through your normal configured channels."

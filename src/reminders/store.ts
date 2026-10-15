@@ -434,15 +434,21 @@ export class ReminderStore {
 
   // ── dispatch side (runner only) ────────────────────────────────────────────
 
-  /** Earliest instant the dispatcher has work, or undefined when idle. */
-  nextWorkAt(): number | undefined {
+  /**
+   * Earliest instant the dispatcher has work, or undefined when idle.
+   * `live` names admissions still owned by a queued prompt in this process:
+   * their own completion re-arms the dispatcher, so they are not work here.
+   */
+  nextWorkAt(live: ReadonlySet<string> = new Set()): number | undefined {
     let next: number | undefined;
     const consider = (value: number) => { next = next === undefined ? value : Math.min(next, value); };
     for (const record of Object.values(this.state.reminders)) {
       if (record.state !== 'active') continue;
       const open = this.openEvent(record);
+      if (open && live.has(open.id)) continue;
       if (!open) consider(Date.parse(record.dueAt));
       else if (open.state === 'pending') consider(open.retryAt ? Date.parse(open.retryAt) : Date.parse(record.dueAt));
+      else if (open.state === 'admitting') consider(Date.parse(record.dueAt));
       if (!open || open.state === 'pending' || open.state === 'admitting') consider(Date.parse(record.expiresAt));
     }
     return next;
@@ -457,7 +463,7 @@ export class ReminderStore {
    * Expire what is past its window and create a pending event for each due
    * reminder. Returns the events ready to admit now, earliest due first.
    */
-  sweep(): ReminderEvent[] {
+  sweep(live: ReadonlySet<string> = new Set()): ReminderEvent[] {
     const now = this.now();
     let changed = false;
     const ready: ReminderEvent[] = [];
@@ -466,6 +472,17 @@ export class ReminderStore {
       if (record.state !== 'active') continue;
       const open = Object.values(next.events).find(event => event.reminderId === record.id
         && event.revision === record.revision && OPEN_EVENT_STATES.has(event.state));
+      if (open && live.has(open.id)) continue;
+      if (open?.state === 'admitting') {
+        // No queued prompt in this process owns it (a write that would have
+        // returned it to pending failed). The release guard never committed
+        // a dispatch, so it is still undispatched: the same move as restart
+        // recovery, made here so it can neither strand nor spin.
+        open.state = 'pending';
+        delete open.promptId;
+        delete open.retryAt;
+        changed = true;
+      }
       if (now >= Date.parse(record.expiresAt) && (!open || open.state === 'pending')) {
         if (open) { open.state = 'expired'; open.closedAt = iso(now); }
         record.state = 'expired';
@@ -500,8 +517,10 @@ export class ReminderStore {
   markAdmitting(eventId: string): boolean {
     const event = this.state.events[eventId];
     const record = event && this.state.reminders[event.reminderId];
+    const now = this.now();
     if (!event || event.state !== 'pending' || !record || record.state !== 'active'
-        || record.revision !== event.revision || this.now() >= Date.parse(record.expiresAt)) return false;
+        || record.revision !== event.revision || now < Date.parse(record.dueAt)
+        || now >= Date.parse(record.expiresAt)) return false;
     return this.commit(() => {
       event.state = 'admitting';
       event.attempts++;
@@ -537,6 +556,9 @@ export class ReminderStore {
     };
     if (!record || record.revision !== event.revision || record.state !== 'active')
       return close('invalidated', 'stale_revision');
+    // The wall clock can step back after admission. Not due yet means not yet:
+    // the event stays undispatched and is admitted again once it is due.
+    if (at < Date.parse(record.dueAt)) return { dispatch: false, reason: 'not_due' };
     if (at >= Date.parse(record.expiresAt)) {
       try {
         this.commit(() => {

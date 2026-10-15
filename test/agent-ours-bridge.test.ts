@@ -109,9 +109,14 @@ it('serves self-reminder tools on the fixed-identity bridge, scoped to the bound
   const { ReminderStore } = await import('../src/reminders/store.js');
   const root = mkdtempSync(join(tmpdir(), 'fleet-mcp-reminders-'));
   let backend: import('../src/reminders/tools.js').ReminderToolBackend | undefined;
+  let admits = 0, released = 0, fenced = false;
   const endpoint = await startMcpEndpoint({
     socket: join(root, 'm.sock'), capability: 'reminder-capability', generation: 1,
-    runtime: { admit: async () => () => {} } as unknown as AgentOursRuntime,
+    runtime: { admit: async () => {
+      if (fenced) throw Error('RUNTIME_NOT_READY');
+      admits++;
+      return () => { released++; };
+    } } as unknown as AgentOursRuntime,
     client: {} as OursClient,
     identities: { list: async () => ['Agent'] } as ApplicationIdentityStore,
     remoteDaemonFiles: true,
@@ -145,6 +150,22 @@ it('serves self-reminder tools on the fixed-identity bridge, scoped to the bound
     expect(listed.structuredContent.reminders).toHaveLength(1);
     const invalid = await client.callTool({ name: 'fleet_reminder_cancel', arguments: { id: 'rem_x', expected_revision: 1 } }) as any;
     expect(JSON.parse(invalid.content[0].text).error).toBe('not_found');
+    expect(admits).toBe(4);
+    expect(released).toBe(4);
+    // The managed runtime fence refuses: nothing is read or changed.
+    fenced = true;
+    for (const [name, args] of [
+      ['fleet_reminder_create', { ...create, request_key: 'fenced', local_time: '2027-01-21T16:00' }],
+      ['fleet_reminder_list', {}],
+      ['fleet_reminder_cancel', { id: created.structuredContent.reminder.id, expected_revision: 1 }],
+    ] as const) {
+      const refused = await client.callTool({ name, arguments: args as any }) as any;
+      expect(refused.isError).toBe(true);
+      expect(JSON.parse(refused.content[0].text).error).toBe('runtime_not_ready');
+    }
+    fenced = false;
+    expect(backend.store.list().reminders.map((item: any) => [item.revision, item.state])).toEqual([[1, 'active']]);
+    expect(changed).toBe(1);
   } finally {
     await client.close();
     await endpoint.close();

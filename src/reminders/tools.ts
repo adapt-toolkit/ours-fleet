@@ -45,19 +45,29 @@ function failure(code: string, message: string) {
  */
 export function registerReminderTools(
   server: McpServer, backend: () => ReminderToolBackend | undefined,
+  /** The endpoint's runtime admission; nothing is read or changed unless it admits. */
+  admit: () => Promise<() => void>,
 ): void {
-  const run = (operation: (target: ReminderToolBackend) => unknown, mutates: boolean) => {
-    const target = backend();
-    if (!target) return failure('reminders_unavailable',
-      'self-reminders are not available in this session (the supervisor has not bound them, or this session cannot take scheduled prompts)');
-    try {
-      const value = operation(target);
-      if (mutates) target.changed();
-      return result(value);
-    } catch (error) {
-      if (error instanceof ReminderError) return failure(error.code, error.message);
-      return failure('reminder_store_failed', 'the reminder could not be recorded; nothing was changed');
+  const run = async (operation: (target: ReminderToolBackend) => unknown, mutates: boolean) => {
+    let release: () => void;
+    try { release = await admit(); }
+    catch {
+      return failure('runtime_not_ready',
+        'the managed runtime is not admitting tool calls right now; nothing was read or changed');
     }
+    try {
+      const target = backend();
+      if (!target) return failure('reminders_unavailable',
+        'self-reminders are not available in this session (the supervisor has not bound them, or this session cannot take scheduled prompts)');
+      try {
+        const value = operation(target);
+        if (mutates) target.changed();
+        return result(value);
+      } catch (error) {
+        if (error instanceof ReminderError) return failure(error.code, error.message);
+        return failure('reminder_store_failed', 'the reminder could not be recorded; nothing was changed');
+      }
+    } finally { release(); }
   };
 
   server.registerTool('fleet_reminder_create', {

@@ -123,7 +123,7 @@ async function supervisor(start: (dir: string) => Promise<Harness>) {
   let current = open();
   let backend: ReminderToolBackend | undefined = { store: current.store, changed: () => current.manager.changed() };
   const server = new McpServer({ name: 'ours', version: 'test' });
-  registerReminderTools(server, () => backend);
+  registerReminderTools(server, () => backend, async () => () => {});
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
   const client = new Client({ name: 'agent', version: 'test' });

@@ -51,6 +51,8 @@ export class ReminderManager implements ReminderManagerHandle {
   private stopping = false;
   private polling = false;
   private busyStreak = 0;
+  /** Consecutive re-arms with work already overdue; drives the spin backoff. */
+  private overdueStreak = 0;
   private readonly inFlight = new Set<string>();
 
   constructor(
@@ -85,7 +87,7 @@ export class ReminderManager implements ReminderManagerHandle {
     this.polling = true;
     let delay: number | undefined;
     try {
-      const ready = this.store.sweep().filter(event => !this.inFlight.has(event.id));
+      const ready = this.store.sweep(this.inFlight);
       for (const event of ready) {
         if (this.stopping) return;
         const outcome = await this.admit(event);
@@ -166,9 +168,16 @@ export class ReminderManager implements ReminderManagerHandle {
     if (this.stopping) return;
     let delay = delayMs;
     if (delay === undefined) {
-      const next = this.store.nextWorkAt();
-      if (next === undefined) return;
+      const next = this.store.nextWorkAt(this.inFlight);
+      if (next === undefined) { this.overdueStreak = 0; return; }
       delay = Math.max(0, next - this.deps.now());
+      // Work that is already overdue after a full poll means the poll could
+      // not move it (storage refusing writes, say). Back off instead of
+      // re-arming at once; any real progress resets the streak.
+      if (delay === 0) {
+        delay = this.overdueStreak ? Math.min(REMINDER_POLL_CEILING_MS, 1_000 * 2 ** Math.min(this.overdueStreak - 1, 6)) : 0;
+        this.overdueStreak++;
+      } else this.overdueStreak = 0;
     }
     delay = Math.min(delay, REMINDER_POLL_CEILING_MS);
     this.timer = this.deps.setTimer(() => {
