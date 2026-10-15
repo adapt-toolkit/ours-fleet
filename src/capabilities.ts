@@ -25,7 +25,11 @@ export const CAP_MANAGED_CLI_SETUP = 'managed-cli.setup-v1';
 /** Managed CLI accepts validated Codex Brain reasoning effort without dropping it (#235). */
 export const CAP_MANAGED_CLI_CODEX_EFFORT = 'managed-cli.codex-reasoning-effort-v1';
 
+/** `ours-fleet service check|refresh`: re-point service definitions after an update. */
+export const CAP_SERVICE_REFRESH = 'service.refresh-v1';
+
 export const CAPABILITIES = [
+  CAP_SERVICE_REFRESH,
   CAP_MANAGED_CLI_CODEX_EFFORT,
   CAP_MANAGED_CLI_SETUP,
   CAP_WORKSPACE_PRESERVE_PROFILE,
