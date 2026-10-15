@@ -41,6 +41,8 @@ export type RegistrationState =
   | 'stale'
   /** Rewritten to the invoking release by this refresh. */
   | 'refreshed'
+  /** Rewritten, but the service manager did not reload it; it still starts the old release. */
+  | 'reload-failed'
   /** Not a definition Fleet generated, or overridden; left untouched. */
   | 'unrecognized';
 
@@ -64,42 +66,103 @@ interface Definition {
   unit?: string;
   /** Argument that identifies the Fleet entry point in this definition. */
   entry: string;
+  /** Description (systemd) or Label (launchd) the Fleet generator writes. */
+  marker: string;
 }
 
 function definitions(platform: NodeJS.Platform, homeDir: string): Definition[] {
   if (platform === 'linux') {
     const dir = join(homeDir, '.config', 'systemd', 'user');
     return [
-      { service: 'supervisor', unit: UNIT_TEMPLATE, path: join(dir, UNIT_TEMPLATE), entry: '_run-fleet' },
-      { service: 'web', unit: WEB_SYSTEMD_UNIT, path: join(dir, WEB_SYSTEMD_UNIT), entry: 'web' },
-      { service: 'watchdogs', unit: WATCHDOG_SYSTEMD_UNIT, path: join(dir, WATCHDOG_SYSTEMD_UNIT), entry: '_run-watchdogs' },
+      { service: 'supervisor', unit: UNIT_TEMPLATE, path: join(dir, UNIT_TEMPLATE), entry: '_run-fleet',
+        marker: 'ours-fleet process manager' },
+      { service: 'web', unit: WEB_SYSTEMD_UNIT, path: join(dir, WEB_SYSTEMD_UNIT), entry: 'web',
+        marker: 'ours-fleet localhost web console' },
+      { service: 'watchdogs', unit: WATCHDOG_SYSTEMD_UNIT, path: join(dir, WATCHDOG_SYSTEMD_UNIT), entry: '_run-watchdogs',
+        marker: 'ours-fleet watchdog scheduler' },
     ];
   }
   if (platform === 'darwin') {
     const dir = join(homeDir, 'Library', 'LaunchAgents');
     return [
-      { service: 'supervisor', path: join(dir, `${labelFor('fleet')}.plist`), entry: '_run-fleet' },
-      { service: 'web', path: join(dir, `${WEB_LAUNCHD_LABEL}.plist`), entry: 'web' },
-      { service: 'watchdogs', path: join(dir, `${WATCHDOG_LAUNCHD_LABEL}.plist`), entry: '_run-watchdogs' },
+      { service: 'supervisor', path: join(dir, `${labelFor('fleet')}.plist`), entry: '_run-fleet', marker: labelFor('fleet') },
+      { service: 'web', path: join(dir, `${WEB_LAUNCHD_LABEL}.plist`), entry: 'web', marker: WEB_LAUNCHD_LABEL },
+      { service: 'watchdogs', path: join(dir, `${WATCHDOG_LAUNCHD_LABEL}.plist`), entry: '_run-watchdogs',
+        marker: WATCHDOG_LAUNCHD_LABEL },
     ];
   }
   return [];
 }
 
-/** The Fleet script a definition launches, from its single command line. */
-function launchedScript(text: string, platform: NodeJS.Platform, entry: string): string | undefined {
+const NODE_RUNTIME = /^node(js)?[0-9.]*$/;
+const systemdQuote = (value: string): string => `"${value.replace(/[%\\"]/g, char => char === '%' ? '%%' : `\\${char}`)}"`;
+const xml = (value: string) => value.replace(/[&<>"']/g, char => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
+}[char]!));
+const unxml = (value: string) => value.replaceAll('&quot;', '"').replaceAll('&apos;', "'")
+  .replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
+
+/**
+ * A definition Fleet generated, reduced to the parts refresh may change: the
+ * launched script argument and the pinned PATH. Anything that does not have the
+ * generator's shape (its Description or Label, a simple service, a Node runtime
+ * and the entry argument) is not Fleet's to rewrite.
+ */
+interface Generated {
+  script: string;
+  /** Replace the script argument and pinned PATH entries; nothing else. */
+  rewrite(script: string, path: (entry: string) => string): string;
+}
+
+function parseGenerated(text: string, platform: NodeJS.Platform, definition: Definition): Generated | undefined {
   if (platform === 'linux') {
-    const lines = text.split('\n').filter(line => /^\s*ExecStart\s*=/.test(line));
-    if (lines.length !== 1) return undefined;
-    const args = [...lines[0].replace(/^\s*ExecStart\s*=\s*/, '').matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)]
-      .map(match => match[1] !== undefined ? match[1].replace(/\\(.)/g, '$1') : match[2]);
-    return args.length >= 3 && args[2] === entry ? args[1] : undefined;
+    const lines = text.split('\n');
+    const only = (pattern: RegExp) => {
+      const found = lines.flatMap((line, index) => pattern.test(line) ? [index] : []);
+      return found.length === 1 ? found[0] : undefined;
+    };
+    if (lines[only(/^Description=/) ?? -1] !== `Description=${definition.marker}`) return undefined;
+    if (lines[only(/^Type=/) ?? -1] !== 'Type=simple') return undefined;
+    const exec = only(/^\s*ExecStart\s*=/);
+    if (exec === undefined || !lines[exec].startsWith('ExecStart="')) return undefined;
+    const args = [...lines[exec].slice('ExecStart='.length).matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)]
+      .map(match => match[1] !== undefined ? match[1].replace(/\\(.)/g, '$1').replaceAll('%%', '%') : match[2]);
+    const [runtime, script, entry] = args;
+    if (!runtime?.startsWith('/') || !NODE_RUNTIME.test(runtime.split('/').at(-1)!) || entry !== definition.entry || !script)
+      return undefined;
+    const quoted = `${systemdQuote(runtime)} ${systemdQuote(script)} `;
+    if (!lines[exec].startsWith(`ExecStart=${quoted}`)) return undefined;
+    const pathLine = only(/^Environment="PATH=/);
+    return {
+      script,
+      rewrite(next, path) {
+        const out = [...lines];
+        out[exec] = `ExecStart=${systemdQuote(runtime)} ${systemdQuote(next)} ${lines[exec].slice(`ExecStart=${quoted}`.length)}`;
+        if (pathLine !== undefined) {
+          const value = /^Environment="PATH=((?:[^"\\]|\\.)*)"$/.exec(lines[pathLine])?.[1];
+          if (value !== undefined && !/[\\%]/.test(value))
+            out[pathLine] = `Environment="PATH=${value.split(':').map(path).join(':')}"`;
+        }
+        return out.join('\n');
+      },
+    };
   }
-  const program = /<key>ProgramArguments<\/key>\s*<array>((?:\s*<string>[^<]*<\/string>)+)\s*<\/array>/.exec(text);
+  if (!new RegExp(`<key>Label</key>\\s*<string>${definition.marker.replaceAll('.', '\\.')}</string>`).test(text)) return undefined;
+  const program = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>\s*<string>([^<]*)<\/string>\s*<string>([^<]*)<\/string>/.exec(text);
   if (!program) return undefined;
-  const args = [...program[1].matchAll(/<string>([^<]*)<\/string>/g)].map(match => match[1]
-    .replaceAll('&quot;', '"').replaceAll('&apos;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&'));
-  return args.length >= 3 && args[2] === entry ? args[1] : undefined;
+  const [, runtime, script, entry] = program.map(unxml);
+  if (!runtime.startsWith('/') || !NODE_RUNTIME.test(runtime.split('/').at(-1)!) || entry !== definition.entry) return undefined;
+  return {
+    script,
+    rewrite(next, path) {
+      const head = program[0];
+      const moved = head.replace(`<string>${program[2]}</string>`, `<string>${xml(next)}</string>`);
+      let out = text.replace(head, moved);
+      out = out.replace(/(<key>PATH<\/key>\s*<string>)([^<]*)(<\/string>)/, (_all, open: string, value: string, close: string) =>
+        `${open}${xml(unxml(value).split(':').map(path).join(':'))}${close}`);
+      return out;
+    },
+  };
 }
 
 /** A systemd drop-in that sets ExecStart owns the command line; Fleet must not fight it. */
@@ -109,23 +172,6 @@ function overriddenByDropIn(path: string): boolean {
     return readdirSync(dir).some(name => name.endsWith('.conf')
       && /^\s*ExecStart\s*=/m.test(readFileSync(join(dir, name), 'utf8')));
   } catch { return false; }
-}
-
-/**
- * Move every path under the old release tree to the same path under the new
- * one, so the pinned PATH entries (bundled plugin bins) follow the entry point.
- * A path the new release does not ship is kept and reported.
- */
-function reroot(text: string, from: string, to: string, exists: (path: string) => boolean): { text: string; kept: string[] } {
-  const kept = new Set<string>();
-  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const next = text.replace(new RegExp(`${escaped}/[^\\s"':<]*`, 'g'), path => {
-    const moved = to + path.slice(from.length);
-    if (exists(moved)) return moved;
-    kept.add(path);
-    return path;
-  });
-  return { text: next, kept: [...kept] };
 }
 
 export interface RefreshOptions {
@@ -178,13 +224,14 @@ export async function refreshServiceRegistrations(options: RefreshOptions): Prom
     }
     const running = await runningState(definition, options, platform);
     const text = readFileSync(definition.path, 'utf8');
-    const script = launchedScript(text, platform, definition.entry);
-    if (!script) {
-      reports.push({ ...base, state: 'unrecognized', running, detail: 'no single Fleet entry point in this definition' });
+    const generated = parseGenerated(text, platform, definition);
+    if (!generated) {
+      reports.push({ ...base, state: 'unrecognized', running,
+        detail: 'not the definition Fleet generates for this service; left untouched' });
       continue;
     }
-    const from = releaseRoot(script);
-    if (!from || script === options.binPath) {
+    const from = releaseRoot(generated.script);
+    if (!from || generated.script === options.binPath) {
       reports.push({ ...base, state: 'current', running, ...(from ? { from } : {}) });
       continue;
     }
@@ -202,22 +249,35 @@ export async function refreshServiceRegistrations(options: RefreshOptions): Prom
       reports.push({ ...base, state: 'stale', running, from, to: target });
       continue;
     }
-    const moved = reroot(text, from, target, exists);
-    if (launchedScript(moved.text, platform, definition.entry) !== options.binPath) {
+    // Only bundled tool directories on PATH follow the release; every other
+    // setting, including a profile or home stored under a release tree, stays.
+    const kept: string[] = [];
+    const next = generated.rewrite(options.binPath, entry => {
+      if (!entry.startsWith(from + '/')) return entry;
+      const moved = target + entry.slice(from.length);
+      if (exists(moved)) return moved;
+      kept.push(entry);
+      return entry;
+    });
+    if (parseGenerated(next, platform, definition)?.script !== options.binPath) {
       reports.push({ ...base, state: 'unrecognized', running, from,
         detail: 'the rewritten definition would not launch the invoking release; left untouched' });
       continue;
     }
-    replaceFileAtomically(definition.path, moved.text, statSync(definition.path).mode & 0o777);
+    replaceFileAtomically(definition.path, next, statSync(definition.path).mode & 0o777);
     rewrote = true;
     reports.push({ ...base, state: 'refreshed', running, from, to: target,
-      ...(moved.kept.length ? { detail: `kept paths absent from the new release: ${moved.kept.join(', ')}` } : {}) });
+      ...(kept.length ? { detail: `kept PATH entries absent from the new release: ${kept.join(', ')}` } : {}) });
   }
   if (rewrote && platform === 'linux') {
     const reload = await (options.exec ?? realExec)('systemctl', ['--user', 'daemon-reload']);
-    if (reload.code !== 0) for (const report of reports) if (report.state === 'refreshed')
-      report.detail = [report.detail, `systemctl --user daemon-reload failed: ${reload.stderr.trim() || `exit ${reload.code}`}`]
-        .filter(Boolean).join('; ');
+    // The file is rewritten, but systemd keeps the loaded unit until a reload,
+    // so a failed reload is not a refresh.
+    if (reload.code !== 0) for (const report of reports) if (report.state === 'refreshed') {
+      report.state = 'reload-failed';
+      report.detail = [report.detail, `systemctl --user daemon-reload failed: ${reload.stderr.trim() || `exit ${reload.code}`}; `
+        + 'run it, then restart the service when convenient'].filter(Boolean).join('; ');
+    }
   }
   return reports;
 }
@@ -233,5 +293,5 @@ export function describeRegistration(report: RegistrationReport): string {
 }
 
 export const registrationDrift = (reports: RegistrationReport[]): RegistrationReport[] =>
-  reports.filter(report => report.state === 'stale' || report.running === 'stale');
+  reports.filter(report => report.state === 'stale' || report.state === 'reload-failed' || report.running === 'stale');
 
