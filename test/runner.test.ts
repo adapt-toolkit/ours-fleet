@@ -331,6 +331,56 @@ describe('managed fleet child environment', () => {
     expect(controlStarted).not.toHaveBeenCalled();
   });
 
+  it('starts recovered prompts only after the control socket, auditor and spawner are live', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const order: string[] = [];
+    const startSession = deps.startAgentSession;
+    deps.startAgentSession = async (...args: Parameters<typeof startSession>) => {
+      expect(args[1]).toMatchObject({ deferRecoveredPrompts: true });
+      const session = await startSession(...args);
+      const queue = session.queuePrompt!.bind(session);
+      session.activateRecoveredPrompts = () => { order.push('activate'); };
+      session.queuePrompt = async (...prompt: Parameters<typeof queue>) => {
+        order.push(`prompt:${prompt[1]?.origin?.kind ?? 'none'}`);
+        return queue(...prompt);
+      };
+      return session;
+    };
+    await runOnce('A', {}, { ...deps, createControlServer: () => ({
+      start: async () => { order.push('control-start'); }, close: async () => {},
+      setFleetSpawner: () => { order.push('spawner'); },
+      setFleetAuditor: () => { order.push('auditor'); }, setOwnerChannel: () => {},
+      setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    expect(order.slice(0, 5)).toEqual(['auditor', 'control-start', 'spawner', 'activate', 'prompt:startup']);
+    expect(order.filter(step => step === 'activate')).toHaveLength(1);
+  });
+
+  it('never activates recovered prompts when the control socket fails to listen', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const activated = vi.fn();
+    const closed = vi.fn();
+    const startSession = deps.startAgentSession;
+    deps.startAgentSession = async (...args: Parameters<typeof startSession>) => {
+      const session = await startSession(...args);
+      const close = session.close.bind(session);
+      session.activateRecoveredPrompts = activated;
+      session.close = async () => { closed(); await close(); };
+      return session;
+    };
+    await expect(runOnce('A', {}, { ...deps, createControlServer: () => ({
+      start: async () => { throw new Error('listen EADDRINUSE'); }, close: async () => {},
+      setFleetSpawner: () => {}, setFleetAuditor: () => {}, setOwnerChannel: () => {},
+      setConfigReloader: () => {}, setLoopManager: () => {},
+    }) })).rejects.toThrow(/EADDRINUSE/);
+    expect(activated).not.toHaveBeenCalled();
+    expect(closed).toHaveBeenCalledOnce();
+  });
+
   it('installs the owner-backed auditor before control startup and never swaps it', async () => {
     writeCfg({ A: { harness: 'fake', session: 'acp',
       owner_channel: { identity: 'A-owner', owners: ['owner-cid'] } } });
