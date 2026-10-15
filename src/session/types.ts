@@ -385,6 +385,12 @@ export interface AgentSession {
   readonly pid: number;
   /** Live capabilities; optional only for source compatibility with external adapters. */
   readonly capabilities?: AgentSessionCapabilities;
+  /**
+   * Start never-started prompts recovered from a prior generation. Sessions
+   * started with deferRecoveredPrompts hold them until the supervisor's
+   * control plane is listening, so recovered work cannot reach a stale socket.
+   */
+  activateRecoveredPrompts?(): void;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
   taskNoticeBinding?():TaskNoticeBinding|undefined;

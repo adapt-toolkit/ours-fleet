@@ -53,6 +53,8 @@ export interface CodexAppServerSessionOptions {
   stateDir: string;
   mode: 'fresh' | 'resume';
   requireResume?: boolean;
+  /** Hold recovered never-started prompts until activateRecoveredPrompts(). */
+  deferRecoveredPrompts?: boolean;
   permissions: CommonPermissions;
   permissionMode: NonNullable<SessionSnapshot['permissionMode']>;
   model?: string | null;
@@ -234,6 +236,7 @@ export class CodexAppServerSession implements AgentSession {
   private lastError?: string;
   private exit: ExitRecord | null = null;
   private queueDepth = 0;
+  private readonly deferredRecovered: Array<{ promptId: string; text: string; origin?: PromptOrigin }> = [];
   private readonly observation = new ConversationObservation(() => this.captureObservation());
   private promptTail: Promise<unknown> = Promise.resolve();
   /** Admitted prompts not yet handed to the app-server, in admission order. */
@@ -672,14 +675,25 @@ export class CodexAppServerSession implements AgentSession {
         });
         continue;
       }
-      this.queueDepth++;
       const origin: PromptOrigin | undefined = open.commandId
         ? { kind: 'owner-admin-console', commandId: open.commandId }
         : undefined;
-      const run = this.enqueue(open.promptId, open.text!, origin);
-      this.observation.publish();
-      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
+      const recovered = { promptId: open.promptId, text: open.text!, ...(origin ? { origin } : {}) };
+      if (this.options.deferRecoveredPrompts) this.deferredRecovered.push(recovered);
+      else this.dispatchRecovered(recovered);
     }
+  }
+
+  /** Dispatch recovered prompts once the caller's control plane is listening. */
+  activateRecoveredPrompts(): void {
+    for (const recovered of this.deferredRecovered.splice(0)) this.dispatchRecovered(recovered);
+  }
+
+  private dispatchRecovered({ promptId, text, origin }: { promptId: string; text: string; origin?: PromptOrigin }): void {
+    this.queueDepth++;
+    const run = this.enqueue(promptId, text, origin);
+    this.observation.publish();
+    void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
   }
 
   private admit(

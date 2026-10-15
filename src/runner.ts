@@ -827,7 +827,7 @@ export async function runOnce(
       managedOurs: managedHarness.ours,
       role, prep,
       launch: { ...launch, argv: wrappedArgv, env: managedHarness.env },
-      cwd: runCwd, stateDir: dir, mode, requireResume, permissions: perms,
+      cwd: runCwd, stateDir: dir, mode, requireResume, deferRecoveredPrompts: true, permissions: perms,
       permissionMode: effectivePermissionMode(role), log: deps.log,
     }));
     managedService.setFileDelivery?.(agentSession.sendFileToChat?.bind(agentSession));
@@ -933,6 +933,9 @@ export async function runOnce(
       }
       return event;
     });
+    // Recovered prompts may run the managed Fleet CLI immediately. Start them
+    // only now that the control socket, audit and spawn handlers are live.
+    agentSession.activateRecoveredPrompts?.();
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
       // refusal or a cancellation reached the agent and was not acted on, so

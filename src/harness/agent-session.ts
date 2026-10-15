@@ -34,6 +34,8 @@ export interface AgentSessionStartOptions {
   mode: 'fresh' | 'resume';
   /** Durable task context must never silently fall back to a fresh session. */
   requireResume?: boolean;
+  /** Hold recovered never-started prompts until AgentSession.activateRecoveredPrompts(). */
+  deferRecoveredPrompts?: boolean;
   permissions: CommonPermissions;
   permissionMode: { fleetMode: FleetPermissionMode; nativeMode: string };
   log(line: string): void;
