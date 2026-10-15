@@ -4,7 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { replaceFileAtomically, withFileLock, type LockDeps, type WriteDeps } from '../src/atomic-file.js';
+import {
+  FileLockOwnerUnverifiableError, replaceFileAtomically, withFileLock, type LockDeps, type WriteDeps,
+} from '../src/atomic-file.js';
 import { procIncarnationProbe } from '../src/process-incarnation.js';
 
 // dist/cli.js et al are built once by vitest's globalSetup
@@ -117,14 +119,25 @@ describe('withFileLock', () => {
       expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('old-holder');
     });
 
-    it('keeps a live legacy holder without markers conservative', async () => {
+    it('fails with a diagnostic, and keeps the lock, for a live legacy holder without markers', async () => {
       const lock = join(home, 'legacy.lock');
       leftover(lock, { pid: 4242 });
       let entered = false;
-      await expect(withFileLock(lock, () => { entered = true; }, {
+      const failure = await withFileLock(lock, () => { entered = true; }, {
         ...bounded(), alive: () => true, incarnation: probe('current-boot', '9000'),
-      }, 50)).rejects.toThrow('still waiting');
+      }, 50).catch(error => error);
+      expect(failure).toBeInstanceOf(FileLockOwnerUnverifiableError);
+      expect(failure.message).toContain(lock);
       expect(entered).toBe(false);
+      expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('old-holder');
+    });
+
+    it('keeps waiting on a live holder where the platform has no incarnation markers', async () => {
+      const lock = join(home, 'nomarkers.lock');
+      leftover(lock, { pid: 4242 });
+      await expect(withFileLock(lock, () => {}, {
+        ...bounded(), alive: () => true, incarnation: { bootId: () => undefined, startTime: () => undefined },
+      }, 50)).rejects.toThrow('still waiting');
       expect(existsSync(join(lock, 'owner.json'))).toBe(true);
     });
 
@@ -138,32 +151,40 @@ describe('withFileLock', () => {
     it('does not let a late reclaimer remove the lock its successor already claimed', async () => {
       const lock = join(home, 'successor.lock');
       leftover(lock, { pid: 4242, boot: 'previous-boot', start: '100' });
-      const deps = { alive: () => true, incarnation: probe('current-boot', '100') };
-      let releaseSuccessor!: () => void;
-      let successorEntered!: () => void;
-      const entered = new Promise<void>(resolve => { successorEntered = resolve; });
-      let successor: Promise<void> | undefined;
-      const inside: string[] = [];
-      // The late reclaimer observed the dead holder, then stalls inside its
-      // reclaim; meanwhile the dead lock disappears and a successor claims it.
-      const late = withFileLock(lock, () => { inside.push('late'); }, {
-        ...deps,
-        beforeReclaim: async () => {
+      let entered = false;
+      // The late reclaimer observed the dead holder; before it re-reads inside
+      // the reclaim section, a faster contender removes it and claims the lock.
+      const failure = await withFileLock(lock, () => { entered = true; }, {
+        ...bounded(), alive: () => true, incarnation: probe('current-boot', '100'),
+        beforeReclaim: () => {
           rmSync(lock, { recursive: true, force: true });
-          successor = withFileLock(lock, () => new Promise<void>(resolve => {
-            inside.push('successor'); successorEntered(); releaseSuccessor = resolve;
-          }), deps);
-          await entered;
+          leftover(lock, { pid: 4343, boot: 'current-boot', start: '100' });
+          writeFileSync(join(lock, 'owner.json'),
+            JSON.stringify({ token: 'successor', pid: 4343, boot: 'current-boot', start: '100' }));
         },
-      });
-      await entered;
-      await new Promise(resolve => setTimeout(resolve, 100));
-      expect(inside).toEqual(['successor']);
-      expect(existsSync(join(lock, 'owner.json'))).toBe(true);
-      releaseSuccessor();
-      await successor; await late;
-      expect(inside).toEqual(['successor', 'late']);
+      }, 50).catch(error => error);
+      expect(failure?.message).toBe('still waiting');
+      expect(entered).toBe(false);
+      expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('successor');
     });
+
+    it('never displaces a live reclaimer stalled inside the reclaim section, however long it stalls', async () => {
+      const lock = join(home, 'stalled.lock');
+      const boot = procIncarnationProbe.bootId(), start = procIncarnationProbe.startTime(process.pid);
+      if (!boot || !start) return; // markers are Linux-only
+      leftover(lock, { pid: 4242, boot: `not-${boot}`, start: '100' });
+      // A live reclaimer (this process, same incarnation) holds the section.
+      mkdirSync(`${lock}.reclaim`);
+      const claim = join(`${lock}.reclaim`, `${process.pid}-00000000-0000-4000-8000-000000000000.json`);
+      writeFileSync(claim, JSON.stringify({ pid: process.pid, choosing: false, ticket: 1, boot, start }));
+      // One full reclaim-section wait, then the first ordinary poll aborts.
+      const failure = await withFileLock(lock, () => {}, {
+        sleep: async () => { throw new Error('still waiting'); }, alive: pid => pid !== 4242,
+      }, 50).catch(error => error);
+      expect(failure?.message).toBe('still waiting');
+      expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).token).toBe('old-holder');
+      expect(existsSync(claim)).toBe(true);
+    }, 30_000);
 
     it('serializes many processes that find the same pre-reboot lock', async () => {
       const lock = join(home, 'many.lock');
