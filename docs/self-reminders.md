@@ -167,11 +167,15 @@ old service.
 ### 2. Fence the old producer persistently
 
 A `stop` alone is not a fence: an enabled unit starts again at the next login or
-boot. The operator records the unit's prior state and then disables it:
+boot. The operator records the unit's prior state and its unit file, then
+disables it. The old setup enabled a generated unit by absolute path outside the
+unit search path, so disabling removes its only link; keep the recorded path and
+do not delete that file until step 6:
 
 ```sh
 systemctl --user is-enabled self-reminders-Name.service   # record: enabled/linked/...
 systemctl --user is-active  self-reminders-Name.service   # record: active/inactive
+systemctl --user show -p FragmentPath self-reminders-Name.service   # record the absolute unit file
 systemctl --user disable --now self-reminders-Name.service
 systemctl --user is-enabled self-reminders-Name.service   # must not be enabled
 systemctl --user is-active  self-reminders-Name.service   # must be inactive
@@ -253,14 +257,15 @@ the agent goes through each `legacy:` Fleet reminder:
 
 | Fleet reminder state | Action before the old producer may run again |
 | --- | --- |
-| open, no event or event `pending` | `fleet_reminder_cancel` it. The old reminder (`legacy:<old id>:…`) must still be `active` in the old system; if it was already cancelled there, keep the Fleet one instead and do not re-enable that copy |
+| open, no event or event `pending` | First check the old reminder named by the key (`legacy:<old id>:…`). Only if it is still `active` in the old system, `fleet_reminder_cancel` the Fleet copy. If the old one is no longer active, the Fleet copy is the only schedule: keep it |
 | event `dispatched` or `uncertain`, or `acknowledged` | the wake already happened in Fleet: **cancel the old reminder** so it cannot fire again, and keep the Fleet record |
 | `cancelled` or `expired` | nothing; make sure the old reminder is not active either unless that is intended |
 
 Only when every `legacy:` reminder has been reconciled may the operator restore
-the unit to its recorded prior state, for example
-`systemctl --user enable --now self-reminders-Name.service` if it was enabled
-and active. Never have both producers active for the same reminder.
+the unit to its recorded prior state from the recorded unit file, for example
+`systemctl --user enable --now /recorded/FragmentPath/self-reminders-Name.service`
+if it was enabled and active. Never have both producers active for the same
+reminder.
 
 ### Instructions to update
 
