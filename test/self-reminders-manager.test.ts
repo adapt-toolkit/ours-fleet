@@ -24,11 +24,13 @@ function world() {
   const timers: number[] = [];
   const admissions: string[] = [];
   const finish: Array<() => void> = [];
+  const hooks: { afterClaim?: () => void } = {};
   /** An admitter whose prompt settles without ever reaching release (session went offline). */
   const admitter: ReminderAdmitter = {
     async tryReminder(text, _origin, beforeQueue) {
       if (!beforeQueue()) return { state: 'unavailable', error: 'declined', admitted: false };
       admissions.push(text);
+      hooks.afterClaim?.();
       const completion = new Promise<ReturnType<typeof turnResult>>(resolve =>
         finish.push(() => resolve(turnResult(false, 'failed', 'offline'))));
       return { state: 'admitted', queued: { promptId: `p${admissions.length}`, queuedBehind: 0, completion } };
@@ -38,7 +40,7 @@ function world() {
     now: () => clock.now, log: () => {},
     setTimer: (_callback, ms) => { timers.push(ms); return ms; }, clearTimer: () => {},
   });
-  return { dir, clock, io, store, timers, admissions, finish, manager };
+  return { dir, clock, io, store, timers, admissions, finish, hooks, manager };
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 5));
@@ -80,6 +82,32 @@ describe('ReminderManager under storage faults', () => {
     await w.manager.poll();
     expect(w.store.list({ state: 'closed' }).reminders[0]).toMatchObject({ state: 'expired' });
     expect(w.timers).toEqual([]);                       // nothing open: no timer at all
+  });
+
+  it('keeps ownership of an admission whose receipt could not be recorded', async () => {
+    const w = world();
+    const { reminder } = w.store.create('k', { title: 't', local_time: '2027-01-20T13:00', time_zone: 'UTC', late_window_seconds: 600 });
+    w.manager.start();
+    w.clock.now = Date.parse(reminder.due_at);
+    w.hooks.afterClaim = () => { w.io.failWrites = true; };   // storage fails right after queue acceptance
+    await w.manager.poll();
+    expect(w.admissions).toHaveLength(1);
+    w.hooks.afterClaim = undefined;
+    // The never-released prompt settles (rejecting, even) while storage is still down.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      w.finish.shift()!();
+      await settle();
+    } finally { process.off('unhandledRejection', onUnhandled); }
+    expect(unhandled).toEqual([]);
+    w.io.failWrites = false;
+    // Ownership was released: the event is recoverable, then expires on time.
+    w.clock.now = Date.parse(reminder.expires_at) + 1;
+    await w.manager.poll();
+    expect(w.store.list({ state: 'closed' }).reminders[0]).toMatchObject({ state: 'expired' });
+    expect(w.admissions).toHaveLength(1);
   });
 
   it('does not touch an admission still owned by a queued prompt', async () => {

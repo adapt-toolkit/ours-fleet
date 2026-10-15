@@ -138,15 +138,21 @@ export class ReminderManager implements ReminderManagerHandle {
       this.deps.log(`[${this.role}] self-reminder ${event.id.slice(0, 12)} not admitted; will retry within its window`);
       return 'skipped';
     }
-    this.store.recordReceipt(event.id, attempt.queued.promptId);
-    this.deps.log(`[${this.role}] self-reminder ${event.id.slice(0, 12)} admitted`);
-    void attempt.queued.completion.then(() => {
+    // Own the completion before anything else can throw: the queued prompt
+    // ends this admission whatever happens to the receipt write below.
+    const settled = () => {
       this.inFlight.delete(event.id);
       // Settled without the guard dispatching it (offline session, refused at
       // release while stopping): still undispatched, so it may be retried.
-      this.store.releaseUndispatched(event.id, this.retryAt(event));
+      // A failed write leaves it admitting with no owner; sweep recovers that.
+      try { this.store.releaseUndispatched(event.id, this.retryAt(event)); } catch { /* recovered by sweep */ }
       this.changed();
-    });
+    };
+    void attempt.queued.completion.then(settled, settled);
+    // The receipt is diagnostic only; dispatch state is the release guard's.
+    try { this.store.recordReceipt(event.id, attempt.queued.promptId); }
+    catch { this.deps.log(`[${this.role}] self-reminder ${event.id.slice(0, 12)} receipt not recorded`); }
+    this.deps.log(`[${this.role}] self-reminder ${event.id.slice(0, 12)} admitted`);
     return 'admitted';
   }
 

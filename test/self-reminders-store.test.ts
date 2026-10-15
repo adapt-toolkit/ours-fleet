@@ -45,7 +45,7 @@ describe('ReminderStore', () => {
     const first = create(h.store);
     expect(first.created).toBe(true);
     expect(first.reminder).toMatchObject({
-      revision: 1, state: 'active', title: 'Check CI', note: 'private note',
+      request_key: 'k1', revision: 1, state: 'active', title: 'Check CI', note: 'private note',
       local_time: '2027-01-20T16:00:00', time_zone: 'UTC', due_at: '2027-01-20T16:00:00.000Z',
       late_window_seconds: 3600, expires_at: '2027-01-20T17:00:00.000Z',
     });
