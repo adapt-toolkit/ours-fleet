@@ -1,5 +1,5 @@
 import {
-  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -27,8 +27,21 @@ export interface LockDeps {
   alive?(pid: number): boolean;
   /** Test seam for boot id and process start markers. */
   incarnation?: IncarnationProbe;
-  /** Test hook after a dead holder is observed, before its lock is removed. */
-  beforeReclaim?(): void | Promise<void>;
+  /** Test hook inside the reclaim section, before the dead holder is re-read. */
+  beforeReclaim?(): void;
+}
+
+/**
+ * A live holder recorded without process-incarnation markers by a release that
+ * predates them. Its PID may be reused, so the lock can be neither trusted nor
+ * removed; the caller fails with the path instead of waiting forever.
+ */
+export class FileLockOwnerUnverifiableError extends Error {
+  constructor(readonly lockPath: string, readonly pid: number) {
+    super(`lock ${lockPath} is held by PID ${pid}, recorded without a boot or start marker, so it cannot be `
+      + 'proved stale; it was left in place. If no Fleet process started before the last update or reboot '
+      + `is still running, remove ${lockPath} and retry.`);
+  }
 }
 
 /** The syscalls a replace depends on, injectable so faults can be forced deterministically. */
@@ -39,6 +52,7 @@ export interface WriteDeps {
 }
 
 const DEFAULT_STALE_MS = 10_000;
+const SYNCHRONOUS_LOCK_TIMEOUT = 'Timed out acquiring synchronous journal lock';
 const POLL_MS = 25;
 
 /**
@@ -93,17 +107,21 @@ export async function withFileLock<T>(
         held = Number.isFinite(n) ? n : null;
       } catch { /* holder died between mkdir and stamp */ }
       let ownerAlive = false;
+      let unverifiable: number | undefined;
       try {
         const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number } & ProcessIncarnation;
         // A reused PID is not the holder: a lock written before a reboot, or by
         // a process that has since exited, must not block every later caller.
-        if (typeof owner.pid === 'number')
+        if (typeof owner.pid === 'number') {
           ownerAlive = alive(owner.pid) && !incarnationEnded(owner.pid, owner, probe);
+          if (ownerAlive && owner.boot === undefined && owner.start === undefined && probe.bootId())
+            unverifiable = owner.pid;
+        }
       } catch { /* legacy or incomplete lock */ }
-      if (!ownerAlive && ((held !== null && now() - held > staleMs) || waited > staleMs * 2)) {
-        await reclaimDeadHolder(reclaimPath, lockPath, observed, holder, staleMs, deps);
-        continue;
-      }
+      const expired = (held !== null && now() - held > staleMs) || waited > staleMs * 2;
+      if (!ownerAlive && expired && reclaimDeadHolder(reclaimPath, lockPath, observed, holder, deps)) continue;
+      if (unverifiable !== undefined && expired && waited > staleMs * 2)
+        throw new FileLockOwnerUnverifiableError(lockPath, unverifiable);
       await sleep(POLL_MS);
       waited += POLL_MS;
     }
@@ -121,29 +139,26 @@ export async function withFileLock<T>(
 
 /**
  * Remove a dead holder's lock only while it is still that holder's. Contenders
- * that observed the same dead holder serialize through a short reclaim gate
- * and re-read the holder inside it, so a late reclaimer cannot delete the lock
- * a faster contender has already claimed.
+ * that observed the same dead holder serialize through a bakery lock, whose
+ * claims are per-process files removed only when their process is provably
+ * gone, never by age. Inside it the holder is re-read, so a reclaimer that was
+ * descheduled after observing the dead holder cannot delete the lock a faster
+ * contender has since claimed.
  */
-async function reclaimDeadHolder(
+function reclaimDeadHolder(
   reclaimPath: string, lockPath: string, observed: string | null,
-  holder: () => string | null, staleMs: number, deps: LockDeps,
-): Promise<void> {
-  try { mkdirSync(reclaimPath); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    // A reclaimer that died inside the gate leaves it behind; the section is a
-    // few syscalls long, so a gate older than the stale interval is abandoned.
-    try { if (Date.now() - statSync(reclaimPath).mtimeMs > staleMs) rmSync(reclaimPath, { recursive: true, force: true }); }
-    catch { /* already released */ }
-    await (deps.sleep ?? ((ms: number) => new Promise<void>(r => { setTimeout(r, ms); })))(POLL_MS);
-    return;
-  }
+  holder: () => string | null, deps: LockDeps,
+): boolean {
   try {
-    await deps.beforeReclaim?.();
-    if (holder() === observed) rmSync(lockPath, { recursive: true, force: true });
-  } finally {
-    rmSync(reclaimPath, { recursive: true, force: true });
+    withSynchronousFileLock(reclaimPath, () => {
+      deps.beforeReclaim?.();
+      if (holder() === observed) rmSync(lockPath, { recursive: true, force: true });
+    });
+    return true;
+  } catch (error) {
+    // A live contender stalled inside the section: wait like any other poll.
+    if (!(error instanceof Error) || error.message !== SYNCHRONOUS_LOCK_TIMEOUT) throw error;
+    return false;
   }
 }
 
@@ -242,7 +257,7 @@ export function withSynchronousFileLock<T>(path: string, work: () => T): T {
       const preceding = claims().some(claim => claim.name !== token && (claim.value.choosing
         || claim.value.ticket < ticket || (claim.value.ticket === ticket && claim.name < token)));
       if (!preceding) return work();
-      if (Date.now() >= deadline) throw new Error('Timed out acquiring synchronous journal lock');
+      if (Date.now() >= deadline) throw new Error(SYNCHRONOUS_LOCK_TIMEOUT);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   } finally { rmSync(own, { force: true }); }
