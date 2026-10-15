@@ -61,12 +61,15 @@ describe('safe web role removal', () => {
     const { root, calls, service } = fixture('  Worker: { harness: codex }\n');
     mkdirSync(agentDir('Worker'), { recursive: true });
     writeFileSync(join(agentDir('Worker'), 'WORKLOG.md'), 'recover me');
+    writeFileSync(join(agentDir('Worker'), '.self-reminders.json'), '{"private":"reminder"}', { mode: 0o600 });
     expect(() => service.previewWeb('worker')).toThrow(/case-sensitive.*Worker/);
     await expect(service.removeWeb({ role: 'Worker', confirmation: 'worker' })).rejects.toMatchObject({ code: 'invalid_request' });
     const result = await service.removeWeb({ role: 'Worker', confirmation: 'Worker' });
     expect(calls).toEqual(['Worker']);
     expect(result.recoveryPath).toContain('-Worker');
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
+    // A removed agent's reminders end with it: not kept in recovery evidence.
+    expect(existsSync(join(result.recoveryPath, 'state', '.self-reminders.json'))).toBe(false);
     expect(existsSync(join(root, 'fleet.yaml'))).toBe(true);
   });
 
@@ -91,10 +94,12 @@ describe('safe web role removal', () => {
     const orphan = fixture('  Stable: {}\n');
     mkdirSync(agentDir('dangling'), { recursive: true });
     writeFileSync(join(agentDir('dangling'), 'briefing.md'), 'minimal');
+    writeFileSync(join(agentDir('dangling'), '.self-reminders.json'), '{}', { mode: 0o600 });
     const result = await orphan.service.removeWeb({ role: 'dangling', confirmation: 'dangling' });
     expect(orphan.calls).toEqual(['dangling']);
     expect(existsSync(agentDir('dangling'))).toBe(false);
     expect(existsSync(join(result.recoveryPath, 'orphan-state', 'briefing.md'))).toBe(true);
+    expect(existsSync(join(result.recoveryPath, 'orphan-state', '.self-reminders.json'))).toBe(false);
   });
 
   it('protects the current control role and requires coordinator impact acknowledgement', async () => {

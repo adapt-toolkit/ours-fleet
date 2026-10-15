@@ -25,6 +25,20 @@ export interface BriefingOpts {
 const managedSession = (role: ResolvedRole): boolean =>
   role.session === 'acp' || role.session === 'codex-app-server';
 
+/** One short, read-once paragraph; the full contract lives in `ours-fleet docs`. */
+function selfReminderGuidance(role: ResolvedRole): string[] {
+  if (!managedSession(role)) return [];
+  return [
+    '', '## Self-reminders',
+    'To return to something at a later time, schedule a one-time wake for yourself with the',
+    '`fleet_reminder_create` tool: a stable `request_key`, a `title`, an optional private `note`, a',
+    '`local_time` such as `2027-01-20T16:00` and an IANA `time_zone`. It messages no one and needs',
+    'no setup. When due, a `[fleet-reminder]` turn arrives: call `fleet_reminder_inspect`, decide,',
+    'then `fleet_reminder_ack` (or `fleet_reminder_update` to postpone). Use it instead of polling,',
+    'sleeping or a recurring loop. Full contract: the "Self-reminders" section of `ours-fleet docs`.',
+  ];
+}
+
 function adminConsoleAuthority(session: ResolvedRole['session']): string[] {
   if (session === 'codex-app-server') return [
     '- A paired web admin-console prompt carries a server-generated Codex application-context entry',
@@ -163,6 +177,7 @@ function generateRoomMemberBriefing(
     L.push('No Fleet Coordinator contact is configured. Put a secret-free blocker report in your final');
     L.push('assistant response for the Fleet supervisor, then stop BLOCKED.');
   }
+  L.push(...selfReminderGuidance(role));
   L.push('', '## Durable log');
   L.push('Append important commands / decisions / results to `' + opts.worklogPath + '` as you go —');
   L.push('it survives restarts. Never store invite material or secrets there.');
@@ -308,6 +323,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('stall. Escalate over ours messaging only when you cannot resolve it yourself.');
   }
 
+  L.push(...selfReminderGuidance(role));
   L.push('', '## Durable log');
   L.push(`Append important commands / decisions / results to \`${opts.worklogPath}\` as you go —`);
   L.push('it survives restarts.');

@@ -27,6 +27,23 @@ export interface WriteDeps {
   writeSync?(fd: number, buffer: Buffer, offset: number, length: number): number;
   fsyncSync?(fd: number): void;
   closeSync?(fd: number): void;
+  /** Directory fsync used by `durable` replaces; injectable for fault tests. */
+  fsyncDirectory?(dir: string): void;
+}
+
+export interface ReplaceOptions {
+  /**
+   * Fail closed unless the rename itself is known durable. Callers whose
+   * recovery treats the previous contents as proof that something did NOT
+   * happen need this: a host crash that rolls the rename back would otherwise
+   * resurrect a state the process had already moved past.
+   */
+  durable?: boolean;
+}
+
+function fsyncDirectory(dir: string): void {
+  const dirFd = openSync(dir, 'r');
+  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
 }
 
 const DEFAULT_STALE_MS = 10_000;
@@ -103,7 +120,9 @@ export async function withFileLock<T>(
  * half-written one — and an interrupted write leaves the previous contents
  * intact.
  */
-export function replaceFileAtomically(path: string, contents: string, mode = 0o600, deps: WriteDeps = {}): void {
+export function replaceFileAtomically(
+  path: string, contents: string, mode = 0o600, deps: WriteDeps = {}, options: ReplaceOptions = {},
+): void {
   const write = deps.writeSync ?? writeSync;
   const fsync = deps.fsyncSync ?? fsyncSync;
   const close = deps.closeSync ?? closeSync;
@@ -139,11 +158,10 @@ export function replaceFileAtomically(path: string, contents: string, mode = 0o6
     rmSync(tmp, { force: true });
     throw e;
   }
-  // Best-effort: make the rename itself durable. Not supported everywhere.
-  try {
-    const dirFd = openSync(dir, 'r');
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-  } catch { /* platform does not allow fsync on a directory */ }
+  // Make the rename itself durable. Best-effort by default because not every
+  // platform allows fsync on a directory; a durable replace refuses instead.
+  try { (deps.fsyncDirectory ?? fsyncDirectory)(dir); }
+  catch (e) { if (options.durable) throw e; }
 }
 
 /** Synchronous Lamport bakery lock: unique claims are never reused, so stale

@@ -25,7 +25,8 @@
     "docs/validation/managed-cli-permissions.md",
     "docs/fleet-migration.md",
     "LICENSE",
-    "docs/acp-files.md"
+    "docs/acp-files.md",
+    "docs/self-reminders.md"
   ],
   "engines": {
     "node": ">=22.13.0"
@@ -55,7 +56,8 @@
     "qrcode": "1.5.4",
     "secure-json-parse": "^4.1.0",
     "ws": "^8.18.3",
-    "yaml": "^2.5.0"
+    "yaml": "^2.5.0",
+    "zod": "^4.4.3"
   },
   "optionalDependencies": {
     "@agentclientprotocol/claude-agent-acp": "^0.63.0",

@@ -21,6 +21,8 @@ export interface PendingPrompt {
   command?: boolean;
   /** Set when a release takes this prompt; every member of that turn shares it. */
   released?: Promise<TurnResult>;
+  /** Last-moment validity check for an internal prompt; see `refuseAtRelease`. */
+  releaseGuard?: () => boolean;
 }
 
 /**
@@ -42,13 +44,13 @@ const INVENTORY_TEXT_CHARS = 200;
  *    adapter as the entire prompt, so it is its own turn and a boundary
  *    between the messages before and after it. The session decides this at
  *    admission; text that merely starts with a slash is an ordinary message.
- *  - `internal`: startup, scheduled-loop and stall-watchdog prompts. They own
+ *  - `internal`: startup, scheduled-loop, self-reminder and stall-watchdog prompts. They own
  *    their turn's lifecycle (and, for a loop, the redaction of its whole
  *    transcript), run alone, and never split the messages around them.
  */
 export type PromptClass = 'message' | 'command' | 'internal';
 
-const INTERNAL = new Set<string>(['startup', 'scheduled-loop', 'stall-watchdog']);
+const INTERNAL = new Set<string>(['startup', 'scheduled-loop', 'stall-watchdog', 'self-reminder']);
 
 export function promptClass(prompt: Pick<PendingPrompt, 'origin' | 'command'>): PromptClass {
   if (INTERNAL.has(prompt.origin?.kind ?? 'local-console')) return 'internal';
@@ -82,6 +84,36 @@ export function takeBatch(pending: PendingPrompt[], head: PendingPrompt): Pendin
   }
   return members;
 }
+
+/**
+ * The release-time fence for a guarded internal prompt. A prompt can wait in
+ * the queue long after it was admitted; whatever it was about may have been
+ * cancelled, revised or expired meanwhile, or the role may be stopping. The
+ * guard answers at the one moment that matters — the prompt is about to reach
+ * the model — and a refusal removes it unsent.
+ *
+ * The guard runs only when the session is live: an offline session fails the
+ * turn without handing it to the adapter, so consuming the guard there would
+ * record a dispatch that never happened. Returns the refused result, or
+ * undefined when the release should proceed.
+ */
+export function refuseAtRelease(
+  pending: PendingPrompt[], entry: PendingPrompt, online: boolean,
+): TurnResult | undefined {
+  if (!entry.releaseGuard || !online) return undefined;
+  // Only an internal prompt is guaranteed to be its own release; any other
+  // class could be carried by another prompt's batch past this fence, so a
+  // guarded prompt of that kind is refused rather than sent unchecked.
+  let allowed = false;
+  if (promptClass(entry) === 'internal')
+    try { allowed = entry.releaseGuard() === true; } catch { allowed = false; }
+  if (allowed) return undefined;
+  const at = pending.indexOf(entry);
+  if (at >= 0) pending.splice(at, 1);
+  return { accepted: false, outcome: 'cancelled', succeeded: false, detail: RELEASE_GUARD_REFUSED };
+}
+
+export const RELEASE_GUARD_REFUSED = 'release-guard-refused';
 
 /** Exact, server-computed identity of one member's body inside a shared turn. */
 export interface MemberBinding {

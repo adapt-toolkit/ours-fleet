@@ -34,6 +34,8 @@ import {
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import type { ResolvedRole } from '../src/config.js';
 import { AcpSession } from '../src/session/acp.js';
+import { ReminderStore } from '../src/reminders/store.js';
+import type { ReminderToolBackend } from '../src/reminders/tools.js';
 import { writeV2Fixture } from './v2-fixture.js';
 
 vi.mock('../src/agent-ours/service.js', async importOriginal => ({
@@ -2375,5 +2377,81 @@ describe('restart-loop containment', () => {
     const d = setup();
     writeFileSync(join(d, '.restart-ledger.json'), '{not json');
     expect(readRestartLedger(d)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 0 });
+  });
+});
+
+describe('built-in self-reminders in the runner', () => {
+  const runtime = { instance: 'reminder-instance', cid: 'D'.repeat(64), action: 'reminder-action' };
+
+  /** A temp role with one reminder already due when the runner starts. */
+  function reminderWorld(name: string, opts: { startup?: TurnResult } = {}) {
+    const d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    const store = new ReminderStore(d, { role: name, ...runtime }, () => -60_000);
+    const { reminder } = store.create('due-at-start', { title: 'T', local_time: '1970-01-01T00:00', time_zone: 'UTC' });
+    const world = fakeWorld({ lifeChecks: 40, exitFile: join(d, '.exit-status') });
+    const bound: Array<ReminderToolBackend | undefined> = [];
+    const prepare = world.deps.prepareAgentOurs;
+    world.deps.prepareAgentOurs = (async (...args: Parameters<typeof prepare>) => {
+      const service = await prepare(...args);
+      Object.assign(service.runtime, { snapshot: runtime });
+      service.setReminders = backend => { bound.push(backend); };
+      return service;
+    }) as typeof prepare;
+    const order: string[] = [];
+    const start = world.deps.startAgentSession;
+    world.deps.startAgentSession = (async (...args: Parameters<typeof start>) => {
+      const session = await start(...args) as SessionHandle & { queuePrompt: any };
+      const queue = session.queuePrompt;
+      session.queuePrompt = async (text: string, options: { releaseGuard?: () => boolean; origin?: { kind: string } } = {}) => {
+        if (options.origin?.kind === 'startup') {
+          order.push('startup');
+          if (opts.startup) return { promptId: 'startup', queuedBehind: 0, completion: Promise.resolve(opts.startup) };
+          return queue(text, options);
+        }
+        // Emulate the session's release: the guard decides whether it is sent.
+        if (options.releaseGuard && !options.releaseGuard()) order.push('refused');
+        else order.push(text.startsWith('[fleet-reminder]') ? 'reminder' : 'prompt');
+        return queue(text, options);
+      };
+      return session;
+    }) as typeof start;
+    const sleep = world.deps.sleep;
+    world.deps.sleep = async (ms: number) => { await sleep(ms); await new Promise(resolve => setTimeout(resolve, 1)); };
+    return { d, reminder, world, bound, order };
+  }
+
+  it('wakes only after the startup turn succeeds, exactly once, then unbinds and retains state', async () => {
+    const { d, reminder, world, bound, order } = reminderWorld('ReminderRole');
+    await runOnce('ReminderRole', { temp: true }, world.deps);
+    expect(order.filter(item => item !== 'prompt')).toEqual(['startup', 'reminder']);
+    expect(order.indexOf('startup')).toBeLessThan(order.indexOf('reminder'));
+    expect(bound[0]).toBeDefined();
+    expect(bound.at(-1)).toBeUndefined();               // unbound before the runtime is released
+    // Ordinary stop keeps the store for the same runtime instance.
+    const reopened = new ReminderStore(d, { role: 'ReminderRole', ...runtime }, () => 0);
+    expect(reopened.list({ state: 'all' }).reminders.map(item => [item.id, item.state])).toEqual([[reminder.id, 'delivered']]);
+    expect(reopened.list().uncertain_events).toBe(1);   // dispatched, never acked: held after restart
+  });
+
+  it('never wakes a role whose startup turn failed', async () => {
+    const { world, bound, order } = reminderWorld('ReminderFails', { startup: turnResult(true, 'failed', 'boom') });
+    await expect(runOnce('ReminderFails', { temp: true }, world.deps)).rejects.toThrow(/startup prompt failed/);
+    expect(order).toEqual(['startup']);
+    expect(bound.at(-1)).toBeUndefined();
+  });
+
+  it('does not offer reminders when the runtime identity is not established', async () => {
+    const { world, bound, order } = reminderWorld('ReminderNoCid');
+    const prepare = world.deps.prepareAgentOurs;
+    world.deps.prepareAgentOurs = (async (...args: Parameters<typeof prepare>) => {
+      const service = await prepare(...args);
+      Object.assign(service.runtime, { snapshot: { ...runtime, cid: undefined } });
+      return service;
+    }) as typeof prepare;
+    await runOnce('ReminderNoCid', { temp: true }, world.deps);
+    expect(order).not.toContain('reminder');
+    expect(bound.filter(Boolean)).toEqual([]);
   });
 });

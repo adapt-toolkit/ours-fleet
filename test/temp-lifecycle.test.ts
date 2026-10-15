@@ -167,6 +167,8 @@ describe('exact operator targeting and evidence', () => {
   it('archives termination evidence idempotently and removes the live roster entry', () => {
     const dir = temp('Done');
     writeFileSync(join(dir, 'WORKLOG.md'), 'valuable evidence\n');
+    writeFileSync(join(dir, '.self-reminders.json'), '{"private":"reminder"}', { mode: 0o600 });
+    writeFileSync(join(dir, '.self-reminders.json.foreign-owner-1'), '{}', { mode: 0o600 });
 
     const archived = archiveTempState(
       'Done', 'identity-closed', 'retired', 'identity disappeared after a confirmed bind',
@@ -175,6 +177,8 @@ describe('exact operator targeting and evidence', () => {
 
     expect(existsSync(dir)).toBe(false);
     expect(readFileSync(join(archived, 'WORKLOG.md'), 'utf8')).toContain('valuable evidence');
+    // Retirement cancels the agent's reminders: scheduling state is not archived evidence.
+    expect(readdirSync(archived).filter(name => name.includes('self-reminders'))).toEqual([]);
     expect(readFileSync(join(archived, TEMP_TERMINATION_FILE), 'utf8'))
       .toContain('"reason":"identity-closed"');
     expect(readFileSync(join(stateRoot(), 'recovery', 'temporary', 'terminations.jsonl'), 'utf8'))
