@@ -42,8 +42,10 @@ The six logical types are:
   `sessionGeneration`, `stateRevision` and `ledgerBarrier`. Do not merge it as a
   patch or use its barrier as coverage.
 - `resync`: `{reason,retry,capability}`. Clear partial assembly and resynchronize
-  explicitly or enter supported fallback. `retry:false` means persistent
-  unsupported/oversize observation: do not loop reconnects. `capability` is
+  explicitly or enter supported fallback. Temporary role read/watch failure is
+  retryable; a fresh observer can recover after repair. `retry:false` alone does
+  not establish permanent incapability on older servers. Explicit unsupported
+  capability or persistent oversize remains supported fallback without tight reconnects. `capability` is
   `degraded`, except `auth-expired` below.
 - `keepalive`: `{at:number}`. Transport liveness only; it cannot certify role,
   session, replay, or private-control health.
@@ -129,6 +131,18 @@ observation and private replay/heartbeat capability. It never certifies requeste
 history. REST remains for initial latest history, user-requested older pages,
 explicit recovery, and older/unsupported/degraded server fallback. Healthy active
 consumers must not periodically fetch role details or history.
+
+Active pane and independent voice consumers recover transient transport, temporary observer or
+bootstrap failures after their bounded fast attempts: one delayed attempt after 10 seconds,
+then 20 seconds, then capped 30 seconds between failed settled attempts. Fallback refresh ticks
+do not start probes. Retire/abort the fallback request and timer before recovery takes cursor
+ownership; fence late responses without waiting indefinitely for cancellation. Resume only
+same-generation certified coverage; otherwise establish a canonical latest baseline. Ordinary
+REST progress and identical unsuccessful resync never reset the fast restart budget. Complete
+ready ends fallback polling and resets delayed backoff. Pane generation replacement may load a
+new baseline; voice generation replacement stops that session until explicit Start, without
+transferring controller/provider leases. Auth-required/expired ends automatic reads/probes.
+
 
 Complete role delivery relies on native directory notifications for fleet config,
 role manifests and session files. Qualified native host filesystems are the
