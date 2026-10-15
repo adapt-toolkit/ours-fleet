@@ -158,7 +158,7 @@ export class WebAuth {
     const id = parseCookies(request.headers.cookie ?? '').ofs_session;
     const session = id ? this.sessions.get(id) : undefined;
     const now = this.now();
-    if (!session || now > session.absoluteExpiresAt || now - session.lastSeenAt > 30 * 60_000) {
+    if (!session || !this.sessionValid(session)) {
       if (id) this.removeSession(id);
       throw new FleetError('unauthorized', 'browser session is missing or expired');
     }
@@ -169,6 +169,14 @@ export class WebAuth {
     }
     session.lastSeenAt = now;
     return session;
+  }
+
+  /** Check a transport's opening lease without refreshing cookie idle activity. */
+  sessionValid(session: Pick<BrowserSession, 'id' | 'absoluteExpiresAt'>): boolean {
+    const current = this.sessions.get(session.id), now = this.now();
+    if (!current || now >= session.absoluteExpiresAt) return false;
+    if (session.id.startsWith('workspace:')) return Boolean(this.workspaceDevices?.valid(session.id.slice(10)));
+    return now < current.absoluteExpiresAt && now - current.lastSeenAt < 30 * 60_000;
   }
 
   logout(request: FastifyRequest): void {

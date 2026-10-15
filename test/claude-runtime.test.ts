@@ -9,7 +9,10 @@ import type { ResolvedRole } from '../src/config.js';
 
 const roots: string[] = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'fleet-claude-runtime-')); roots.push(dir); return dir; };
-beforeEach(() => { vi.stubEnv('OURS_FLEET_HOME', temp()); vi.stubEnv('HOME', temp()); });
+beforeEach(() => {
+  vi.stubEnv('CLAUDE_CODE_EXECUTABLE', undefined);
+  vi.stubEnv('OURS_FLEET_HOME', temp()); vi.stubEnv('HOME', temp());
+});
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const manifest = () => resolveBundledAcpAgent('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp').manifestPath;
 const role = (env?: Record<string, string>, over: Partial<ResolvedRole> = {}): ResolvedRole => ({
