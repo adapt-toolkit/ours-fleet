@@ -22,12 +22,12 @@ const tree=():Row[]=>[{name:'alice@home',cid:ROOT,kind:'root',temp:null,session:
 async function host(rows:Row[]=tree()) {
   const dir=mkdtempSync(join(tmpdir(),'fleet-child-')),prior={...process.env};
   const messenger:Array<{path:string;body?:unknown}>=[];const daemon:Array<[string,unknown?]>=[];
-  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase() as string|undefined,releaseFailed:0,preserveProfile:true};
+  const behaviour={choose:():unknown=>({name:'alice@home',cid:ROOT,switchedFrom:null}),peer:SERVER,contacts:[SERVER],sent:true,messengerCid:CHILD,messengerRoot:ROOT.toLowerCase() as string|undefined,releaseFailed:0,preserveProfile:true,optionalWorkspaceProfileV1:true};
   const server:Server=createServer(async(req,res)=>{res.setHeader('Content-Type','application/json');const path=new URL(req.url!,'http://host').pathname.replace(/^\/messenger\/api\//,'');
     if(req.method==='GET'){messenger.push({path});
       if(path==='contacts'){res.end(JSON.stringify({contacts:behaviour.contacts.map(container_id=>({container_id})),pending:[]}));return;}
       // Messenger names the root the daemon describes for the identity it runs as.
-      res.end(JSON.stringify({cid:behaviour.messengerCid,rootCid:behaviour.messengerRoot,...(behaviour.preserveProfile?{preserveProfile:true}:{})}));return;}
+      res.end(JSON.stringify({cid:behaviour.messengerCid,rootCid:behaviour.messengerRoot,optionalWorkspaceProfileV1:behaviour.optionalWorkspaceProfileV1,...(behaviour.preserveProfile?{preserveProfile:true}:{})}));return;}
     const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(chunk);messenger.push({path,body:JSON.parse(Buffer.concat(chunks).toString())});
     res.end(JSON.stringify(path==='invites'?{blob:'fixture-child-public-invite'}:path==='workspace/unregister'?{submitted:true,rootCid:behaviour.messengerCid}:path==='contacts/add'?{cid:behaviour.peer}:{}));});
   server.listen(0,'127.0.0.1');await once(server,'listening');
@@ -318,4 +318,18 @@ describe('credential-free same-registration renewal',()=>{
     chmodSync(join(h.workspace,'connector'),0o644);await expect(h.enroll()).rejects.toThrow('remove and re-create');
     expect(readFileSync(join(h.workspace,'binding.json'),'utf8')).toBe(binding);expect(h.did('sendCommand')).toHaveLength(sent);
   });
+});
+
+it('fresh optional profile reaches the validated permanent identity; preserved hosts never send a profile',async()=>{
+ const h=await host();await ensureMinimalSetup(h.config);h.payload.fullName='Prince';h.payload.name=null;h.payload.surname=null;
+ await h.enroll({preserveProfile:false});expect(h.posted('identity/profile')).toEqual([{path:'identity/profile',body:{fullName:'Prince',name:null,surname:null}}]);
+ await h.enroll();expect(h.posted('identity/profile')).toHaveLength(1);
+});
+it('missing Messenger optional support rejects the delegated path before profile or proof changes',async()=>{
+ const h=await host();await ensureMinimalSetup(h.config);h.payload.fullName='Prince';h.payload.name=null;h.payload.surname=null;h.behaviour.optionalWorkspaceProfileV1=false;const before=readFileSync(h.config);
+ await expect(h.enroll({preserveProfile:false})).rejects.toThrow(/updated Messenger/);expect(h.posted('identity/profile')).toEqual([]);expect(h.did('chooseIdentity')).toEqual([]);expect(h.did('sendCommand')).toEqual([]);expect(readFileSync(h.config)).toEqual(before);expect(existsSync(join(h.workspace,'connector'))).toBe(false);
+});
+it('optional profile cannot overwrite an identity the daemon does not own under the Human root',async()=>{
+ const h=await host(tree().filter(row=>row.name!=='Alice Tester'));await ensureMinimalSetup(h.config);h.payload.fullName='Prince';h.payload.name=null;h.payload.surname=null;
+ await expect(h.enroll({preserveProfile:false})).rejects.toThrow(/not a permanent identity/);expect(h.posted('identity/profile')).toEqual([]);expect(h.did('sendCommand')).toEqual([]);
 });
