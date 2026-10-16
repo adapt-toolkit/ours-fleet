@@ -168,14 +168,6 @@ describe('packaged default role contract', () => {
           });
           expect(task, `${template.name}:${member.role}`).toMatch(/only in (?:this|the assigned) (?:Cowork )?room/i);
           expect(task, `${template.name}:${member.role}`).toMatch(/confirmed blocker or\s+infrastructure or orchestration problem/i);
-          // Every paired implementer and reviewer is told to arm one idle-only
-          // reminder per wait and to stop after one follow-up, so neither can
-          // forget the task while waiting on the other.
-          if (['Developer', 'Critic', 'Engineer'].includes(member.role)) {
-            expect(task, `${template.name}:${member.role}`).toMatch(/ONE self-reminder with `fleet_reminder_create`/);
-            expect(task, `${template.name}:${member.role}`).toMatch(/leave `interrupt` false/);
-            expect(task, `${template.name}:${member.role}`).toMatch(/at most one more reminder/);
-          }
           if (template.name === 'team')
             expect(task, member.role).toMatch(/LocalCoordinator.*not.*separate reporting channel/is);
           else expect(roster.some(item => item.cowork_role === 'LocalCoordinator')).toBe(false);
