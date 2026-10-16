@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentDir } from '../src/paths.js';
 import { writeV2Fixture } from './v2-fixture.js';
-import { waitForRoleDaemon, waitForTaskRoomManagement, STARTUP_WAIT_MS, STARTUP_RETRY_MS } from '../src/startup-readiness.js';
+import { waitForRoleDaemon, waitForTaskRoomManagement, STARTUP_WAIT_MS, STARTUP_RETRY_MS, ROOM_PROBE_TIMEOUT_MS } from '../src/startup-readiness.js';
 import { CoworkProtocolError, CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { stringify } from 'yaml';
 import type { DaemonGenerationProbe } from '../src/daemon-recovery.js';
@@ -121,7 +121,8 @@ describe('task room management readiness', () => {
     const showRoom = vi.fn(async () => { throw unavailable(); });
     const log = vi.fn();
     expect(await waitForTaskRoomManagement('M', { showRoom, now: c.now, sleep: c.sleep, log })).toBe('unavailable');
-    expect(c.clock).toBe(STARTUP_WAIT_MS);
+    expect(c.clock).toBeLessThanOrEqual(STARTUP_WAIT_MS);
+    expect(c.clock).toBeGreaterThan(STARTUP_WAIT_MS - 2 * STARTUP_RETRY_MS);
     expect(log.mock.calls.at(-1)?.[0]).toContain('starting the attempt so the restart budget applies');
   });
 
@@ -146,7 +147,22 @@ describe('task room management readiness', () => {
       showRoom: async () => { throw unavailable(); }, now: c.now, sleep: c.sleep, log: () => {},
       shouldStop: () => ++polls > 2,
     })).toBe('unavailable');
-    expect(c.clock).toBe(2 * STARTUP_RETRY_MS);
+    expect(c.clock).toBe(STARTUP_RETRY_MS);   // checked after the failure and after the sleep
+  });
+
+  it('caps each probe to the remaining budget so slow timeouts cannot extend the wait', async () => {
+    member();
+    const c = clockDeps();
+    const timeouts: number[] = [];
+    // Every probe hangs until its own timeout, as a half-started gateway can.
+    const showRoom = vi.fn(async (_id: string, _env: NodeJS.ProcessEnv, timeoutMs: number) => {
+      timeouts.push(timeoutMs);
+      await c.sleep(timeoutMs);
+      throw new CoworkUnavailableError('Cowork HTTP room.show failed during management response (timeout)', { retryable: true });
+    });
+    expect(await waitForTaskRoomManagement('M', { showRoom, now: c.now, sleep: c.sleep, log: () => {} })).toBe('unavailable');
+    expect(c.clock).toBeLessThanOrEqual(STARTUP_WAIT_MS);
+    expect(Math.max(...timeouts)).toBeLessThanOrEqual(ROOM_PROBE_TIMEOUT_MS);
   });
 
   it('a member without a room has nothing to wait for', async () => {
