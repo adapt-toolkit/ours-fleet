@@ -2381,21 +2381,30 @@ describe('restart-loop containment', () => {
 });
 
 describe('built-in self-reminders in the runner', () => {
-  const runtime = { instance: 'reminder-instance', cid: 'D'.repeat(64), action: 'reminder-action' };
+  const runtime = { lifetime: 'temporary' as const, instance: 'reminder-instance', cid: 'D'.repeat(64), action: 'reminder-action' };
 
   /** A temp role with one reminder already due when the runner starts. */
-  function reminderWorld(name: string, opts: { startup?: TurnResult } = {}) {
-    const d = agentDir(name, true); mkdirSync(d, { recursive: true });
-    writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
-    prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
-    const store = new ReminderStore(d, { role: name, ...runtime }, () => -60_000);
-    const { reminder } = store.create('due-at-start', { title: 'T', local_time: '1970-01-01T00:00', time_zone: 'UTC' });
+  function reminderWorld(name: string, opts: { startup?: TurnResult; permanent?: { instance: string; seed: boolean } } = {}) {
+    const d = agentDir(name, !opts.permanent); mkdirSync(d, { recursive: true });
+    const owner = opts.permanent
+      ? { role: name, ...runtime, lifetime: 'permanent' as const, instance: opts.permanent.instance }
+      : { role: name, ...runtime };
+    if (opts.permanent) writeCfg({ [name]: { harness: 'fake', session: 'acp' } });
+    else {
+      writeFileSync(join(d, 'role.yaml'), stringify({ name, identity: name, harness: 'fake', session: 'acp' }));
+      prepareTempSupervisor(d, name, { taskId: 'task', creationActionId: 'action' });
+    }
+    let reminder: ReturnType<ReminderStore['create']>['reminder'] | undefined;
+    if (!opts.permanent || opts.permanent.seed) {
+      const store = new ReminderStore(d, owner, () => -60_000);
+      reminder = store.create('due-at-start', { title: 'T', local_time: '1970-01-01T00:00', time_zone: 'UTC' }).reminder;
+    }
     const world = fakeWorld({ lifeChecks: 40, exitFile: join(d, '.exit-status') });
     const bound: Array<ReminderToolBackend | undefined> = [];
     const prepare = world.deps.prepareAgentOurs;
     world.deps.prepareAgentOurs = (async (...args: Parameters<typeof prepare>) => {
       const service = await prepare(...args);
-      Object.assign(service.runtime, { snapshot: runtime });
+      Object.assign(service.runtime, { snapshot: owner });
       service.setReminders = backend => { bound.push(backend); };
       return service;
     }) as typeof prepare;
@@ -2419,7 +2428,7 @@ describe('built-in self-reminders in the runner', () => {
     }) as typeof start;
     const sleep = world.deps.sleep;
     world.deps.sleep = async (ms: number) => { await sleep(ms); await new Promise(resolve => setTimeout(resolve, 1)); };
-    return { d, reminder, world, bound, order };
+    return { d, reminder: reminder!, world, bound, order, owner };
   }
 
   it('wakes only after the startup turn succeeds, exactly once, then unbinds and retains state', async () => {
@@ -2433,6 +2442,19 @@ describe('built-in self-reminders in the runner', () => {
     const reopened = new ReminderStore(d, { role: 'ReminderRole', ...runtime }, () => 0);
     expect(reopened.list({ state: 'all' }).reminders.map(item => [item.id, item.state])).toEqual([[reminder.id, 'delivered']]);
     expect(reopened.list().uncertain_events).toBe(1);   // dispatched, never acked: held after restart
+  });
+
+  it('keeps a permanent agent\'s reminders across an orderly restart that re-provisions its runtime', async () => {
+    // First start: the agent schedules (seeded here) and the runner stops before it is due.
+    const first = reminderWorld('ReminderPerm', { permanent: { instance: 'instance-before', seed: true } });
+    // Second start after release: same identity and state directory, new runtime instance.
+    const second = reminderWorld('ReminderPerm', { permanent: { instance: 'instance-after', seed: false } });
+    await runOnce('ReminderPerm', {}, second.world.deps);
+    expect(second.order.filter(item => item !== 'prompt')).toEqual(['startup', 'reminder']);
+    const reopened = new ReminderStore(second.d, second.owner, () => 0);
+    expect(reopened.list({ state: 'all' }).reminders.map(item => [item.id, item.state]))
+      .toEqual([[first.reminder.id, 'delivered']]);
+    expect(readdirSync(second.d).filter(name => name.includes('.self-reminders.json.'))).toEqual([]);
   });
 
   it('never wakes a role whose startup turn failed', async () => {

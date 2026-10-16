@@ -121,8 +121,9 @@ current wake becomes void and a new one is issued at the new time.
 - **Deletion.** Removing or retiring an agent, or deleting or finishing its task,
   cancels its reminders and deletes their state, including from retained
   evidence. A replaced identity or a new agent with the same name never inherits
-  them; a store that does not belong to the running instance is set aside and
-  nothing in it is delivered.
+  them: a store is bound to the agent's role and identity (and, for a temporary
+  or task agent, its runtime instance), and a store that does not match is set
+  aside and nothing in it is delivered.
 - **At most once.** Four facts are separate: the supervisor queued the wake, the
   wake was released to the model, the agent acknowledged it, and any external
   action the agent took. A wake is recorded as dispatched, durably, at the moment

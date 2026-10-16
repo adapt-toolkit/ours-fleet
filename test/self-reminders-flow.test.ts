@@ -27,7 +27,7 @@ import { FakeAppServer } from './fixtures/codex-app-server.js';
  */
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
-const OWNER: ReminderOwner = { role: 'Dev', instance: 'inst-1', cid: 'C'.repeat(64), action: 'act-1' };
+const OWNER: ReminderOwner = { role: 'Dev', lifetime: 'temporary', instance: 'inst-1', cid: 'C'.repeat(64), action: 'act-1' };
 const T0 = Date.parse('2027-01-20T12:00:00Z');
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const step of cleanup.splice(0).reverse()) await step(); });
