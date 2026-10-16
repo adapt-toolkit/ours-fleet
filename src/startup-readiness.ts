@@ -6,6 +6,8 @@ import type { FetchLike } from './monitor.js';
 
 export const STARTUP_WAIT_MS = 240_000;
 export const STARTUP_RETRY_MS = 5_000;
+/** Upper bound for one read-only Cowork room probe during the startup wait. */
+export const ROOM_PROBE_TIMEOUT_MS = 10_000;
 interface ReadinessDeps {
   probe(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   now(): number;
@@ -51,7 +53,7 @@ export async function waitForRoleDaemon(
 
 interface RoomManagementDeps {
   /** Read-only room observation; production uses Cowork `room.show`. */
-  showRoom(roomId: string, env: NodeJS.ProcessEnv): Promise<unknown>;
+  showRoom(roomId: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<unknown>;
   now(): number;
   sleep(ms: number): Promise<void>;
   log(message: string): void;
@@ -76,7 +78,7 @@ export async function waitForTaskRoomManagement(
   if (!startup) return 'not-required';
   const { createCoworkAdapter, CoworkUnavailableError } = await import('./rooms-tasks/cowork-adapter.js');
   const deps: RoomManagementDeps = {
-    showRoom: (roomId, env) => createCoworkAdapter({ env }).getRoom(roomId),
+    showRoom: (roomId, env, timeoutMs) => createCoworkAdapter({ env, timeoutMs }).getRoom(roomId),
     now: Date.now,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     log: message => process.stderr.write(message + '\n'),
@@ -89,8 +91,10 @@ export async function waitForTaskRoomManagement(
   const deadline = started + STARTUP_WAIT_MS;
   let waited = false;
   for (;;) {
+    // Each probe fits in what is left of the wait, so the wait itself is bounded.
+    const timeoutMs = Math.min(ROOM_PROBE_TIMEOUT_MS, Math.max(1, deadline - deps.now()));
     try {
-      await deps.showRoom(startup.room_id, env);
+      await deps.showRoom(startup.room_id, env, timeoutMs);
       if (waited) deps.log(`[${name}] cowork room management ready after ${deps.now() - started}ms`);
       return 'ready';
     } catch (error) {
@@ -98,12 +102,13 @@ export async function waitForTaskRoomManagement(
       if (!waited) deps.log(`[${name}] waiting for cowork room management: ${error.message}`);
       waited = true;
       if (deps.shouldStop()) return 'unavailable';
-      if (deps.now() >= deadline) {
+      if (deps.now() + STARTUP_RETRY_MS >= deadline) {
         deps.log(`[${name}] cowork room management still unavailable after ${STARTUP_WAIT_MS}ms: `
           + `${error.message}; starting the attempt so the restart budget applies`);
         return 'unavailable';
       }
-      await deps.sleep(Math.min(STARTUP_RETRY_MS, Math.max(0, deadline - deps.now())));
+      await deps.sleep(STARTUP_RETRY_MS);
+      if (deps.shouldStop()) return 'unavailable';
     }
   }
 }
