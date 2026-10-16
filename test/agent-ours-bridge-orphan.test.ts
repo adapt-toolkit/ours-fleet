@@ -86,14 +86,20 @@ it('leaves a regular file and a symlink to a dead socket untouched', async () =>
   expect(lstatSync(target).isSocket()).toBe(true);
 });
 
+// The replacement often reuses the orphan's inode number at once (seen on CI's
+// ext4), so identity must not rest on device and inode alone. Repeat to meet it.
 it('keeps a path replaced by a live listener between the probe and the cleanup', async () => {
-  const socket = join(dir(), 'g1.sock');
-  await orphan(socket);
-  const server = createServer();
-  await expect(listenOnBridgeSocket(server, socket, { afterProbe: async () => {
-    unlinkSync(socket);
-    await live(socket);
-  } })).rejects.toMatchObject({ code: 'EADDRINUSE' });
-  expect(server.listening).toBe(false);
-  expect(await reaches(socket)).toBe(true);
+  for (let round = 0; round < 20; round++) {
+    const socket = join(dir(), 'g1.sock');
+    await orphan(socket);
+    const server = createServer();
+    let replacement: Server | undefined;
+    await expect(listenOnBridgeSocket(server, socket, { afterProbe: async () => {
+      unlinkSync(socket);
+      replacement = await live(socket);
+    } })).rejects.toMatchObject({ code: 'EADDRINUSE' });
+    expect(server.listening).toBe(false);
+    expect(replacement?.listening).toBe(true);
+    expect(await reaches(socket)).toBe(true);
+  }
 });

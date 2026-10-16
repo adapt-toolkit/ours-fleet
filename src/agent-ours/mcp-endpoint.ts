@@ -39,12 +39,21 @@ function listenOnce(server: Server, path: string): Promise<void> {
 }
 
 /**
- * The identity (device, inode) of a socket file, never a symlink or other
- * file, that refuses connections; undefined when it is not provably dead.
+ * Identity of one file: device, inode and nanosecond change and birth times.
+ * An inode number alone is reused at once after an unlink, so a socket bound
+ * in its place can carry the same device and inode.
  */
-async function orphanSocket(path: string): Promise<{ dev: number; ino: number } | undefined> {
+type SocketIdentity = { dev: bigint; ino: bigint; ctimeNs: bigint; birthtimeNs: bigint };
+const sameFile = (a: SocketIdentity, b: SocketIdentity) =>
+  a.dev === b.dev && a.ino === b.ino && a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs;
+
+/**
+ * The identity of a socket file, never a symlink or other file, that refuses
+ * connections; undefined when it is not provably dead.
+ */
+async function orphanSocket(path: string): Promise<SocketIdentity | undefined> {
   let found;
-  try { found = await lstat(path); } catch { return undefined; }
+  try { found = await lstat(path, { bigint: true }); } catch { return undefined; }
   if (!found.isSocket()) return undefined;
   const dead = await new Promise<boolean>(resolve => {
     const probe = connect(path);
@@ -53,14 +62,14 @@ async function orphanSocket(path: string): Promise<{ dev: number; ino: number } 
     probe.once('connect', () => done(false));
     probe.once('error', error => done((error as NodeJS.ErrnoException).code === 'ECONNREFUSED'));
   });
-  return dead ? { dev: found.dev, ino: found.ino } : undefined;
+  return dead ? { dev: found.dev, ino: found.ino, ctimeNs: found.ctimeNs, birthtimeNs: found.birthtimeNs } : undefined;
 }
 
 /**
  * Listen on the bridge socket. A close unlinks it, but a predecessor that ended
  * abruptly leaves the file behind, and every later start of the same generation
  * then fails with EADDRINUSE until the role is held down. Only a provably dead
- * socket is removed, once, and only if the path still names that same inode;
+ * socket is removed, once, and only if the path still names that same file;
  * a live listener, a symlink, any other file, an inconclusive probe or a path
  * replaced since the probe still fails as before. `afterProbe` is a test seam.
  */
@@ -77,8 +86,8 @@ export async function listenOnBridgeSocket(
   if (!orphan) throw original;
   await hooks.afterProbe?.();
   let now;
-  try { now = await lstat(path); } catch { throw original; }
-  if (!now.isSocket() || now.dev !== orphan.dev || now.ino !== orphan.ino) throw original;
+  try { now = await lstat(path, { bigint: true }); } catch { throw original; }
+  if (!now.isSocket() || !sameFile(now, orphan)) throw original;
   await unlink(path);
   await listenOnce(server, path);
 }
