@@ -4,6 +4,12 @@ import type {
 } from "../../src/session/codex-app-server-transport.js";
 
 export class FakeAppServer implements CodexAppServerConnection {
+  /** Turns whose first input matches stay running until `finishHeld()` or turn/interrupt. */
+  holdMatching?: (text: string) => boolean;
+  private readonly held = new Set<string>();
+  finishHeld(): void {
+    for (const turnId of [...this.held]) { this.held.delete(turnId); this.complete(turnId, "native final"); }
+  }
   readonly pid = 4242;
   readonly signals: Array<NodeJS.Signals | number | undefined> = [];
   readonly requests: Array<{
@@ -76,7 +82,9 @@ export class FakeAppServer implements CodexAppServerConnection {
           threadId: "thread-native-1",
           turn: { id: turnId, status: "inProgress" },
         });
-        if (input[0]?.text?.includes("additional permission")) {
+        if (this.holdMatching?.(input[0]?.text ?? "")) {
+          this.held.add(turnId);
+        } else if (input[0]?.text?.includes("additional permission")) {
           const requestId = 900 + this.turn;
           this.approvalTurn = { requestId, turnId, kind: "permissions" };
           this.options.onRequest?.(
@@ -114,6 +122,8 @@ export class FakeAppServer implements CodexAppServerConnection {
           });
         } else if (input[0]?.text?.includes("ignore interrupt")) {
           this.ignoreSigterm = true;
+        } else if (input[0]?.text?.includes("hold running")) {
+          // Busy until turn/interrupt: the cooperative long-running turn.
         } else {
           const missingTerminal = input[0]?.text?.includes("missing terminal");
           if (input[0]?.text?.includes("with commentary")) {
@@ -159,6 +169,7 @@ export class FakeAppServer implements CodexAppServerConnection {
     if (method === "turn/steer") return { turnId: params.expectedTurnId } as T;
     if (method === "turn/interrupt") {
       if (this.ignoreSigterm) return {} as T;
+      this.held.delete(String(params.turnId));
       queueMicrotask(() =>
         this.options.onNotification?.("turn/completed", {
           threadId: "thread-native-1",

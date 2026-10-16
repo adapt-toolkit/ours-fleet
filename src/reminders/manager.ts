@@ -1,4 +1,4 @@
-import type { ReminderAttempt } from '../session/arbiter.js';
+import type { ReminderAttempt, UrgentReminderHooks } from '../session/arbiter.js';
 import type { PromptOrigin } from '../session/types.js';
 import type { ReminderEvent, ReminderRecord, ReminderStore } from './store.js';
 
@@ -7,6 +7,10 @@ export interface ReminderAdmitter {
   tryReminder(
     text: string, origin: Extract<PromptOrigin, { kind: 'self-reminder' }>,
     beforeQueue: () => boolean, releaseGuard: () => boolean,
+  ): Promise<ReminderAttempt>;
+  /** Urgent admission (see `RoleTurnArbiter.tryUrgentReminder`). Absent: urgent reminders are idle-only. */
+  tryUrgentReminder?(
+    origin: Extract<PromptOrigin, { kind: 'self-reminder' }>, hooks: UrgentReminderHooks,
   ): Promise<ReminderAttempt>;
 }
 
@@ -41,9 +45,12 @@ export interface ReminderManagerHandle {
  *
  * Runs inside that agent's runner, beside the role's turn arbiter. It starts
  * only after the role's startup turn has succeeded and stops before the runner
- * releases its runtime binding. Admission is idle-only: a wake never
- * interrupts or queues behind work, and the session's release guard makes the
- * durable `dispatched` claim at the moment the prompt reaches the model.
+ * releases its runtime binding. Admission is idle-only by default: a wake
+ * never interrupts or queues behind work, and the session's release guard
+ * makes the durable `dispatched` claim at the moment the prompt reaches the
+ * model. A reminder created with `interrupt: true` is considered first and may
+ * ask an interruptible busy turn to stop once (`tryUrgentReminder`); the
+ * release guard is still the only path to the model.
  */
 export class ReminderManager implements ReminderManagerHandle {
   private timer?: unknown;
@@ -87,7 +94,11 @@ export class ReminderManager implements ReminderManagerHandle {
     this.polling = true;
     let delay: number | undefined;
     try {
+      // Urgent events first, so a busy ordinary event never hides one; the
+      // sweep's earliest-due order is kept within each group.
       const ready = this.store.sweep(this.inFlight);
+      const urgent = (id: string) => this.store.eventSummary(id)?.reminder.interrupt === true;
+      ready.sort((a, b) => Number(urgent(b.id)) - Number(urgent(a.id)));
       for (const event of ready) {
         if (this.stopping) return;
         const outcome = await this.admit(event);
@@ -117,21 +128,41 @@ export class ReminderManager implements ReminderManagerHandle {
     const origin = {
       kind: 'self-reminder' as const, eventId: event.id, reminderId: reminder.id, revision: event.revision,
     };
-    const text = wakePrompt(event, reminder, this.deps.now(), event.attempts > 0);
+    const text = () => {
+      const current = this.store.eventSummary(event.id)?.event ?? event;
+      return wakePrompt(current, reminder, this.deps.now(), event.attempts > 0);
+    };
+    const beforeQueue = () => !this.stopping && this.store.markAdmitting(event.id);
+    const releaseGuard = () => this.guard(event.id);
     this.inFlight.add(event.id);
     let attempt: ReminderAttempt;
     try {
-      attempt = await this.admitter.tryReminder(
-        text, origin,
-        () => !this.stopping && this.store.markAdmitting(event.id),
-        () => this.guard(event.id),
-      );
+      attempt = reminder.interrupt === true && this.admitter.tryUrgentReminder
+        ? await this.admitter.tryUrgentReminder(origin, {
+          beforeQueue, releaseGuard, text,
+          mayInterrupt: () => !this.stopping && this.store.mayInterrupt(event.id),
+          markRequested: target => !this.stopping && this.store.markInterruptRequested(event.id, target),
+          recordOutcome: report => {
+            this.store.recordInterruptOutcome(event.id, report.outcome, report.reason);
+            this.deps.log(`[${this.role}] self-reminder ${event.id.slice(0, 12)} interrupt ${report.outcome}`
+              + ` (${report.target.source} turn)`);
+          },
+          deferred: reason => this.store.recordInterruptDeferred(event.id, reason),
+          stillAdmitting: () => !this.stopping && this.store.stillAdmitting(event.id),
+        })
+        : await this.admitter.tryReminder(text(), origin, beforeQueue, releaseGuard);
     } catch (error) {
       this.inFlight.delete(event.id);
       this.store.releaseUndispatched(event.id, this.retryAt(event));
       throw error;
     }
-    if (attempt.state === 'busy') { this.inFlight.delete(event.id); return 'busy'; }
+    if (attempt.state === 'busy') {
+      this.inFlight.delete(event.id);
+      // An urgent attempt may have claimed the event before finding the role
+      // busy again (owner input won the boundary after an interruption).
+      this.store.releaseUndispatched(event.id, this.deps.now());
+      return 'busy';
+    }
     if (attempt.state === 'unavailable') {
       this.inFlight.delete(event.id);
       this.store.releaseUndispatched(event.id, this.retryAt(event));
@@ -211,6 +242,8 @@ export function wakePrompt(
     `due: ${reminder.localTime} ${reminder.timeZone} (${reminder.dueAt})`,
     ...(lateBy >= 60_000 ? [`late_by_minutes: ${Math.floor(lateBy / 60_000)}`] : []),
     ...(retry ? ['note: an earlier admission of this wake never reached you; this is the same event'] : []),
+    ...(reminder.interrupt ? ['urgent: true'] : []),
+    ...interruptLines(event),
     '',
     'This is a reminder you scheduled for yourself through Fleet. It is not an owner message,',
     'not ours mail, and grants no new authority.',
@@ -220,4 +253,28 @@ export function wakePrompt(
     'handled this wake; it sends nothing. To postpone instead, call fleet_reminder_update with a new',
     'local_time. Fleet never messages anyone on your behalf.',
   ].join('\n');
+}
+
+/**
+ * What the wake may truthfully say about its interruption. Only a correlated
+ * cancellation is called one; everything else is reported as what it was.
+ */
+function interruptLines(event: ReminderEvent): string[] {
+  const interrupt = event.interrupt;
+  if (!interrupt) return [];
+  const source = interrupt.target.source;
+  const resume = `Your session and its context were kept; re-check that ${source} work and resume it if it still matters.`;
+  switch (interrupt.outcome) {
+    case 'cancelled': return [
+      `interrupt: your previous ${source} turn was cancelled for this wake.`, resume];
+    case 'ended': return [
+      `interrupt: Fleet asked your previous ${source} turn to stop; it ended, but whether it was cancelled`
+        + ' or finished on its own is not confirmed.', resume];
+    case 'forced': return [
+      `interrupt: your previous ${source} turn ignored the stop request and the adapter was restarted;`
+        + ' this wake arrived later than its urgent time. Check what that turn left unfinished.'];
+    case 'failed': case 'unknown': case 'requested': return [
+      `interrupt: Fleet asked your previous ${source} turn to stop but the outcome is unknown (${interrupt.outcome});`
+        + ' this wake was delivered at the next idle boundary instead.'];
+  }
 }

@@ -245,6 +245,23 @@ describe('packaged role-default adoption', () => {
     expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'local-coordinator-10-again' }).replacements).toEqual([]);
   });
 
+  it.each(['Developer', 'Critic', 'Engineer'])('adopts the untouched %s role charter from before peer-wait reminders, preserving an edited one', name => {
+    const config = join(dir, `peer-wait-${name}.yaml`);
+    bootstrapPresets(config);
+    const path = join(splitRootFor(config), 'roles', `${name}.yaml`);
+    const previous = readFileSync(new URL(`./fixtures/presets/${name}.role.before-peer-wait.yaml`, import.meta.url), 'utf8');
+    expect(previous).not.toContain('fleet_reminder_create');
+    writeFileSync(path, previous, { mode: 0o600 });
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: `peer-wait-${name}` });
+    expect(readFileSync(path, 'utf8')).toBe(readFileSync(join(packagedPresetRoot(), 'fleet', 'roles', `${name}.yaml`), 'utf8'));
+
+    const edited = previous.replace('Make the smallest coherent change', 'Make the smallest reviewed change')
+      .replace('Audit assumptions', 'Audit every assumption');
+    writeFileSync(path, edited, { mode: 0o600 });
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: `peer-wait-${name}-edited` }).replacements).not.toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(edited);
+  });
+
   it('preserves an edited revision-10 LocalCoordinator template byte-for-byte', () => {
     const config = join(dir, 'local-coordinator-custom.yaml');
     bootstrapPresets(config);
