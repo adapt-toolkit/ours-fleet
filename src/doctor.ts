@@ -1,4 +1,4 @@
-import { describeRegistration, refreshServiceRegistrations, type RefreshOptions } from './supervisor/registration-refresh.js';
+import { describeRegistration, refreshServiceRegistrations, registrationDrift, type RefreshOptions } from './supervisor/registration-refresh.js';
 import { join } from 'node:path';
 import { userInfo, homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
@@ -136,7 +136,8 @@ export async function doctor(
       });
       for (const report of reports.filter(report => report.state !== 'absent')) checks.push({
         name: `service: ${report.service}`,
-        ok: report.state !== 'stale' && report.running !== 'stale',
+        // Same predicate as `service check`, so a pending reload is drift here too.
+        ok: registrationDrift([report]).length === 0,
         detail: describeRegistration(report).replace(/^\S+\s+/, '')
           + (report.state === 'stale' ? '; run: ours-fleet service refresh' : ''),
       });
