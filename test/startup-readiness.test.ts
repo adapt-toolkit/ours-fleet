@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentDir } from '../src/paths.js';
 import { writeV2Fixture } from './v2-fixture.js';
-import { waitForRoleDaemon, STARTUP_WAIT_MS } from '../src/startup-readiness.js';
+import { waitForRoleDaemon, waitForTaskRoomManagement, STARTUP_WAIT_MS, STARTUP_RETRY_MS } from '../src/startup-readiness.js';
+import { CoworkProtocolError, CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
+import { stringify } from 'yaml';
 import type { DaemonGenerationProbe } from '../src/daemon-recovery.js';
 
 let home: string;
@@ -74,5 +76,83 @@ describe('service daemon readiness', () => {
     expect(probe).toHaveBeenCalledWith({ OURS_CONFIG: '/service/profile.json' });
     await expect(waitForRoleDaemon('Missing', path, { probe })).rejects.toThrow();
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('task room management readiness', () => {
+  const room = '01m4r67ed38q3wkj2452nebadb';
+  function member(withRoom = true) {
+    const dir = agentDir('M', true);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'role.yaml'), stringify({
+      name: 'M', harness: 'codex', identity: 'M', env: { OURS_CONFIG: '/role/profile.json' },
+      ...(withRoom ? { roomMemberStartup: { room_id: room, room_identity_cid: 'C'.repeat(64), invite_id: 'seat', role: 'Developer' } } : {}),
+    }));
+    writeFileSync(join(dir, '.restart-ledger.json'), '{"consecutiveImmediateFailures":4}\n');
+    return dir;
+  }
+  const unavailable = () => new CoworkUnavailableError(
+    'Cowork HTTP room.show failed: gateway answered HTTP 502, text/html without an RPC response', { retryable: true });
+  const clockDeps = () => {
+    let clock = 0;
+    return { now: () => clock, sleep: async (ms: number) => { clock += ms; }, get clock() { return clock; } };
+  };
+
+  it('waits read-only through a Cowork upstream still starting, then lets the attempt run', async () => {
+    const dir = member();
+    const c = clockDeps();
+    const calls: Array<[string, string | undefined]> = [];
+    const log = vi.fn();
+    const result = await waitForTaskRoomManagement('M', {
+      showRoom: async (id, env) => { calls.push([id, env.OURS_CONFIG]); if (calls.length <= 6) throw unavailable(); return {}; },
+      now: c.now, sleep: c.sleep, log, env: { OURS_CONFIG: '/service/profile.json' },
+    });
+    expect(result).toBe('ready');
+    expect(calls).toHaveLength(7);
+    expect(calls.every(([id, cfg]) => id === room && cfg === '/role/profile.json')).toBe(true);
+    expect(c.clock).toBe(6 * STARTUP_RETRY_MS);
+    expect(log).toHaveBeenCalledTimes(2);   // one wait line, one ready line
+    expect(readFileSync(join(dir, '.restart-ledger.json'), 'utf8')).toBe('{"consecutiveImmediateFailures":4}\n');
+  });
+
+  it('bounds persistent unavailability so the restart budget still applies', async () => {
+    member();
+    const c = clockDeps();
+    const showRoom = vi.fn(async () => { throw unavailable(); });
+    const log = vi.fn();
+    expect(await waitForTaskRoomManagement('M', { showRoom, now: c.now, sleep: c.sleep, log })).toBe('unavailable');
+    expect(c.clock).toBe(STARTUP_WAIT_MS);
+    expect(log.mock.calls.at(-1)?.[0]).toContain('starting the attempt so the restart budget applies');
+  });
+
+  it.each([
+    ['malformed 200', new CoworkProtocolError('room.show', 'server returned malformed JSON (HTTP 200, text/html)')],
+    ['credential rejected', new CoworkProtocolError('room.show', 'server credential was rejected', 'unauthorized')],
+    ['selection mismatch', new CoworkUnavailableError('Cowork HTTP room.show failed during server verification (transport_error)')],
+  ])('does not wait on a terminal or invalid response: %s', async (_label, error) => {
+    member();
+    const c = clockDeps();
+    const showRoom = vi.fn(async () => { throw error; });
+    expect(await waitForTaskRoomManagement('M', { showRoom, now: c.now, sleep: c.sleep, log: () => {} })).toBe('deferred');
+    expect(showRoom).toHaveBeenCalledTimes(1);
+    expect(c.clock).toBe(0);
+  });
+
+  it('stops waiting when the supervisor is asked to stop', async () => {
+    member();
+    const c = clockDeps();
+    let polls = 0;
+    expect(await waitForTaskRoomManagement('M', {
+      showRoom: async () => { throw unavailable(); }, now: c.now, sleep: c.sleep, log: () => {},
+      shouldStop: () => ++polls > 2,
+    })).toBe('unavailable');
+    expect(c.clock).toBe(2 * STARTUP_RETRY_MS);
+  });
+
+  it('a member without a room has nothing to wait for', async () => {
+    member(false);
+    const showRoom = vi.fn();
+    expect(await waitForTaskRoomManagement('M', { showRoom })).toBe('not-required');
+    expect(showRoom).not.toHaveBeenCalled();
   });
 });

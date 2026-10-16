@@ -2477,3 +2477,159 @@ describe('built-in self-reminders in the runner', () => {
     expect(bound.filter(Boolean)).toEqual([]);
   });
 });
+
+describe('sustained-health failure budget', () => {
+  // 0mv53mqa/0mv5bb6m, 2026-10-15/16: each host boot hit one or two transient
+  // Cowork failures before a resumed session came up and ran for hours. A host
+  // reset ended those sessions without the attempt ever returning, so the
+  // streak only grew across boots until a single transient failure held the
+  // role down.
+  const stableMs = 20 * RESTART_FAIL_THRESHOLD * 1000;   // fake adapter: 20s × N
+  const exit = { version: 1, class: 'program-exit', code: 1, detail: 'exited with code 1' } as const;
+  const seed = (d: string, failures: number) => writeRestartLedger(d, {
+    version: 1, consecutiveImmediateFailures: failures, lastReason: 'cowork room.show: transient',
+    nextDelayMs: backoffFor(failures), resumeDiscarded: false, circuit: 'closed',
+    updatedAt: '2026-10-15T21:53:54.181Z',
+  });
+  function world(d: string) {
+    let clock = 0, stop = false, sleeps = 0;
+    const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+    const logs: string[] = [];
+    const deps: Partial<RunnerDeps> = {
+      sleep: async ms => { clock += ms; sleeps++; },
+      now: () => clock,
+      log: l => { logs.push(l); },
+      // Runaway guard: a broken policy must fail the assertions, not spin.
+      shouldStop: () => stop || sleeps > 20 || readRestartLedger(d).circuit === 'open',
+      setTimer: (fn, ms) => {
+        const t = { fn, ms, cancelled: false };
+        timers.push(t);
+        return () => { t.cancelled = true; };
+      },
+    };
+    return {
+      deps, timers, logs,
+      advance: (secs: number) => { clock += secs * 1000; },
+      requestStop: () => { stop = true; },
+    };
+  }
+  const setup = (failures: number) => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    seed(d, failures);
+    return d;
+  };
+
+  it('clears a stale streak while the healthy session is still running, so a host reset cannot keep it', async () => {
+    const d = setup(4);
+    const w = world(d);
+    let observedDuringSession: number | undefined;
+    await runSupervised('A', {}, w.deps, async (_n, o) => {
+      o.onHealthy?.();
+      expect(w.timers).toHaveLength(1);
+      expect(w.timers[0].ms).toBe(stableMs);
+      w.advance(stableMs / 1000);
+      w.timers[0].fn();
+      // Read while the attempt is still in flight: this is what survives a kill.
+      observedDuringSession = readRestartLedger(d).consecutiveImmediateFailures;
+      w.requestStop();
+      return { elapsedSecs: stableMs / 1000, healthySecs: stableMs / 1000, exit, rotated: false, mode: 'resume' };
+    });
+    expect(observedDuringSession).toBe(0);
+    expect(readRestartLedger(d)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 0 });
+    expect(w.logs.some(l => l.includes('cleared 4 earlier immediate failure'))).toBe(true);
+  });
+
+  it('a transient boot failure after the reset starts a fresh streak instead of holding down', async () => {
+    const d = setup(4);
+    // Boot N: healthy long enough, then the host resets (attempt never returns normally).
+    const boot = world(d);
+    await runSupervised('A', {}, boot.deps, async (_n, o) => {
+      o.onHealthy?.(); boot.timers[0].fn(); boot.requestStop();
+      return { elapsedSecs: 500, healthySecs: 500, exit, rotated: false, mode: 'resume' };
+    });
+    // Boot N+1: one transient failure, then the stop guard ends the fake loop.
+    const next = world(d);
+    let n = 0;
+    await runSupervised('A', {}, next.deps, async () => {
+      if (++n > 1) next.requestStop();
+      return { elapsedSecs: 0, exit: { version: 1, class: 'unknown', detail: 'cowork room.show: transient' }, rotated: false, mode: 'resume' };
+    });
+    expect(readRestartLedger(d)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 2 });
+  });
+
+  it('an orderly SIGTERM stop after sustained healthy runtime clears stale failures', async () => {
+    const d = setup(4);
+    const w = world(d);
+    await runSupervised('A', {}, w.deps, async () => {
+      process.emit('SIGTERM');
+      return { elapsedSecs: 999, healthySecs: 999, exit, rotated: false, mode: 'resume' };
+    });
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(0);
+  });
+
+  it('does not reset during a startup stall or a short healthy run, and cancels the timer on exit', async () => {
+    const d = setup(4);
+    const w = world(d);
+    await runSupervised('A', {}, w.deps, async () => {
+      // A long startup stall that never came up: no healthy signal, no timer.
+      process.emit('SIGTERM');
+      return { elapsedSecs: 999, exit, rotated: false, mode: 'resume' };
+    });
+    expect(w.timers).toHaveLength(0);
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(4);
+
+    const short = world(d);
+    await runSupervised('A', {}, short.deps, async (_n, o) => {
+      o.onHealthy?.();
+      process.emit('SIGTERM');
+      return { elapsedSecs: 60, healthySecs: 50, exit, rotated: false, mode: 'resume' };
+    });
+    expect(short.timers[0].cancelled).toBe(true);
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(4);
+  });
+
+  it('a near-threshold crash after coming up still counts and opens the circuit', async () => {
+    const d = setup(4);
+    const w = world(d);
+    await runSupervised('A', {}, w.deps, async (_n, o) => {
+      o.onHealthy?.();
+      return { elapsedSecs: 40, healthySecs: 30, exit, rotated: false, mode: 'resume' };
+    });
+    expect(w.timers[0].cancelled).toBe(true);
+    expect(readRestartLedger(d)).toMatchObject({ circuit: 'open', consecutiveImmediateFailures: 5 });
+  });
+
+  it('the timer never overwrites an operator reset, an open circuit or a successor supervisor', async () => {
+    for (const interfere of ['open', 'reset', 'successor'] as const) {
+      const d = setup(4);
+      const w = world(d);
+      await runSupervised('A', {}, w.deps, async (_n, o) => {
+        o.onHealthy?.();
+        if (interfere === 'open') writeRestartLedger(d, {
+          ...readRestartLedger(d), circuit: 'open', updatedAt: '2026-10-16T06:41:35.998Z',
+        });
+        else if (interfere === 'reset') resetRestartLedger(d);
+        else writeFileSync(join(d, RUN_MARKER_FILE), JSON.stringify({
+          version: 1, pid: process.pid + 1, startedAt: '2099-01-01T00:00:00.000Z',
+        }) + '\n');
+        const before = readFileSync(join(d, '.restart-ledger.json'), 'utf8');
+        w.timers[0].fn();
+        expect(readFileSync(join(d, '.restart-ledger.json'), 'utf8')).toBe(before);
+        w.requestStop();
+        return { elapsedSecs: 1, healthySecs: 1, exit, rotated: false, mode: 'resume' };
+      });
+    }
+  });
+
+  it('a clean ledger arms no timer', async () => {
+    const d = setup(0);
+    const w = world(d);
+    await runSupervised('A', {}, w.deps, async (_n, o) => {
+      o.onHealthy?.(); w.requestStop();
+      return { elapsedSecs: 1, healthySecs: 1, exit, rotated: false, mode: 'resume' };
+    });
+    expect(w.timers).toHaveLength(0);
+  });
+});

@@ -48,3 +48,62 @@ export async function waitForRoleDaemon(
   }
   throw new Error(`Daemon not ready (${lastReason}); service manager will retry startup`);
 }
+
+interface RoomManagementDeps {
+  /** Read-only room observation; production uses Cowork `room.show`. */
+  showRoom(roomId: string, env: NodeJS.ProcessEnv): Promise<unknown>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  log(message: string): void;
+  env: NodeJS.ProcessEnv;
+  shouldStop(): boolean;
+}
+
+/**
+ * Read-only preflight for a room member: wait while Cowork management is still
+ * starting behind the gateway. Only a retryable `CoworkUnavailableError` waits;
+ * success, any other error and the deadline all return so the real attempt
+ * decides, fails closed and counts. Never redeems invites, binds identities or
+ * judges room/seat identity — that remains the attempt's admission check.
+ */
+export async function waitForTaskRoomManagement(
+  name: string, partial: Partial<RoomManagementDeps> = {},
+): Promise<'ready' | 'not-required' | 'unavailable' | 'deferred'> {
+  let role: ReturnType<typeof loadTempRole>;
+  // An unreadable snapshot is the attempt's failure to report, not this wait's.
+  try { role = loadTempRole(name); } catch { return 'deferred'; }
+  const startup = role.roomMemberStartup;
+  if (!startup) return 'not-required';
+  const { createCoworkAdapter, CoworkUnavailableError } = await import('./rooms-tasks/cowork-adapter.js');
+  const deps: RoomManagementDeps = {
+    showRoom: (roomId, env) => createCoworkAdapter({ env }).getRoom(roomId),
+    now: Date.now,
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    log: message => process.stderr.write(message + '\n'),
+    env: process.env,
+    shouldStop: () => false,
+    ...partial,
+  };
+  const env = { ...deps.env, ...role.env };
+  const started = deps.now();
+  const deadline = started + STARTUP_WAIT_MS;
+  let waited = false;
+  for (;;) {
+    try {
+      await deps.showRoom(startup.room_id, env);
+      if (waited) deps.log(`[${name}] cowork room management ready after ${deps.now() - started}ms`);
+      return 'ready';
+    } catch (error) {
+      if (!(error instanceof CoworkUnavailableError) || !error.retryable) return 'deferred';
+      if (!waited) deps.log(`[${name}] waiting for cowork room management: ${error.message}`);
+      waited = true;
+      if (deps.shouldStop()) return 'unavailable';
+      if (deps.now() >= deadline) {
+        deps.log(`[${name}] cowork room management still unavailable after ${STARTUP_WAIT_MS}ms: `
+          + `${error.message}; starting the attempt so the restart budget applies`);
+        return 'unavailable';
+      }
+      await deps.sleep(Math.min(STARTUP_RETRY_MS, Math.max(0, deadline - deps.now())));
+    }
+  }
+}
