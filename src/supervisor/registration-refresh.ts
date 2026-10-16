@@ -208,6 +208,18 @@ async function runningState(definition: Definition, options: RefreshOptions, pla
   return script === options.binPath ? 'current' : 'stale';
 }
 
+/**
+ * Whether systemd still runs an older load of this unit than the file on disk.
+ * A rewrite whose daemon-reload failed looks current on the next pass; this is
+ * what keeps that pending reload visible instead of losing it.
+ */
+async function reloadPending(definition: Definition, options: RefreshOptions, platform: NodeJS.Platform): Promise<boolean> {
+  if (platform !== 'linux' || !definition.unit) return false;
+  const shown = await (options.exec ?? realExec)(
+    'systemctl', ['--user', 'show', '-p', 'NeedDaemonReload', '--value', definition.unit]);
+  return shown.code === 0 && shown.stdout.trim() === 'yes';
+}
+
 /** Report, and with `write` refresh, each installed Fleet service definition. */
 export async function refreshServiceRegistrations(options: RefreshOptions): Promise<RegistrationReport[]> {
   const platform = options.platform ?? process.platform;
@@ -232,6 +244,17 @@ export async function refreshServiceRegistrations(options: RefreshOptions): Prom
     }
     const from = releaseRoot(generated.script);
     if (!from || generated.script === options.binPath) {
+      if (await reloadPending(definition, options, platform)) {
+        // Normally an earlier refresh whose daemon-reload failed: the file is
+        // right, the loaded unit is not. Reload now, or keep reporting drift.
+        if (options.write) {
+          rewrote = true;
+          reports.push({ ...base, state: 'refreshed', running, ...(from ? { from } : {}),
+            detail: 'definition on disk was not loaded yet; reloaded' });
+        } else reports.push({ ...base, state: 'reload-failed', running, ...(from ? { from } : {}),
+          detail: 'systemd has not loaded the definition on disk; run systemctl --user daemon-reload' });
+        continue;
+      }
       reports.push({ ...base, state: 'current', running, ...(from ? { from } : {}) });
       continue;
     }

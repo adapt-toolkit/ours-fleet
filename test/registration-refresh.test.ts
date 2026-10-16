@@ -56,15 +56,18 @@ async function initUnit(release: string, profile = join(oldRelease, 'profile.jso
 }
 
 /** A fake user manager: MainPID per unit, an optional failing reload, and every call recorded. */
-function systemd(mainPid: Record<string, number> = {}, reloadCode = 0) {
+/** systemd's view: MainPID per unit, and units whose file changed since the last load. */
+function systemd(mainPid: Record<string, number> = {}, reloadCode = 0, needsReload = new Set<string>()) {
   const calls: string[][] = [];
   const exec: Exec = async (cmd, args) => {
     calls.push([cmd, ...args]);
+    if (args.includes('NeedDaemonReload')) return { stdout: needsReload.has(args.at(-1)!) ? 'yes\n' : 'no\n', stderr: '', code: 0 };
     if (args.includes('show')) return { stdout: `${mainPid[args.at(-1)!] ?? 0}\n`, stderr: '', code: 0 };
     if (args.includes('daemon-reload') && reloadCode) return { stdout: '', stderr: 'Failed to connect to bus', code: reloadCode };
+    if (args.includes('daemon-reload')) needsReload.clear();
     return { stdout: '', stderr: '', code: 0 };
   };
-  return { exec, calls };
+  return { exec, calls, needsReload };
 }
 const argvOf = (table: Record<number, string[]>) => (pid: number) => table[pid];
 const refresh = (write: boolean, exec: Exec, extra: Partial<Parameters<typeof refreshServiceRegistrations>[0]> = {}) =>
@@ -138,6 +141,30 @@ describe('service registration refresh', () => {
     expect(supervisor(reports)).toMatchObject({ state: 'reload-failed' });
     expect(supervisor(reports).detail).toMatch(/daemon-reload failed: Failed to connect to bus; run it/);
     expect(registrationDrift(reports)).toHaveLength(1);
+  });
+
+  it('keeps a failed daemon-reload pending across refreshes until a reload succeeds', async () => {
+    await initUnit(oldRelease);
+    // The rewrite lands but the reload fails: systemd now flags the unit as changed on disk.
+    expect(supervisor(await refresh(true, systemd({}, 1).exec)).state).toBe('reload-failed');
+    const pending = new Set(['ours-fleet.service']);
+
+    // A read-only check must still report drift although the file is current.
+    const check = await refresh(false, systemd({}, 0, new Set(pending)).exec);
+    expect(supervisor(check).state).toBe('reload-failed');
+    expect(registrationDrift(check).map(r => r.service)).toContain('supervisor');
+
+    // A second failed attempt keeps it pending; a successful one clears it.
+    expect(supervisor(await refresh(true, systemd({}, 1, new Set(pending)).exec)).state).toBe('reload-failed');
+    const retry = systemd({}, 0, new Set(pending));
+    const reports = await refresh(true, retry.exec);
+    expect(retry.calls).toContainEqual(['systemctl', '--user', 'daemon-reload']);
+    expect(supervisor(reports).state).toBe('refreshed');
+    expect(retry.needsReload.size).toBe(0);
+    // And afterwards it is simply current, with no further reload.
+    const after = systemd();
+    expect(supervisor(await refresh(true, after.exec)).state).toBe('current');
+    expect(after.calls).not.toContainEqual(['systemctl', '--user', 'daemon-reload']);
   });
 
   it('models the reboot after a refresh: the unit and the process both run the new release', async () => {
