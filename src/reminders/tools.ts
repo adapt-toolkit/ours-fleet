@@ -23,6 +23,10 @@ const schedule = {
   time_zone: z.string().describe('IANA zone the time is meant in, e.g. "Europe/London", "America/New_York" or "UTC". Use the zone of the person or task, not a guess.'),
   fold: z.union([z.literal(0), z.literal(1)]).optional().describe('Only for a wall time that occurs twice when clocks go back: 0 = first occurrence, 1 = second.'),
   late_window_seconds: z.number().int().optional().describe('How late the wake may still be delivered if this agent or the host was offline or busy at the due time (60..604800, default 3600). After it the reminder expires without a wake.'),
+  interrupt: z.boolean().optional().describe('Default false: the wake waits until you are idle. true only for a return that is genuinely time-bound: '
+    + 'when due and you are busy with interruptible work, Fleet asks your current turn to stop (session and context are kept) and wakes you with this reminder instead of waiting. '
+    + 'At most one interruption per reminder revision. It never pre-empts owner requests, the owner console, startup, a pending permission, queued work or another reminder; '
+    + 'then it waits like an ordinary reminder. Not a hard real-time alarm: no wake while the host or agent is down, and model start-up still takes time.'),
 };
 
 function result(value: unknown) {
@@ -105,6 +109,7 @@ export function registerReminderTools(
       time_zone: schedule.time_zone.optional(),
       fold: schedule.fold,
       late_window_seconds: schedule.late_window_seconds,
+      interrupt: schedule.interrupt,
     },
   }, async ({ id, expected_revision, ...changes }) =>
     run(({ store }) => store.update(id, expected_revision, changes), true));
@@ -115,7 +120,8 @@ export function registerReminderTools(
   }, async ({ id, expected_revision }) => run(({ store }) => store.cancel(id, expected_revision), true));
 
   server.registerTool('fleet_reminder_inspect', {
-    description: 'Read the reminder behind a [fleet-reminder] wake, including its note, and whether the wake is still current and eligible.',
+    description: 'Read the reminder behind a [fleet-reminder] wake, including its note, whether the wake is still current and eligible, '
+      + 'and for an urgent reminder what its interruption request did (interrupt.state).',
     inputSchema: { event_id: z.string() },
   }, async ({ event_id }) => run(({ store }) => store.inspect(event_id), false));
 

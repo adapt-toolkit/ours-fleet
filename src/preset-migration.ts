@@ -96,6 +96,14 @@ const REREADING_CONTINUITY_LOOP_FINGERPRINTS: Readonly<Record<string, readonly s
   ],
 });
 
+// The packaged Developer, Critic and Engineer charters before they described one bounded
+// self-reminder per peer wait. Untouched copies adopt the current text; edited ones stay.
+const PEER_WAIT_REMINDER_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'roles/Developer.yaml': ['2884366ce02760d66d3edbaed2adc83f2959fd7906a7cd3b5a8b90cf601bc3e6'],
+  'roles/Critic.yaml': ['998abdbc5159e8e1c26eb1ca09f9707b005ba1930bd5b7a4989c4d6893804c4a'],
+  'roles/Engineer.yaml': ['a361453ad32cde08797cf90fff17a35bde1871ccea17389448b44398b45ccfa5'],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'roles/Engineer.yaml',
@@ -251,6 +259,7 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(V5_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS),
       ...Object.keys(REREADING_CONTINUITY_LOOP_FINGERPRINTS),
+      ...Object.keys(PEER_WAIT_REMINDER_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -264,6 +273,7 @@ export function migratePackagedRoleDefaults(
         V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
         ...(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS[relative] ?? []),
         ...(REREADING_CONTINUITY_LOOP_FINGERPRINTS[relative] ?? []),
+        ...(PEER_WAIT_REMINDER_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);

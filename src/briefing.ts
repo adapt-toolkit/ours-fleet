@@ -35,7 +35,9 @@ function selfReminderGuidance(role: ResolvedRole): string[] {
     '`local_time` such as `2027-01-20T16:00` and an IANA `time_zone`. It messages no one and needs',
     'no setup. When due, a `[fleet-reminder]` turn arrives: call `fleet_reminder_inspect`, decide,',
     'then `fleet_reminder_ack` (or `fleet_reminder_update` to postpone). Use it instead of polling,',
-    'sleeping or a recurring loop. Full contract: the "Self-reminders" section of `ours-fleet docs`.',
+    'sleeping or a recurring loop. By default a wake waits until you are idle; pass `interrupt: true`',
+    'only for a return genuinely bound to a time (it may stop interruptible busy work once, never owner',
+    'work, and is not a hard real-time alarm). Full contract: the "Self-reminders" section of `ours-fleet docs`.',
   ];
 }
 
