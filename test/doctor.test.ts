@@ -88,6 +88,24 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
 
 describe('doctor', () => {
 
+  it('marks a service whose current definition still awaits a daemon reload as unhealthy', async () => {
+    const unitDir = join(dir, '.config', 'systemd', 'user');
+    mkdirSync(unitDir, { recursive: true });
+    const script = join(dir, 'release', 'node_modules', '@ours.network', 'fleet', 'dist', 'cli.js');
+    writeFileSync(join(unitDir, 'ours-fleet.service'),
+      `[Unit]\nDescription=ours-fleet process manager\n[Service]\nType=simple\nExecStart="${process.execPath}" "${script}" _run-fleet\n`);
+    const exec = (pending: boolean): Exec => async (_cmd, args) => ({ code: 0, stderr: '',
+      stdout: args.includes('NeedDaemonReload') ? (pending ? 'yes\n' : 'no\n') : args.includes('MainPID') ? '0\n' : '' });
+    const check = async (pending: boolean) => (await doctor(
+      { serviceRegistration: { binPath: script, homeDir: dir } }, exec(pending), 'linux',
+    )).checks.find(c => c.name === 'service: supervisor')!;
+    const pending = await check(true);
+    expect(pending.ok).toBe(false);
+    expect(pending.detail).toContain('reload-failed');
+    expect(pending.detail).toContain('daemon-reload');
+    expect((await check(false)).ok).toBe(true);
+  });
+
   it('reports one failed daemon check when client cleanup fails', async () => {
     const report = await doctor({}, execWith({}), 'darwin', undefined, async () => ({
       version: async () => HEALTHY_DAEMON_INFO,

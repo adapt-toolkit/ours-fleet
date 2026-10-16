@@ -308,6 +308,11 @@ export interface AcpSessionOptions {
   stateDir: string;
   mode: 'fresh' | 'resume';
   requireResume?: boolean;
+  /**
+   * Hold never-started prompts recovered from a prior generation until the
+   * caller's control plane is listening; see activateRecoveredPrompts().
+   */
+  deferRecoveredPrompts?: boolean;
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
@@ -410,6 +415,7 @@ export class AcpSession implements AgentSession {
   private advertisedCommands = new Set<string>();
   private presentedCommands: ConversationObservationState['commands'] = [];
   private queueDepth = 0;
+  private readonly deferredRecovered: Array<{ promptId: string; text: string }> = [];
   private readonly observation = new ConversationObservation(() => this.captureObservation());
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
@@ -604,13 +610,27 @@ export class AcpSession implements AgentSession {
         });
         continue;
       }
-      const text = open.text;
-      const promptId = open.promptId;
-      this.queueDepth++;
-      const run = this.enqueue(promptId, text, undefined);
-      this.observation.publish();
-      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
+      const recovered = { promptId: open.promptId, text: open.text };
+      if (this.options.deferRecoveredPrompts) this.deferredRecovered.push(recovered);
+      else this.dispatchRecovered(recovered);
     }
+  }
+
+  /**
+   * Dispatch recovered prompts held by deferRecoveredPrompts. A recovered turn
+   * can run tools at once, including the managed Fleet CLI, so it must not
+   * start before the supervisor's control socket accepts connections. Prompts
+   * never activated stay admitted-unstarted and recover again on next start.
+   */
+  activateRecoveredPrompts(): void {
+    for (const recovered of this.deferredRecovered.splice(0)) this.dispatchRecovered(recovered);
+  }
+
+  private dispatchRecovered({ promptId, text }: { promptId: string; text: string }): void {
+    this.queueDepth++;
+    const run = this.enqueue(promptId, text, undefined);
+    this.observation.publish();
+    void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
   }
 
   isAlive(): boolean {

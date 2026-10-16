@@ -15,6 +15,9 @@ import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
+import {
+  describeRegistration, refreshServiceRegistrations, registrationDrift, type RegistrationReport,
+} from './supervisor/registration-refresh.js';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
@@ -1289,9 +1292,35 @@ cOpt(program.command('doctor').description('prerequisite report'))
       harness: opts.harness,
       configPath: opts.configuration,
       yamlMode: opts.yamlMode as YamlMode,
+      serviceRegistration: { binPath },
     });
     for (const c of rep.checks) console.log(`${c.ok ? 'ok  ' : 'MISS'} ${c.name.padEnd(22)} ${c.detail}`);
     if (!rep.ok) throw new FleetCliExit(1);
+  });
+
+const serviceCommand = program.command('service')
+  .description('installed Fleet service definitions (supervisor, web, watchdogs)');
+const printRegistrations = (reports: RegistrationReport[], json?: boolean) => {
+  if (json) console.log(JSON.stringify({ binPath, services: reports }, null, 2));
+  else for (const report of reports) console.log(describeRegistration(report));
+};
+serviceCommand.command('check')
+  .description('report whether installed definitions and running services use this release; changes nothing')
+  .option('--json', 'machine-readable report')
+  .action(async (opts: { json?: boolean }) => {
+    const reports = await refreshServiceRegistrations({ binPath, write: false });
+    printRegistrations(reports, opts.json);
+    if (registrationDrift(reports).length) throw new FleetCliExit(1);
+  });
+serviceCommand.command('refresh')
+  .description('point installed definitions at this release; never creates, enables, starts, stops or restarts a service')
+  .option('--json', 'machine-readable report')
+  .action(async (opts: { json?: boolean }) => {
+    const reports = await refreshServiceRegistrations({ binPath, write: true });
+    printRegistrations(reports, opts.json);
+    if (!opts.json && reports.some(report => report.running === 'stale'))
+      console.log('A running service still uses another release. Restart it when convenient, '
+        + 'e.g. systemctl --user restart ours-fleet.service; agents resume through their supervisor.');
   });
 
 cOpt(program.command('init').description('add missing Fleet defaults while preserving existing configuration')

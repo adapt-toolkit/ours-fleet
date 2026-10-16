@@ -24,7 +24,7 @@ afterEach(async () => {
 
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
-  extra: { stateDir?: string; mode?: 'fresh' | 'resume'; env?: Record<string, string>; permissionTimeoutMs?: number } = {},
+  extra: { stateDir?: string; mode?: 'fresh' | 'resume'; env?: Record<string, string>; permissionTimeoutMs?: number; deferRecoveredPrompts?: boolean } = {},
 ) {
   const stateDir = extra.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-acp-conv-'));
   if (!extra.stateDir) dirs.push(stateDir);
@@ -39,6 +39,7 @@ async function start(
     log: () => {},
     cancelGraceMs: 2_000,
     permissionTimeoutMs: extra.permissionTimeoutMs,
+    deferRecoveredPrompts: extra.deferRecoveredPrompts,
   });
   sessions.push(session);
   return { session, stateDir };
@@ -378,6 +379,58 @@ describe('AcpSession conversation ledger', () => {
     const echo = all.find(e => e.kind === 'message.chunk' && e.promptId === 'p-queued');
     expect((echo?.payload as MessageChunkPayload).content)
       .toMatchObject({ text: 'echo:never started' });
+  });
+
+  it('holds recovered never-started prompts until the caller activates them', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-acp-conv-'));
+    dirs.push(stateDir);
+    const seed = () => {
+      const store = new ConversationEventStore(join(stateDir, '.conversation'), { roleId: 'A' });
+      store.append({
+        kind: 'prompt.admitted', sessionGeneration: 'gen-old', promptId: 'p-started',
+        turnId: 'p-started', commandId: 'cmd-a', source: 'browser',
+        payload: { text: { type: 'text', text: 'was running', bytes: 11 }, queuedBehind: 0 },
+      });
+      store.append({
+        kind: 'prompt.started', sessionGeneration: 'gen-old',
+        promptId: 'p-started', turnId: 'p-started', payload: {},
+      });
+      store.append({
+        kind: 'prompt.admitted', sessionGeneration: 'gen-old', promptId: 'p-queued',
+        turnId: 'p-queued', commandId: 'cmd-b', source: 'browser',
+        payload: { text: { type: 'text', text: 'run managed cli', bytes: 15 }, queuedBehind: 1 },
+      });
+      store.close();
+    };
+    seed();
+    const started = (session: AcpSession) =>
+      events(session).filter(e => e.kind === 'prompt.started' && e.promptId === 'p-queued');
+
+    // A supervisor that dies before its control plane listens must not lose
+    // the recovered prompt: it is never dispatched, so it stays recoverable.
+    const first = await start('allow', { stateDir, deferRecoveredPrompts: true });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(started(first.session)).toHaveLength(0);
+    expect(events(first.session).find(e => e.kind === 'turn.completed' && e.promptId === 'p-started')
+      ?.payload).toMatchObject({ outcome: 'unknown_after_restart' });
+    await first.session.close();
+
+    const { session } = await start('allow', { stateDir, deferRecoveredPrompts: true });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(started(session)).toHaveLength(0);
+    expect(session.conversationSnapshot().queueDepth).toBe(0);
+
+    session.activateRecoveredPrompts();
+    session.activateRecoveredPrompts();
+    for (let i = 0; i < 200 && !events(session).some(e =>
+      e.kind === 'turn.completed' && e.promptId === 'p-queued'); i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(started(session)).toHaveLength(1);
+    expect(events(session).find(e => e.kind === 'turn.completed' && e.promptId === 'p-queued')
+      ?.payload).toMatchObject({ outcome: 'completed' });
+    // The started turn is never replayed, by either generation.
+    expect(events(session).filter(e => e.kind === 'prompt.started' && e.promptId === 'p-started'))
+      .toHaveLength(0);
   });
 
   it('exposes a conversation snapshot with generation and queue state', async () => {
