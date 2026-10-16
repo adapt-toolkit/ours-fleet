@@ -6,6 +6,8 @@ import type { FetchLike } from './monitor.js';
 
 export const STARTUP_WAIT_MS = 240_000;
 export const STARTUP_RETRY_MS = 5_000;
+/** Upper bound for one read-only Cowork room probe during the startup wait. */
+export const ROOM_PROBE_TIMEOUT_MS = 10_000;
 interface ReadinessDeps {
   probe(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   now(): number;
@@ -47,4 +49,66 @@ export async function waitForRoleDaemon(
     await deps.sleep(Math.min(STARTUP_RETRY_MS, Math.max(0, deadline - deps.now())));
   }
   throw new Error(`Daemon not ready (${lastReason}); service manager will retry startup`);
+}
+
+interface RoomManagementDeps {
+  /** Read-only room observation; production uses Cowork `room.show`. */
+  showRoom(roomId: string, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<unknown>;
+  now(): number;
+  sleep(ms: number): Promise<void>;
+  log(message: string): void;
+  env: NodeJS.ProcessEnv;
+  shouldStop(): boolean;
+}
+
+/**
+ * Read-only preflight for a room member: wait while Cowork management is still
+ * starting behind the gateway. Only a retryable `CoworkUnavailableError` waits;
+ * success, any other error and the deadline all return so the real attempt
+ * decides, fails closed and counts. Never redeems invites, binds identities or
+ * judges room/seat identity — that remains the attempt's admission check.
+ */
+export async function waitForTaskRoomManagement(
+  name: string, partial: Partial<RoomManagementDeps> = {},
+): Promise<'ready' | 'not-required' | 'unavailable' | 'deferred'> {
+  let role: ReturnType<typeof loadTempRole>;
+  // An unreadable snapshot is the attempt's failure to report, not this wait's.
+  try { role = loadTempRole(name); } catch { return 'deferred'; }
+  const startup = role.roomMemberStartup;
+  if (!startup) return 'not-required';
+  const { createCoworkAdapter, CoworkUnavailableError } = await import('./rooms-tasks/cowork-adapter.js');
+  const deps: RoomManagementDeps = {
+    showRoom: (roomId, env, timeoutMs) => createCoworkAdapter({ env, timeoutMs }).getRoom(roomId),
+    now: Date.now,
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    log: message => process.stderr.write(message + '\n'),
+    env: process.env,
+    shouldStop: () => false,
+    ...partial,
+  };
+  const env = { ...deps.env, ...role.env };
+  const started = deps.now();
+  const deadline = started + STARTUP_WAIT_MS;
+  let waited = false;
+  for (;;) {
+    // Each probe fits in what is left of the wait, so the wait itself is bounded.
+    const timeoutMs = Math.min(ROOM_PROBE_TIMEOUT_MS, Math.max(1, deadline - deps.now()));
+    try {
+      await deps.showRoom(startup.room_id, env, timeoutMs);
+      if (waited) deps.log(`[${name}] cowork room management ready after ${deps.now() - started}ms`);
+      return 'ready';
+    } catch (error) {
+      if (!(error instanceof CoworkUnavailableError) || !error.retryable) return 'deferred';
+      if (!waited) deps.log(`[${name}] waiting for cowork room management: ${error.message}`);
+      waited = true;
+      if (deps.shouldStop()) return 'unavailable';
+      if (deps.now() + STARTUP_RETRY_MS >= deadline) {
+        deps.log(`[${name}] cowork room management still unavailable after ${STARTUP_WAIT_MS}ms: `
+          + `${error.message}; starting the attempt so the restart budget applies`);
+        return 'unavailable';
+      }
+      await deps.sleep(STARTUP_RETRY_MS);
+      if (deps.shouldStop()) return 'unavailable';
+    }
+  }
 }

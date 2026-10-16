@@ -111,6 +111,8 @@ export interface RunnerDeps {
   shouldStop?(): boolean;
   /** Parent shutdown suspends a managed transient member; explicit stop still retires. */
   suspendOnStop?: boolean;
+  /** One-shot timer for the sustained-health check; returns its cancel function. */
+  setTimer?(fn: () => void, ms: number): () => void;
 }
 
 export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
@@ -439,6 +441,12 @@ const carriedForward = (previous: RestartLedger): Partial<RestartLedger> => ({
   ...(previous.supervisorStartedAt ? { supervisorStartedAt: previous.supervisorStartedAt } : {}),
 });
 
+function unrefTimer(fn: () => void, ms: number): () => void {
+  const timer = setTimeout(fn, ms);
+  timer.unref?.();
+  return () => clearTimeout(timer);
+}
+
 /** Bounded exponential backoff for the nth consecutive immediate failure. */
 export function backoffFor(consecutiveFailures: number): number {
   if (consecutiveFailures <= 0) return 0;
@@ -574,6 +582,8 @@ export interface AttemptResult {
   modelRecovery?: 'advance' | 'hold';
   /** Present only when a temporary-role lifecycle signal ended the session. */
   retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal' | 'idle-timeout';
+  /** Seconds the session spent up after startup completed; absent if it never came up. */
+  healthySecs?: number;
 }
 
 /** Continuous authoritative absence required after an identity was observed. */
@@ -593,7 +603,12 @@ export function isRecoverableTempStartupCancellation(
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
-  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean; identityLifetime?: 'permanent' | 'temporary' } = {},
+  opts: {
+    temp?: boolean; configPath?: string; allowResumeRotation?: boolean;
+    identityLifetime?: 'permanent' | 'temporary';
+    /** Called once when the session is up, so the supervisor can time sustained health. */
+    onHealthy?: () => void;
+  } = {},
   partialDeps: Partial<RunnerDeps> = {},
 ): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
@@ -1147,6 +1162,8 @@ export async function runOnce(
   }
   deps.log(
     `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
+  const healthyAt = deps.now();
+  opts.onHealthy?.();
 
   // Keep arrivals behind the early prime() cursor; never re-prime at startup.
   // Recoverable cancellation preserves the supervisor, not monitor readiness.
@@ -1327,6 +1344,7 @@ export async function runOnce(
   if (supervisorRecycleRequired) throw new SupervisorRecycleRequiredError();
   return {
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
+    healthySecs: (deps.now() - healthyAt) / 1000,
     ...(layoutRetiring ? { retirementReason: 'operator-stop' as const } : retirementReason ? { retirementReason } : {}),
   };
   } finally {
@@ -1351,7 +1369,9 @@ export async function runSupervised(
   opts: { configPath?: string; temp?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
   attempt: (
-    n: string, o: { configPath?: string; allowResumeRotation?: boolean; temp?: boolean }, d: Partial<RunnerDeps>,
+    n: string,
+    o: { configPath?: string; allowResumeRotation?: boolean; temp?: boolean; onHealthy?: () => void },
+    d: Partial<RunnerDeps>,
   ) => Promise<AttemptResult> = runOnce,
 ): Promise<RestartLedger> {
   const deps = { ...defaultDeps(), ...partialDeps };
@@ -1418,6 +1438,47 @@ export async function runSupervised(
       await waitForRoleDaemon(name, undefined, {}, true);
     }
     if (taskMember && (shouldStop() || !taskSupervisorMayRun(name))) break;
+    if (attempt === runOnce && taskMember) {
+      // Cowork can come up after the daemon on boot. Wait read-only so a
+      // gateway still starting its upstream does not spend the failure budget.
+      const { waitForTaskRoomManagement } = await import('./startup-readiness.js');
+      await waitForTaskRoomManagement(name, { shouldStop });
+    }
+    if (taskMember && (shouldStop() || !taskSupervisorMayRun(name))) break;
+    const fastFailSecs = taskMember ? tempFastFailSecs(name) : fastFailSecsFor(name, opts.configPath);
+    // The fast-fail boundary starts a recovery episode; it must not also be
+    // the boundary that declares recovery successful. Otherwise alternating
+    // 19s and 20s deaths erase one another forever. Require the configured
+    // number of fast-fail windows to survive before closing an active streak.
+    // This hysteresis stays adapter-relative (100s for the current 20s/5-attempt
+    // policy) and still lets a genuinely sustained session reset the breaker.
+    const stableRecoverySecs = fastFailSecs * RESTART_FAIL_THRESHOLD;
+    // A session that stays up that long has recovered, even if it never
+    // returns: a host reset or OOM-kill ends it without reaching the
+    // post-attempt reset below, and a stale streak would then hold the role
+    // down after a few transient boot failures spread over days.
+    const streakAtStart = ledger;
+    const clearSustainedStreak = () => {
+      if (streakAtStart.consecutiveImmediateFailures === 0) return;
+      const current = readRestartLedger(dir);
+      // Never overwrite an operator reset, an open circuit or a successor's state.
+      if (current.circuit === 'open' || current.updatedAt !== streakAtStart.updatedAt
+          || current.consecutiveImmediateFailures !== streakAtStart.consecutiveImmediateFailures
+          || readRunMarker(dir)?.startedAt !== startedAt) return;
+      writeRestartLedger(dir, {
+        ...emptyLedger(),
+        ...carriedForward(current),
+        lastReason: `sustained healthy session (${stableRecoverySecs}s)`,
+        updatedAt: stamp(),
+      });
+      deps.log(`[${name}] healthy for ${stableRecoverySecs}s; cleared `
+        + `${current.consecutiveImmediateFailures} earlier immediate failure(s)`);
+    };
+    let cancelStabilityTimer: (() => void) | undefined;
+    const onHealthy = () => {
+      if (cancelStabilityTimer || streakAtStart.consecutiveImmediateFailures === 0) return;
+      cancelStabilityTimer = (deps.setTimer ?? unrefTimer)(clearSustainedStreak, stableRecoverySecs * 1000);
+    };
     let result: AttemptResult;
     try {
       // Service-manager boot and automatic retry bypass the operator-facing
@@ -1431,8 +1492,9 @@ export async function runSupervised(
       }
       result = await attempt(
         name, { configPath: opts.configPath, ...(taskMember ? { temp: true } : {}),
-          allowResumeRotation: taskMember ? false : !ledger.resumeDiscarded }, deps);
+          allowResumeRotation: taskMember ? false : !ledger.resumeDiscarded, onHealthy }, deps);
     } catch (e) {
+      cancelStabilityTimer?.();
       if (e instanceof SupervisorRecycleRequiredError) {
         writeRestartLedger(dir, {
           ...ledger,
@@ -1452,8 +1514,14 @@ export async function runSupervised(
         mode: 'fresh',
       };
     }
+    cancelStabilityTimer?.();
 
-    if (stopping || (taskMember && (shouldStop() || result.retirementReason))) break;
+    if (stopping || (taskMember && (shouldStop() || result.retirementReason))) {
+      // An orderly stop of a session that was healthy long enough is a
+      // recovery too; only the timer's race with the stop is decided here.
+      if ((result.healthySecs ?? 0) >= stableRecoverySecs) clearSustainedStreak();
+      break;
+    }
 
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
@@ -1471,15 +1539,6 @@ export async function runSupervised(
       await deps.sleep(HELD_DOWN_POLL_MS);
       continue;
     }
-    const fastFailSecs = taskMember ? getAdapter(loadTempRole(name).harness).exitPolicy.fastFailSecs
-      : fastFailSecsFor(name, opts.configPath);
-    // The fast-fail boundary starts a recovery episode; it must not also be
-    // the boundary that declares recovery successful. Otherwise alternating
-    // 19s and 20s deaths erase one another forever. Require the configured
-    // number of fast-fail windows to survive before closing an active streak.
-    // This hysteresis stays adapter-relative (100s for the current 20s/5-attempt
-    // policy) and still lets a genuinely sustained session reset the breaker.
-    const stableRecoverySecs = fastFailSecs * RESTART_FAIL_THRESHOLD;
     const recoveryFailed = result.elapsedSecs < fastFailSecs
       || (ledger.consecutiveImmediateFailures > 0 && result.elapsedSecs < stableRecoverySecs);
 
@@ -1540,6 +1599,10 @@ function fastFailSecsFor(name: string, configPath?: string): number {
     const role = findRole(loadConfig(configPath), name);
     return getAdapter(role.harness).exitPolicy.fastFailSecs;
   } catch { return 20; }
+}
+
+function tempFastFailSecs(name: string): number {
+  try { return getAdapter(loadTempRole(name).harness).exitPolicy.fastFailSecs; } catch { return 20; }
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
