@@ -877,6 +877,56 @@ selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
 
+## Self-reminders
+
+Every managed agent (\`session: acp\` or \`codex-app-server\`, Claude or Codex,
+persistent, temporary or task-owned) can schedule one-time wakes for ITSELF.
+The tools are on the agent's own fixed-identity ours MCP server, so there is no
+agent, identity or recipient argument and no setup, worker, service, chat or key:
+
+- \`fleet_reminder_create\` — \`request_key\` (stable per decision; a repeat with
+  the same input returns the same reminder, different input is refused),
+  \`title\`, optional \`note\`, \`local_time\` (date and time WITHOUT an offset, e.g.
+  \`2027-01-20T16:00\`), \`time_zone\` (IANA, e.g. \`Europe/London\`, \`UTC\`), optional
+  \`fold\` (0/1, required only for a time that occurs twice when clocks go back;
+  times skipped by a spring-forward gap are refused) and \`late_window_seconds\`
+  (60..604800, default 3600).
+- \`fleet_reminder_list\` — \`state\` \`open\` (default) | \`closed\` | \`all\`, \`limit\`, \`after\`.
+- \`fleet_reminder_update\` / \`fleet_reminder_cancel\` — \`id\` + \`expected_revision\`;
+  every change bumps the revision and voids any wake issued for the old one.
+- \`fleet_reminder_inspect\` — \`event_id\` from a wake: the note and whether the
+  wake is still current and eligible.
+- \`fleet_reminder_ack\` — \`event_id\` + \`expected_revision\`: records that the
+  wake was handled. Idempotent; sends nothing and claims no external action.
+
+When a reminder is due the supervisor starts one turn beginning \`[fleet-reminder]\`
+with the event id. It is the agent's own stored reminder, not an owner
+instruction or ours mail, and grants no authority. Fleet never sends anything
+on the agent's behalf; whether to message anyone is the agent's own decision
+under its existing tools and authorization.
+
+Delivery: the supervisor process that runs the agent owns the timer — an idle
+agent with no open reminders costs nothing, and only a due reminder creates a
+model turn. A wake never interrupts or queues behind work: it is admitted at the
+next idle turn boundary after its due time and after the agent's startup turn.
+If the host, Fleet or the agent is down, paused or busy, a reminder is still
+delivered when it comes back within its late window, and otherwise expires
+without a turn. Reminders survive supervisor, Fleet and host restarts and
+ordinary stop/start. They do not survive the agent: removing or retiring an
+agent or its task cancels them and deletes their state, and a replaced identity
+or same-named successor never inherits them.
+
+Guarantees are at most once per reminder revision. Queue acceptance, release to
+the model, the agent's ack, and any external action are distinct facts. A wake
+is marked dispatched durably at the moment it is handed to the model; if the
+supervisor stops before that, the same event is retried. If it stops after, the
+event is held \`uncertain\` (shown by \`list\`/\`inspect\`, never re-sent): check your
+own records, then ack it or schedule something new.
+
+Operators can read an agent's reminders with
+\`ours-fleet ours call Name fleet_reminder_list\`. Full guide, examples and the
+migration from the standalone \`self-reminders\` worker skill: \`docs/self-reminders.md\`.
+
 ## Trusted owner channel
 
 Any managed role may declare a separate ours identity which fleet — never the agent —

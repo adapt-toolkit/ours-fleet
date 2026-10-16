@@ -2,6 +2,7 @@ import {
   appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 } from 'node:fs';
 import { parse } from 'yaml';
+import { removeReminderState } from './reminders/store.js';
 import { randomUUID } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock, withSynchronousFileLock } from './atomic-file.js';
@@ -247,8 +248,14 @@ export function archiveTempState(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !existsSync(dir)) return undefined;
     throw error;
   }
+  // Archived evidence is inert: no runner will ever load it again. Scheduling
+  // state is not evidence, so the retired agent's reminders (and their private
+  // notes) are removed rather than archived with it.
   try { appendTermination(paths.retiring, record); }
-  finally { renameSync(paths.retiring, paths.target); }
+  finally {
+    try { removeReminderState(paths.retiring); }
+    finally { renameSync(paths.retiring, paths.target); }
+  }
   return paths.target;
 }
 

@@ -1,4 +1,5 @@
 import type { AgentSession } from '../session/types.js';
+import type { ReminderToolBackend } from '../reminders/tools.js';
 import { chatFilePath } from '../file-delivery/reader.js';
 import { ArtifactStore } from '../file-delivery/store.js';
 import { resolve, basename, extname } from 'node:path';
@@ -24,6 +25,8 @@ export interface ManagedAgentService {
   descriptor: string;
   privatePaths: string[];
   setFileDelivery?(sender: AgentSession['sendFileToChat']): void;
+  /** Bind (or unbind) this agent's self-reminders behind its own MCP tools. */
+  setReminders?(backend: ReminderToolBackend | undefined): void;
   close(terminal: boolean): Promise<void>;
 }
 /**
@@ -155,6 +158,7 @@ export async function prepareManagedAgent(
   );
   let closeClient: (() => Promise<void>) | undefined;
   let fileSender: AgentSession['sendFileToChat'];
+  let reminders: ReminderToolBackend | undefined;
   let partialEndpoint: { close(): Promise<void> } | undefined;
   try {
     let prior = controller.journal.read();
@@ -294,6 +298,7 @@ export async function prepareManagedAgent(
       client,
       identities,
       remoteDaemonFiles: true,
+      reminders: () => reminders,
       currentChatFile: currentChatFileHandler({
         role, cwd, store: new ArtifactStore(stateDir), sender: () => fileSender,
         privateState: [privateRuntimeRoot(), join(stateRoot(), 'private-file-delivery'), profile.configPath, profile.credentialPath],
@@ -307,9 +312,11 @@ export async function prepareManagedAgent(
       descriptor,
       privatePaths: [root, profile.configPath, profile.credentialPath, join(stateRoot(), 'private-file-delivery')],
       setFileDelivery: sender => { fileSender = sender; },
+      setReminders: backend => { reminders = backend; },
       close: async (terminal) => {
         try {
           fileSender = undefined;
+          reminders = undefined;
           await endpoint.close();
           if (terminal) await runtime.terminal();
           else await runtime.suspend();

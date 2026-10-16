@@ -17,6 +17,22 @@ const opts = {
 };
 
 describe('generateBriefing', () => {
+  it('tells managed agents once how to schedule their own wakes, and nobody else', () => {
+    const managed = generateBriefing({ ...base, session: 'codex-app-server' }, vocab, opts);
+    expect(managed.match(/## Self-reminders/g)).toHaveLength(1);
+    expect(managed).toContain('`fleet_reminder_create`');
+    expect(managed).toContain('It messages no one and needs');
+    const room = generateBriefing({
+      ...base, session: 'acp',
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: 'r', invite_id: 'i',
+        invite: 'x', role: 'Reviewer', task: 'Review.', owner_seat_cid: null,
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(room.match(/## Self-reminders/g)).toHaveLength(1);
+    expect(generateBriefing(base, vocab, opts)).not.toContain('fleet_reminder_');
+  });
+
   it('renders identity boot steps from the vocabulary', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('# Alice — Role Briefing');

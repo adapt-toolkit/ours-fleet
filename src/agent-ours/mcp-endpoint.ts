@@ -12,6 +12,7 @@ import { JSONRPCMessageSchema, type JSONRPCMessage } from '@modelcontextprotocol
 import { FileCallbacks } from './file-rpc.js';
 import { Wire } from './wire.js';
 import type { AgentOursRuntime } from './runtime.js';
+import { registerReminderTools, type ReminderToolBackend } from '../reminders/tools.js';
 
 export interface EndpointOptions {
   socket: string;
@@ -22,6 +23,8 @@ export interface EndpointOptions {
   identities: ApplicationIdentityStore;
   remoteDaemonFiles: boolean;
   currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
+  /** Fleet self-reminders, bound later by the runner; tools refuse until then. */
+  reminders?: () => ReminderToolBackend | undefined;
 }
 export async function startMcpEndpoint(
   options: EndpointOptions,
@@ -56,25 +59,29 @@ export async function startMcpEndpoint(
       },
       close: async () => wire.close(),
     };
+    // One admission path for every tool on this connection: the same
+    // authentication, in-flight bound and managed-runtime fence.
+    const admit = async () => {
+      if (!authenticated || inFlight >= 32) throw Error('MCP_ADMISSION_LIMIT');
+      inFlight++;
+      try {
+        const release = await options.runtime.admit();
+        return () => {
+          inFlight--;
+          release();
+        };
+      } catch (error) {
+        inFlight--;
+        throw error;
+      }
+    };
     const mcp = createManagedOursMcpServer(options.client, 'managed-v1', options.identities, {
       remoteDaemonFiles: options.remoteDaemonFiles,
       ...(options.currentChatFile ? { currentChatFile: (input: FileDeliveryInput, extra: ToolRequestExtra) => options.currentChatFile!(input, extra, files) } : {}),
       fileContext: files,
-      admit: async () => {
-        if (!authenticated || inFlight >= 32) throw Error('MCP_ADMISSION_LIMIT');
-        inFlight++;
-        try {
-          const release = await options.runtime.admit();
-          return () => {
-            inFlight--;
-            release();
-          };
-        } catch (error) {
-          inFlight--;
-          throw error;
-        }
-      },
+      admit,
     });
+    if (options.reminders) registerReminderTools(mcp, options.reminders, admit);
     wire.onClose = () => {
       clearTimeout(deadline);
       sockets.delete(wire);

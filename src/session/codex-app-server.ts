@@ -15,6 +15,7 @@ import type {
 import { SessionEvents } from './events.js';
 import {
   memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+  refuseAtRelease, RELEASE_GUARD_REFUSED,
 } from './prompt-batch.js';
 import { CodexAppServerTransport } from './codex-app-server-transport.js';
 import type {
@@ -109,6 +110,7 @@ function sourceFor(origin: PromptOrigin | undefined): {
     case 'owner': return { source: 'owner_channel', persistBody: false };
     case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
     case 'scheduled-loop': return { source: 'scheduled_loop', persistBody: false };
+    case 'self-reminder': return { source: 'fleet_monitor', persistBody: false };
     case 'local-console':
     default: return { source: 'local_console', persistBody: true };
   }
@@ -317,6 +319,8 @@ export class CodexAppServerSession implements AgentSession {
   }
 
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
+    // A guarded prompt must reach the model only through the release fence.
+    if (options.releaseGuard) options = { ...options, interrupt: false, steer: false };
     if (this.closing || !this.threadId || !this.transport.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'Codex app-server session is offline');
 
@@ -342,7 +346,7 @@ export class CodexAppServerSession implements AgentSession {
     const run = this.observation.checkpoint(() => {
       this.admit(promptId, text, queuedBehind, options);
       this.queueDepth++;
-      return this.enqueue(promptId, text, options.origin);
+      return this.enqueue(promptId, text, options.origin, options.releaseGuard);
     });
     const completion = run.then(result => {
       this.queueDepth = Math.max(0, this.queueDepth - 1);
@@ -365,11 +369,14 @@ export class CodexAppServerSession implements AgentSession {
   }
 
   /** Each prompt keeps its own step in the chain; the step it reaches releases a whole snapshot. */
-  private enqueue(promptId: string, text: string, origin: PromptOrigin | undefined): Promise<TurnResult> {
+  private enqueue(
+    promptId: string, text: string, origin: PromptOrigin | undefined, releaseGuard?: () => boolean,
+  ): Promise<TurnResult> {
     const entry: PendingPrompt = {
       promptId, text, origin, ...sourceFor(origin), admittedAt: new Date().toISOString(),
       // The one text the native session runs as an operation instead of a turn.
       command: text.trim() === '/compact',
+      ...(releaseGuard ? { releaseGuard } : {}),
     };
     this.pendingPrompts.push(entry);
     const run = this.promptTail.then(() => this.release(entry));
@@ -385,6 +392,17 @@ export class CodexAppServerSession implements AgentSession {
    */
   private release(entry: PendingPrompt): Promise<TurnResult> {
     if (entry.released) return entry.released;
+    const refused = refuseAtRelease(
+      this.pendingPrompts, entry, Boolean(this.threadId && this.transport.isAlive()));
+    if (refused) {
+      this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+        promptId: entry.promptId, turnId: entry.promptId,
+        payload: { outcome: 'cancelled', stopReason: RELEASE_GUARD_REFUSED },
+      });
+      entry.released = Promise.resolve(refused);
+      return entry.released;
+    }
     const members = takeBatch(this.pendingPrompts, entry);
     for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
     const run = this.runPrompt(members).finally(() => {

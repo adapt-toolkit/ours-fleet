@@ -7,6 +7,7 @@ import {
 } from '../src/session/codex-app-server.js';
 import {
   commandName, pendingInventory, promptClass, takeBatch, type PendingPrompt,
+  refuseAtRelease, RELEASE_GUARD_REFUSED,
 } from '../src/session/prompt-batch.js';
 import type { PromptOrigin } from '../src/session/types.js';
 
@@ -180,5 +181,36 @@ describe('pending inventory', () => {
     expect(inventory.pendingPrompts.every(item => item.text!.length === 200 && item.textTruncated)).toBe(true);
     // 320 thousand-character prompts stay a small snapshot.
     expect(JSON.stringify(inventory).length).toBeLessThan(140_000);
+  });
+});
+
+describe('refuseAtRelease', () => {
+  const entry = (origin: PromptOrigin | undefined, releaseGuard?: () => boolean): PendingPrompt => ({
+    promptId: 'p', text: 't', origin, source: 'fleet_monitor', persistBody: false,
+    admittedAt: '2027-01-01T00:00:00Z', ...(releaseGuard ? { releaseGuard } : {}),
+  });
+  const reminder: PromptOrigin = { kind: 'self-reminder', eventId: 'e', reminderId: 'r', revision: 1 };
+
+  it('consults the guard only for a live release and drops a refused prompt unsent', () => {
+    let calls = 0;
+    const refusing = entry(reminder, () => { calls++; return false; });
+    const pending = [refusing];
+    expect(refuseAtRelease(pending, refusing, false)).toBeUndefined();
+    expect(calls).toBe(0);
+    expect(refuseAtRelease(pending, refusing, true)).toMatchObject({ accepted: false, outcome: 'cancelled', detail: RELEASE_GUARD_REFUSED });
+    expect(pending).toEqual([]);
+    const allowing = entry(reminder, () => true);
+    expect(refuseAtRelease([allowing], allowing, true)).toBeUndefined();
+    const throwing = entry(reminder, () => { throw new Error('boom'); });
+    expect(refuseAtRelease([throwing], throwing, true)?.outcome).toBe('cancelled');
+    expect(refuseAtRelease([], entry(reminder), true)).toBeUndefined();
+  });
+
+  it('fails closed for a guarded prompt that could be batched past the fence', () => {
+    let calls = 0;
+    const guarded = entry({ kind: 'fleet-monitor' }, () => { calls++; return true; });
+    expect(refuseAtRelease([guarded], guarded, true)?.detail).toBe(RELEASE_GUARD_REFUSED);
+    expect(calls).toBe(0);
+    expect(promptClass(entry(reminder))).toBe('internal');
   });
 });
