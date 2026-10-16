@@ -104,9 +104,20 @@ export interface CoworkAdapter {
 }
 
 export class CoworkUnavailableError extends Error {
-  constructor(message = 'Cowork gateway management is not reachable', options?: ErrorOptions) {
+  /**
+   * True only when the failure is a dependency that may still be starting
+   * (connection refused/reset, timeout, a gateway 502/503/504 without an RPC
+   * body). Selection, capability, credential and permission failures are
+   * never retryable, whatever transport reported them.
+   */
+  readonly retryable: boolean;
+  constructor(
+    message = 'Cowork gateway management is not reachable',
+    options?: ErrorOptions & { retryable?: boolean },
+  ) {
     super(message, options);
     this.name = 'CoworkUnavailableError';
+    this.retryable = options?.retryable === true;
   }
 }
 
