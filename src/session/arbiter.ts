@@ -11,6 +11,12 @@ import type {
   SubmitPromptCommand,
 } from './conversation-types.js';
 
+export type ReminderAttempt =
+  /** Admitted; `queued.completion` settles when the turn (or its refusal) ends. */
+  | { state: 'admitted'; queued: QueuedPrompt }
+  | { state: 'busy' }
+  | { state: 'unavailable'; error: string; admitted: false };
+
 export type ScheduledAttempt =
   | { state: 'started'; queued: QueuedPrompt }
   | { state: 'skipped_busy' }
@@ -176,6 +182,40 @@ export class RoleTurnArbiter implements AgentSession {
       // own rescheduling — from being abandoned mid-tick.
       if (error instanceof AdmissionRetiredError)
         return { state: 'unavailable', error: error.message } as ScheduledAttempt;
+      throw error;
+    });
+  }
+
+  /**
+   * Admit a self-reminder wake only into an idle role, at the same boundary
+   * every producer uses. It never interrupts or steers, and never joins a
+   * queue behind other work: a busy role answers `busy` and the caller tries
+   * again later. `beforeQueue` makes the caller's durable claim; if it
+   * declines, nothing is queued. `releaseGuard` is the session's last-moment
+   * fence and is the only way the prompt can reach the model.
+   */
+  async tryReminder(
+    text: string, origin: Extract<PromptOrigin, { kind: 'self-reminder' }>,
+    beforeQueue: () => boolean, releaseGuard: () => boolean,
+  ): Promise<ReminderAttempt> {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return this.exclusive(async (): Promise<ReminderAttempt> => {
+      const snapshot = this.session.snapshot();
+      if (this.stopping || this.retiring || !snapshot.alive || snapshot.readiness === 'failed')
+        return { state: 'unavailable', error: this.stopping ? 'role is stopping' : 'session is unavailable', admitted: false };
+      if (snapshot.readiness !== 'idle' || this.unsettled > 0) return { state: 'busy' };
+      if (!beforeQueue()) return { state: 'unavailable', error: 'claim declined', admitted: false };
+      try {
+        const queued = await this.session.queuePrompt(text, {
+          interrupt: false, steer: false, origin, releaseGuard,
+        });
+        return { state: 'admitted', queued: this.track(queued) };
+      } catch (error) {
+        return { state: 'unavailable', error: (error as Error)?.message ?? String(error), admitted: false };
+      }
+    }).catch(error => {
+      if (error instanceof AdmissionRetiredError)
+        return { state: 'unavailable', error: error.message, admitted: false } as ReminderAttempt;
       throw error;
     });
   }

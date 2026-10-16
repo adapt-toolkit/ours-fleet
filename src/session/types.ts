@@ -32,6 +32,8 @@ export type PromptOrigin =
   | { kind: 'owner'; requestId: string; displayText?: string }
   | { kind: 'fleet-monitor' }
   | { kind: 'scheduled-loop'; loop: string; runId: string }
+  /** A due self-reminder wake; the agent's own stored reminder, never owner input. */
+  | { kind: 'self-reminder'; eventId: string; reminderId: string; revision: number }
   | { kind: 'owner-admin-console'; commandId: string };
 
 export interface RuntimeSelectorMetadata {
@@ -234,6 +236,12 @@ export interface SubmitPromptOptions {
   steer?: boolean;
   /** Audit-grade actor detail persisted with the conversation admission record. */
   actor?: { browserSession?: string };
+  /**
+   * Checked synchronously at the turn boundary, immediately before the prompt
+   * would be handed to a live model. False drops the prompt unsent. Only
+   * honoured for internal prompts, which always run alone.
+   */
+  releaseGuard?: () => boolean;
 }
 
 export interface SessionSnapshot {

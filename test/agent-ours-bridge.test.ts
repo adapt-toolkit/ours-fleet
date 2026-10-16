@@ -104,3 +104,71 @@ it.each(['socket', 'capability'])('refuses descriptor %s replacement at the same
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+it('serves self-reminder tools on the fixed-identity bridge, scoped to the bound agent only', async () => {
+  const { ReminderStore } = await import('../src/reminders/store.js');
+  const root = mkdtempSync(join(tmpdir(), 'fleet-mcp-reminders-'));
+  let backend: import('../src/reminders/tools.js').ReminderToolBackend | undefined;
+  let admits = 0, released = 0, fenced = false;
+  const endpoint = await startMcpEndpoint({
+    socket: join(root, 'm.sock'), capability: 'reminder-capability', generation: 1,
+    runtime: { admit: async () => {
+      if (fenced) throw Error('RUNTIME_NOT_READY');
+      admits++;
+      return () => { released++; };
+    } } as unknown as AgentOursRuntime,
+    client: {} as OursClient,
+    identities: { list: async () => ['Agent'] } as ApplicationIdentityStore,
+    remoteDaemonFiles: true,
+    reminders: () => backend,
+  });
+  const descriptor = join(root, 'descriptor.json');
+  writeFileSync(descriptor, JSON.stringify({ socket: join(root, 'm.sock'), capability: 'reminder-capability', generation: 1 }));
+  const client = new Client({ name: 'test', version: '1' });
+  try {
+    await client.connect(new StdioClientTransport({
+      command: process.execPath, args: [resolve('dist/agent-ours/bridge.js')], cwd: root,
+      env: { FLEET_OURS_BRIDGE_DESCRIPTOR: descriptor }, stderr: 'pipe',
+    }));
+    const tools = (await client.listTools()).tools;
+    expect(tools).toHaveLength(27 + 6);
+    const create = { request_key: 'k', title: 'T', local_time: '2099-01-20T16:00', time_zone: 'UTC' };
+    const unbound = await client.callTool({ name: 'fleet_reminder_create', arguments: create }) as any;
+    expect(unbound.isError).toBe(true);
+    expect(JSON.parse(unbound.content[0].text).error).toBe('reminders_unavailable');
+    let changed = 0;
+    backend = {
+      store: new ReminderStore(root, { role: 'Agent', lifetime: 'temporary', instance: 'i', cid: 'E'.repeat(64), action: 'a' }, () => Date.parse('2027-01-01T00:00:00Z')),
+      changed: () => { changed++; },
+    };
+    const created = await client.callTool({ name: 'fleet_reminder_create', arguments: { ...create, local_time: '2027-01-20T16:00' } }) as any;
+    expect(created.isError).toBe(false);
+    expect(created.structuredContent.reminder.due_at).toBe('2027-01-20T16:00:00.000Z');
+    expect(changed).toBe(1);
+    // An argument naming another agent is not part of the contract and changes nothing.
+    const listed = await client.callTool({ name: 'fleet_reminder_list', arguments: { agent: 'Other' } as any }) as any;
+    expect(listed.structuredContent.reminders).toHaveLength(1);
+    const invalid = await client.callTool({ name: 'fleet_reminder_cancel', arguments: { id: 'rem_x', expected_revision: 1 } }) as any;
+    expect(JSON.parse(invalid.content[0].text).error).toBe('not_found');
+    expect(admits).toBe(4);
+    expect(released).toBe(4);
+    // The managed runtime fence refuses: nothing is read or changed.
+    fenced = true;
+    for (const [name, args] of [
+      ['fleet_reminder_create', { ...create, request_key: 'fenced', local_time: '2027-01-21T16:00' }],
+      ['fleet_reminder_list', {}],
+      ['fleet_reminder_cancel', { id: created.structuredContent.reminder.id, expected_revision: 1 }],
+    ] as const) {
+      const refused = await client.callTool({ name, arguments: args as any }) as any;
+      expect(refused.isError).toBe(true);
+      expect(JSON.parse(refused.content[0].text).error).toBe('runtime_not_ready');
+    }
+    fenced = false;
+    expect(backend.store.list().reminders.map((item: any) => [item.revision, item.state])).toEqual([[1, 'active']]);
+    expect(changed).toBe(1);
+  } finally {
+    await client.close();
+    await endpoint.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
