@@ -232,6 +232,83 @@ describe.each(harnesses)('self-reminders over %s', (_label, start) => {
     expect(s.harness.modelTurns().filter(turn => turn.some(text => text.includes('long owner work')))).toHaveLength(1);
   });
 
+  it('rechecks at the idle boundary instead of waiting out its busy backoff', async () => {
+    const s = await supervisor(start);
+    const unsubscribe = s.arbiter.onAdmissionBoundary(() => s.manager.boundary());
+    cleanup.push(unsubscribe);
+    s.manager.start();
+    const { value } = await s.call('fleet_reminder_create', {
+      request_key: 'k', title: 'later', local_time: '2027-01-20T13:00', time_zone: 'UTC',
+    });
+    const busy = await s.harness.occupy();
+    s.clock.now = Date.parse(value.reminder.due_at);
+    await s.manager.poll();
+    expect(s.timers.at(-1)!.ms).toBe(2_000);
+    await s.manager.poll();
+    expect(s.timers.at(-1)!.ms).toBe(4_000);
+    const beforeRelease = s.timers.length;
+    await busy.release();
+    await until(() => s.harness.session.snapshot().readiness === 'idle', 'idle');
+    // The idle transition re-armed the poll at once; firing it admits the wake.
+    await until(() => s.timers.length > beforeRelease, 'boundary re-arm');
+    expect(s.timers.slice(beforeRelease).map(timer => timer.ms)).toEqual([0]);
+    expect(s.reminderTurns()).toEqual([]);
+    await s.manager.poll();
+    await until(() => s.reminderTurns().length === 1, 'reminder at the boundary');
+    unsubscribe();
+  });
+
+  it('signals each settled claim and idle transition, and nothing after unsubscribe', async () => {
+    const s = await supervisor(start);
+    let signals = 0;
+    const unsubscribe = s.arbiter.onAdmissionBoundary(() => { signals++; });
+    cleanup.push(unsubscribe);
+    const quiet = signals;                             // a session already idle may report it once
+    const queued = await s.arbiter.queuePrompt('tracked work', { origin: { kind: 'local-console' } });
+    await queued.completion;
+    await until(() => s.harness.session.snapshot().readiness === 'idle', 'idle');
+    await until(() => signals >= quiet + 2, 'settled claim and idle transition');
+    const afterTurn = signals;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(signals).toBe(afterTurn);                   // staying idle is not a new boundary
+    unsubscribe();
+    const later = await s.arbiter.queuePrompt('more work', { origin: { kind: 'local-console' } });
+    await later.completion;
+    await until(() => s.harness.session.snapshot().readiness === 'idle', 'idle again');
+    expect(signals).toBe(afterTurn);
+  });
+
+  it('lets an Owner prompt arriving at the same boundary go first', async () => {
+    const s = await supervisor(start);
+    let owner: Promise<unknown> | undefined;
+    const unsubscribe = s.arbiter.onAdmissionBoundary(() => {
+      // The Owner's next message lands in the same tick as the boundary signal.
+      owner ??= s.arbiter.queuePrompt('owner follow-up', { origin: { kind: 'local-console' } });
+      s.manager.boundary();
+    });
+    cleanup.push(unsubscribe);
+    s.manager.start();
+    const { value } = await s.call('fleet_reminder_create', {
+      request_key: 'k', title: 'later', local_time: '2027-01-20T13:00', time_zone: 'UTC',
+    });
+    const busy = await s.harness.occupy();
+    s.clock.now = Date.parse(value.reminder.due_at);
+    await s.manager.poll();
+    await busy.release();
+    await until(() => owner !== undefined, 'boundary');
+    await owner;
+    await s.manager.poll();                            // the boundary's re-check
+    await until(() => s.harness.modelTurns().some(turn => turn.includes('owner follow-up')), 'owner turn');
+    await until(() => s.harness.session.snapshot().readiness === 'idle', 'idle after owner');
+    await s.manager.poll();
+    await until(() => s.reminderTurns().length === 1, 'reminder after the Owner');
+    const turns = s.harness.modelTurns();
+    // Separate turns: the wake neither joined nor preceded the Owner's prompt.
+    expect(turns.filter(turn => turn.includes('owner follow-up'))).toEqual([['owner follow-up']]);
+    expect(turns.findIndex(turn => turn.includes('owner follow-up')))
+      .toBeLessThan(turns.findIndex(turn => turn.some(text => text.startsWith('[fleet-reminder]'))));
+  });
+
   it('drops a wake that went stale while it waited, at the moment of release', async () => {
     const s = await supervisor(start);
     const { value } = await s.call('fleet_reminder_create', {
