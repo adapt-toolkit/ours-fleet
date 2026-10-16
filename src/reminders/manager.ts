@@ -94,11 +94,17 @@ export class ReminderManager implements ReminderManagerHandle {
     this.polling = true;
     let delay: number | undefined;
     try {
-      // Urgent events first, so a busy ordinary event never hides one; the
-      // sweep's earliest-due order is kept within each group.
+      // Urgent events that may still interrupt come first, so neither a busy
+      // ordinary event nor an urgent one whose single interruption is spent
+      // (now idle-only) can hide them. Earliest-due order is kept within each
+      // group; ordinary and spent events keep the idle-only default.
       const ready = this.store.sweep(this.inFlight);
-      const urgent = (id: string) => this.store.eventSummary(id)?.reminder.interrupt === true;
-      ready.sort((a, b) => Number(urgent(b.id)) - Number(urgent(a.id)));
+      const rank = (id: string) => {
+        const summary = this.store.eventSummary(id);
+        return summary?.reminder.interrupt === true && !summary.event.interrupt ? 0 : 1;
+      };
+      const ranks = new Map(ready.map(event => [event.id, rank(event.id)]));
+      ready.sort((a, b) => ranks.get(a.id)! - ranks.get(b.id)!);
       for (const event of ready) {
         if (this.stopping) return;
         const outcome = await this.admit(event);

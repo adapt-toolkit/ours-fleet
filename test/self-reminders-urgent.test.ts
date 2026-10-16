@@ -189,6 +189,12 @@ describe.each(harnesses)('urgent self-reminders over %s', (_label, start) => {
       .toBeLessThan(turns.findIndex(item => item.some(text => text.startsWith('[fleet-reminder]'))));
 
     const eventId = /event_id: (\S+)/.exec(turn![0]!)![1]!;
+    // The persisted target is the exact interrupted prompt of this session generation.
+    const persisted = JSON.parse(readFileSync(s.store.path, 'utf8')).events[eventId].interrupt.target;
+    expect(persisted).toMatchObject({
+      source: 'fleet-monitor', promptId: work.promptId,
+      generation: s.harness.session.conversationSnapshot!().sessionGeneration,
+    });
     const inspected = (await s.call('fleet_reminder_inspect', { event_id: eventId })).value;
     expect(inspected).toMatchObject({
       eligible: true, reminder: { interrupt: true },
@@ -287,6 +293,37 @@ describe.each(harnesses)('urgent self-reminders over %s', (_label, start) => {
     expect(s.store.list({ state: 'all' }).reminders[0]).toMatchObject({ state: 'cancelled' });
   });
 
+  it('a spent urgent event left undispatched by a restart never hides a fresh urgent one', async () => {
+    const s = await supervisor(start);
+    const spent = await s.create('spent', { interrupt: true });
+    const fresh = await s.create('fresh', { interrupt: true, local_time: '2027-01-20T13:00:30' });
+    // The older urgent event asked to interrupt, then the supervisor restarted
+    // before the outcome: it is pending, idle-only, with outcome unknown.
+    s.clock.now = Date.parse(spent.due_at);
+    const [old] = s.store.sweep();
+    s.store.markAdmitting(old!.id);
+    s.store.markInterruptRequested(old!.id, { source: 'fleet-monitor', promptId: 'gone', generation: 'old' });
+    const restarted = s.restart();
+    expect(restarted.store.inspect(old!.id).event).toMatchObject({ state: 'pending', interrupt: { state: 'unknown' } });
+    restarted.manager.start();
+    const work = await s.busy('interruptible');
+    s.clock.now = Date.parse(fresh.due_at) + 1_000;
+    await restarted.manager.poll();
+    // The fresh one interrupts the busy mail work and is delivered first.
+    expect(await work.completion).toMatchObject({ outcome: 'cancelled', cancellationSource: 'self-reminder' });
+    await until(() => s.reminderTurns().length >= 1, 'fresh urgent wake');
+    expect(s.reminderTurns()[0]![0]).toContain('title: "fresh"');
+    expect(s.eventOf(fresh.id)).toMatchObject({ interrupt_state: 'cancelled' });
+    // The spent one never asked again; it follows idle-only.
+    await until(() => s.harness.session.snapshot().readiness === 'idle', 'idle');
+    await restarted.manager.poll();
+    await until(() => s.reminderTurns().length === 2, 'spent wake, idle-only');
+    expect(s.reminderTurns()[1]![0]).toContain('title: "spent"');
+    expect(s.reminderTurns()[1]![0]).toContain('outcome is unknown (unknown)');
+    expect(s.harness.session.conversationPage!({ limit: 500 }).events
+      .filter(item => item.kind === 'prompt.interrupt_requested')).toHaveLength(1);
+  });
+
   it('keeps a RUNNING reminder turn intact against a second urgent reminder and an interrupting mail-wake retry', async () => {
     const s = await supervisor(start);
     s.manager.start();
@@ -372,14 +409,23 @@ describe('urgent self-reminder state', () => {
     const { reminder } = store.create('k', { title: 't', local_time: '2027-01-20T13:00', time_zone: 'UTC', interrupt: true });
     clock.now = Date.parse(reminder.due_at);
     const [event] = store.sweep();
-    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor' })).toBe(false);   // not claimed yet
+    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor', promptId: 'p-1', generation: 'g-1' })).toBe(false);   // not claimed yet
     expect(store.markAdmitting(event!.id)).toBe(true);
-    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor', sessionId: 's1' })).toBe(true);
-    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor' })).toBe(false);
+    // A target that does not name the exact turn is refused.
+    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor', promptId: '', generation: 'g-1' })).toBe(false);
+    expect(store.markInterruptRequested(event!.id,
+      { source: 'fleet-monitor', promptId: 'p-active', generation: 'gen-7', sessionId: 's1' })).toBe(true);
+    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor', promptId: 'p-1', generation: 'g-1' })).toBe(false);
     // Supervisor dies before the outcome is known.
     const restarted = new ReminderStore(dir, OWNER, () => clock.now);
     const view = restarted.inspect(event!.id).event;
-    expect(view).toMatchObject({ state: 'pending', interrupt: { state: 'unknown', reason: 'restarted_before_outcome' } });
+    expect(view).toMatchObject({ state: 'pending', interrupt: {
+      state: 'unknown', reason: 'restarted_before_outcome',
+      target: { source: 'fleet-monitor', prompt_id: 'p-active', generation: 'gen-7', session_id: 's1' },
+    } });
+    // The exact target is on disk, not only in memory.
+    const onDisk = JSON.parse(readFileSync(restarted.path, 'utf8')).events[event!.id].interrupt.target;
+    expect(onDisk).toEqual({ source: 'fleet-monitor', promptId: 'p-active', generation: 'gen-7', sessionId: 's1' });
     restarted.markAdmitting(event!.id);
     expect(restarted.mayInterrupt(event!.id)).toBe(false);
   });
@@ -397,11 +443,34 @@ describe('urgent self-reminder state', () => {
     const [event] = store.sweep();
     store.markAdmitting(event!.id);
     io.fail = true;
-    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor' })).toBe(false);
+    expect(store.markInterruptRequested(event!.id, { source: 'fleet-monitor', promptId: 'p-1', generation: 'g-1' })).toBe(false);
     expect(store.mayInterrupt(event!.id)).toBe(true);           // a failed mark does not consume it
     expect(store.claimDispatch(event!.id, false)).toEqual({ dispatch: false, reason: 'dispatch_commit_failed' });
     io.fail = false;
     expect(store.inspect(event!.id).event.state).toBe('admitting');
+  });
+
+  it('considers a fresh urgent reminder before an older urgent one whose interruption is spent', async () => {
+    const dir = fresh();
+    const clock = { now: T0 };
+    const store = new ReminderStore(dir, OWNER, () => clock.now);
+    store.create('spent', { title: 'spent', local_time: '2027-01-20T12:30', time_zone: 'UTC', interrupt: true });
+    clock.now = Date.parse('2027-01-20T12:31:00Z');
+    const [old] = store.sweep();
+    store.markAdmitting(old!.id);
+    store.markInterruptRequested(old!.id, { source: 'fleet-monitor', promptId: 'p', generation: 'g' });
+    store.recordInterruptOutcome(old!.id, 'failed', 'control_error');
+    store.releaseUndispatched(old!.id, clock.now);
+    store.create('fresh', { title: 'fresh', local_time: '2027-01-20T12:45', time_zone: 'UTC', interrupt: true });
+    clock.now = Date.parse('2027-01-20T13:00:00Z');
+    const seen: string[] = [];
+    const manager = new ReminderManager('Dev', store, {
+      async tryReminder() { throw new Error('urgent reminders use the urgent path'); },
+      async tryUrgentReminder(_origin, hooks) { seen.push(/title: "(\w+)"/.exec(hooks.text())![1]!); return { state: 'busy' }; },
+    }, { now: () => clock.now, log: () => {}, setTimer: () => ({}), clearTimer: () => {} });
+    manager.start();
+    await manager.poll();
+    expect(seen).toEqual(['fresh']);
   });
 
   it('considers a due urgent reminder before an older ordinary one held by a busy role', async () => {

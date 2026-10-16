@@ -159,8 +159,11 @@ What happens, as separate recorded facts:
 
 1. **Due.** The reminder reaches its time (nothing happens before it).
 2. **Interruption requested.** Only if the busy turn is interruptible (below).
-   The request, and which turn it targets, is durably recorded *before* the
-   session is asked to stop. Each reminder revision may request this **once**.
+   The request and its exact target (the turn's source, prompt id and session
+   generation; `inspect` shows them as `interrupt.target`) are durably recorded
+   *before* the session is asked to stop. Each reminder revision may request
+   this **once**. Urgent reminders that may still interrupt are considered
+   before ordinary ones and before urgent ones whose interruption is spent.
 3. **Terminal.** How the stop ended, shown by `inspect` as `interrupt.state`:
    `cancelled` (the target turn's own result confirms this request cancelled it),
    `ended` (the session reported it settled, but cancellation is not confirmed),

@@ -116,9 +116,15 @@ export interface ReminderRecord {
 export type ReminderInterruptOutcome = 'requested' | 'cancelled' | 'ended' | 'forced' | 'failed' | 'unknown';
 const INTERRUPT_OUTCOMES = new Set<string>(['requested', 'cancelled', 'ended', 'forced', 'failed', 'unknown']);
 
-/** The turn an urgent event asked to stop: typed provenance only, never a body. */
+/**
+ * The exact turn an urgent event asked to stop: typed provenance and the
+ * session's own identifiers for it (prompt id within that session generation),
+ * never a body.
+ */
 export interface ReminderInterruptTarget {
   source: string;
+  promptId: string;
+  generation: string;
   sessionId?: string;
 }
 
@@ -688,12 +694,16 @@ export class ReminderStore {
    */
   markInterruptRequested(eventId: string, target: ReminderInterruptTarget): boolean {
     if (!this.mayInterrupt(eventId) || this.state.events[eventId]!.state !== 'admitting') return false;
+    if (!target.source || !target.promptId || !target.generation) return false;
     const event = this.state.events[eventId]!;
     try {
       this.commit(() => {
         event.interrupt = {
           requestedAt: iso(this.now()), outcome: 'requested',
-          target: { source: target.source, ...(target.sessionId ? { sessionId: target.sessionId } : {}) },
+          target: {
+            source: target.source, promptId: target.promptId, generation: target.generation,
+            ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+          },
         };
         delete event.interruptDeferred;
       });
@@ -809,6 +819,11 @@ export class ReminderStore {
       ...(event.interrupt ? { interrupt: {
         state: event.interrupt.outcome, requested_at: event.interrupt.requestedAt,
         target_source: event.interrupt.target.source,
+        target: {
+          source: event.interrupt.target.source, prompt_id: event.interrupt.target.promptId,
+          generation: event.interrupt.target.generation,
+          ...(event.interrupt.target.sessionId ? { session_id: event.interrupt.target.sessionId } : {}),
+        },
         ...(event.interrupt.settledAt ? { settled_at: event.interrupt.settledAt } : {}),
         ...(event.interrupt.reason ? { reason: event.interrupt.reason } : {}),
       } } : {}),
@@ -849,6 +864,8 @@ function validFile(value: unknown): value is StoreFile {
       && Number.isSafeInteger(item.attempts)
       && (item.interrupt === undefined || (typeof item.interrupt === 'object' && item.interrupt !== null
         && typeof item.interrupt.requestedAt === 'string' && typeof item.interrupt.target?.source === 'string'
+        && typeof item.interrupt.target.promptId === 'string' && typeof item.interrupt.target.generation === 'string'
+        && (item.interrupt.target.sessionId === undefined || typeof item.interrupt.target.sessionId === 'string')
         && INTERRUPT_OUTCOMES.has(item.interrupt.outcome))));
 }
 
