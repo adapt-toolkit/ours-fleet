@@ -7,6 +7,16 @@ import { CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js
 const TRANSPORT_CODES = new Set(['EACCES', 'ENOENT', 'ECONNREFUSED', 'ECONNRESET',
   'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
   'CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID']);
+/** Failure kinds a dependency still starting (or restarting) produces. */
+const RETRYABLE_KINDS = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'timeout']);
+/** Statuses a reverse proxy answers with while its upstream is not serving. */
+const GATEWAY_UNAVAILABLE = new Set([502, 503, 504]);
+/** Media type only, never parameters; anything unusual collapses to a fixed label. */
+function safeContentType(response: Response): string {
+  const value = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+  return /^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,40}$/.test(value) ? value : 'unknown type';
+}
 function safeFailureKind(error: unknown, signal: AbortSignal): string {
   if (signal.aborted) return 'timeout';
   for (const value of [error, error instanceof Error ? error.cause : undefined]) {
@@ -18,6 +28,10 @@ function safeFailureKind(error: unknown, signal: AbortSignal): string {
     if (name === 'AbortError') return 'aborted';
   }
   return 'transport_error';
+}
+
+function safeOperation(method: string): string {
+  return /^[a-z][a-z0-9_.-]{0,79}$/.test(method) ? method : 'management';
 }
 
 /** Same RPC protocol as the local socket; never replay a possibly delivered mutation. */
@@ -58,12 +72,23 @@ export async function coworkHttpCall(profile: ExplicitClientProfile, method: str
         chunks.push(value);
       }
     } finally { await reader.cancel(); }
-    let rpc: Record<string, unknown>;
-    try { rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-    catch { throw new CoworkProtocolError(method, 'server returned malformed JSON'); }
-    if (!rpc || Array.isArray(rpc) || rpc.version !== 1 || rpc.id !== id
-        || Object.hasOwn(rpc, 'result') === Object.hasOwn(rpc, 'error'))
-      throw new CoworkProtocolError(method, 'server returned an invalid RPC response');
+    // Status and media type, never the body: a proxy page may echo request data.
+    const shape = `HTTP ${response.status}, ${safeContentType(response)}`;
+    let rpc: Record<string, unknown> | undefined;
+    let malformed = false;
+    try { rpc = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { malformed = true; }
+    if (malformed || !rpc || Array.isArray(rpc) || rpc.version !== 1 || rpc.id !== id
+        || Object.hasOwn(rpc, 'result') === Object.hasOwn(rpc, 'error')) {
+      // A gateway whose Cowork upstream is still starting answers with its own
+      // error page. That is unavailability, not a Cowork protocol violation; a
+      // well-formed RPC error under the same status keeps its meaning below.
+      if (GATEWAY_UNAVAILABLE.has(response.status))
+        throw new CoworkUnavailableError(
+          `Cowork HTTP ${safeOperation(method)} failed: gateway answered ${shape} without an RPC response`,
+          { retryable: true });
+      throw new CoworkProtocolError(method,
+        `server returned ${malformed ? 'malformed JSON' : 'an invalid RPC response'} (${shape})`);
+    }
     if (Object.hasOwn(rpc, 'error')) {
       const error = rpc.error as { code?: unknown; message?: unknown } | null;
       if (!error || typeof error.code !== 'string' || typeof error.message !== 'string')
@@ -73,10 +98,11 @@ export async function coworkHttpCall(profile: ExplicitClientProfile, method: str
     if (!response.ok) throw new CoworkProtocolError(method, `management answered HTTP ${response.status}`);
     return rpc.result;
   } catch (error) {
-    if (error instanceof CoworkProtocolError) throw error;
+    if (error instanceof CoworkProtocolError || error instanceof CoworkUnavailableError) throw error;
     // Durable cleanup records retain only .message. Keep the RPC step and a
     // bounded allowlisted category there, never raw URLs, credentials or cause text.
-    const operation = /^[a-z][a-z0-9_.-]{0,79}$/.test(method) ? method : 'management';
-    throw new CoworkUnavailableError(`Cowork HTTP ${operation} failed during ${stage} (${safeFailureKind(error, signal)})`, { cause: error });
+    const kind = safeFailureKind(error, signal);
+    throw new CoworkUnavailableError(`Cowork HTTP ${safeOperation(method)} failed during ${stage} (${kind})`,
+      { cause: error, retryable: stage !== 'credential read' && RETRYABLE_KINDS.has(kind) });
   }
 }
