@@ -28,6 +28,15 @@ import { ReminderScheduleError, resolveSchedule } from './schedule.js';
  * are not retained, so session recovery cannot replay them) and is retried
  * under the same event id. An event found `dispatched` may or may not have been
  * seen, so it is held as `uncertain` and never automatically re-admitted.
+ *
+ * Urgency is an explicit opt-in per reminder (`interrupt`). Absent means false,
+ * so stores written before it existed keep their exact idle-only meaning, and
+ * an older runtime that ignores the field stays idle-only. An urgent event may
+ * request at most ONE interruption of the agent's current turn per revision:
+ * the request is durably recorded before the session is asked to cancel, so a
+ * crash, a forced adapter restart or a second urgent reminder can never turn
+ * it into a cancellation loop. Every later admission of that event is
+ * idle-only, and only the release guard ever records `dispatched`.
  */
 
 export const SELF_REMINDERS_FILE = '.self-reminders.json';
@@ -87,6 +96,38 @@ export interface ReminderRecord {
   createdAt: string;
   updatedAt: string;
   closedReason?: string;
+  /** Present (true) only for an urgent reminder; absent is the idle-only default. */
+  interrupt?: true;
+}
+
+/**
+ * What became of an urgent event's single interruption request. `requested` is
+ * the durable mark written before the session is asked to cancel; it is never
+ * evidence that anything was cancelled or delivered.
+ *
+ * - `cancelled`: the target turn's own terminal result says it was cancelled
+ *   by this request (correlated, not inferred).
+ * - `ended`: the session reported the cancellation settled, but the target's
+ *   terminal could not be correlated, or it ended some other way.
+ * - `forced`: the adapter ignored the cancel and was restarted.
+ * - `failed`: the control call failed; it may or may not have reached the adapter.
+ * - `unknown`: the supervisor restarted before the outcome was recorded.
+ */
+export type ReminderInterruptOutcome = 'requested' | 'cancelled' | 'ended' | 'forced' | 'failed' | 'unknown';
+const INTERRUPT_OUTCOMES = new Set<string>(['requested', 'cancelled', 'ended', 'forced', 'failed', 'unknown']);
+
+/** The turn an urgent event asked to stop: typed provenance only, never a body. */
+export interface ReminderInterruptTarget {
+  source: string;
+  sessionId?: string;
+}
+
+export interface ReminderEventInterrupt {
+  requestedAt: string;
+  target: ReminderInterruptTarget;
+  outcome: ReminderInterruptOutcome;
+  settledAt?: string;
+  reason?: string;
 }
 
 export interface ReminderEvent {
@@ -102,6 +143,10 @@ export interface ReminderEvent {
   dispatchedAt?: string;
   closedAt?: string;
   reason?: string;
+  /** The one interruption an urgent event may have requested. */
+  interrupt?: ReminderEventInterrupt;
+  /** Why an urgent event last found the busy turn not interruptible (diagnostic). */
+  interruptDeferred?: string;
 }
 
 interface StoreFile {
@@ -167,6 +212,13 @@ export interface ScheduleInput {
   time_zone?: unknown;
   fold?: unknown;
   late_window_seconds?: unknown;
+  interrupt?: unknown;
+}
+
+function urgency(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return false;
+  if (typeof raw !== 'boolean') throw new ReminderError('invalid_request', 'interrupt must be true or false');
+  return raw;
 }
 
 export interface ReminderView {
@@ -182,12 +234,14 @@ export interface ReminderView {
   fold?: 0 | 1;
   due_at: string;
   late_window_seconds: number;
+  /** True only when this reminder may interrupt a busy turn when due. */
+  interrupt: boolean;
   expires_at: string;
   created_at: string;
   updated_at: string;
   closed_reason?: string;
   /** The current revision's wake, if one exists. */
-  event?: { id: string; state: ReminderEventState; revision: number };
+  event?: { id: string; state: ReminderEventState; revision: number; interrupt_state?: ReminderInterruptOutcome };
 }
 
 export class ReminderStore {
@@ -237,6 +291,10 @@ export class ReminderStore {
   private recover(): void {
     const at = iso(this.now());
     for (const event of Object.values(this.state.events)) {
+      // An interruption requested by the previous process has an unknown end.
+      // Keep the mark (so it is never requested again) and say so.
+      if (event.interrupt?.outcome === 'requested')
+        event.interrupt = { ...event.interrupt, outcome: 'unknown', settledAt: at, reason: 'restarted_before_outcome' };
       if (event.state === 'admitting') {
         // The release guard never ran, so the model never saw it.
         event.state = 'pending';
@@ -289,6 +347,8 @@ export class ReminderStore {
     const retime = !previous || input.local_time !== undefined || input.time_zone !== undefined || input.fold !== undefined;
     const late = input.late_window_seconds === undefined && previous
       ? previous.lateWindowSeconds : lateWindow(input.late_window_seconds);
+    const interrupt = input.interrupt === undefined && previous
+      ? previous.interrupt === true : urgency(input.interrupt);
     let when: { localTime: string; timeZone: string; fold?: 0 | 1; dueAt: number };
     if (retime) {
       try {
@@ -305,7 +365,7 @@ export class ReminderStore {
     } else {
       when = { localTime: previous.localTime, timeZone: previous.timeZone, fold: previous.fold, dueAt: Date.parse(previous.dueAt) };
     }
-    return { title, note, ...when, late };
+    return { title, note, ...when, late, interrupt };
   }
 
   private openCount(): number {
@@ -318,6 +378,9 @@ export class ReminderStore {
       title: input.title ?? null, note: input.note ?? null, local_time: input.local_time ?? null,
       time_zone: input.time_zone ?? null, fold: input.fold ?? null,
       late_window_seconds: input.late_window_seconds ?? null,
+      // Only an explicit urgent request changes the digest, so a retry of a
+      // call made before `interrupt` existed (or with it false) still matches.
+      ...(input.interrupt === true ? { interrupt: true } : {}),
     });
     const existing = Object.values(this.state.reminders).find(item => item.requestKey === key);
     if (existing) {
@@ -336,6 +399,7 @@ export class ReminderStore {
         ...(values.fold === undefined ? {} : { fold: values.fold }),
         dueAt: iso(values.dueAt), lateWindowSeconds: values.late,
         expiresAt: iso(values.dueAt + values.late * 1000), createdAt: at, updatedAt: at,
+        ...(values.interrupt ? { interrupt: true as const } : {}),
       };
       state.reminders[record.id] = record;
       this.prune(state);
@@ -364,6 +428,7 @@ export class ReminderStore {
         expiresAt: iso(values.dueAt + values.late * 1000), updatedAt: at,
       });
       if (values.fold === undefined) delete target.fold; else target.fold = values.fold;
+      if (values.interrupt) target.interrupt = true; else delete target.interrupt;
       delete target.closedReason;
       return this.view(target);
     });
@@ -604,6 +669,71 @@ export class ReminderStore {
   }
 
   /**
+   * Whether this undispatched event may still ask to interrupt a busy turn: its
+   * reminder is urgent and current, and no interruption was ever requested
+   * for it (in this process or before a restart).
+   */
+  mayInterrupt(eventId: string): boolean {
+    const event = this.state.events[eventId];
+    const record = event && this.state.reminders[event.reminderId];
+    return Boolean(event && record && record.interrupt === true && !event.interrupt
+      && (event.state === 'pending' || event.state === 'admitting')
+      && record.state === 'active' && record.revision === event.revision);
+  }
+
+  /**
+   * Durable mark made BEFORE the session is asked to cancel. False: do not
+   * interrupt. Once written it is never cleared, which is what bounds every
+   * urgent event to one interruption.
+   */
+  markInterruptRequested(eventId: string, target: ReminderInterruptTarget): boolean {
+    if (!this.mayInterrupt(eventId) || this.state.events[eventId]!.state !== 'admitting') return false;
+    const event = this.state.events[eventId]!;
+    try {
+      this.commit(() => {
+        event.interrupt = {
+          requestedAt: iso(this.now()), outcome: 'requested',
+          target: { source: target.source, ...(target.sessionId ? { sessionId: target.sessionId } : {}) },
+        };
+        delete event.interruptDeferred;
+      });
+    } catch { return false; }
+    return true;
+  }
+
+  /**
+   * Record why an urgent event did not interrupt this time. Written only when
+   * the reason changes, so a long busy stretch costs one write, not one per poll.
+   */
+  recordInterruptDeferred(eventId: string, reason: string): void {
+    const event = this.state.events[eventId];
+    if (!event || event.interrupt || event.interruptDeferred === reason) return;
+    try { this.commit(() => { event.interruptDeferred = reason; }); }
+    catch { /* diagnostic only */ }
+  }
+
+  /** How the requested interruption ended. Diagnostic; never moves the event. */
+  recordInterruptOutcome(eventId: string, outcome: Exclude<ReminderInterruptOutcome, 'requested'>, reason?: string): void {
+    const event = this.state.events[eventId];
+    if (!event?.interrupt || event.interrupt.outcome !== 'requested') return;
+    try {
+      this.commit(() => {
+        event.interrupt = {
+          ...event.interrupt!, outcome, settledAt: iso(this.now()), ...(reason ? { reason } : {}),
+        };
+      });
+    } catch { /* stays `requested`: still never re-requested, still not delivered */ }
+  }
+
+  /** Still the current, undispatched claim this process made? Re-checked after every await. */
+  stillAdmitting(eventId: string): boolean {
+    const event = this.state.events[eventId];
+    const record = event && this.state.reminders[event.reminderId];
+    return Boolean(event && record && event.state === 'admitting' && record.state === 'active'
+      && record.revision === event.revision);
+  }
+
+  /**
    * An admission that ended without the release guard dispatching it (queue
    * refused, session died, release refused while stopping) goes back to
    * pending. Anything already past `admitting` is left exactly as it is.
@@ -657,10 +787,14 @@ export class ReminderStore {
       title: record.title, note: record.note,
       local_time: record.localTime, time_zone: record.timeZone,
       ...(record.fold === undefined ? {} : { fold: record.fold }),
-      due_at: record.dueAt, late_window_seconds: record.lateWindowSeconds, expires_at: record.expiresAt,
+      due_at: record.dueAt, late_window_seconds: record.lateWindowSeconds, interrupt: record.interrupt === true,
+      expires_at: record.expiresAt,
       created_at: record.createdAt, updated_at: record.updatedAt,
       ...(record.closedReason ? { closed_reason: record.closedReason } : {}),
-      ...(event ? { event: { id: event.id, state: event.state, revision: event.revision } } : {}),
+      ...(event ? { event: {
+        id: event.id, state: event.state, revision: event.revision,
+        ...(event.interrupt ? { interrupt_state: event.interrupt.outcome } : {}),
+      } } : {}),
     };
   }
 
@@ -671,6 +805,13 @@ export class ReminderStore {
       ...(event.dispatchedAt ? { dispatched_at: event.dispatchedAt } : {}),
       ...(event.closedAt ? { closed_at: event.closedAt } : {}),
       ...(event.reason ? { reason: event.reason } : {}),
+      ...(event.interruptDeferred ? { interrupt_deferred: event.interruptDeferred } : {}),
+      ...(event.interrupt ? { interrupt: {
+        state: event.interrupt.outcome, requested_at: event.interrupt.requestedAt,
+        target_source: event.interrupt.target.source,
+        ...(event.interrupt.settledAt ? { settled_at: event.interrupt.settledAt } : {}),
+        ...(event.interrupt.reason ? { reason: event.interrupt.reason } : {}),
+      } } : {}),
     };
   }
 }
@@ -701,10 +842,14 @@ function validFile(value: unknown): value is StoreFile {
   return Object.entries(file.reminders).every(([id, item]) => item && item.id === id
       && Number.isSafeInteger(item.revision) && item.revision >= 1 && reminderStates.has(item.state)
       && typeof item.requestKey === 'string' && typeof item.title === 'string' && typeof item.note === 'string'
-      && Number.isFinite(Date.parse(item.dueAt)) && Number.isFinite(Date.parse(item.expiresAt)))
+      && Number.isFinite(Date.parse(item.dueAt)) && Number.isFinite(Date.parse(item.expiresAt))
+      && (item.interrupt === undefined || item.interrupt === true))
     && Object.entries(file.events).every(([id, item]) => item && item.id === id
       && typeof item.reminderId === 'string' && Number.isSafeInteger(item.revision) && eventStates.has(item.state)
-      && Number.isSafeInteger(item.attempts));
+      && Number.isSafeInteger(item.attempts)
+      && (item.interrupt === undefined || (typeof item.interrupt === 'object' && item.interrupt !== null
+        && typeof item.interrupt.requestedAt === 'string' && typeof item.interrupt.target?.source === 'string'
+        && INTERRUPT_OUTCOMES.has(item.interrupt.outcome))));
 }
 
 /** Remove a retired agent's reminder store and any quarantined copies. */

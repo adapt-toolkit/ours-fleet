@@ -19,6 +19,7 @@ is nothing to install or enable.
   at 16:00", "follow up on the review on Monday morning".
 - Replace polling or sleeping inside a turn. A reminder costs nothing while it
   waits; a turn that sleeps or a loop that polls costs model time every tick.
+- Wait for a peer without forgetting the task: see [Waiting on a peer](#waiting-on-a-peer).
 - Not for recurring maintenance: use configured `loops` for that.
 
 ## Tools
@@ -29,11 +30,11 @@ reminders, and an id that belongs to another agent is simply not found.
 
 | Tool | Arguments | Result |
 | --- | --- | --- |
-| `fleet_reminder_create` | `request_key`, `title`, `note`?, `local_time`, `time_zone`, `fold`?, `late_window_seconds`? | the reminder (`id`, `revision`, `due_at`, `expires_at`, …) and `created` |
+| `fleet_reminder_create` | `request_key`, `title`, `note`?, `local_time`, `time_zone`, `fold`?, `late_window_seconds`?, `interrupt`? | the reminder (`id`, `revision`, `due_at`, `expires_at`, `interrupt`, …) and `created` |
 | `fleet_reminder_list` | `state`? (`open` default, `closed`, `all`), `limit`? (1–100), `after`? | a page of reminders, `more`, `after`, `uncertain_events` |
 | `fleet_reminder_update` | `id`, `expected_revision`, any of the schedule fields | the reminder at its new revision |
 | `fleet_reminder_cancel` | `id`, `expected_revision` | the cancelled reminder |
-| `fleet_reminder_inspect` | `event_id` | the event, its reminder (with `note`), `current`, `eligible` |
+| `fleet_reminder_inspect` | `event_id` | the event (with `interrupt` / `interrupt_deferred` for an urgent one), its reminder (with `note`), `current`, `eligible` |
 | `fleet_reminder_ack` | `event_id`, `expected_revision` | `acknowledged` (repeat calls return `duplicate: true`) |
 
 ### Time
@@ -58,6 +59,10 @@ Daylight-saving changes are explicit:
 arrive if the agent, Fleet or the host was down, paused or busy at the due time.
 After the window the reminder expires without a turn.
 
+`interrupt` (default `false`) marks a reminder as urgent; see
+[Urgent reminders](#urgent-reminders-interrupt-true). Leave it out for ordinary
+reminders.
+
 ### Idempotency and revisions
 
 `request_key` identifies one scheduling decision. Repeating `create` with the same
@@ -65,6 +70,11 @@ key and the same input returns the existing reminder, so a retried call after a
 timeout never creates a second one; the same key with different input is refused
 (`request_key_conflict`). Keys are remembered while the reminder is retained (the
 200 most recent closed reminders are kept; at most 100 can be open).
+
+An urgent request differs from an ordinary one: repeating a call made without
+`interrupt` (or with `interrupt: false`) matches the original, while the same key
+with `interrupt: true` is a `request_key_conflict`. `update` can turn urgency on or
+off; it keeps its current value when not given.
 
 Every `update` and `cancel` names the revision it expects (`stale_revision`
 otherwise) and bumps it. A wake issued for an older revision is void: if it is
@@ -109,11 +119,12 @@ current wake becomes void and a new one is issued at the new time.
   directory). With no open reminders it arms no timer; otherwise it checks at the
   next due time and at least once a minute. Only a due reminder creates a model
   turn.
-- **When it arrives.** At the first idle turn boundary after the due time, and
-  only after the agent's startup turn has succeeded. A wake never interrupts the
-  agent and never waits in a queue behind other work; a busy agent receives it
-  when its current work finishes. A reminder wake always runs as its own turn and
-  is never combined with owner or mail input.
+- **When it arrives.** By default, at the first idle turn boundary after the
+  due time, and only after the agent's startup turn has succeeded. An ordinary
+  wake never interrupts the agent and never waits in a queue behind other work;
+  a busy agent receives it when its current work finishes. An urgent reminder may
+  instead stop interruptible busy work once (next section). A reminder wake always
+  runs as its own turn and is never combined with owner or mail input.
 - **Offline.** Nothing runs while the host is off or asleep, or while Fleet or the
   agent is stopped. Reminders are kept, and those still inside their late window
   are delivered when the agent is back; the rest expire without a turn. Pause and
@@ -135,6 +146,90 @@ current wake becomes void and a new one is issued at the new time.
 - **Privacy.** Titles and notes are visible only through the agent's own tools.
   The wake text contains the title, not the note, and the conversation ledger
   stores only a digest of the wake. Logs carry event ids, never reminder text.
+
+## Urgent reminders (`interrupt: true`)
+
+An ordinary reminder waits for the agent to be idle, so a long busy turn delays
+it. For a return that is genuinely bound to a time — a deadline, a meeting, a
+window that closes — the agent can create the reminder with `interrupt: true`.
+When it is due and the agent is busy, the supervisor may ask the current turn to
+stop and then start the wake in the same session, instead of waiting.
+
+What happens, as separate recorded facts:
+
+1. **Due.** The reminder reaches its time (nothing happens before it).
+2. **Interruption requested.** Only if the busy turn is interruptible (below).
+   The request, and which turn it targets, is durably recorded *before* the
+   session is asked to stop. Each reminder revision may request this **once**.
+3. **Terminal.** How the stop ended, shown by `inspect` as `interrupt.state`:
+   `cancelled` (the target turn's own result confirms this request cancelled it),
+   `ended` (the session reported it settled, but cancellation is not confirmed),
+   `forced` (the adapter ignored the stop and was restarted), `failed` (the
+   control call failed) or `unknown` (Fleet restarted before the outcome).
+4. **Released.** The wake is handed to the model through the same release fence
+   as every reminder. After `forced` or `failed` it is not queued; it is
+   delivered later, idle-only, within its late window.
+5. **Acknowledged**, and any **external action** the agent then takes, are the
+   agent's own and remain separate facts.
+
+The session and its context are kept: nothing is reset, no second agent and no
+parallel model turn is started. The wake tells the agent what it interrupted so
+it can re-check and resume that work. It sends nothing to anyone and grants no
+authority.
+
+An urgent reminder **never** stops, and instead waits like an ordinary one:
+
+- an owner-channel request or an owner admin-console turn (owner commands keep
+  priority, and cancelling one would end the owner's request and its reply);
+- the startup turn, a stall-recovery turn, or another reminder's wake;
+- a turn with a pending permission decision;
+- work queued behind the current turn, or another admission waiting for the role;
+- a turn Fleet cannot identify exactly (for example one started by adapter-side
+  steering, which reports the role idle).
+
+Interruptible turns are mail wakes, scheduled loops and local-console prompts.
+When the reminder defers, `inspect` shows why in `event.interrupt_deferred`, and it
+interrupts at a later boundary if one becomes interruptible. A mail wake that was
+stopped is retried by the monitor and queued behind the reminder; it cannot stop
+the reminder in turn.
+
+Limits:
+
+- Not a hard real-time alarm: the dispatcher checks at least once a minute, and
+  stopping a turn and starting a model turn both take time.
+- Nothing happens while the host is off or asleep, or Fleet or the agent is down.
+- One interruption per revision: after it (whatever its outcome) the wake is
+  idle-only. A failed or forced stop means the urgency was lost for that event,
+  and `inspect` says so; it never reports a successful interruption.
+- Use it sparingly. Ordinary coordination waits stay `interrupt: false`.
+
+## Waiting on a peer
+
+In paired work (Developer and Critic, Engineer and Critic) an agent that stops to
+wait for a review, answer, artifact or check schedules **one** idle-only reminder
+about 20 minutes out (or at the agreed time), naming the task or room and the
+exact expectation:
+
+```json
+fleet_reminder_create {
+  "request_key": "pr-412-wait-critic-final-1",
+  "title": "PR 412: Critic FINAL on head 1a2b3c",
+  "note": "Task room for PR 412: waiting for the Critic's FINAL on head 1a2b3c. If it arrived, just ack.",
+  "local_time": "2027-01-20T16:20",
+  "time_zone": "UTC"
+}
+```
+
+- The answer arrives, the state changes or the work is finished: `cancel` (or
+  `update`) the reminder with its current revision.
+- On the wake: `inspect`, re-check the task. Resolved or closed: `ack`, nothing
+  else. Still waiting: one concise follow-up in the same room, `ack`, and at most
+  one more reminder; if that one finds no progress either, report the
+  nonresponse or blocker once through the configured routes and stop reminding.
+- Never a short polling interval, a recurring chain of reminders, repeated
+  follow-ups or acknowledgements, or a "done" status because a reminder fired.
+- A deleted or finished task removes the agent's reminders, so a closed task
+  produces no wake.
 
 Operators can see an agent's reminders through the existing supervisor tool
 route, which acts as that agent's supervisor:
