@@ -12,7 +12,7 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const scratch = () => { const dir = mkdtempSync(join(tmpdir(), 'rem-store-')); dirs.push(dir); return dir; };
 
-const OWNER: ReminderOwner = { role: 'Dev', instance: 'inst-1', cid: 'A'.repeat(64), action: 'act-1' };
+const OWNER: ReminderOwner = { role: 'Dev', lifetime: 'temporary', instance: 'inst-1', cid: 'A'.repeat(64), action: 'act-1' };
 const T0 = Date.parse('2027-01-20T12:00:00Z');
 
 function harness(dir = scratch(), owner = OWNER) {
@@ -67,7 +67,7 @@ describe('ReminderStore', () => {
   it('never adopts a store written for another instance, identity or role', () => {
     for (const foreign of [
       { ...OWNER, instance: 'inst-2' }, { ...OWNER, cid: 'B'.repeat(64) },
-      { ...OWNER, action: 'act-2' }, { ...OWNER, role: 'Other' },
+      { ...OWNER, action: 'act-2' }, { ...OWNER, role: 'Other' }, { ...OWNER, lifetime: 'permanent' as const },
     ]) {
       const h = harness();
       create(h.store);
@@ -77,6 +77,18 @@ describe('ReminderStore', () => {
       expect(successor.logs.join('\n')).toMatch(/foreign-owner; moved aside/);
       expect(readdirSync(h.dir).some(name => name.startsWith(`${SELF_REMINDERS_FILE}.foreign-owner-`))).toBe(true);
     }
+  });
+
+  it('keeps a permanent agent\'s reminders when its runtime is re-provisioned for the same identity', () => {
+    const permanent: ReminderOwner = { ...OWNER, lifetime: 'permanent' };
+    const h = harness(scratch(), permanent);
+    const { reminder } = create(h.store);
+    // Orderly stop releases the runtime; the next start has a new instance and action.
+    const next = harness(h.dir, { ...permanent, instance: 'inst-2', action: 'act-2' });
+    expect(next.store.list().reminders.map(item => item.id)).toEqual([reminder.id]);
+    expect(next.logs).toEqual([]);
+    // A different identity (replacement) or role is still never adopted.
+    expect(harness(h.dir, { ...permanent, instance: 'inst-3', cid: 'B'.repeat(64) }).store.list().reminders).toEqual([]);
   });
 
   it('sets aside a corrupt or insecure store instead of trusting it', () => {

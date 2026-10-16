@@ -138,7 +138,7 @@ it('serves self-reminder tools on the fixed-identity bridge, scoped to the bound
     expect(JSON.parse(unbound.content[0].text).error).toBe('reminders_unavailable');
     let changed = 0;
     backend = {
-      store: new ReminderStore(root, { role: 'Agent', instance: 'i', cid: 'E'.repeat(64), action: 'a' }, () => Date.parse('2027-01-01T00:00:00Z')),
+      store: new ReminderStore(root, { role: 'Agent', lifetime: 'temporary', instance: 'i', cid: 'E'.repeat(64), action: 'a' }, () => Date.parse('2027-01-01T00:00:00Z')),
       changed: () => { changed++; },
     };
     const created = await client.callTool({ name: 'fleet_reminder_create', arguments: { ...create, local_time: '2027-01-20T16:00' } }) as any;

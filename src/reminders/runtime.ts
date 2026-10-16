@@ -6,7 +6,7 @@ export interface RoleReminderBinding {
   role: string;
   stateDir: string;
   /** The managed runtime's own record; nothing here comes from the agent. */
-  runtime: { instance?: string; cid?: string; action?: string };
+  runtime: { instance?: string; cid?: string; action?: string; lifetime?: 'permanent' | 'temporary' };
   /** Whether this session backend accepts supervisor-submitted prompts. */
   promptInput: boolean;
   admitter: ReminderAdmitter;
@@ -23,11 +23,14 @@ export interface RoleReminderBinding {
 export function bindRoleReminders(binding: RoleReminderBinding): ReminderManager | undefined {
   const { role, runtime, deps } = binding;
   if (!binding.promptInput || !binding.service.setReminders) return undefined;
-  if (!runtime.instance || !runtime.action || !/^[A-Fa-f0-9]{64}$/.test(runtime.cid ?? '')) {
+  if (!runtime.instance || !runtime.action || !/^[A-Fa-f0-9]{64}$/.test(runtime.cid ?? '')
+      || (runtime.lifetime !== 'permanent' && runtime.lifetime !== 'temporary')) {
     deps.log(`[${role}] self-reminders unavailable: managed runtime identity is not established`);
     return undefined;
   }
-  const owner: ReminderOwner = { role, instance: runtime.instance, cid: runtime.cid!, action: runtime.action };
+  const owner: ReminderOwner = {
+    role, lifetime: runtime.lifetime, instance: runtime.instance, cid: runtime.cid!, action: runtime.action,
+  };
   let store: ReminderStore;
   try { store = new ReminderStore(binding.stateDir, owner, deps.now, deps.log); }
   catch (error) {

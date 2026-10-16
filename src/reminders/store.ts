@@ -46,9 +46,24 @@ export type ReminderEventState =
   | 'pending' | 'admitting' | 'dispatched' | 'uncertain'
   | 'acknowledged' | 'invalidated' | 'expired';
 
+/**
+ * Who a store belongs to. The fields that must match depend on lifetime,
+ * because that is what each lifetime keeps stable across its ordinary
+ * stop/start:
+ *
+ * - `permanent`: an orderly stop releases the managed runtime, and the next
+ *   start provisions a new runtime instance and action for the SAME identity
+ *   and state directory. Ownership is the role plus its identity CID. A
+ *   removed agent's state directory is deleted, so a later same-named agent
+ *   starts without this store; a replaced identity has a different CID.
+ * - `temporary` (including task members): suspend/resume keeps the runtime
+ *   instance and action, and retirement archives the directory with this store
+ *   removed. Ownership is role, CID, instance and action.
+ */
 export interface ReminderOwner {
   role: string;
-  /** Logical managed-runtime instance; survives reconnects, changes on replacement. */
+  lifetime: 'permanent' | 'temporary';
+  /** Logical managed-runtime instance. */
   instance: string;
   cid: string;
   /** Creation action of that runtime instance. */
@@ -180,9 +195,9 @@ export class ReminderStore {
   private state: StoreFile;
 
   /**
-   * Load or create the store for exactly this owner. A store written for a
-   * different runtime instance or identity is never adopted: it is moved aside
-   * and nothing in it is delivered, so a same-named successor or a replaced
+   * Load or create the store for exactly this owner (see `ReminderOwner`). A
+   * store written for anyone else is never adopted: it is moved aside and
+   * nothing in it is delivered, so a same-named successor or a replaced
    * identity cannot inherit a predecessor's wakes.
    */
   constructor(
@@ -199,7 +214,12 @@ export class ReminderStore {
         const parsed = JSON.parse(readFileSync(this.path, 'utf8')) as StoreFile;
         if (!validFile(parsed)) reason = 'corrupt';
         else if (!sameOwner(parsed.owner, owner)) reason = 'foreign-owner';
-        else restored = parsed;
+        else {
+          // A permanent agent's runtime is re-provisioned on every orderly
+          // start; record the current one, keep the reminders.
+          parsed.owner = { ...owner };
+          restored = parsed;
+        }
       } catch { reason = 'corrupt'; }
       if (!restored) {
         const aside = `${this.path}.${reason}-${now()}`;
@@ -656,8 +676,8 @@ export class ReminderStore {
 }
 
 function sameOwner(a: ReminderOwner, b: ReminderOwner): boolean {
-  return a.role === b.role && a.instance === b.instance && a.action === b.action
-    && a.cid.toUpperCase() === b.cid.toUpperCase();
+  if (a.role !== b.role || a.lifetime !== b.lifetime || a.cid.toUpperCase() !== b.cid.toUpperCase()) return false;
+  return a.lifetime === 'permanent' || (a.instance === b.instance && a.action === b.action);
 }
 
 function privateFile(path: string): boolean {
@@ -673,6 +693,7 @@ function validFile(value: unknown): value is StoreFile {
   const owner = file.owner;
   if (file.version !== 1 || !owner || typeof owner !== 'object'
       || !['role', 'instance', 'cid', 'action'].every(key => typeof (owner as unknown as Record<string, unknown>)[key] === 'string')
+      || (owner.lifetime !== 'permanent' && owner.lifetime !== 'temporary')
       || !file.reminders || typeof file.reminders !== 'object' || !file.events || typeof file.events !== 'object')
     return false;
   const reminderStates = new Set(['active', 'delivered', 'acknowledged', 'cancelled', 'expired']);

@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createServer, request as httpRequest } from 'node:http';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
@@ -27,6 +27,7 @@ import { getTask } from '../dist/rooms-tasks/task-state.js';
 import { retireOwnedLayoutMember, layoutOwnedMemberName, ownedLayoutRetirementSeats } from '../dist/rooms-tasks/layout-member-retirement.js';
 import { eraseMemberArtifacts } from '../dist/rooms-tasks/erasure.js';
 import { managedStartupPrompt, managedTaskPrompt } from '../dist/startup-prompt.js';
+import { SupervisorOursTools } from '../dist/application/supervisor-ours-tools.js';
 const script = fileURLToPath(import.meta.url), cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
 const acp = fileURLToPath(new URL('./fixtures/acp-agent.mjs', import.meta.url));
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -280,6 +281,30 @@ if (process.argv[2] === 'parent') {
     await until(() => taskPrompts().length === 1 && taskCursor().active && taskCursor().initial === 'dispatching', 'initial assignment in flight');
     assert.equal(taskPrompts()[0], managedTaskPrompt(task.dir, 'fresh', false));
     const savedTaskOwner = readFileSync(join(runtimeRoot, binderKey(daemonId, task.name), 'owner.json'));
+    // Self-reminders scheduled through the agents' own fixed-identity tool route
+    // must survive every ordinary parent restart: the permanent runtime is
+    // re-provisioned (new instance) while the task member keeps its instance.
+    const tools = new SupervisorOursTools();
+    const reminderTool = async (agent, tool, args) => {
+      const { result } = await tools.call(agent, { tool, arguments: args });
+      assert.equal(result.isError, false, `${tool} for ${agent}: ${result.content?.[0]?.text}`);
+      return result.structuredContent;
+    };
+    const scheduled = new Map();
+    for (const f of [permanent, task]) {
+      const { reminder } = await reminderTool(f.name, 'fleet_reminder_create', {
+        request_key: 'recovery-' + f.name, title: 'Recovery fixture', local_time: new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 16), time_zone: 'UTC' });
+      scheduled.set(f.name, reminder.id);
+    }
+    const assertRemindersRetained = async when => {
+      for (const f of [permanent, task]) {
+        const listed = await reminderTool(f.name, 'fleet_reminder_list', {});
+        assert.deepEqual(listed.reminders.map(item => [item.id, item.revision, item.state]),
+          [[scheduled.get(f.name), 1, 'active']], `${f.name} reminder retained ${when}`);
+        assert.deepEqual(readdirSync(f.dir).filter(name => name.startsWith('.self-reminders.json.')), [],
+          `${f.name} store never set aside ${when}`);
+      }
+    };
     let priorPermanent = originalPermanent;
     for (const signal of ['SIGTERM', 'SIGKILL']) {
       console.log('recovery: ' + signal); await stopParent(signal);
@@ -294,6 +319,7 @@ if (process.argv[2] === 'parent') {
       assert.deepEqual(readFileSync(join(runtimeRoot, binderKey(daemonId, task.name), 'owner.json')), savedTaskOwner);
       await until(() => taskCursor().initial === 'completed' && !taskCursor().active, 'continuation completed');
       await pause(200); assert.equal(taskPrompts().length, 2);
+      await assertRemindersRetained('after parent ' + signal);
     }
     for (const f of [permanent, task]) {
       assert.equal(observed.get(f.key).size, 3); const wire = lines(f.wire);
@@ -311,6 +337,11 @@ if (process.argv[2] === 'parent') {
     assert(taskPrompts()[1].includes(join(task.dir, 'briefing.md')));
     assert.equal(taskPrompts().filter(text => text === managedTaskPrompt(task.dir, 'fresh', false)).length, 1);
     console.log('delete: parent up with lost release response and retry before artifact erasure'); await deleteTaskMember(task, permanent, true);
+    // Deleting the task removed its member's reminders everywhere; the permanent agent's remain.
+    const reminderFiles = readdirSync(stateRoot(), { recursive: true }).map(String)
+      .filter(path => path.split('/').pop().includes('self-reminders.json'));
+    assert.deepEqual(reminderFiles.map(path => join(stateRoot(), path)), [join(permanent.dir, '.self-reminders.json')]);
+    assert.equal((await reminderTool(permanent.name, 'fleet_reminder_list', {})).reminders.length, 1);
     const fresh = await addTask('TaskFirstSession', 'fresh'); const firstFresh = await ready(fresh);
     await until(() => json(join(fresh.dir, '.managed-recovery.json')).initial === 'completed', 'first-session assignment completed');
     const freshWire = lines(fresh.wire); assert.equal(freshWire.filter(row => row.method === 'session/new').length, 1);

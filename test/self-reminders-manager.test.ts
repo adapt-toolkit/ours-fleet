@@ -8,7 +8,7 @@ import { ReminderManager, type ReminderAdmitter } from '../src/reminders/manager
 import { ReminderStore, type ReminderOwner } from '../src/reminders/store.js';
 import { turnResult } from '../src/session/types.js';
 
-const OWNER: ReminderOwner = { role: 'Dev', instance: 'i', cid: 'F'.repeat(64), action: 'a' };
+const OWNER: ReminderOwner = { role: 'Dev', lifetime: 'temporary', instance: 'i', cid: 'F'.repeat(64), action: 'a' };
 const T0 = Date.parse('2027-01-20T12:00:00Z');
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
