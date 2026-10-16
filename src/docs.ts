@@ -901,13 +901,13 @@ agent, identity or recipient argument and no setup, worker, service, chat or key
   \`title\`, optional \`note\`, \`local_time\` (date and time WITHOUT an offset, e.g.
   \`2027-01-20T16:00\`), \`time_zone\` (IANA, e.g. \`Europe/London\`, \`UTC\`), optional
   \`fold\` (0/1, required only for a time that occurs twice when clocks go back;
-  times skipped by a spring-forward gap are refused) and \`late_window_seconds\`
-  (60..604800, default 3600).
+  times skipped by a spring-forward gap are refused), \`late_window_seconds\`
+  (60..604800, default 3600) and \`interrupt\` (default false; see below).
 - \`fleet_reminder_list\` — \`state\` \`open\` (default) | \`closed\` | \`all\`, \`limit\`, \`after\`.
 - \`fleet_reminder_update\` / \`fleet_reminder_cancel\` — \`id\` + \`expected_revision\`;
   every change bumps the revision and voids any wake issued for the old one.
-- \`fleet_reminder_inspect\` — \`event_id\` from a wake: the note and whether the
-  wake is still current and eligible.
+- \`fleet_reminder_inspect\` — \`event_id\` from a wake: the note, whether the
+  wake is still current and eligible, and for an urgent one \`interrupt.state\`.
 - \`fleet_reminder_ack\` — \`event_id\` + \`expected_revision\`: records that the
   wake was handled. Idempotent; sends nothing and claims no external action.
 
@@ -919,8 +919,22 @@ under its existing tools and authorization.
 
 Delivery: the supervisor process that runs the agent owns the timer — an idle
 agent with no open reminders costs nothing, and only a due reminder creates a
-model turn. A wake never interrupts or queues behind work: it is admitted at the
-next idle turn boundary after its due time and after the agent's startup turn.
+model turn. By default a wake never interrupts or queues behind work: it is
+admitted at the next idle turn boundary after its due time and after the agent's
+startup turn.
+
+Urgent (\`interrupt: true\`), only for a return genuinely bound to a time: when
+due and the agent is busy with an interruptible turn (mail wake, scheduled loop,
+local console), the supervisor durably records the request, asks that exact turn
+to stop once per revision, keeps the session and context, and releases the wake
+through the same fence. It never stops owner-channel or owner-console work,
+startup, stall recovery, another reminder, a pending permission, queued work or a
+turn it cannot identify; then it waits like an ordinary reminder and \`inspect\`
+shows \`interrupt_deferred\`. Due, interruption requested, its terminal
+(\`cancelled\` only when correlated; else \`ended\`/\`forced\`/\`failed\`/\`unknown\`),
+release, ack and any external action are separate facts. A forced or failed stop
+never queues the wake. It is not a hard real-time alarm and does nothing while
+the host or agent is down.
 If the host, Fleet or the agent is down, paused or busy, a reminder is still
 delivered when it comes back within its late window, and otherwise expires
 without a turn. Reminders survive supervisor, Fleet and host restarts and
@@ -934,6 +948,14 @@ is marked dispatched durably at the moment it is handed to the model; if the
 supervisor stops before that, the same event is retried. If it stops after, the
 event is held \`uncertain\` (shown by \`list\`/\`inspect\`, never re-sent): check your
 own records, then ack it or schedule something new.
+
+Waiting on a peer (Developer/Critic/Engineer): before waiting on a specific
+review, answer or artifact, schedule ONE idle-only reminder about 20 minutes out
+naming the task/room and the expectation; cancel or reschedule it (with its
+revision) when the state changes; on the wake re-check, ack if resolved, else one
+follow-up in the same room and at most one more reminder, then report the
+nonresponse once. No polling, recurring chains, repeated follow-ups or automatic
+done.
 
 Operators can read an agent's reminders with
 \`ours-fleet ours call Name fleet_reminder_list\`. Full guide, examples and the

@@ -24,7 +24,9 @@ export type SessionReadiness =
 
 export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
 export type TurnCancellationSource =
-  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown' | 'stall-watchdog';
+  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown' | 'stall-watchdog'
+  /** An urgent self-reminder of the same agent asked its current turn to stop. */
+  | 'self-reminder';
 export type PromptOrigin =
   | { kind: 'startup' }
   | { kind: 'stall-watchdog' }
