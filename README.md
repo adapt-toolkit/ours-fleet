@@ -299,6 +299,7 @@ ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
+ours-fleet service check|refresh [--json]   service definitions vs this release (refresh never starts or restarts)
 ours-fleet managed-cli setup [--enable <Agent>]... | status [--json]   native harness policy for the task workflow
 ours-fleet version [--json]         build identity, capabilities, installs on PATH
 ours-fleet init
@@ -325,6 +326,28 @@ Qualified end to end on Linux with Codex (native and ACP) and Claude ACP; macOS
 is prepared the same way but not yet qualified. Scope, boundaries, unsupported
 combinations and the evidence are in
 [docs/validation/managed-cli-permissions.md](docs/validation/managed-cli-permissions.md).
+
+### Service definitions after an update
+
+`ours-fleet init`, `web install` and the watchdog installer write user service
+definitions (systemd units on Linux, LaunchAgents on macOS) that start the exact
+release tree they were written from. An update installs a new tree, but a running
+service keeps its code, and an unrefreshed definition starts the previous release
+again after the next reboot while agents and the CLI use the new one.
+
+```sh
+ours-fleet service check     # read-only; exit 1 when a definition or running service uses another release
+ours-fleet service refresh   # re-point existing definitions at this release
+```
+
+`refresh` changes only the release paths in definitions Fleet generated. It keeps
+environment, profile, ports and drop-ins, runs `daemon-reload`, and never creates,
+enables, starts, stops or restarts a service. Definitions that Fleet did not
+generate, or whose `ExecStart` a drop-in overrides, are reported and left alone.
+A running supervisor still uses its old code until you restart it
+(`systemctl --user restart ours-fleet.service`); its agents resume through it.
+`ours-install` runs `refresh` after updating Fleet, and `doctor` shows the same
+rows as `check`.
 
 ### Which build am I running?
 

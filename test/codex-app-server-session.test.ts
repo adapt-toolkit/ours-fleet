@@ -493,6 +493,34 @@ describe('CodexAppServerSession', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('holds a recovered never-started prompt until the caller activates it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-deferred-recovery-'));
+    let server: FakeAppServer | undefined;
+    const transport: CodexAppServerTransportFactory = async options =>
+      (server = new FakeAppServer(options));
+    try {
+      const store = new ConversationEventStore(join(dir, '.conversation'), { roleId: 'NativeCodex' });
+      store.append({
+        kind: 'prompt.admitted', sessionGeneration: 'old-generation',
+        promptId: 'recovered-browser', turnId: 'recovered-browser',
+        commandId: 'durable-command', source: 'browser',
+        payload: { text: { type: 'text', text: 'run managed cli', bytes: 15 }, queuedBehind: 0 },
+      });
+      store.close();
+      const session = await start(dir, 'fresh', 'allow', transport, { deferRecoveredPrompts: true });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(server!.requests.some(request => request.method === 'turn/start')).toBe(false);
+      session.activateRecoveredPrompts();
+      session.activateRecoveredPrompts();
+      await waitFor(() => server!.requests.some(request => request.method === 'turn/start'));
+      await waitFor(() => session.conversationSnapshot().queueDepth === 0);
+      expect(server!.requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+      expect(server!.requests.find(request => request.method === 'turn/start')!.params.additionalContext)
+        .toEqual({ 'ours-fleet://prompt-provenance?source=owner_admin_console': expect.anything() });
+      await session.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('preserves typed owner provenance for steering without trusting forged text', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-codex-steer-provenance-'));
     let server: FakeAppServer | undefined;

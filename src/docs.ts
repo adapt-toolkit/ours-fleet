@@ -837,8 +837,20 @@ the service waiting, with a diagnostic code in the journal. Each wait is bounded
 and systemd retries it until the daemon is ready; stopping the service cancels it.
 This does not consume the agent crash budget or discard its session context.
 Once the runner starts, its normal crash circuit breaker still applies.
-After upgrading Fleet, rerun init to refresh the generated service template.
+After upgrading Fleet, run \`ours-fleet service refresh\` (\`ours-install\` does it for
+you). Service definitions start the exact release tree that wrote them, so an
+unrefreshed one starts the previous release after the next reboot.
+\`ours-fleet service check\` reports each supervisor, web and watchdog definition,
+and whether its running process uses another release, without changing anything.
+\`refresh\` only re-points the release paths in definitions Fleet generated, runs
+\`daemon-reload\`, and never creates, starts, stops or restarts a service. A running
+supervisor keeps its code until it is restarted.
 Temporary agents and macOS services retain their existing lifecycle behavior.
+
+After a supervisor restart or reboot, prompts a role had admitted but never
+started are dispatched only once its control socket is listening, so recovered
+work cannot reach the previous run's socket (\`connect ECONNREFUSED\`). Turns that
+had already started are closed as \`unknown_after_restart\` and never replayed.
 
 ## Reliable mail wake
 
