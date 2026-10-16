@@ -11,7 +11,7 @@ import { attachOursClient, type AttachOursClientOptions, type OursClient } from 
 import { preflightInitPaths } from './init-wizard.js';
 import { WebAccessStore } from './web/access.js';
 import { WorkspaceDeviceStore } from './web/workspace-devices.js';
-export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;rootName:string;name:string;surname:string;connectorToken?:string;invitation:string;serverCid:string;challenge:{nonce:string;workspaceId:string;accountId:string;expiresAt:number}}
+export interface WorkspacePayload {version:1;appOrigin:string;hostname:string;rootName:string;fullName?:string|null;name?:string|null;surname?:string|null;connectorToken?:string;invitation:string;serverCid:string;challenge:{nonce:string;workspaceId:string;accountId:string;expiresAt:number}}
 export function readWorkspacePayload(file:string):WorkspacePayload {
   const path=resolve(file),stat=lstatSync(path);
   if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>32768)throw Error('Setup payload requires an owned private regular file (chmod 600)');
@@ -19,8 +19,9 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
 }
 export function decodeWorkspacePayload(input:string,options:{allowExpired?:boolean}={}):WorkspacePayload {
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
-  if(p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
-  for(const k of ['connectorToken','invitation','name','surname'] as const){if(k==='connectorToken' && p[k]===undefined)continue;if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');}
+  if(!p || typeof p!=='object' || Array.isArray(p) || p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
+  for(const k of ['connectorToken','invitation'] as const){if(k==='connectorToken' && p[k]===undefined)continue;if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');}
+  for(const k of ['fullName','name','surname'] as const){const value=p[k];if(value==null || value===''){p[k]=null;continue;}if(typeof value!=='string' || value.length>8192 || /[\x00-\x1f\x7f]/.test(value))throw Error('Invalid workspace profile');p[k]=value.trim()||null;}
   return p;
 }
 /** Credential-free renewal is allowed only on the host already holding this private connector. */
@@ -81,12 +82,12 @@ interface HumanRoot {name:string;cid:string}
  * daemon, asked by Fleet itself, lists exactly one Human root, that root is the named one, and the
  * Messenger identity is listed as a permanent identity under it.
  */
-async function messengerIdentity(request:ReturnType<typeof hostMessenger>,attach:AttachDaemonClient):Promise<{cid:string;preserveProfile:boolean;root?:HumanRoot}> {
+async function messengerIdentity(request:ReturnType<typeof hostMessenger>,attach:AttachDaemonClient):Promise<{cid:string;preserveProfile:boolean;optionalWorkspaceProfileV1:boolean;root?:HumanRoot}> {
   const bound=await request('workspace/enrollment-identity');
-  if(bound.rootCid===undefined)return {cid:bound.cid,preserveProfile:bound.preserveProfile===true};
+  if(bound.rootCid===undefined)return {cid:bound.cid,preserveProfile:bound.preserveProfile===true,optionalWorkspaceProfileV1:bound.optionalWorkspaceProfileV1===true};
   if(typeof bound.cid!=='string' || !CID.test(bound.cid) || typeof bound.rootCid!=='string' || !CID.test(bound.rootCid) || same(bound.cid,bound.rootCid))throw Error('Bound Messenger identity unavailable');
   const root=await humanRoot(attach,bound.rootCid,bound.cid);
-  return {cid:bound.cid,preserveProfile:bound.preserveProfile===true,root};
+  return {cid:bound.cid,preserveProfile:bound.preserveProfile===true,optionalWorkspaceProfileV1:bound.optionalWorkspaceProfileV1===true,root};
 }
 /** This host's only Human root, as its daemon lists it; optionally with a permanent identity that must be listed under it. */
 async function humanRoot(attach:AttachDaemonClient,rootCid:string,under?:string):Promise<HumanRoot> {
@@ -192,11 +193,12 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const moved=Boolean(loaded.rooms) && !lost && !!identity.root && !same(loaded.rooms!.owner.expected_cid,identity.cid) && managedRootOwner(resolve(configuration),loaded.rooms!,identity.root)
     && (options.replacingWorkspace!==undefined || JSON.parse(readFileSync(previousFile,'utf8')).serverCid?.toUpperCase()===payload.serverCid.toUpperCase());
   if(options.preserveProfile && identity.preserveProfile!==true)throw Error('Existing-host setup requires Messenger profile-preservation support; update the host Messenger before retrying');
+  if(!options.preserveProfile && (payload.fullName?.trim() || !payload.name?.trim() || !payload.surname?.trim()) && !identity.optionalWorkspaceProfileV1)throw Error('Optional workspace profile requires updated Messenger; update the host Messenger before retrying (the host is not enrolled)');
   if(loaded.rooms && !lost && !moved && loaded.rooms.owner.expected_cid.toLowerCase()!==identity.cid.toLowerCase())throw Error('Retained room owner CID conflicts with the Human root');
   const inviteFile=loaded.rooms?.owner.public_invite_file || join(dir,'owner.invite');
   if(existsSync(inviteFile)) {const stat=lstatSync(inviteFile);if(!stat.isFile() || stat.isSymbolicLink() || stat.uid!==process.getuid?.() || stat.nlink!==1 || (stat.mode&0o077)!==0)throw Error('Retained Owner invitation file must be owned and private');}
   const devices=new WorkspaceDeviceStore();const hostWorkspaceId=devices.workspaceId;devices.close();
-  const {name,surname,...proofPayload}=payload;
+  const {fullName,name,surname,...proofPayload}=payload;
   let result:{submitted?:boolean;rootCid:string;ownerInvite:string},ownerCid:string;
   // A replacement can stop after its one-time proof but before local files commit. Read the
   // account's existing signed receipt first; a verified proof must not be sent a second time.
@@ -209,6 +211,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
     try{proofAlreadyConfirmed=(await response.json() as {verified?:boolean}).verified===true;}catch{throw Error('Invalid replacement proof receipt');}
   }
   if(identity.root){
+    if(!options.preserveProfile)await request('identity/profile',{fullName:fullName??null,name:name??null,surname:surname??null});
     // The Human root signs the binding; the person's own Messenger identity is the room Owner and issues the Owner invitation.
     if(!proofAlreadyConfirmed)await proveWithHumanRoot(attach,identity.root,payload,hostWorkspaceId,options.contactWaitMs ?? 10000,options.replacingWorkspace!==undefined);
     const invite=await request('invites',{mode:'public'});
