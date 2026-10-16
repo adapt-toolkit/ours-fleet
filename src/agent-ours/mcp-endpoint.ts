@@ -1,8 +1,8 @@
 import * as managedMcp from '@ours.network/mcp/server';
 import type { FileDeliveryInput, DeliveredFile } from '../file-delivery/types.js';
 import type { ToolRequestExtra } from '@ours.network/mcp/dist/types/mcp/tool.js';
-import { createServer, type Server } from 'node:net';
-import { chmod, unlink } from 'node:fs/promises';
+import { connect, createServer, type Server } from 'node:net';
+import { chmod, lstat, unlink } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
 import { createManagedOursMcpServer } from '@ours.network/mcp/server';
 import type { ApplicationIdentityStore } from '@ours.network/mcp/application-identities';
@@ -26,6 +26,72 @@ export interface EndpointOptions {
   /** Fleet self-reminders, bound later by the runner; tools refuse until then. */
   reminders?: () => ReminderToolBackend | undefined;
 }
+const ORPHAN_PROBE_TIMEOUT_MS = 1_000;
+
+function listenOnce(server: Server, path: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(path, () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Identity of one file: device, inode and nanosecond change and birth times.
+ * An inode number alone is reused at once after an unlink, so a socket bound
+ * in its place can carry the same device and inode.
+ */
+type SocketIdentity = { dev: bigint; ino: bigint; ctimeNs: bigint; birthtimeNs: bigint };
+const sameFile = (a: SocketIdentity, b: SocketIdentity) =>
+  a.dev === b.dev && a.ino === b.ino && a.ctimeNs === b.ctimeNs && a.birthtimeNs === b.birthtimeNs;
+
+/**
+ * The identity of a socket file, never a symlink or other file, that refuses
+ * connections; undefined when it is not provably dead.
+ */
+async function orphanSocket(path: string): Promise<SocketIdentity | undefined> {
+  let found;
+  try { found = await lstat(path, { bigint: true }); } catch { return undefined; }
+  if (!found.isSocket()) return undefined;
+  const dead = await new Promise<boolean>(resolve => {
+    const probe = connect(path);
+    const done = (orphan: boolean) => { clearTimeout(timer); probe.destroy(); resolve(orphan); };
+    const timer = setTimeout(() => done(false), ORPHAN_PROBE_TIMEOUT_MS);
+    probe.once('connect', () => done(false));
+    probe.once('error', error => done((error as NodeJS.ErrnoException).code === 'ECONNREFUSED'));
+  });
+  return dead ? { dev: found.dev, ino: found.ino, ctimeNs: found.ctimeNs, birthtimeNs: found.birthtimeNs } : undefined;
+}
+
+/**
+ * Listen on the bridge socket. A close unlinks it, but a predecessor that ended
+ * abruptly leaves the file behind, and every later start of the same generation
+ * then fails with EADDRINUSE until the role is held down. Only a provably dead
+ * socket is removed, once, and only if the path still names that same file;
+ * a live listener, a symlink, any other file, an inconclusive probe or a path
+ * replaced since the probe still fails as before. `afterProbe` is a test seam.
+ */
+export async function listenOnBridgeSocket(
+  server: Server, path: string, hooks: { afterProbe?: () => Promise<void> } = {},
+): Promise<void> {
+  let original: unknown;
+  try { return await listenOnce(server, path); }
+  catch (error) {
+    original = error;
+    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
+  }
+  const orphan = await orphanSocket(path);
+  if (!orphan) throw original;
+  await hooks.afterProbe?.();
+  let now;
+  try { now = await lstat(path, { bigint: true }); } catch { throw original; }
+  if (!now.isSocket() || !sameFile(now, orphan)) throw original;
+  await unlink(path);
+  await listenOnce(server, path);
+}
+
 export async function startMcpEndpoint(
   options: EndpointOptions,
 ): Promise<{ close(): Promise<void> }> {
@@ -121,13 +187,7 @@ export async function startMcpEndpoint(
       transport.onmessage?.(message);
     };
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(options.socket, () => {
-      server.removeListener('error', reject);
-      resolve();
-    });
-  });
+  await listenOnBridgeSocket(server, options.socket);
   await chmod(options.socket, 0o600);
   return {
     close: async () => {
