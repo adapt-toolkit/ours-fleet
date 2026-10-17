@@ -149,3 +149,117 @@ describe('ReminderManager timer discipline', () => {
     expect(timers.at(-1)).toBe(0);
   });
 });
+
+describe('ReminderManager at an idle boundary', () => {
+  /** A role that answers `busy` until released; timers are captured and fired by hand. */
+  function boundaryWorld() {
+    const w = world();
+    const role = { busy: true, polls: 0 };
+    const live = new Map<number, { ms: number; callback: () => void }>();
+    let ids = 0;
+    const admitter: ReminderAdmitter = {
+      async tryReminder(text, _origin, beforeQueue) {
+        role.polls++;
+        if (role.busy) return { state: 'busy' };
+        if (!beforeQueue()) return { state: 'unavailable', error: 'declined', admitted: false };
+        w.admissions.push(text);
+        return { state: 'admitted', queued: { promptId: 'p', queuedBehind: 0, completion: new Promise(() => {}) } };
+      },
+    };
+    const manager = new ReminderManager('Dev', w.store, admitter, {
+      now: () => w.clock.now, log: () => {},
+      setTimer: (callback, ms) => { const id = ++ids; live.set(id, { ms, callback }); return id; },
+      clearTimer: id => { live.delete(id as number); },
+    });
+    const armed = () => [...live.values()].map(timer => timer.ms);
+    /** Advance the clock to the armed timer and run its poll. */
+    const fire = async () => {
+      expect(live.size).toBe(1);
+      const [id, timer] = [...live.entries()][0]!;
+      live.delete(id);
+      w.clock.now += timer.ms;
+      timer.callback();
+      await settle();
+    };
+    const { reminder } = w.store.create('k', { title: 't', local_time: '2027-01-20T13:00', time_zone: 'UTC', late_window_seconds: 600 });
+    return { ...w, role, manager, armed, fire, dueAt: Date.parse(reminder.due_at) };
+  }
+
+  it('admits at the boundary that ends a busy wait instead of at the next backoff step', async () => {
+    const w = boundaryWorld();
+    w.manager.start();
+    w.clock.now = w.dueAt;
+    await w.manager.poll();
+    // Busy retries at 0, 2, 6, 14, 30 and 60s: the next would be 90s.
+    for (let i = 0; i < 5; i++) await w.fire();
+    expect(w.clock.now - w.dueAt).toBe(60_000);
+    expect(w.armed()).toEqual([30_000]);
+    w.clock.now = w.dueAt + 62_000;                    // the Owner's turn ends here
+    w.role.busy = false;
+    w.manager.boundary();
+    expect(w.armed()).toEqual([0]);
+    await w.fire();
+    expect(w.admissions).toHaveLength(1);
+    expect(w.clock.now - w.dueAt).toBe(62_000);
+  });
+
+  it('keeps backing off when the role is still busy at a boundary', async () => {
+    const w = boundaryWorld();
+    w.manager.start();
+    w.clock.now = w.dueAt;
+    await w.manager.poll();
+    expect(w.armed()).toEqual([2_000]);
+    w.manager.boundary();
+    await w.fire();
+    expect(w.admissions).toEqual([]);
+    expect(w.armed()).toEqual([4_000]);
+  });
+
+  it('coalesces repeated boundaries into one poll and one admission', async () => {
+    const w = boundaryWorld();
+    w.manager.start();
+    w.clock.now = w.dueAt;
+    await w.manager.poll();
+    w.role.busy = false;
+    const before = w.role.polls;
+    for (let i = 0; i < 3; i++) w.manager.boundary();
+    expect(w.armed()).toEqual([0]);
+    await w.fire();
+    expect(w.role.polls - before).toBe(1);
+    expect(w.admissions).toHaveLength(1);
+    const afterAdmission = w.armed();
+    w.manager.boundary();                              // nothing is waiting on busy any more
+    expect(w.armed()).toEqual(afterAdmission);
+  });
+
+  it('rechecks at once when the boundary arrives while a poll is reading the role as busy', async () => {
+    const w = boundaryWorld();
+    w.manager.start();
+    w.clock.now = w.dueAt;
+    await w.manager.poll();
+    const polling = w.manager.poll();                 // reads busy...
+    w.manager.boundary();                              // ...while the role goes idle
+    w.role.busy = false;
+    await polling;
+    expect(w.armed()).toEqual([0]);
+    await w.fire();
+    expect(w.admissions).toHaveLength(1);
+  });
+
+  it('ignores a boundary when nothing waits on a busy role, and after stop', async () => {
+    const w = boundaryWorld();
+    w.manager.boundary();                              // not started
+    expect(w.armed()).toEqual([]);
+    w.manager.start();
+    await w.fire();                                    // initial poll: nothing due yet
+    const idleTimers = w.armed();
+    w.manager.boundary();
+    expect(w.armed()).toEqual(idleTimers);
+    w.clock.now = w.dueAt;
+    await w.manager.poll();
+    expect(w.armed()).toEqual([2_000]);
+    w.manager.stop();
+    w.manager.boundary();
+    expect(w.armed()).toEqual([]);
+  });
+});

@@ -117,6 +117,8 @@ export class RoleTurnArbiter implements AgentSession {
   private generation = 0;
   /** Resolves the instant the CURRENT generation is retired. */
   private retirement = retirementSignal();
+  private readonly boundaryListeners = new Set<() => void>();
+  private stopObservingIdle?: () => void;
 
   constructor(private readonly session: AgentSession) {
     this.backend = session.backend;
@@ -152,9 +154,41 @@ export class RoleTurnArbiter implements AgentSession {
       this.live.delete(queued.promptId);
       // A retired generation's claims were released in one step already.
       if (generation === this.generation) this.unsettled = Math.max(0, this.unsettled - 1);
+      this.admissionBoundary();
     });
     this.live.set(queued.promptId, completion);
     return { ...queued, completion };
+  }
+
+  /**
+   * Called whenever the role may have become admissible again: a claim
+   * settled, or the session reported idle (which already counts a steered
+   * turn's occupancy). Only a hint for producers waiting on `busy`; admission
+   * still makes every check itself.
+   */
+  onAdmissionBoundary(listener: () => void): () => void {
+    this.boundaryListeners.add(listener);
+    if (!this.stopObservingIdle && this.session.observeConversation) {
+      let idle = false;
+      const observation = this.session.observeConversation(state => {
+        const now = state.readiness === 'idle';
+        if (now && !idle) this.admissionBoundary();
+        idle = now;
+      });
+      this.stopObservingIdle = () => observation.unsubscribe();
+    }
+    return () => {
+      this.boundaryListeners.delete(listener);
+      if (this.boundaryListeners.size > 0) return;
+      this.stopObservingIdle?.();
+      this.stopObservingIdle = undefined;
+    };
+  }
+
+  private admissionBoundary(): void {
+    for (const listener of [...this.boundaryListeners]) {
+      try { listener(); } catch { /* a hint; the listener's own retry still runs */ }
+    }
   }
 
   /**
@@ -179,6 +213,7 @@ export class RoleTurnArbiter implements AgentSession {
     this.unsettled = 0;
     this.waiting = 0;
     retired.retire();
+    this.admissionBoundary();
   }
 
   queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {

@@ -38,6 +38,8 @@ export interface ReminderManagerHandle {
   stop(): void;
   /** Called after an agent tool changed the schedule so the timer reflects it. */
   changed(): void;
+  /** Called when the role may have become idle, so a busy wait need not run out its backoff. */
+  boundary(): void;
 }
 
 /**
@@ -57,6 +59,8 @@ export class ReminderManager implements ReminderManagerHandle {
   private started = false;
   private stopping = false;
   private polling = false;
+  /** A boundary arrived during a poll that may already have read the role as busy. */
+  private boundaryDuringPoll = false;
   private busyStreak = 0;
   /** Consecutive re-arms with work already overdue; drives the spin backoff. */
   private overdueStreak = 0;
@@ -88,10 +92,19 @@ export class ReminderManager implements ReminderManagerHandle {
     if (this.started && !this.stopping && !this.polling) this.schedule();
   }
 
+  boundary(): void {
+    if (!this.started || this.stopping) return;
+    if (this.polling) { this.boundaryDuringPoll = true; return; }
+    // Only a wait on a busy role is shortened; due times and the unavailable
+    // backoff keep their own schedule.
+    if (this.busyStreak > 0) this.schedule(0);
+  }
+
   /** Public fake-clock seam; the timer calls the same transition. */
   async poll(): Promise<void> {
     if (!this.started || this.stopping || this.polling) return;
     this.polling = true;
+    this.boundaryDuringPoll = false;
     let delay: number | undefined;
     try {
       // Urgent events that may still interrupt come first, so neither a busy
@@ -124,7 +137,7 @@ export class ReminderManager implements ReminderManagerHandle {
     } finally {
       this.polling = false;
     }
-    this.schedule(delay);
+    this.schedule(this.busyStreak > 0 && this.boundaryDuringPoll ? 0 : delay);
   }
 
   private async admit(event: ReminderEvent): Promise<'admitted' | 'busy' | 'skipped'> {

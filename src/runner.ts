@@ -879,6 +879,9 @@ export async function runOnce(
         clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
       },
     });
+    const roleReminders = reminderManager;
+    const unsubscribeBoundary = roleReminders
+      ? arbiter.onAdmissionBoundary(() => roleReminders.boundary()) : undefined;
     const unsubscribeFailure = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text || event.origin?.kind === 'stall-watchdog') return;
       const evidence = classifyFailureText(
@@ -907,7 +910,7 @@ export async function runOnce(
         if (event.payload.outcome === 'completed') saveRecovery({ active: activePrompts.size > 0 });
       }
     });
-    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); unsubscribeContinuity?.(); };
+    unsubscribeRecovery = () => { unsubscribeFailure(); unsubscribeBoundary?.(); unsubscribeStartup?.(); unsubscribeTelemetry?.(); unsubscribeContinuity?.(); };
     if (role.owner_channel) {
       try {
         ownerBinder = await deps.acquireOwnerBinder(
