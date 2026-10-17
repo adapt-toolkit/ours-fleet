@@ -188,3 +188,9 @@ explicit recovery and unsupported-host fallback. DOM mutation and fixture latenc
 measurements have no claim about real-provider inference or physical-device audio.
 The App and Fleet changes require coordinated upstream delivery; source qualification
 does not establish that installed or serving packages contain them.
+
+## Full resource delivery qualification
+
+Directory, configuration/definitions, previews, provider/status, layout and admitted-operation views share the authenticated ephemeral resource connection with per-view epochs. Complete ready requires the canonical subscribed payload; a heartbeat does not certify a failed upstream watcher. User commands remain HTTP. Controller, voice and selected-daemon health are independent owners. The selected-daemon health deadline passes its cancellation signal through the public SDK selection/request API, cancelling underlying HTTP I/O as well as retiring the result.
+
+The matching App source qualification composes the existing ACP/Codex browser fixture and records sixty-second healthy windows separately from initial/history/recovery/command/health/lease/long-poll traffic. Unit and HTTP producer checks are not proof of every rendered resource combination or installed deployment. Preserve existing room-layout suite sources and qualify released service/dependency versions separately.

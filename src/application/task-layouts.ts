@@ -1,3 +1,4 @@
+import { publishFleetResourceCommit } from './resource-observer.js';
 /** Task ↔ Room Layout bridge.
  * A layout task owns exactly one Room Layout run, `task-<task_id>`, snapshotted
  * from the named source layout with task context added to every room contract.
@@ -154,6 +155,7 @@ export class TaskLayouts {
   private writeOperation(runId: string, record: Omit<TaskLayoutOperationRecord, 'updated_at'>): void {
     layoutRunPath(runId); // validates the ID and creates the private layouts directory
     replaceFileAtomically(this.operationPath(runId), JSON.stringify({ ...record, updated_at: new Date().toISOString() }), 0o600);
+    publishFleetResourceCommit(this.operationPath(runId));
   }
 
   /** Sanitized read model: no Agent Template snapshots, owner fingerprints or session internals. */
