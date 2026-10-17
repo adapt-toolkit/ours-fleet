@@ -181,7 +181,7 @@ export async function probeIdentityPresence(
   } finally { await client?.close().catch(() => undefined); }
 }
 
-function classifyIdentityPresence(name: string, identities: unknown): IdentityPresence {
+export function classifyIdentityPresence(name: string, identities: unknown): IdentityPresence {
   if (!Array.isArray(identities))
     return { state: 'unknown', detail: 'identity index response is malformed' };
   // A healthy daemon normally has at least its Human identity. During daemon

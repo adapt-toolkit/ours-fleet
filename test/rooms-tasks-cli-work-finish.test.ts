@@ -2,6 +2,7 @@ import { ensureFleetParent } from '../src/supervisor/fleet.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
@@ -1273,17 +1274,30 @@ describe('task delete', () => {
     const t = doneTask();
     mocks.launchFleetWorker.mockImplementation(async () => { /* worker never completes */ });
     vi.useFakeTimers();
+    // Admission awaits real filesystem work before installing its 100ms poll.
+    // Yield the real event loop without advancing the command's fake deadline.
+    const advanceAcceptedWait = async (command: Promise<void>) => {
+      const timers = vi.spyOn(globalThis, 'setTimeout');
+      while (!timers.mock.calls.some(([, delay]) => delay === 100)) {
+        await nextTurn();
+      }
+      timers.mockRestore();
+      let settled = false;
+      void command.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(59_900);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_100);
+      await command;
+    };
     try {
       const pendingJson = run('delete', t.task_id, t.task_id, '--json');
-      await vi.advanceTimersByTimeAsync(61_000);
-      await pendingJson;
+      await advanceAcceptedWait(pendingJson);
       expectExactJson({
         schema_version: 1, task_id: t.task_id, accepted: true, deleted: false, pending: true,
       });
       out = [];
       const pendingHuman = run('delete', t.task_id, t.task_id);
-      await vi.advanceTimersByTimeAsync(61_000);
-      await pendingHuman;
+      await advanceAcceptedWait(pendingHuman);
     } finally { vi.useRealTimers(); }
     const text = out.join('\n');
     expect(text).toContain('deletion was accepted and cleanup is still settling');

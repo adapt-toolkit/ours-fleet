@@ -55,13 +55,14 @@ const CONFIG_CACHE_TTL_MS = 5_000;
  * short TTL rather than re-parsing per request. Runtime-only concern (not the
  * scheduler's), so a plain Date.now() clock is fine.
  */
-function cachedConfigProvider(configPath: string | undefined): () => FleetConfig {
+function cachedConfigProvider(configPath: string | undefined) {
   let cached: { at: number; cfg: FleetConfig } | undefined;
-  return () => {
+  const read = () => {
     const now = Date.now();
     if (!cached || now - cached.at >= CONFIG_CACHE_TTL_MS) cached = { at: now, cfg: loadConfig(configPath) };
     return cached.cfg;
   };
+  return Object.assign(read,{invalidate:()=>{cached=undefined;}});
 }
 
 export interface StartWebOptions {
@@ -210,6 +211,8 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration, observeRole,
+    resourceScope:{configPath:configuration.path,subscribeMutations:listener=>events.subscribeResources(listener)},
+    invalidateResourceCaches:()=>{watchdogConfigProvider.invalidate();watchdogFindings.invalidate();},
     taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
     roomLayouts: new RoomLayoutDefinitions(options.configPath),
     layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),

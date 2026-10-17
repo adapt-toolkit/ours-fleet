@@ -1,3 +1,4 @@
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import type { ArchivedMemberAbsence } from './types.js';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
@@ -104,6 +105,7 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
   if (pending.length) persisted.notification_events = pending;
   else delete persisted.notification_events;
   replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
+  publishFleetResourceCommit(taskPath(record.task_id));
 }
 
 const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
@@ -286,7 +288,7 @@ export function updateTaskExecutionPlan(
 }
 
 export function listTasks(filter?: {
-  state?: TaskState | TaskState[]; listId?: string; includeDeleting?: boolean;
+  state?: TaskState | TaskState[]; listId?: string; includeDeleting?: boolean; strict?: boolean;
 }): TaskRecord[] {
   const dir = tasksDir();
   if (!existsSync(dir)) return [];
@@ -300,7 +302,7 @@ export function listTasks(filter?: {
       const t = withTaskLock(id, () => presentTask(JSON.parse(readFileSync(join(dir, f), 'utf8')) as StoredTaskRecord));
       if (t.deletion?.status === 'pending' && !filter?.includeDeleting) continue;
       if ((!states || states.includes(t.state)) && (!filter?.listId || t.list_id === filter.listId)) tasks.push(t);
-    } catch { /* corrupt file, skip */ }
+    } catch (error) { if(filter?.strict)throw error; /* legacy CLI inventory tolerates corrupt files */ }
   }
   const order = new Map(readTaskLists().map((item, index) => [item.list_id, index]));
   return tasks.sort((a, b) => (order.get(a.list_id!)! - order.get(b.list_id!)!)

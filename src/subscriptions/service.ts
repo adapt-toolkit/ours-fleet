@@ -83,7 +83,7 @@ export class SubscriptionService {
     this.now = options.now ?? Date.now;
   }
 
-  async list(): Promise<ProviderView[]> {
+  async list(observeOnly = false): Promise<ProviderView[]> {
     const state = readSubscriptionState();
     const pins = await this.pins();
     return SUBSCRIPTION_PROVIDERS.map(provider => {
@@ -91,7 +91,7 @@ export class SubscriptionService {
       const profiles = p.profiles.map(profile => {
         const key = `${provider}/${profile.id}`;
         const cached = this.checks.get(key);
-        if (!cached || this.now() - Date.parse(cached.health.checkedAt ?? '0') > STALE_CHECK_MS)
+        if (!observeOnly && (!cached || this.now() - Date.parse(cached.health.checkedAt ?? '0') > STALE_CHECK_MS))
           void this.check(provider, profile.id).catch(() => {});
         const observed = provider === 'claude' ? this.observedUsage(pins, profile.id) : undefined;
         const probed = provider === 'claude' ? this.probedUsage(profile.id) : undefined;
@@ -194,8 +194,8 @@ export class SubscriptionService {
     }
     const { id: profileId, home } = createProfileHome(provider);
     const login = provider === 'claude'
-      ? new ClaudeLogin(owner, this.bins, home, profileId)
-      : new CodexDeviceLogin(owner, this.bins, home, profileId);
+      ? new ClaudeLogin(owner, this.bins, home, profileId, this.options.onChange)
+      : new CodexDeviceLogin(owner, this.bins, home, profileId, this.options.onChange);
     const loginId = login.view().loginId;
     this.logins.set(loginId, login);
     void this.completeLogin(provider, profileId, login);

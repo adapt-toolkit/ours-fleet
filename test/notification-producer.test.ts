@@ -1,8 +1,9 @@
+import { NotificationOutbox } from '../src/notifications/outbox.js';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { FleetNotificationProducer } from '../src/notifications/fleet-producer.js';
 
@@ -140,4 +141,32 @@ it('uses canonical defaults while replaying pending value overrides and frozen p
   writeFileSync(file,JSON.stringify(saved));
   producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());await producer.drain();
   expect(accepted.map(row=>row.url)).toEqual(['/fleet/chats/agents/new',legacy,legacy]);expect(accepted[2]).toEqual(payload);
+});
+
+it('retries transient ledger admission without a new mutation after the final committed completion', async () => {
+  mkdirSync('.test-artifacts', {recursive:true});const dir=mkdtempSync(join('.test-artifacts','admission-retry-'));
+  const root=join(dir,'agents');mkdirSync(root);const accepted:any[]=[];
+  const server=createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;accepted.push(JSON.parse(text));res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');
+  cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));});
+  const original=NotificationOutbox.prototype.enqueue;let failing=true;
+  const spy=vi.spyOn(NotificationOutbox.prototype,'enqueue').mockImplementation(function(...args){if(failing)throw Error('transient admission failure');return original.apply(this,args);});
+  const warnings:string[]=[];
+  const producer=new FleetNotificationProducer([root],join(dir,'outboxes'),{origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)},line=>warnings.push(line));
+  cleanup.push(()=>producer.close());
+  const store=new ConversationEventStore(join(root,'agent','.conversation'),{roleId:'agent'});cleanup.push(async()=>store.close());
+  store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});
+  const completed=store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
+  producer.poll();
+  try {
+    // Let the final filesystem callbacks run while admission still fails. No
+    // new ledger mutation or manual producer poll is performed after this.
+    await new Promise(resolve=>setTimeout(resolve,100));
+    expect(warnings.some(line=>line.includes('admission pending'))).toBe(true);expect(accepted).toHaveLength(0);
+    failing=false;
+    const queueFile=join(dir,'outboxes',readdirSync(join(dir,'outboxes'))[0]);
+    await expect.poll(()=>JSON.parse(readFileSync(queueFile,'utf8')).entries.some((entry:any)=>entry.id===`agent:g:${completed.seq}`),{timeout:1800}).toBe(true);
+    await producer.drain();expect(accepted).toHaveLength(1);
+    expect(accepted[0].eventId).toBe(`agent:g:${completed.seq}`);
+  }finally{spy.mockRestore();}
 });

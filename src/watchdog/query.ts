@@ -70,13 +70,14 @@ export function cachedWatchdogFindingsProvider(
   build: () => Map<string, WatchdogRoleFinding>,
   ttlMs: number,
   now: () => number = Date.now,
-): () => Map<string, WatchdogRoleFinding> {
+) {
   let cached: { at: number; value: Map<string, WatchdogRoleFinding> } | undefined;
-  return () => {
+  const read = () => {
     const at = now();
     if (!cached || at - cached.at >= ttlMs) cached = { at, value: build() };
     return cached.value;
   };
+  return Object.assign(read,{invalidate:()=>{cached=undefined;}});
 }
 
 export interface WatchdogSummary {

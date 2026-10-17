@@ -198,6 +198,22 @@ describe('subscription profiles: isolation', () => {
 });
 
 describe('subscription service', () => {
+  it('streams last-observed providers without admitting a provider probe',async()=>{
+    const svc=new SubscriptionService({agents:async()=>[],binaries:bins});
+    let checks=0;svc.check=async()=>{checks++;return {health:{state:'ok'}};};
+    await svc.list(true);await svc.list(true);expect(checks).toBe(0);
+    await svc.list();expect(checks).toBe(2);
+  });
+  it('publishes external device-tab login transitions through the existing mutation callback',async()=>{
+    const states:string[]=[];let svc:SubscriptionService|undefined;
+    svc=new SubscriptionService({agents:async()=>[],binaries:bins,onChange:()=>{
+      try {states.push(svc!.login(id,'owner').view().state);}catch{/* login constructor may not have returned yet */}
+    }});
+    let id='';const started=await svc.startLogin('codex','owner');id=started.loginId;
+    const login=svc.login(id,'owner');await login.done;
+    expect(states).toContain('verifying');expect(states).toContain('succeeded');
+    expect(()=>svc!.login(id,'other')).toThrow('login not found');
+  });
   const agents: AgentRef[] = [];
   const service = () => new SubscriptionService({ agents: async () => agents, binaries: bins });
   beforeEach(() => { agents.length = 0; });
