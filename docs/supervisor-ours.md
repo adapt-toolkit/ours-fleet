@@ -40,6 +40,31 @@ Watchdog and notifier sessions use permanent assigned identities through the sam
 supervisor path. Temporary supervisor recycle keeps the logical run and replaces the
 worker process, with at most three replacement attempts.
 
+## Selected-daemon runtime health
+
+Each process retains one health owner per selected endpoint, expected daemon instance
+and credential profile while at least one running role needs it. It shares one
+nonoverlapping `version({ startup: true })` then `identities()` chain, with a two-second
+interval after completion and a ten-second deadline for selection and I/O. The final
+consumer releases the timer and closes any in-flight selected client; late selection
+cannot publish into a replacement owner. Separate supervisor processes retain their
+own health owners.
+
+Generation validation still requires matching ready startup PID and daemon PID,
+valid boot ID/timestamps and a nonempty authoritative identity index. SDK selection
+continues to enforce the configured daemon instance. Failed selection, startup,
+authentication or transport remains unknown identity presence. A temporary role must
+first observe its own identity; retirement then requires five seconds of continuous
+authoritative absence measured from the completed response. Unknown presence resets
+that debounce. Generation recovery remains owned by the existing per-role observer
+and recovery controller.
+
+This runtime health is independent of resource SSE readiness. Notification long polls,
+cross-process append checks, authentication/leases/presence, bounded startup probes,
+process/idle monitoring, retries and scheduled business deadlines retain their owners.
+Configuration/reset discovery continues through the existing qualified watches;
+health consolidation does not alter supervisor policy.
+
 ## Migration and installation
 
 Use an explicit daemon client profile with endpoint, expected instance UUID and a

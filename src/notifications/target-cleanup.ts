@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import { producerConfig, type ProducerConfig } from './outbox.js';
-const cleanupDir = () => join(stateRoot(), 'notifications', 'removed-targets');
+export const cleanupDir = () => join(stateRoot(), 'notifications', 'removed-targets');
 /** Only the canonical agent namespace can authorize role-target cleanup. */
 export function notificationAgentId(path: string): string | null {
   try {

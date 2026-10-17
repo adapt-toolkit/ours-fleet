@@ -250,8 +250,9 @@ it('summarizes layout rooms for task listings without exposing run internals', a
   expect(app.withLayoutRooms(task).layout_rooms).toEqual([{ key: 'design', state: 'declared' }, { key: 'delivery', state: 'declared' }]);
   expect(app.getTask(task.task_id).task.layout_rooms).toHaveLength(2);
   rmSync(layoutRunPath(task.layout!.run_id));
-  writeFileSync(layoutRunPath(task.layout!.run_id), 'not json', { mode: 0o600 });
   expect(app.withLayoutRooms(task).layout_rooms).toEqual([]);
+  writeFileSync(layoutRunPath(task.layout!.run_id), 'not json', { mode: 0o600 });
+  expect(app.withLayoutRooms(task).layout_rooms).toBeUndefined();
 });
 
 describe('layout task races and worker boundaries', () => {

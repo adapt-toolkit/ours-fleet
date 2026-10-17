@@ -24,7 +24,8 @@ import {
   type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike,
 } from './monitor.js';
 import {
-  DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration,
+  DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration, acquireSelectedDaemonHealth,
+  type SelectedDaemonHealthLease,
   type DaemonGenerationProbe,
 } from './daemon-recovery.js';
 import { realExec, type Exec } from './exec.js';
@@ -125,6 +126,9 @@ export class SupervisorRecycleRequiredError extends Error {
   }
 }
 
+const defaultProbeGeneration = (env: NodeJS.ProcessEnv) => probeDaemonGeneration(
+  (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>, env);
+
 const defaultDeps = (): RunnerDeps => ({
   prepareAgentOurs: prepareManagedAgent,
   releaseAgentOurs: releaseManagedAgent,
@@ -135,8 +139,7 @@ const defaultDeps = (): RunnerDeps => ({
   now: () => Date.now(),
   log: line => process.stderr.write(line + '\n'),
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
-  probeGeneration: env => probeDaemonGeneration(
-    (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>, env),
+  probeGeneration: defaultProbeGeneration,
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
   startAgentSession: (adapter, options) => adapter.start(options),
@@ -749,6 +752,7 @@ export async function runOnce(
   // Self-reminders live and die with this attempt's runtime binding: every exit
   // path below stops the dispatcher before that binding is released.
   let reminderManager: ReminderManager | undefined;
+  let selectedHealth: SelectedDaemonHealthLease | undefined;
   try {
   const managedHarness = prepareManagedHarness(role, dir, runCwd, managedService.descriptor,
     { ...harnessChildEnv(role, launch.env, dir), ...subscription?.env });
@@ -801,9 +805,15 @@ export async function runOnce(
     name, identity: role.identity, agentDir: dir, cfg: role.monitor,
     deps: resolvedMonitorDeps,
   }) : null;
+  // Injected legacy probes keep their test/embedding contract. Production uses
+  // one retained owner for generation and identity health in this process.
+  const retainHealth = deps.probeGeneration === defaultProbeGeneration
+    && !deps.identityProbeDeps ? acquireSelectedDaemonHealth : undefined;
+  selectedHealth = retainHealth?.(resolvedMonitorDeps.env);
   const daemonObserver = new DaemonGenerationObserver();
-  const initialDaemon = daemonObserver.observe(
-    await deps.probeGeneration(resolvedMonitorDeps.env));
+  const initialDaemon = daemonObserver.observe(selectedHealth
+    ? (await selectedHealth.sample()).generation
+    : await deps.probeGeneration(resolvedMonitorDeps.env));
   let sessionStartedWithoutDaemonBaseline = initialDaemon.kind !== 'baseline';
   if (monitor) await monitor.prime({ resetCursor: resetMonitorCursor });
 
@@ -1208,8 +1218,9 @@ export async function runOnce(
     const now = deps.now();
     if (now >= nextDaemonProbeAt) {
       nextDaemonProbeAt = now + 2_000;
-      const observation = daemonObserver.observe(
-        await deps.probeGeneration(resolvedMonitorDeps.env));
+      const observation = daemonObserver.observe(selectedHealth
+        ? (await selectedHealth.sample()).generation
+        : await deps.probeGeneration(resolvedMonitorDeps.env));
       if (observation.kind === 'lost') recoveryController.noteLoss(observation.reason);
       if (observation.kind === 'changed' || observation.kind === 'available'
           || (observation.kind === 'baseline' && sessionStartedWithoutDaemonBaseline)) {
@@ -1238,19 +1249,22 @@ export async function runOnce(
     }
     if (temp && now >= nextIdentityPollAt) {
       nextIdentityPollAt = now + TEMP_IDENTITY_POLL_MS;
-      const presence = await probeIdentityPresence(
-        role.identity, deps.fetch, resolvedMonitorDeps.env, deps.identityProbeDeps);
+      const presence = selectedHealth
+        ? selectedHealth.presence(role.identity, await selectedHealth.sample())
+        : await probeIdentityPresence(
+          role.identity, deps.fetch, resolvedMonitorDeps.env, deps.identityProbeDeps);
+      const identityObservedAt = deps.now();
       if (presence.state === 'present') {
         identityObserved = true;
         identityAbsentSince = undefined;
       } else if (presence.state === 'absent' && identityObserved) {
-        identityAbsentSince ??= now;
+        identityAbsentSince ??= identityObservedAt;
         // Require a continuous, time-bounded run of authoritative absence.
         // The first positive observation is the readiness gate: cold harness
         // starts may spend minutes loading the harness and briefing before the
         // agent creates/binds its identity, and absence before then is not a
         // close event. After readiness, debounce a real disappearance.
-        if (now - identityAbsentSince >= TEMP_IDENTITY_CLOSE_DEBOUNCE_MS) {
+        if (identityObservedAt - identityAbsentSince >= TEMP_IDENTITY_CLOSE_DEBOUNCE_MS) {
           retirementReason = 'identity-closed';
           deps.log(`[${name}] temporary identity '${role.identity}' closed; retiring session and supervisor`);
           reminderManager?.stop();
@@ -1352,6 +1366,7 @@ export async function runOnce(
     ...(layoutRetiring ? { retirementReason: 'operator-stop' as const } : retirementReason ? { retirementReason } : {}),
   };
   } finally {
+    selectedHealth?.release();
     reminderManager?.stop();
     managedService.setReminders?.(undefined);
     await managedService.close(layoutRetiring);

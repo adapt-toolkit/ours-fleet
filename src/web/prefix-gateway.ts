@@ -113,11 +113,14 @@ export function createPrefixGateway(options: GatewayOptions) {
     if (socketCredential !== undefined || String(headers['sec-websocket-protocol'] ?? '').includes(DEVICE_SOCKET_BEARER)) delete headers['sec-websocket-protocol'];
     return { ...route, headers, session, authHeaders, deviceSocket: socketCredential !== undefined };
   };
-  const track = (authHeaders: IncomingMessage['headers'], session: { id: string; absoluteExpiresAt: number } | undefined, close: () => void) => {
+  const track = (authHeaders: IncomingMessage['headers'], session: { id: string; absoluteExpiresAt: number } | undefined, close: () => void, neutral = false) => {
     if (!session) return () => {};
     // The session authenticated for this request, with its own deadline, not whatever is current later.
     const unbind = auth!.bindTransport(session, close);
-    const timer = setInterval(() => { try { auth!.authenticate({ headers: authHeaders } as FastifyRequest); } catch { close(); } }, 30_000);
+    const timer = setInterval(() => {
+      if (neutral) { if (!auth!.sessionValid(session)) close(); }
+      else try { auth!.authenticate({ headers: authHeaders } as FastifyRequest); } catch { close(); }
+    }, neutral ? 1000 : 30_000);
     timer.unref();
     return () => { clearInterval(timer); unbind(); };
   };
@@ -127,7 +130,7 @@ export function createPrefixGateway(options: GatewayOptions) {
   const accountCors = (req: IncomingMessage): Record<string, string> => {
     const origin = auth?.accountOrigin(req as unknown as FastifyRequest);
     return origin ? { 'access-control-allow-origin': origin, vary: 'Origin',
-      'access-control-expose-headers': 'Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag, X-Ours-Workspace-Auth, X-Ours-Request-Id' } : {};
+      'access-control-expose-headers': 'Accept-Ranges, Content-Disposition, Content-Length, Content-Range, Content-Type, ETag, X-Ours-Workspace-Auth, X-Ours-Request-Id, X-Resource-Producer, X-Resource-Revision, X-Resource-Source-Generation, X-Resource-Source-Position, X-Resource-Connection, X-Resource-View, X-Resource-Epoch, X-Resource-Baseline' } : {};
   };
   const server = createServer((req, res) => {
     const cors = accountCors(req);
@@ -138,7 +141,7 @@ export function createPrefixGateway(options: GatewayOptions) {
         auth!.validateBoundary({ headers: req.headers, method: req.method, url: req.url } as FastifyRequest, false);
         res.writeHead(204, { ...cors, 'cache-control': 'no-store', 'access-control-max-age': '600',
           'access-control-allow-methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
-          'access-control-allow-headers': 'Authorization, Content-Type, Idempotency-Key, If-None-Match, Range, X-CSRF-Token, X-Ours-Messenger-CSRF, X-Voice-Duration' });
+          'access-control-allow-headers': 'Authorization, Content-Type, Idempotency-Key, If-None-Match, Range, X-CSRF-Token, X-Ours-Messenger-CSRF, X-Voice-Duration, X-Resource-Connection, X-Resource-View, X-Resource-Epoch, X-Resource-Baseline' });
         res.end(); return;
       }
       route = prepare(req);
@@ -184,7 +187,10 @@ export function createPrefixGateway(options: GatewayOptions) {
       if (!res.headersSent) res.writeHead(502, { ...(route.service ? cors : {}), 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { code: 'upstream_unavailable', message: 'Service is unavailable' } }));
     });
-    const untrack = track(route.authHeaders, route.session, () => { upstream.destroy(); res.destroy(); });
+    const neutral = req.method === 'GET' && route.service?.prefix === '/notifications'
+      && new URL(req.url ?? '/', 'http://gateway.invalid').searchParams.get('resources') === '1'
+      && new URL(req.url ?? '/', 'http://gateway.invalid').pathname === '/notifications/api/v1/events';
+    const untrack = track(route.authHeaders, route.session, () => { upstream.destroy(); res.destroy(); }, neutral);
     res.on('close', untrack);
     req.on('aborted', () => upstream.destroy());
     res.on('close', () => upstream.destroy());

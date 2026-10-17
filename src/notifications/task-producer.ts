@@ -1,3 +1,5 @@
+import { observeFleetResources } from '../application/resource-observer.js';
+import { tasksDir } from '../rooms-tasks/task-state.js';
 import { acknowledgeTaskNotification, pendingTaskNotifications } from '../rooms-tasks/task-state.js';
 import type { ProducerConfig } from './outbox.js';
 
@@ -5,21 +7,39 @@ import type { ProducerConfig } from './outbox.js';
  * Events are already durable in their owning task commit, so no second outbox
  * admission/crash window is needed. A failed task does not block other tasks. */
 export class TaskNotificationProducer {
-  private readonly timer: ReturnType<typeof setInterval>;
+  private timer?: ReturnType<typeof setTimeout>;
+  private dirty = false;
   private running?: Promise<void>;
   private offset = 0;
   private stopped = false;
   private readonly shutdown = new AbortController();
   constructor(private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {},
     private readonly request: typeof fetch = fetch) {
-    this.timer = setInterval(() => { void this.drain(); }, 3000);
-    this.timer.unref();
+    // Subscribe before startup replay: a commit while fetch is pending needs a second pass.
+    observeFleetResources({ retryWatchFailures: true, paths: [tasksDir()], roots: [] }, state => {
+      if (state.health !== 'healthy') this.warn('Task notification observation unavailable; committed events retained');
+      else { this.dirty = true; void this.drain(); }
+    }, this.shutdown.signal);
     void this.drain();
   }
   drain(): Promise<void> {
-    return this.running ??= this.drainOnce().catch(() => {
+    if (this.stopped) return Promise.resolve();
+    if (this.running) return this.running;
+    this.dirty = false;
+    clearTimeout(this.timer); this.timer = undefined;
+    this.running = this.drainOnce().catch(() => {
       this.warn('Task notification snapshot unavailable; committed events retained');
-    }).finally(() => { this.running = undefined; });
+      this.retry();
+    }).finally(() => {
+      this.running = undefined;
+      if (this.dirty && !this.stopped) { this.dirty = false; void this.drain(); }
+    });
+    return this.running;
+  }
+  private retry() {
+    if (this.stopped || this.timer) return;
+    this.timer = setTimeout(() => { this.timer = undefined; void this.drain(); }, 3000);
+    this.timer.unref();
   }
   private async drainOnce(): Promise<void> {
     if (this.stopped) return;
@@ -28,6 +48,8 @@ export class TaskNotificationProducer {
     const start = this.offset % pending.length;
     const batch = [...pending.slice(start), ...pending.slice(0, start)].slice(0, 32);
     this.offset = start + batch.length;
+    // Retry only outstanding work; never run an idle discovery timer.
+    this.retry();
     for (let index = 0; index < batch.length; index += 4) {
       if (this.stopped) break;
       await Promise.all(batch.slice(index, index + 4).map(async task => {
@@ -55,5 +77,5 @@ export class TaskNotificationProducer {
       }));
     }
   }
-  async close(): Promise<void> { this.stopped = true; clearInterval(this.timer); this.shutdown.abort(); await this.running; }
+  async close(): Promise<void> { this.stopped = true; clearTimeout(this.timer); this.shutdown.abort(); await this.running; }
 }

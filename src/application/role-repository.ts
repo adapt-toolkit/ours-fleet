@@ -36,12 +36,12 @@ export interface RoleRepositoryOptions {
   timeoutMs?: number;
 }
 
-function safeDirs(root: string): string[] {
+function safeDirs(root: string, strict = false): string[] {
   try {
     return readdirSync(root, { withFileTypes: true })
       .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && ROLE_NAME_RE.test(entry.name))
       .map(entry => entry.name);
-  } catch { return []; }
+  } catch (error) { if (strict && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; return []; }
 }
 
 function view(role: ResolvedRole): ResolvedRoleView {
@@ -117,17 +117,18 @@ async function boundedMap<T, R>(
 export class RoleRepository {
   constructor(private readonly options: RoleRepositoryOptions = {}) {}
 
-  async list(): Promise<RoleRecord[]> {
+  async list(strict = false): Promise<RoleRecord[]> {
     const permanentRoot = this.options.permanentRoot ?? agentsRoot();
     const temporaryRoot = this.options.temporaryRoot ?? tmpRoot();
     let configured: ResolvedRole[] = [];
     let configProblem: Problem | undefined;
     try { configured = loadConfig(this.options.configPath).roles; }
     catch (error) {
+      if (strict) throw error;
       configProblem = { code: 'config_invalid', severity: 'error', source: 'config', detail: (error as Error).message };
     }
-    const permanent = new Set(safeDirs(permanentRoot));
-    const temporary = new Set(safeDirs(temporaryRoot));
+    const permanent = new Set(safeDirs(permanentRoot, strict));
+    const temporary = new Set(safeDirs(temporaryRoot, strict));
     const configuredByName = new Map(configured.map(role => [role.name, role]));
     const names = [...new Set([...configuredByName.keys(), ...permanent, ...temporary])].sort();
 
@@ -141,6 +142,7 @@ export class RoleRepository {
       if (inTemporary) {
         const read = snapshot(join(temporaryRoot, name, 'role.yaml'), name);
         tempRole = read.role;
+        if (strict && read.problem) throw new Error('temporary role snapshot unavailable');
         if (read.problem) { problems.push(read.problem); stateHealth = 'corrupt'; }
       }
       if (inPermanent && inTemporary)

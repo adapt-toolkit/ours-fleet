@@ -152,3 +152,47 @@ export async function conversationHasAttachment(stateDir: string, attachment: im
   }
   return found;
 }
+
+/** Passive, bounded last assistant text for directory previews. Never opens the
+ * ledger writer/recovery path or acquires a session/controller. An incomplete
+ * newest append is not committed yet; completed malformed records still fail. */
+export async function conversationPreview(stateDir: string, signal: AbortSignal): Promise<{text:string;at:string}> {
+  signal.throwIfAborted();
+  const dir=join(stateDir,'.conversation');
+  let files:string[];
+  try {files=(await readdir(dir)).filter(name=>/^events-\d{6}\.jsonl$/.test(name)).sort().reverse();}
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return {text:'No recent agent output',at:''};throw error;}
+  const events:ConversationEventV1[]=[];
+  for(const name of files){
+    signal.throwIfAborted();
+    const file=await open(join(dir,name),'r');
+    try {
+      const size=(await file.stat()).size,length=Math.min(size,2*1024*1024),buffer=Buffer.alloc(length);
+      await file.read(buffer,0,length,size-length);
+      const completeEnd = buffer.lastIndexOf(10) + 1;
+      // Only the newest segment can have an in-flight append. If its tail
+      // fills the bounded window, we cannot establish the previous preview.
+      if (completeEnd < length && (name !== files[0] || (size > length && completeEnd === 0))) throw Error('preview ledger has partial record');
+      const lines=buffer.toString('utf8',0,completeEnd).split('\n');lines.pop();if(size>length)lines.shift();
+      for(let i=lines.length-1;i>=0 && events.length<200;i--){
+        const event=JSON.parse(lines[i]) as ConversationEventV1;
+        if(event.schemaVersion!==1 || !Number.isSafeInteger(event.seq))throw Error('preview ledger invalid');
+        events.push(event);
+      }
+    }finally{await file.close();}
+    if(events.length>=200)break;
+  }
+  signal.throwIfAborted();
+  const assistant=(event:ConversationEventV1)=>['message.chunk','message.replace'].includes(event.kind) && (event.payload as any)?.role==='assistant' && typeof (event.payload as any)?.content?.type==='string';
+  const end=events.findIndex(assistant);if(end<0)return {text:'No recent agent output',at:''};
+  const last=events[end],parts:string[]=[];
+  for(let i=end;i<events.length;i++){
+    const event=events[i];
+    if(last.messageId!==undefined){if(!assistant(event)||event.messageId!==last.messageId)continue;}
+    else if(!assistant(event)||event.messageId!==undefined)break;
+    const content=(event.payload as any).content;
+    parts.unshift(content.type==='text'?content.text:`[${content.type}]`);
+    if(event.kind==='message.replace')break;
+  }
+  return {text:parts.join('').replace(/\s+/g,' ').trim().slice(0,300)||'No recent agent output',at:last.at??''};
+}

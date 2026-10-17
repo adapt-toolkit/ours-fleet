@@ -231,7 +231,7 @@ export class TaskRoomApplicationService {
       const view = this.layouts().view(task);
       return { ...task, layout_rooms: (view?.rooms ?? []).map(({ key, state, room_id, identity_cid }) =>
         ({ key, state, ...(room_id ? { room_id } : {}), ...(identity_cid ? { identity_cid } : {}) })) };
-    } catch { return { ...task, layout_rooms: [] }; }
+    } catch { return task; /* An unreadable run cannot prove room absence. */ }
   }
 
   /** Backlog only: choose, change or clear the task's Room Layout before it starts. */
@@ -388,16 +388,16 @@ export class TaskRoomApplicationService {
   }
 
   listTasks(filter?: {
-    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean; strict?: boolean;
   }): TaskRecord[] {
     const listId = filter?.list === undefined ? undefined : resolveTaskList(filter.list).list_id;
-    return readTasks({ state: filter?.state, listId, includeDeleting: filter?.includeDeleting });
+    return readTasks({ state: filter?.state, listId, includeDeleting: filter?.includeDeleting, strict:filter?.strict });
   }
 
   listTaskLists(): TaskListRecord[] { return readTaskLists(); }
 
   groupedTasks(filter?: {
-    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean; strict?: boolean;
   }): Array<{
     list: TaskListRecord; tasks: TaskRecord[];
   }> {

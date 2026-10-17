@@ -36,6 +36,12 @@ for (const status of [200, 401, 502]) {
       expect(response.status).toBe(status);
       expect(response.headers.get('access-control-allow-origin')).toBe(appOrigin);
       expect(response.headers.get('vary')).toBe('Origin');
+      expect(response.headers.get('access-control-expose-headers')).toContain('X-Resource-Producer');
+      expect(response.headers.get('access-control-expose-headers')).toContain('X-Resource-Baseline');
+      const preflight = await fetch(origin + '/messenger/api/contacts', { method: 'OPTIONS', headers: { origin: appOrigin,
+        'access-control-request-method': 'GET', 'access-control-request-headers': 'x-resource-connection,x-resource-view,x-resource-epoch,x-resource-baseline' } });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get('access-control-allow-headers')).toContain('X-Resource-Baseline');
       expect(response.headers.get('x-ours-workspace-auth')).toBe(status === 401 ? 'service' : null);
       expect(store.authenticate(device.token).id).toBe(device.device.id);
       if (status === 200) {
@@ -54,3 +60,38 @@ for (const status of [200, 401, 502]) {
     }
   });
 }
+
+it('forwards resource binding headers and expires neutral streams without touching cookie idle activity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gateway-neutral-'));
+  let now = Date.now();
+  const auth = new WebAuth('http://localhost', 'localhost', () => now, new TrustedDeviceStore(join(dir, 'trusted')), { version: 1, mode: 'none' });
+  const backend = createServer((req, res) => {
+    expect(req.headers['x-resource-baseline']).toBe('baseline');
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'X-Resource-Producer': 'generation', 'X-Resource-Revision': '7',
+      'X-Resource-Source-Generation': 'generation', 'X-Resource-Source-Position': '7' }); res.flushHeaders();
+  });
+  backend.listen(0, '127.0.0.1'); await once(backend, 'listening');
+  const upstream = `http://127.0.0.1:${(backend.address() as { port: number }).port}`;
+  const gateway = createPrefixGateway({ auth, fleetOrigin: upstream, services: [{ prefix: '/notifications', origin: upstream }] });
+  gateway.server.listen(0, '127.0.0.1'); await once(gateway.server, 'listening');
+  const origin = `http://127.0.0.1:${(gateway.server.address() as { port: number }).port}`;
+  auth.setBoundary(origin, new URL(origin).host);
+  const session = auth.anonymous({ headers: { host: new URL(origin).host, origin } } as any);
+  const controller = new AbortController();
+  try {
+    const response = await fetch(origin + '/notifications/api/v1/events?resources=1', {
+      headers: { cookie: `ofs_session=${session.id}`, 'X-Resource-Baseline': 'baseline' }, signal: controller.signal,
+    });
+    expect(response.status).toBe(200); expect(response.headers.get('x-resource-producer')).toBe('generation');
+    const openedAt = session.lastSeenAt;
+    now += 1000; await new Promise(resolve => setTimeout(resolve, 1100));
+    expect(session.lastSeenAt).toBe(openedAt);
+    now += 30 * 60_000;
+    const deadline = setTimeout(() => controller.abort(Error('neutral stream failed to expire')), 2500);
+    try { await expect(response.body!.getReader().read()).rejects.not.toThrow('neutral stream failed to expire'); }
+    finally { clearTimeout(deadline); }
+  } finally {
+    controller.abort(); await gateway.close(); auth.shutdown(); backend.closeAllConnections();
+    await new Promise<void>(resolve => backend.close(() => resolve())); rmSync(dir, { recursive: true, force: true });
+  }
+});

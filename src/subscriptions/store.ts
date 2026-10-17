@@ -1,3 +1,4 @@
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
@@ -136,6 +137,7 @@ export async function updateSubscriptionState<T>(
     const state = readSubscriptionState();
     const result = fn(state);
     replaceFileAtomically(stateFile(), `${JSON.stringify(state, null, 2)}\n`, 0o600);
+    publishFleetResourceCommit(stateFile());
     return result;
   });
 }
@@ -175,4 +177,5 @@ export function readPin(stateDir: string, provider?: SubscriptionProvider): Subs
 
 export function writePin(stateDir: string, pin: SubscriptionPin): void {
   replaceFileAtomically(join(stateDir, PIN_FILE), `${JSON.stringify({ [pin.provider]: pin })}\n`, 0o600);
+  publishFleetResourceCommit(join(stateDir, PIN_FILE));
 }
