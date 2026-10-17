@@ -1,3 +1,8 @@
+import { FleetResourceViews, ResourceBindingError, canonicalResourceDescriptor, type ResourceDescriptor } from './resource-views.js';
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
+import { stateRoot, defaultConfigPath } from '../paths.js';
+import type { FleetResourceScope } from '../application/resource-observer.js';
+import { conversationPreview } from '../application/conversation-history.js';
 import { registerConversationStream } from './conversation-stream.js';
 import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
 import { conversationHasAttachment } from '../application/conversation-history.js';
@@ -51,6 +56,8 @@ import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.j
 const ONBOARDING_WORK = ['coordination', 'development', 'review'] as const;
 
 export interface WebServices {
+  resourceScope?: FleetResourceScope;
+  invalidateResourceCaches?(): void;
   observeRole?(roleId: string, listener: (state: ConversationRoleState) => void): ConversationRoleObservation;
   layoutBindings?: Pick<LayoutBindingGrants, 'control'>;
   query: FleetQueryService;
@@ -127,6 +134,13 @@ export async function buildWebServer(
     auth.validateBoundary(request, false);
   });
 
+  app.addHook('onResponse',async(request,reply)=>{
+    if(reply.statusCode<400 && ['POST','PUT','PATCH','DELETE'].includes(request.method) && !request.url.includes('/resource-subscriptions')) {
+      publishFleetResourceCommit(services.configuration?.path??defaultConfigPath());
+      publishFleetResourceCommit(stateRoot());
+    }
+  });
+
   app.post<{ Params: { id: string } }>('/api/v1/layout-bindings/:id/control', async request => {
     // Initial support is direct same-host Fleet-to-Fleet transport.
     const forwarded = Object.keys(request.headers).some(name =>
@@ -140,6 +154,7 @@ export async function buildWebServer(
   });
 
   app.setErrorHandler(async (error, request, reply) => {
+    if(error instanceof ResourceBindingError)return reply.code(error.status).send({error:{code:'resource_binding',message:error.message}});
     const privateToolParseError = ['/api/v1/roles/:id/ours/call', '/api/v1/layout-bindings/:id/control'].includes(request.routeOptions.url ?? '')
       && error instanceof Error && 'code' in error
       && typeof error.code === 'string' && error.code.startsWith('FST_ERR_CTP_');
@@ -254,8 +269,10 @@ export async function buildWebServer(
     };
   });
 
+  let onboardingObserved: { owner: string; revision: unknown; payload: Record<string, unknown> } | undefined;
   app.get<{ Querystring: { view?: string } }>('/api/v1/onboarding',async request=>{
-    auth.authenticate(request);
+    const browser=auth.authenticate(request);
+    const revision=services.configuration?.read().revision;
     // Opening an existing workspace needs configuration state, not CLI/account discovery.
     // Keep the full report for the setup screens and older App clients.
     if(request.query.view==='state')return {configured:onboardingConfigured()};
@@ -267,7 +284,9 @@ export async function buildWebServer(
     // When it could not be asked, none is offered and the reason is reported.
     const codexModels=services.codexModels ? await services.codexModels() : undefined;
     const offered=(model:CatalogModel)=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model));
-    return {harnesses,catalog:catalog.models.filter(offered),...(codexModels?{codexModels:codexModels.state==='known'?{state:'known'}:codexModels}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    const payload = {harnesses,catalog:catalog.models.filter(offered),...(codexModels?{codexModels:codexModels.state==='known'?{state:'known'}:codexModels}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    if(revision===services.configuration?.read().revision) { onboardingObserved={owner:browser.id,revision,payload}; events.publish('onboarding.changed',{}); }
+    return payload;
   });
 
   // First-time setup is what creates the persistent coordinator. A configuration that loads and
@@ -341,6 +360,9 @@ export async function buildWebServer(
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
     const query = request.query as { includeTemporary?: string };
+    // Unbound REST retains the existing problem-bearing inventory. Bound reads
+    // are handled by the strict resource preHandler before this route.
+    services.invalidateResourceCaches?.();
     return { roles: await services.query.list(query.includeTemporary === 'true') };
   });
 
@@ -365,9 +387,117 @@ export async function buildWebServer(
     return services.taskRooms;
   };
 
+  const projectTasks = async (query: Record<string,string|undefined>, strict = true) => {
+    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
+    if (query.state && query.state !== 'all' && !states.includes(query.state))
+      throw new FleetError('invalid_request', 'invalid task state filter');
+    if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
+      throw new FleetError('invalid_request', 'groupByList must be true or false');
+    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
+      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
+    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
+    const filter = { strict, ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
+      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
+    const api = requireTaskRooms();
+    return taskApi(() => query.groupByList === 'true'
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => api.withLayoutRooms(task)) })) }
+      : { tasks: api.listTasks(filter).map(task => api.withLayoutRooms(task)) });
+  };
+  const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
+    signal.throwIfAborted(); services.invalidateResourceCaches?.();
+    switch(descriptor.resource) {
+      case 'task-layout':
+        try {return {layout:await taskApi(()=>requireTaskRooms().taskLayout(descriptor.entityId!))};}
+        catch(error) {if((error as any)?.code==='task_not_found' || (error as any)?.code==='resource_not_found')return {deleted:true,id:descriptor.entityId};throw error;}
+      case 'creation-action': return services.creation.get(descriptor.entityId!) ?? {deleted:true,id:descriptor.entityId};
+      case 'action': return services.commands.get(descriptor.entityId!) ?? {deleted:true,id:descriptor.entityId};
+      case 'member-addition':
+        try{return await taskApi(()=>requireTaskRooms().memberAddition(descriptor.entityId!,descriptor.receiptId!));}
+        catch(error){if(['task_not_found','resource_not_found'].includes((error as any)?.code) || (error as Error)?.message==='Member request not found')return {deleted:true,id:descriptor.receiptId};throw error;}
+      case 'login':
+        // A foreign login must never be delivered, including its URL/device code.
+        try{return subscriptions().login(descriptor.entityId!,owner).view();}
+        catch(error){if((error as any)?.code==='resource_not_found')return {deleted:true,id:descriptor.entityId};throw error;}
+      case 'subscriptions': return {providers:await subscriptions().list(true)};
+      case 'onboarding-health': {
+        const revision=services.configuration?.read().revision;
+        if(onboardingObserved && onboardingObserved.revision!==revision)onboardingObserved=undefined;
+        const observed=onboardingObserved?.owner===owner ? onboardingObserved : undefined;
+        return {...observed?.payload,observationCurrent:!!observed,configured:onboardingConfigured(),providers:services.subscriptions?await services.subscriptions.list(true):[]};
+      }
+
+      case 'roles': return {roles: await services.query.list(descriptor.includeTemporary ?? false, true)};
+      case 'tasks': return projectTasks({state:descriptor.state,list:descriptor.list,groupByList:String(descriptor.groupByList??false),includeDeleting:String(descriptor.includeDeleting??false)});
+      case 'task-lists': return {lists:requireTaskRooms().listTaskLists()};
+      case 'configuration':
+        if(!services.configuration)throw new FleetError('capability_unavailable','fleet configuration editing is unavailable');
+        return {...services.configuration.read(descriptor.includeDefinitions??false), provenance:services.presetProvenance?.read() ?? null};
+      case 'directory': {
+        const [roles,tasks]=await Promise.all([services.query.list(true,true),projectTasks({})]);
+        return {roles,tasks:(tasks as {tasks:unknown[]}).tasks,lists:requireTaskRooms().listTaskLists()};
+      }
+      case 'previews': {
+        const roles=await services.repository.list(true),selected=new Map(roles.map(role=>[role.id,role]));
+        const previews:Record<string,unknown>={};
+        for(const id of descriptor.ids??[]) {
+          signal.throwIfAborted(); const role=selected.get(id),dir=role && services.repository.stateDir(role);
+          if(!role)continue;
+          try {
+            previews[id]=dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
+          } catch {
+            signal.throwIfAborted();
+            // A damaged/unreadable ledger is unavailable, not empty or removed.
+            // Keep this selected row observable so a repair can refresh it,
+            // without retiring previews for the other selected roles.
+            previews[id]={text:'Preview unavailable',at:'',unavailable:true};
+          }
+        }
+        return {previews};
+      }
+    }
+  };
+  const resources=new FleetResourceViews(services.resourceScope??{},project);
+  app.addHook('preClose',async()=>resources.close());
+  app.get('/api/v1/resource-events', async (request,reply)=>{
+    const browser=auth.authenticate(request);
+    reply.hijack(); reply.raw.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform',Connection:'keep-alive','X-Accel-Buffering':'no'});reply.raw.flushHeaders();
+    const opened=resources.open(reply.raw,browser.id,()=>auth.sessionValid(browser));
+    const binding=auth.bindTransport(browser,opened.close);
+    reply.raw.once('close',()=>binding());
+  });
+  app.post('/api/v1/resource-subscriptions',async (request,reply)=>{
+    const browser=auth.authenticate(request,true),body=request.body as any;
+    const binding=resources.register(browser.id,String(body?.connectionId??''),String(body?.viewId??''),body?.subscriptionEpoch,body?.descriptor);
+    const retire=()=>{
+      if(reply.raw.writableFinished)return;
+      try {resources.remove(browser.id,String(body.connectionId),String(body.viewId),body.subscriptionEpoch);} catch { /* Connection may already be closed. */ }
+    };
+    reply.raw.once('close',retire);
+    reply.raw.once('finish',()=>reply.raw.off('close',retire));
+    if(reply.raw.destroyed)retire();
+    return binding;
+  });
+  app.delete('/api/v1/resource-subscriptions',async request=>{
+    const browser=auth.authenticate(request,true),body=request.body as any;
+    resources.remove(browser.id,String(body?.connectionId??''),String(body?.viewId??''),body?.subscriptionEpoch);return {removed:true};
+  });
+  // Bound reads return precisely the registered initial capture, never an unrelated GET.
+  app.addHook('preHandler',async(request,reply)=>{
+    if(request.method!=='GET' || !request.headers['x-resource-connection'])return;
+    const browser=auth.authenticate(request),headers=request.headers;
+    const baseline=await resources.bound(browser.id,String(headers['x-resource-connection']),String(headers['x-resource-view']),Number(headers['x-resource-epoch']),String(headers['x-resource-baseline']));
+    const expected='/api/v1/'+baseline.descriptor.resource;
+    if(request.url.split('?')[0]!==expected)throw new ResourceBindingError(409,'resource route mismatch');
+    for(const name of ['Connection','View','Epoch','Baseline'])reply.header('X-Resource-'+name,String(headers['x-resource-'+name.toLowerCase()]));
+    reply.header('X-Resource-Producer',baseline.producerGeneration).header('X-Resource-Revision',baseline.revision).header('X-Resource-Source-Generation',baseline.source.producerGeneration).header('X-Resource-Source-Position',baseline.source.position);
+    return reply.send(baseline.payload);
+  });
+  for(const resource of ['task-layout','creation-action','action','member-addition','login','onboarding-health'] as const) app.get('/api/v1/'+resource,async()=>{throw new ResourceBindingError(409,'resource binding required');});
+  app.get('/api/v1/directory',async request=>{auth.authenticate(request);return project({viewId:'read',resource:'directory'},new AbortController().signal);});
+  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const ids=String((request.query as any).ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids}),new AbortController().signal);});
   app.get('/api/v1/task-lists', async request => {
     auth.authenticate(request);
-    return { lists: requireTaskRooms().listTaskLists() };
+    return project({viewId:'read',resource:'task-lists'},new AbortController().signal);
   });
   app.post('/api/v1/task-lists', async (request, reply) => {
     auth.authenticate(request, true);
@@ -389,23 +519,7 @@ export async function buildWebServer(
   });
   app.get('/api/v1/tasks', async request => {
     auth.authenticate(request);
-    const query = request.query as {
-      state?: string; list?: string; groupByList?: string; includeDeleting?: string;
-    };
-    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
-    if (query.state && query.state !== 'all' && !states.includes(query.state))
-      throw new FleetError('invalid_request', 'invalid task state filter');
-    if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
-      throw new FleetError('invalid_request', 'groupByList must be true or false');
-    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
-      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
-    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
-    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
-      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
-    const api = requireTaskRooms();
-    return taskApi(() => query.groupByList === 'true'
-      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => api.withLayoutRooms(task)) })) }
-      : { tasks: api.listTasks(filter).map(task => api.withLayoutRooms(task)) });
+    return projectTasks(request.query as Record<string,string>, false);
   });
   app.delete('/api/v1/tasks/:id', async (request, reply) => {
     auth.authenticate(request, true);
@@ -603,7 +717,7 @@ export async function buildWebServer(
     auth.authenticate(request);
     if (!services.configuration)
       throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
-    return services.configuration.read((request.query as { includeDefinitions?: string }).includeDefinitions === 'true');
+    return project({viewId:'read',resource:'configuration',includeDefinitions:(request.query as {includeDefinitions?:string}).includeDefinitions==='true'},new AbortController().signal);
   });
 
   app.post('/api/v1/configuration/preview', async request => {

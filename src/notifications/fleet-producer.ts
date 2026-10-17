@@ -1,5 +1,6 @@
+import { observeFleetResources } from '../application/resource-observer.js';
 import { roomsDir } from '../rooms-tasks/room-state.js';
-import { drainNotificationTargetCleanup, notificationAgentId } from './target-cleanup.js';
+import { cleanupDir, drainNotificationTargetCleanup, notificationAgentId } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -31,20 +32,26 @@ function taskRoleAssociations():Map<string,string>{
  * checkpoint; it never loads a complete transcript or requests model history. */
 export class FleetNotificationProducer {
   private readonly queues = new Map<string, NotificationOutbox>();
-  private readonly timer: ReturnType<typeof setInterval>;
+  private readonly observation = new AbortController();
+  private continuation?: ReturnType<typeof setTimeout>;
+  private stopped = false;
   private readonly existing = new Set<string>();
   private cleanup?: Promise<void>;
   constructor(private readonly roots: string[], private readonly stateDir: string,
     private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {}) {
+    observeFleetResources({ retryWatchFailures: true, roots, paths:[...roots,roomsDir(),cleanupDir()] }, state => {
+      if (state.health === 'healthy') this.poll();
+      else this.warn('Notification discovery observation unavailable; checkpoint retained');
+    }, this.observation.signal);
     for (const root of roots) for (const name of this.names(root)) this.existing.add(join(root, name));
     this.poll();
-    this.timer = setInterval(() => this.poll(), 1000); this.timer.unref();
   }
   private names(root: string): string[] {
     try { return readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory() && /^[a-zA-Z0-9_-]+$/.test(d.name)).map(d => d.name); }
     catch { return []; }
   }
   poll(): void {
+    if (this.stopped) return;
     this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(url)=>{
       const name=notificationAgentId(url);
       if(!name || !/^[A-Za-z0-9_-]+$/.test(name))return false;
@@ -62,7 +69,9 @@ export class FleetNotificationProducer {
         }
       }
       return true;
-    }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;});
+    }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;
+      try{if(readdirSync(cleanupDir()).some(name=>/^[a-f0-9]{64}\.json$/.test(name)))this.resume(3000);}catch{}
+    });
     let taskRoles:Map<string,string>|undefined;
     try{taskRoles=taskRoleAssociations();}
     catch{this.warn('Notification task association unavailable; delivering unclassified events');}
@@ -96,6 +105,7 @@ export class FleetNotificationProducer {
         const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(256 * 1024);
         let count: number;
         try { count = readSync(fd, buffer, 0, buffer.length, current.offset); } finally { closeSync(fd); }
+        if (current.offset + count < statSync(join(dir, current.segment)).size || index < segments.length - 1) this.resume();
         let position = 0;
         while (position < count) {
           const end = buffer.indexOf(10, position);
@@ -119,15 +129,25 @@ export class FleetNotificationProducer {
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats/agents/${encodeURIComponent(roleId)}#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) break;
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats/agents/${encodeURIComponent(roleId)}#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) {this.resume(1000);break;}
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
         }
         if (current.segment !== saved.segment || current.offset !== saved.offset) outbox.saveCheckpoint(current);
-      } catch { this.warn('Notification ledger admission pending; checkpoint will replay'); }
+      } catch {
+        this.warn('Notification ledger admission pending; checkpoint will replay');
+        // Retained, not-yet-admitted ledger work needs its own next-due wake;
+        // the outbox sender can retry only events that were already admitted.
+        this.resume(1000);
+      }
     }
   }
+  private resume(delay = 0) {
+    if (this.continuation || this.stopped) return;
+    this.continuation = setTimeout(() => { this.continuation = undefined; this.poll(); }, delay);
+    this.continuation.unref();
+  }
   async drain(): Promise<void> { await Promise.all([...this.queues.values()].map(q => q.drain())); }
-  async close(): Promise<void> { clearInterval(this.timer); await this.cleanup; await Promise.all([...this.queues.values()].map(q => q.close())); }
+  async close(): Promise<void> { this.stopped = true; this.observation.abort(); clearTimeout(this.continuation); await this.cleanup; await Promise.all([...this.queues.values()].map(q => q.close())); }
 }

@@ -1,3 +1,4 @@
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -54,7 +55,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
       {[r.slot]:{role:r.role,brain:r.brain}});}catch(error){throw new MemberAdditionRejected(error instanceof Error?error.message:'Invalid member configuration');}})();
     const template=sealTemplateSnapshot(plan.snapshot,input.cfg.agentTemplates??{},plan.launchDefinitions);
     const receipt:Receipt={taskId,requestId:r.requestId,roleId,hash,state:'running'};
-    const save=()=>replaceFileAtomically(path,JSON.stringify(receipt)+'\n',0o600);
+    const save=()=>{replaceFileAtomically(path,JSON.stringify(receipt)+'\n',0o600);publishFleetResourceCommit(path);};
     save();running.add(path);
     void (input.provision??provisionMembers)({cfg:input.cfg,cowork:input.cowork,configPath:input.configPath,binPath:input.binPath,
       taskId,roomId:room.room_id,template,goal:task.title,brief:task.brief,append:true}).then(result=>{

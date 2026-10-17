@@ -1,3 +1,5 @@
+import * as sdkClient from '@ours.network/sdk/client';
+import { acquireSelectedDaemonHealth } from '../src/daemon-recovery.js';
 import { writeManagedRecovery, readManagedRecovery } from '../src/managed-recovery.js';
 import { gatewayFixture } from './gateway-fixture.js';
 import { controlRequest } from '../src/session/control.js';
@@ -37,6 +39,11 @@ import { AcpSession } from '../src/session/acp.js';
 import { ReminderStore } from '../src/reminders/store.js';
 import type { ReminderToolBackend } from '../src/reminders/tools.js';
 import { writeV2Fixture } from './v2-fixture.js';
+
+vi.mock('@ours.network/sdk/client', async importOriginal => {
+  const actual = await importOriginal<typeof import('@ours.network/sdk/client')>();
+  return { ...actual, attachOursClient: vi.fn(actual.attachOursClient) };
+});
 
 vi.mock('../src/agent-ours/service.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/agent-ours/service.js')>(),
@@ -608,6 +615,31 @@ describe('runOnce isolation', () => {
 });
 
 describe('daemon generation recovery integration', () => {
+  it('routes production health through one shared probe and releases its final consumer', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const world = fakeWorld({ lifeChecks: 4, exitFile: join(d, '.exit-status') });
+    let reads = 0;
+    const attached = vi.spyOn(sdkClient, 'attachOursClient').mockImplementation(async () => ({
+      version: async () => { reads++; return { name: 'ours', pid: 1, stateDir: dir, startup: {
+        version: 1, pid: 1, bootId: 'shared', phase: 'ready', startedAt: 1, updatedAt: 1,
+      } }; },
+      identities: async () => [{ name: 'A' }], close: async () => {},
+    }) as never);
+    // Remove the legacy fixture probes: exercise default runOnce wiring exactly
+    // as a real supervisor does, retaining only the fake agent/session boundary.
+    const { probeGeneration: _generation, identityProbeDeps: _identity, ...productionHealth } = world.deps;
+    try {
+      await runOnce('A', {}, productionHealth);
+      expect(reads).toBe(1);
+      const replacement = acquireSelectedDaemonHealth(process.env);
+      try {
+        await replacement.sample();
+        expect(reads).toBe(2); // Exit released the old owner instead of retaining its cached answer.
+      } finally { replacement.release(); }
+    } finally { attached.mockRestore(); }
+  });
   it('does not report active recovery after an ordinary clean persistent shutdown', async () => {
     writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A');
@@ -1880,6 +1912,23 @@ describe('temporary identity retirement', () => {
     expect(result.elapsedSecs).toBeGreaterThanOrEqual(TEMP_IDENTITY_CLOSE_DEBOUNCE_MS / 1000);
     expect(probes).toBeGreaterThan(2);
     expect(world.paneCommands).toHaveLength(1);
+  });
+
+  it('starts the five-second absence debounce when the authoritative response completes', async () => {
+    const d = writeTemp('T');
+    const world = fakeWorld({ lifeChecks: 100, exitFile: join(d, '.exit-status') });
+    let reads = 0;
+    let absentAt = 0;
+    world.deps.fetch = async () => {
+      const read = reads++;
+      if (read === 1) { await world.deps.sleep(6000); absentAt = world.deps.now(); }
+      return { status: 200, ok: true, json: async () => ({
+        identities: [{ name: read === 0 ? 'T' : 'Other' }],
+      }) };
+    };
+    const result = await runOnce('T', { temp: true }, world.deps);
+    expect(result.retirementReason).toBe('identity-closed');
+    expect(world.deps.now() - absentAt).toBeGreaterThanOrEqual(TEMP_IDENTITY_CLOSE_DEBOUNCE_MS);
   });
 
   it('cancels in-flight generation recovery on temp stop and fences late completion', async () => {

@@ -11,6 +11,8 @@ export interface FleetEvent {
 
 export class FleetEventBus {
   private readonly events: FleetEvent[] = [];
+  private readonly resourceListeners = new Set<() => void>();
+  subscribeResources(listener: () => void): () => void {this.resourceListeners.add(listener);return()=>{this.resourceListeners.delete(listener);};}
   private readonly clients = new Set<WebSocket>();
   publish(kind: string, payload: unknown, roleId?: string): FleetEvent {
     const event = { eventId: randomUUID(), at: new Date().toISOString(), roleId, kind, payload };
@@ -20,6 +22,7 @@ export class FleetEventBus {
     for (const socket of this.clients) {
       if (socket.readyState === socket.OPEN && socket.bufferedAmount < 1024 * 1024) socket.send(frame);
     }
+    for(const listener of this.resourceListeners){try{listener();}catch{}}
     return event;
   }
   attach(socket: WebSocket, lastEventId?: string): () => void {
@@ -34,5 +37,6 @@ export class FleetEventBus {
   close(): void {
     for (const socket of this.clients) socket.close(1001, 'server shutdown');
     this.clients.clear();
+    this.resourceListeners.clear();
   }
 }

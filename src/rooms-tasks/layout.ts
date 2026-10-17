@@ -1,3 +1,4 @@
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
 /** Durable local room-layout controller.
  * Uses native Cowork operations and a supervising Fleet's exact-instance port.
  * Unknown mutation outcomes stop for reconciliation; they are never replayed.
@@ -79,7 +80,7 @@ export class RoomLayout {
   }
   private get cowork(): CoworkAdapter { return this.coworkAdapter ??= this.coworkFactory(); }
   snapshot(): RoomLayoutState { return JSON.parse(readFileSync(this.file, 'utf8')); }
-  private save(s: RoomLayoutState): void { replaceFileAtomically(this.file, JSON.stringify(s, null, 2)); }
+  private save(s: RoomLayoutState): void { replaceFileAtomically(this.file, JSON.stringify(s, null, 2)); publishFleetResourceCommit(this.file); }
   private async verify(i: LayoutInstance): Promise<void> {
     need(i.supervisor === this.supervisor.id || i.remote, 'remote binding unsupported');
     need(i.launch && i.cid && i.session, 'incomplete instance reference');

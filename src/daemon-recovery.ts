@@ -5,7 +5,7 @@ import {
   attachOursClient, type AttachOursClientOptions, type OursClient,
 } from '@ours.network/sdk/client';
 
-import { type FetchLike } from './monitor.js';
+import { classifyIdentityPresence, type FetchLike, type IdentityPresence } from './monitor.js';
 import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { replaceFileAtomically } from './atomic-file.js';
 
@@ -47,6 +47,7 @@ interface StartupProgress {
 }
 
 interface GenerationProbeDeps {
+  requestSignal?: AbortSignal;
   readText?(path: string): string;
   canonicalize?(path: string): string;
   attachClient?(
@@ -84,7 +85,10 @@ export async function probeDaemonGeneration(
   env: NodeJS.ProcessEnv,
   deps: GenerationProbeDeps = {},
 ): Promise<DaemonGenerationProbe> {
-  try { return await probeSelectedDaemon(deps, readClientProfile(env)); }
+  try {
+    const { identities: _identities, ...generation } = await probeSelectedDaemon(deps, readClientProfile(env));
+    return generation;
+  }
   catch { return { state: 'unavailable', reason: 'CLIENT_GATEWAY_PROFILE_INVALID' }; }
 }
 
@@ -92,7 +96,7 @@ export async function probeDaemonGeneration(
 async function probeSelectedDaemon(
   deps: GenerationProbeDeps,
   profile: ExplicitClientProfile,
-): Promise<DaemonGenerationProbe> {
+): Promise<DaemonGenerationProbe & { identities?: unknown[] }> {
   // Defer credential-file access to SDK selection, which checks the configured
   // daemon identity/capability before it reads or sends the credential.
   let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
@@ -100,7 +104,7 @@ async function probeSelectedDaemon(
     const options: AttachOursClientOptions = {
       endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
       credentialPath: profile.credentialPath,
-      sessionMode: 'external', leaseToken: randomUUID(), env: {},
+      sessionMode: 'external', leaseToken: randomUUID(), env: {}, requestSignal: deps.requestSignal,
     };
     client = await (deps.attachClient?.(options) ?? attachOursClient(options));
     const info = await client.version({startup:true});
@@ -114,13 +118,127 @@ async function probeSelectedDaemon(
     const identities = await client.identities();
     if (!Array.isArray(identities)) return {state:'unavailable', reason:'DAEMON_IDENTITIES_INVALID'};
     if (!identities.length) return {state:'unavailable', reason:'DAEMON_IDENTITIES_NOT_READY'};
-    return {state:'ready', generation:{
+    return {state:'ready', identities, generation:{
       bootId:progress.bootId, pid:progress.pid, startedAt:progress.startedAt, stateDir:info.stateDir,
     }};
   } catch {
     // Failed selection, auth or transport is unavailable, never owner death.
     return {state:'unavailable', reason:'DAEMON_SELECTED_PROBE_UNAVAILABLE'};
   } finally { await client?.close().catch(() => undefined); }
+}
+
+export interface SelectedDaemonHealthSnapshot {
+  generation: DaemonGenerationProbe;
+  identities?: unknown[];
+}
+
+export interface SelectedDaemonHealthLease {
+  sample(): Promise<SelectedDaemonHealthSnapshot>;
+  presence(name: string, snapshot: SelectedDaemonHealthSnapshot): IdentityPresence;
+  release(): void;
+}
+
+interface SelectedHealthOwner {
+  consumers: number;
+  sample(): Promise<SelectedDaemonHealthSnapshot>;
+  stop(): void;
+}
+const selectedHealthOwners = new Map<string, SelectedHealthOwner>();
+const unavailableHealth = (reason: string): SelectedDaemonHealthSnapshot => ({
+  generation: { state: 'unavailable', reason },
+});
+
+/** Retained runtime health, independent of browser delivery and stream readiness. */
+export function acquireSelectedDaemonHealth(
+  env: NodeJS.ProcessEnv, deps: GenerationProbeDeps = {},
+): SelectedDaemonHealthLease {
+  let profile: ExplicitClientProfile;
+  try { profile = readClientProfile(env); }
+  catch {
+    return {
+      sample: async () => unavailableHealth('CLIENT_GATEWAY_PROFILE_INVALID'),
+      presence: () => ({ state: 'unknown', detail: 'selected daemon unavailable' }),
+      release: () => {},
+    };
+  }
+  // Credentials are part of the selection boundary, not merely endpoint identity.
+  const key = JSON.stringify([profile.endpoint, profile.expectedInstanceId, profile.credentialPath]);
+  let owner = selectedHealthOwners.get(key);
+  if (!owner) {
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    let current: SelectedDaemonHealthSnapshot | undefined;
+    let nextProbeAt = 0;
+    let pending: Promise<SelectedDaemonHealthSnapshot> | undefined;
+    let cancelProbe: (() => void) | undefined;
+    const run = (): Promise<SelectedDaemonHealthSnapshot> => {
+      let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
+      let closed = false;
+      let cancelled = false;
+      const request = new AbortController();
+      const close = async () => {
+        if (client && !closed) { closed = true; await client.close().catch(() => undefined); }
+      };
+      let deadline: NodeJS.Timeout | undefined;
+      const interrupted = new Promise<SelectedDaemonHealthSnapshot>(resolve => {
+        cancelProbe = () => {
+          cancelled = true;
+          request.abort();
+          void close();
+          resolve(unavailableHealth('DAEMON_SELECTED_PROBE_UNAVAILABLE'));
+        };
+        deadline = setTimeout(cancelProbe, 10_000);
+        deadline.unref?.();
+      });
+      const probe = probeSelectedDaemon({ ...deps, requestSignal: request.signal, attachClient: async options => {
+        client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+        if (cancelled) { void close(); throw new Error('health probe cancelled'); }
+        return { version: (...args) => client!.version(...args),
+          identities: () => client!.identities(), close };
+      } }, profile).then(({ identities, ...generation }) => ({ generation, identities }));
+      pending = Promise.race([probe, interrupted]).then(snapshot => {
+        if (!stopped) current = snapshot;
+        return snapshot;
+      }).finally(() => {
+        if (deadline) clearTimeout(deadline);
+        cancelProbe = undefined;
+        pending = undefined;
+        if (!stopped) {
+          nextProbeAt = Date.now() + 2_000;
+          timer = setTimeout(() => { void run(); }, 2_000);
+          timer.unref?.();
+        }
+      });
+      return pending;
+    };
+    owner = {
+      consumers: 0,
+      sample: () => {
+        if (pending) return pending;
+        if (current && Date.now() < nextProbeAt) return Promise.resolve(current);
+        // A delayed timer after process suspension cannot certify old absence.
+        if (timer) clearTimeout(timer);
+        return run();
+      },
+      stop: () => { stopped = true; if (timer) clearTimeout(timer); cancelProbe?.(); },
+    };
+    selectedHealthOwners.set(key, owner);
+    void run();
+  }
+  const retained = owner;
+  retained.consumers++;
+  let released = false;
+  return {
+    sample: () => released ? Promise.resolve(unavailableHealth('HEALTH_OWNER_RELEASED')) : retained.sample(),
+    presence: (name, snapshot) => snapshot.generation.state === 'ready'
+      ? classifyIdentityPresence(name, snapshot.identities)
+      : { state: 'unknown', detail: 'selected daemon unavailable' },
+    release: () => {
+      if (released) return;
+      released = true;
+      if (--retained.consumers === 0) { retained.stop(); selectedHealthOwners.delete(key); }
+    },
+  };
 }
 
 export class DaemonGenerationObserver {

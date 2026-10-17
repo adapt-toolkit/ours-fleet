@@ -64,7 +64,7 @@ abstract class BaseLogin implements LoginHandle {
 
   constructor(
     readonly provider: SubscriptionProvider, readonly owner: string,
-    readonly kind: LoginView['kind'], now = Date.now(),
+    readonly kind: LoginView['kind'], now = Date.now(), protected readonly changed: () => void = () => {},
   ) {
     this.expiresAt = now + LOGIN_TTL_MS;
     this.done = new Promise(resolve => { this.finish = resolve; });
@@ -96,6 +96,7 @@ abstract class BaseLogin implements LoginHandle {
     clearTimeout(this.timer);
     this.stop();
     this.finish(state === 'succeeded');
+    this.changed();
   }
 
   /** Called by the service after verifying the new home. */
@@ -111,8 +112,8 @@ export class ClaudeLogin extends BaseLogin {
   /** Resolves with the CLI exit status once it exits. */
   exited: Promise<number | null>;
 
-  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string) {
-    super('claude', owner, 'paste_code');
+  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string, changed?: () => void) {
+    super('claude', owner, 'paste_code', Date.now(), changed);
     const darwin = process.platform === 'darwin';
     const args = darwin
       ? ['-q', '/dev/null', bins.claude, 'auth', 'login']
@@ -139,6 +140,7 @@ export class ClaudeLogin extends BaseLogin {
           if (!url) { this.end('failed', 'the CLI returned an unexpected sign-in address'); return; }
           this.url = url;
           this.state = 'awaiting_user';
+        this.changed();
         }
       }
       // Claude asks for Enter after success; the answer carries no secret.
@@ -161,6 +163,7 @@ export class ClaudeLogin extends BaseLogin {
     if (!PASTE_CODE_RE.test(code)) throw new FleetError('invalid_request', 'that does not look like a sign-in code');
     this.submitted = true;
     this.state = 'verifying';
+    this.changed();
     this.output = '';
     this.child?.stdin.write(`${code}\r`);
   }
@@ -179,8 +182,8 @@ export class CodexDeviceLogin extends BaseLogin {
   /** Resolves true when the app-server reports a successful login. */
   completed: Promise<boolean>;
 
-  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string) {
-    super('codex', owner, 'device_code');
+  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string, changed?: () => void) {
+    super('codex', owner, 'device_code', Date.now(), changed);
     this.completed = (async () => {
       try {
         this.server = await CodexAppServer.start(bins.codex, profileEnv('CODEX_HOME', profileId, home));
@@ -203,8 +206,9 @@ export class CodexDeviceLogin extends BaseLogin {
         this.url = url;
         this.userCode = String(started.userCode).slice(0, 32);
         this.state = 'awaiting_user';
+        this.changed();
         const ok = await Promise.race([completion, this.done.then(() => false)]);
-        if (this.state === 'awaiting_user') this.state = 'verifying';
+        if (this.state === 'awaiting_user') { this.state = 'verifying'; this.changed(); }
         return ok;
       } catch {
         this.end('failed', 'could not start the sign-in');
