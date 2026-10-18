@@ -33,7 +33,7 @@ it('commits creation and every effective state atomically, including block/unblo
     'active (blocked) → review.', 'review → done.',
   ]);
   expect(new Set(pending.map(e => e.eventId)).size).toBe(pending.length);
-  for (const e of pending) { expect(e.taskId).toBe(task.task_id); expect(e.url).toBe(`/fleet/tasks/${task.task_id}`); }
+  for (const e of pending) { expect(e.taskId).toBe(task.task_id); expect(e.target).toEqual({kind:'task',taskId:task.task_id});expect(e).not.toHaveProperty('url'); }
   expect(() => reviewTask(task.task_id)).toThrow(); expect(events(task.task_id)).toEqual(pending);
 });
 
@@ -64,7 +64,7 @@ it('keeps events across removal and acknowledges duplicate pre-unlink copies', (
   expect(unlinkDeletedTask(task.task_id)).toBe(true);
   expect(events(task.task_id).slice(0, -1)).toEqual(pending);
   expect(events(task.task_id).at(-1)?.body).toContain('deleting → deleted');
-  expect(events(task.task_id).at(-1)?.url).toBe(`/fleet/tasks?deletedTask=${task.task_id}`);
+  expect(events(task.task_id).at(-1)?.target).toEqual({kind:'task-deleted',taskId:task.task_id});
   for (const e of events(task.task_id)) acknowledgeTaskNotification(task.task_id, e.eventId);
   expect(events(task.task_id)).toEqual([]);
 });
@@ -107,4 +107,26 @@ it('continues admitted task deliveries when another task record is corrupt', asy
   await producer.drain(); await producer.close();
   expect(sent).toHaveLength(1); expect(events(valid.task_id)).toEqual([]);
   expect(warnings.some(line => line.includes('other task deliveries continue'))).toBe(true);
+});
+
+it('retains unsupported task journal entries across typed delivery, acknowledgement and deletion',async()=>{
+ const task=create(),file=join(tasksDir(),task.task_id+'.json'),stored=JSON.parse(readFileSync(file,'utf8'));
+ const legacy=Array.from({length:40},(_,i)=>({eventId:`task:${task.task_id}:old-${i}`,title:'Old',body:'Retain',taskId:task.task_id,url:`/fleet/tasks/${task.task_id}`}));
+ stored.notification_events=[...legacy,...stored.notification_events];writeFileSync(file,JSON.stringify(stored));
+ const sent:any[]=[];const sender=new TaskNotificationProducer({origin:'https://service.invalid',token:'t'.repeat(40)},undefined,(async(_url,init)=>{sent.push(JSON.parse(String(init?.body)));return new Response('{}');})as typeof fetch);
+ await sender.drain();await sender.close();expect(sent).toHaveLength(1);expect(sent[0].target).toEqual({kind:'task',taskId:task.task_id});
+ acknowledgeTaskNotification(task.task_id,legacy[0].eventId);expect(JSON.parse(readFileSync(file,'utf8')).notification_events).toEqual(legacy);
+ cancelTask(task.task_id);beginTaskDeletionIntent(task.task_id,{kind:'local_control',surface:'cli'});unlinkDeletedTask(task.task_id);
+ for(const event of events(task.task_id))acknowledgeTaskNotification(task.task_id,event.eventId);
+ expect(JSON.parse(readFileSync(join(tasksDir(),'.notification-retired',task.task_id+'.json'),'utf8')).notification_events).toEqual(legacy);
+ expect(pendingTaskNotifications()).toEqual([]);
+});
+
+it('resumes a pre-upgrade prepared deletion without reprojecting its committed deleted event ID',()=>{
+ const task=create();cancelTask(task.task_id);beginTaskDeletionIntent(task.task_id,{kind:'local_control',surface:'cli'});
+ const file=join(tasksDir(),task.task_id+'.json'),stored=JSON.parse(readFileSync(file,'utf8'));
+ const legacy=stored.notification_events.map(({target,...event}:any)=>({...event,url:`/fleet/tasks/${task.task_id}`}));stored.notification_events=legacy;writeFileSync(file,JSON.stringify(stored));
+ const removed={eventId:`task:${task.task_id}:deleted`,taskId:task.task_id,title:'Old deleted',body:'Preserve',url:`/fleet/tasks?deletedTask=${task.task_id}`};
+ const dir=join(tasksDir(),'.notification-retired');mkdirSync(dir,{recursive:true});const retired=join(dir,task.task_id+'.json');writeFileSync(retired,JSON.stringify({notification_events:[...legacy,removed]}));
+ expect(unlinkDeletedTask(task.task_id)).toBe(true);expect(JSON.parse(readFileSync(retired,'utf8')).notification_events).toEqual([...legacy,removed]);expect(pendingTaskNotifications()).toEqual([]);
 });

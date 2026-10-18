@@ -1,4 +1,4 @@
-import {validateAccountOrigin} from './account-origin.js';
+import {validateAccountOrigin,validateConfiguredAccountOrigin,validateConfiguredWorkspaceHost} from './account-origin.js';
 import { lstatSync, readFileSync, readdirSync, mkdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readClientProfile } from './client-profile.js';
@@ -19,7 +19,8 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
 }
 export function decodeWorkspacePayload(input:string,options:{allowExpired?:boolean}={}):WorkspacePayload {
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
-  if(!p || typeof p!=='object' || Array.isArray(p) || p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
+  try { validateConfiguredAccountOrigin(p?.appOrigin); } catch { throw Error('Workspace payload is invalid or expired'); }
+  if(!p || typeof p!=='object' || Array.isArray(p) || p.version!==1 || !validateConfiguredWorkspaceHost(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
   for(const k of ['connectorToken','invitation'] as const){if(k==='connectorToken' && p[k]===undefined)continue;if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');}
   for(const k of ['fullName','name','surname'] as const){const value=p[k];if(value==null || value===''){p[k]=null;continue;}if(typeof value!=='string' || value.length>8192 || /[\x00-\x1f\x7f]/.test(value))throw Error('Invalid workspace profile');p[k]=value.trim()||null;}
   return p;
@@ -31,7 +32,7 @@ export function checkWorkspaceConnector(payload:WorkspacePayload):void {
 
   const dir=join(stateRoot(),'workspace');let previous:any;
   try{previous=JSON.parse(readFileSync(join(dir,'binding.json'),'utf8'));}catch{reject();}
-  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin??'https://app.ours.network')!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
+  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin)!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
   try{
     const file=join(dir,'connector'),stat=lstatSync(file);
     if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>8193 || !readFileSync(file,'utf8').trim())reject();
@@ -182,7 +183,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const appOrigin=validateAccountOrigin(payload.appOrigin);
   const previousFile=join(dir,'binding.json');
   let migrating=false;
-  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin ?? 'https://app.ours.network');migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
+  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin);migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
   const loaded=loadConfig(configuration,{deferredOwnerInviteFile:workspaceOwnerInvite()});
   // Decided before anything is sent or written: the Owner entry is replaced only when it records an enrollment this host has lost.
   const lost=Boolean(loaded.rooms) && recordsLostEnrollment(resolve(configuration));

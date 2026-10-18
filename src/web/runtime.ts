@@ -98,8 +98,8 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   }
   const access = options.access ?? new WebAccessStore(webDir).read();
   const bindingFile=resolve(stateRoot(),'workspace','binding.json');
-  let appOrigin='https://app.ours.network';
-  try {if(existsSync(bindingFile))appOrigin=validateAccountOrigin(JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin ?? appOrigin);}catch(error){lock.release();throw error;}
+  let appOrigin:string|undefined;
+  try {if(existsSync(bindingFile))appOrigin=validateAccountOrigin(JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin);}catch(error){lock.release();throw error;}
   const auth = new WebAuth(
     publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
     publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,

@@ -57,7 +57,7 @@ export class WebAuth {
     private readonly devices = new TrustedDeviceStore(),
     private readonly access: WebAccessConfig = { version: 1, mode: 'pairing' },
     private readonly workspaceDevices?: WorkspaceDeviceStore,
-    readonly appOrigin = 'https://app.ours.network',
+    readonly appOrigin?: string,
   ) {}
   get bootstrapSecret(): string { return this._bootstrapSecret; }
   get origin(): string { return this._origin; }
@@ -82,7 +82,7 @@ export class WebAuth {
 
   /** The configured account origin, when this request comes from it and workspace devices are enabled. */
   accountOrigin(request: Pick<FastifyRequest, 'headers'>): string | undefined {
-    return this.workspaceDevices && request.headers.origin === this.appOrigin ? this.appOrigin : undefined;
+    return this.workspaceDevices && this.appOrigin && request.headers.origin === this.appOrigin ? this.appOrigin : undefined;
   }
 
   validateBoundary(request: FastifyRequest, requireOrigin: boolean): void {
@@ -92,7 +92,7 @@ export class WebAuth {
     if (!host || !hosts.has(host)) throw new FleetError('forbidden',
       `This address is not configured for the fleet console. Open ${this.origin} or set --public-origin.`);
     if(this.workspaceDevices && String(request.headers.authorization ?? '').startsWith('Bearer ') && request.headers.origin && request.headers.origin!==this.appOrigin && !origins.has(request.headers.origin))throw new FleetError('forbidden','workspace request Origin does not match configured account origin');
-    const workspaceRequest = Boolean(this.workspaceDevices) && request.headers.origin === this.appOrigin
+    const workspaceRequest = Boolean(this.workspaceDevices) && Boolean(this.appOrigin) && request.headers.origin === this.appOrigin
       && (String(request.headers.authorization ?? '').startsWith('Bearer ') || (request.url ?? '').split('?')[0] === '/api/v1/devices/enroll' || request.method === 'OPTIONS');
     if (requireOrigin && !workspaceRequest && (!request.headers.origin || !origins.has(request.headers.origin)))
       throw new FleetError('forbidden', 'request Origin does not match the configured control-panel origin');
@@ -154,7 +154,7 @@ export class WebAuth {
       return session;
     }
     this.validateBoundary(request, mutation);
-    if (request.headers.origin === this.appOrigin && !this.allowedOrigins.has(this.appOrigin)) throw new FleetError('unauthorized','workspace bearer credential required');
+    if (this.appOrigin && request.headers.origin === this.appOrigin && !this.allowedOrigins.has(this.appOrigin)) throw new FleetError('unauthorized','workspace bearer credential required');
     const id = parseCookies(request.headers.cookie ?? '').ofs_session;
     const session = id ? this.sessions.get(id) : undefined;
     const now = this.now();

@@ -17,7 +17,7 @@ const opaque = /^[\w-]{43}$/;
 function binding(value: WorkspaceBinding): WorkspaceBinding {
   if (!value || !opaque.test(value.workspaceId) || !opaque.test(value.hostWorkspaceId) || (value.serverCid!==undefined && !/^[a-f0-9]{64}$/i.test(value.serverCid))
     || (value.proofRootCid !== undefined && !/^[a-f0-9]{64}$/i.test(value.proofRootCid))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
-  return {...value, appOrigin: validateAccountOrigin(value.appOrigin ?? 'https://app.ours.network')};
+  return {...value, appOrigin: validateAccountOrigin(value.appOrigin)};
 }
 export function readWorkspaceBinding(): WorkspaceBinding | undefined {
   const file = join(workspaceDir(), 'binding.json');
@@ -40,7 +40,7 @@ export async function confirmWorkspaceReplacement(previous: WorkspaceBinding, ex
   write?: (value: string) => void; interactive?: boolean; ask?: () => Promise<string>;
 } = {}): Promise<boolean> {
   const write = effects.write ?? (value => { process.stderr.write(value); });
-  let hostname='';try{const tunnel=JSON.parse(readFileSync(join(workspaceDir(),'tunnel.json'),'utf8'));if(typeof tunnel.origin==='string' && /^https:\/\/[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(tunnel.origin))hostname=` (${new URL(tunnel.origin).hostname})`;}catch{}
+  let hostname='';try{const tunnel=JSON.parse(readFileSync(join(workspaceDir(),'tunnel.json'),'utf8'));if(typeof tunnel.origin==='string' && validateAccountOrigin(tunnel.origin))hostname=` (${new URL(tunnel.origin).hostname})`;}catch{}
   write(`This host is registered to workspace ${previous.workspaceId}${hostname} at ${previous.appOrigin}.\nReplacing it removes the old account registration and revokes its linked devices. The account service retires tunnel resources it knows; a migrated database may have no old resources to delete. Installation identities, agents and data are preserved.\n`);
   if (explicit) return true;
   if (!(effects.interactive ?? process.stdin.isTTY)) { write('Existing setup preserved. Run in a terminal to confirm, or pass --replace-registration to confirm explicitly.\n'); return false; }

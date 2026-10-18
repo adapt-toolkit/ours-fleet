@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { redeemTunnelSetup, readTunnelSetupStdin, readTunnelSetupArgument, inspectTunnelSetup, verifyTunnelSetupTarget } from '../src/tunnel-setup-input.js';
 const encode=(value:unknown)=>Buffer.from(JSON.stringify(value)).toString('base64url');
 const payload={version:1,appOrigin:'https://app.ours.network',hostname:'home.ours-tunnel.com',rootName:'human@home',name:'Name',surname:'Surname',connectorToken:'connector-secret',invitation:'invite-secret',serverCid:'A'.repeat(64),challenge:{nonce:'n'.repeat(43),workspaceId:'w'.repeat(43),accountId:'a'.repeat(43),expiresAt:Date.now()+600000}};
 const grant={version:2,appOrigin:payload.appOrigin,code:'c'.repeat(43),expiresAt:Date.now()+600000};
+beforeEach(()=>{vi.stubEnv('OURS_ACCOUNT_ORIGIN',payload.appOrigin);vi.stubEnv('OURS_WORKSPACE_HOST',payload.hostname);});
+afterEach(()=>vi.unstubAllEnvs());
 describe('tunnel setup input',()=>{
   it('accepts only minimal v2 arguments and never echoes rejected input',()=>{
     expect(readTunnelSetupArgument(encode(grant))).toBe(encode(grant));
@@ -25,7 +27,7 @@ describe('tunnel setup input',()=>{
   it('refuses replay, redirects, mismatched origin and malformed answers without leaking credentials',async()=>{
     await expect(redeemTunnelSetup(encode(grant),(async()=>new Response('',{status:410})) as typeof fetch)).rejects.toThrow(/already used/);
     await expect(redeemTunnelSetup(encode(grant),(async()=>{throw Error(grant.code);}) as typeof fetch)).rejects.toThrow('Could not reach');
-    await expect(redeemTunnelSetup(encode(grant),(async()=>new Response(JSON.stringify({payload:encode({...payload,appOrigin:'https://app.ours-tunnel.com'})}))) as typeof fetch)).rejects.toThrow(/origin mismatch/);
+    await expect(redeemTunnelSetup(encode(grant),(async()=>new Response(JSON.stringify({payload:encode({...payload,appOrigin:'https://app.ours-tunnel.com'})}))) as typeof fetch)).rejects.toThrow(/origin mismatch|invalid or expired/);
   });
   it('inspects a grant without redeeming and rejects changed targets before any setup',async()=>{
     const calls:string[]=[];const target=await inspectTunnelSetup(encode(grant),(async(url:string)=>{calls.push(url);return new Response(JSON.stringify({workspaceId:payload.challenge.workspaceId,serverCid:payload.serverCid}));}) as typeof fetch);
