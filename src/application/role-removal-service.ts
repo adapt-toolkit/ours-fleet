@@ -101,7 +101,7 @@ export class RoleRemovalService {
         renameSync(sourceState, join(recoveryPath, 'orphan-state'));
         removeReminderState(join(recoveryPath, 'orphan-state'));
       }
-      await retireNotificationTarget(`/fleet/chats/agents/${encodeURIComponent(preview.role)}`).catch(()=>{});
+      await retireNotificationTarget({kind: 'agent', agentId: preview.role}).catch(()=>{});
       this.options.ops.log(`removed orphaned backend/state '${preview.role}'`);
     }
     return { ...preview, removed: true, recoveryPath };

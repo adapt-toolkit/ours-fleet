@@ -1,3 +1,4 @@
+import {validateConfiguredAccountOrigin} from './account-origin.js';
 import { lstatSync, readFileSync } from 'node:fs';
 import { decodeWorkspacePayload, type WorkspacePayload } from './workspace-enrollment.js';
 
@@ -29,8 +30,8 @@ function decodeTunnelSetupGrant(input: string): {version: 2; appOrigin: string; 
   let grant: any;
   try { grant = JSON.parse(Buffer.from(input.trim(), 'base64url').toString()); }
   catch { throw Error('Invalid tunnel setup payload'); }
+  try { validateConfiguredAccountOrigin(grant?.appOrigin); } catch { throw Error('Tunnel setup grant is invalid or expired; get a fresh command from the App'); }
   if (grant?.version !== 2 || Object.keys(grant).sort().join(',') !== 'appOrigin,code,expiresAt,version'
-    || !['https://app.ours.network', 'https://app.ours-tunnel.com'].includes(grant.appOrigin)
     || !/^[A-Za-z0-9_-]{43}$/.test(grant.code) || !Number.isSafeInteger(grant.expiresAt)
     || grant.expiresAt <= Date.now() || grant.expiresAt > Date.now() + 16 * 60000)
     throw Error('Tunnel setup grant is invalid or expired; get a fresh command from the App');

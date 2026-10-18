@@ -122,7 +122,7 @@ it('authenticates conversation events with local/frame cookies and hosted worksp
 
 it('streams hosted conversation role events through the existing Fleet prefix with readable CORS',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'conversation-prefix-')),store=new WorkspaceDeviceStore(dir);
-  const auth=new WebAuth('http://localhost','localhost',Date.now,new TrustedDeviceStore(join(dir,'trusted')),undefined,store);
+  const auth=new WebAuth('http://localhost','localhost',Date.now,new TrustedDeviceStore(join(dir,'trusted')),undefined,store,'https://accounts.example.test');
   const link=store.mint(),device=store.enroll(link.enrollment,link.workspaceId,'hosted');
   let disposed=0;
   const role={roleId:'A',roleRevision:1,roleLifetime:'missing',availability:'missing',health:'healthy'};

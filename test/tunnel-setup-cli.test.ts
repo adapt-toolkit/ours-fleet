@@ -20,7 +20,7 @@ describe('setup-tunnel positional grant CLI', () => {
     const grant = {version:2, appOrigin:'https://app.ours.network', code:'c'.repeat(43), expiresAt:Date.now()+600000};
     const run = (argument: string, extra: string[] = [], env: Record<string,string> = {}) => {
       const result = spawnSync(process.execPath, ['--import', preload, resolve('dist/cli.js'), 'setup-tunnel', argument, ...extra, '--configuration', join(root,'fleet.yaml')], {
-        env:{...process.env,PATH:bin,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture,...env},encoding:'utf8',timeout:10000,
+        env:{...process.env,OURS_ACCOUNT_ORIGIN:grant.appOrigin,OURS_WORKSPACE_DOMAIN:'ours-tunnel.com',PATH:bin,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture,...env},encoding:'utf8',timeout:10000,
       });
       expect(result.error).toBeUndefined(); expect(result.status).toBe(1);
       const output=result.stdout+result.stderr;
@@ -52,7 +52,7 @@ describe('setup-tunnel positional grant CLI', () => {
     const preload=join(root,'fetch.mjs'),capture=join(root,'fetch-called');writeFileSync(preload,`import {writeFileSync} from 'node:fs';globalThis.fetch=async(url)=>{writeFileSync(process.env.FETCH_CAPTURE,String(url));return new Response(null,{status:404});};`);
     const grant=encode({version:2,appOrigin:binding.appOrigin,code:'c'.repeat(43),expiresAt:Date.now()+600000});
     try{
-      const result=spawnSync(process.execPath,['--import',preload,resolve('dist/cli.js'),'setup-tunnel',grant,'--configuration',join(root,'fleet.yaml')],{env:{...process.env,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture},encoding:'utf8',timeout:10000,input:''});
+      const result=spawnSync(process.execPath,['--import',preload,resolve('dist/cli.js'),'setup-tunnel',grant,'--configuration',join(root,'fleet.yaml')],{env:{...process.env,OURS_ACCOUNT_ORIGIN:binding.appOrigin,OURS_WORKSPACE_DOMAIN:'ours-tunnel.com',OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture},encoding:'utf8',timeout:10000,input:''});
       expect(result.error).toBeUndefined();expect(result.status).toBe(1);expect(result.stderr).toContain('Existing setup preserved');expect(result.stderr).toContain(binding.workspaceId);expect(result.stderr).not.toContain(grant);expect(result.stderr).not.toContain('fixture-retained-private-token');
       expect(readFileSync(capture,'utf8')).toContain('workspace-install-inspect');expect(existsSync(join(root,'fleet.yaml'))).toBe(false);expect(existsSync(join(workspace,'replacement.json'))).toBe(false);expect(readFileSync(join(workspace,'binding.json'),'utf8')).toBe(JSON.stringify(binding));expect(readFileSync(join(workspace,'connector'),'utf8')).toBe('fixture-retained-private-token');
     }finally{rmSync(root,{recursive:true,force:true});}
@@ -67,7 +67,7 @@ describe('setup-tunnel positional grant CLI', () => {
     writeFileSync(preload,`import {writeFileSync} from 'node:fs';const calls=[];globalThis.fetch=async(url)=>{calls.push(String(url));writeFileSync(process.env.FETCH_CAPTURE,JSON.stringify(calls));if(String(url).endsWith('workspace-install-inspect'))return Response.json({workspaceId:process.env.INSPECT_WORKSPACE,serverCid:process.env.INSPECT_SERVER});if(process.env.REDEEM_PAYLOAD)return Response.json({payload:process.env.REDEEM_PAYLOAD});return new Response(null,{status:410});};`);
     const run=(origin=binding.appOrigin,extra:string[]=[],env:Record<string,string>={})=>{
       const grant=encode({version:2,appOrigin:origin,code:'g'.repeat(43),expiresAt:Date.now()+600000});
-      const result=spawnSync(process.execPath,['--import',preload,resolve('dist/cli.js'),'setup-tunnel',grant,'--configuration',join(root,'fleet.yaml'),...extra],{env:{...process.env,PATH:bin,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture,INSPECT_WORKSPACE:binding.workspaceId,INSPECT_SERVER:binding.serverCid,...env},encoding:'utf8',timeout:10000,input:''});
+      const result=spawnSync(process.execPath,['--import',preload,resolve('dist/cli.js'),'setup-tunnel',grant,'--configuration',join(root,'fleet.yaml'),...extra],{env:{...process.env,OURS_ACCOUNT_ORIGIN:origin,OURS_WORKSPACE_HOST:payload.hostname,PATH:bin,OURS_FLEET_HOME:join(root,'state'),FETCH_CAPTURE:capture,INSPECT_WORKSPACE:binding.workspaceId,INSPECT_SERVER:binding.serverCid,...env},encoding:'utf8',timeout:10000,input:''});
       expect(result.error).toBeUndefined();expect(result.status).toBe(1);expect(result.stderr).not.toContain(grant);expect(result.stderr).not.toContain('fixture-new-private');
       expect(readFileSync(join(workspace,'binding.json'),'utf8')).toBe(before);expect(readFileSync(join(workspace,'connector'),'utf8')).toBe('fixture-retained');expect(existsSync(join(root,'fleet.yaml'))).toBe(false);expect(existsSync(join(workspace,'replacement.json'))).toBe(false);
       return {output:result.stderr,calls:JSON.parse(readFileSync(capture,'utf8')) as string[]};

@@ -85,7 +85,7 @@ it('sends through the authenticated server gateway with the producer credential 
   const dir = mkdtempSync(join('.test-artifacts', 'producer-gateway-'));
   const outbox = new NotificationOutbox(join(dir, 'outbox.json'),
     { origin: `http://127.0.0.1:${(server.address() as any).port}/base/notifications`, token, gatewayCredential: credential },
-    async (_value, id) => ({ eventId: id, title: 'Done', body: 'Open', url: '/fleet/chats?chat=a' }));
+    async (_value, id) => ({ eventId: id, title: 'Done', body: 'Open', target: {kind:'agent',agentId:'a'} }));
   cleanup.push(() => outbox.close());
   outbox.enqueue('event-1', {}); await outbox.drain();
   expect(seen).toHaveLength(1);

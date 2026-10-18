@@ -132,7 +132,7 @@ export interface TaskLayoutLink {
 }
 
 export interface TaskNotificationEvent {
-  eventId: string; title: string; body: string; url: string; taskId: string;
+  eventId: string; title: string; body: string; target: { kind: 'task' | 'task-deleted'; taskId: string }; taskId: string;
 }
 
 export interface TaskRecord {

@@ -1,4 +1,4 @@
-import {it,expect} from 'vitest';
+import {it,expect,vi,afterEach} from 'vitest';
 import {createServer} from 'node:http';
 import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,existsSync} from 'node:fs';
@@ -17,6 +17,7 @@ it.each([true,false])('existing host requires profile preservation capability (%
   const config=join(dir,'fleet.yaml'),invite=join(dir,'owner.invite');writeFileSync(invite,'old-public-fixture',{mode:0o600});writeV2Fixture(config,{roles:{},rooms:{owner:{provider:'messenger-server',expected_cid:root.toUpperCase(),public_invite_file:invite,role:'Owner'},defaults:{attach_owner:true,close_when_task_done:true}}});const original=readFileSync(config);
   new WebAccessStore().write({version:1,mode:'pairing'});
   const payload:WorkspacePayload={version:1,appOrigin:'https://app.ours-tunnel.com',hostname:'alice-home.ours-tunnel.com',rootName:'alice@home',fullName:'New Account',name:'New',surname:'Account',connectorToken:'fixture-scoped',invitation:'fixture-invite',serverCid:'b'.repeat(64),challenge:{nonce:'n'.repeat(43),accountId:'c'.repeat(43),workspaceId:'w'.repeat(43),expiresAt:Date.now()+600000}};
+  process.env.OURS_ACCOUNT_ORIGIN=payload.appOrigin;
   if(supported){const result=await enrollWorkspace(payload,config,{preserveProfile:true});expect(result.origin).toBe('https://alice-home.ours-tunnel.com');expect(received).toHaveLength(1);expect(received[0]).toMatchObject({preserveProfile:true,challenge:payload.challenge});expect(received[0]).not.toHaveProperty('fullName');expect(received[0]).not.toHaveProperty('name');expect(received[0]).not.toHaveProperty('surname');expect(readFileSync(join(dir,'.ours-fleet','workspace','connector'),'utf8')).toBe('fixture-scoped\n');}
   else{await expect(enrollWorkspace(payload,config,{preserveProfile:true})).rejects.toThrow('requires Messenger profile-preservation support');expect(received).toHaveLength(0);}
   expect(readFileSync(config)).toEqual(original);expect(JSON.parse(readFileSync(profile,'utf8')).endpoint).toBe(endpoint+'/daemon');
@@ -24,6 +25,7 @@ it.each([true,false])('existing host requires profile preservation capability (%
 });
 
 const profilePayload={version:1,appOrigin:'https://app.ours.network',hostname:'alice-home.ours-tunnel.com',rootName:'alice@home',connectorToken:'fixture',invitation:'invite',serverCid:'a'.repeat(64),challenge:{nonce:'n'.repeat(43),accountId:'a'.repeat(43),workspaceId:'w'.repeat(43),expiresAt:Date.now()+600000}};
+afterEach(()=>vi.unstubAllEnvs());
 it.each([
  [{fullName:'Prince',name:null,surname:null},{fullName:'Prince',name:null,surname:null}],
  [{},{fullName:null,name:null,surname:null}],
@@ -31,10 +33,12 @@ it.each([
  [{surname:'Tester'},{fullName:null,name:null,surname:'Tester'}],
  [{name:'Alice',surname:'Tester'},{fullName:null,name:'Alice',surname:'Tester'}],
 ])('decodes independent optional profile %s',(fields,want)=>{
+ vi.stubEnv('OURS_ACCOUNT_ORIGIN',profilePayload.appOrigin);vi.stubEnv('OURS_WORKSPACE_HOST',profilePayload.hostname);
  const result=decodeWorkspacePayload(Buffer.from(JSON.stringify({...profilePayload,...fields})).toString('base64url'));
  expect({fullName:result.fullName,name:result.name,surname:result.surname}).toEqual(want);
 });
 it.each(['fullName','name','surname'])('rejects malformed optional profile %s',(key)=>{
+ vi.stubEnv('OURS_ACCOUNT_ORIGIN',profilePayload.appOrigin);vi.stubEnv('OURS_WORKSPACE_HOST',profilePayload.hostname);
  for(const value of [42,{},'bad\nname','x'.repeat(8193)])expect(()=>decodeWorkspacePayload(Buffer.from(JSON.stringify({...profilePayload,name:'Alice',surname:'Tester',[key]:value})).toString('base64url'))).toThrow();
 });
 
