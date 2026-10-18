@@ -3,8 +3,8 @@ import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { validateAccountOrigin } from './account-origin.js';
-import { replaceFileAtomically } from './atomic-file.js';
-import { stateRoot } from './paths.js';
+import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
+import { stateRoot, workspaceBindingLock, workspaceReplacementFile } from './paths.js';
 import { decodeWorkspacePayload, enrollWorkspace, unregisterWorkspace, checkWorkspaceConnector, type AttachDaemonClient, type WorkspacePayload } from './workspace-enrollment.js';
 import { WorkspaceDeviceStore } from './web/workspace-devices.js';
 import { webControlPath } from './web/control.js';
@@ -12,12 +12,13 @@ import { WebServiceManager } from './web/service.js';
 
 export interface WorkspaceBinding { workspaceId: string; hostWorkspaceId: string; appOrigin: string; serverCid?: string; proofRootCid?: string }
 const workspaceDir = () => join(stateRoot(), 'workspace');
-const replacementPath = () => join(workspaceDir(), 'replacement.json');
+const replacementPath = workspaceReplacementFile;
 const opaque = /^[\w-]{43}$/;
 function binding(value: WorkspaceBinding): WorkspaceBinding {
-  if (!value || !opaque.test(value.workspaceId) || !opaque.test(value.hostWorkspaceId) || (value.serverCid!==undefined && !/^[a-f0-9]{64}$/i.test(value.serverCid))
-    || (value.proofRootCid !== undefined && !/^[a-f0-9]{64}$/i.test(value.proofRootCid))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
-  return {...value, appOrigin: validateAccountOrigin(value.appOrigin ?? 'https://app.ours.network')};
+  const text = (id: unknown, pattern: RegExp) => typeof id === 'string' && pattern.test(id);
+  if (!value || typeof value !== 'object' || !text(value.workspaceId, opaque) || !text(value.hostWorkspaceId, opaque) || (value.serverCid!==undefined && !text(value.serverCid, /^[a-f0-9]{64}$/i))
+    || (value.proofRootCid !== undefined && !text(value.proofRootCid, /^[a-f0-9]{64}$/i))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
+  return {...value, appOrigin: validateAccountOrigin(value.appOrigin)};
 }
 export function readWorkspaceBinding(): WorkspaceBinding | undefined {
   const file = join(workspaceDir(), 'binding.json');
@@ -40,7 +41,7 @@ export async function confirmWorkspaceReplacement(previous: WorkspaceBinding, ex
   write?: (value: string) => void; interactive?: boolean; ask?: () => Promise<string>;
 } = {}): Promise<boolean> {
   const write = effects.write ?? (value => { process.stderr.write(value); });
-  let hostname='';try{const tunnel=JSON.parse(readFileSync(join(workspaceDir(),'tunnel.json'),'utf8'));if(typeof tunnel.origin==='string' && /^https:\/\/[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(tunnel.origin))hostname=` (${new URL(tunnel.origin).hostname})`;}catch{}
+  let hostname='';try{const tunnel=JSON.parse(readFileSync(join(workspaceDir(),'tunnel.json'),'utf8'));if(typeof tunnel.origin==='string' && validateAccountOrigin(tunnel.origin))hostname=` (${new URL(tunnel.origin).hostname})`;}catch{}
   write(`This host is registered to workspace ${previous.workspaceId}${hostname} at ${previous.appOrigin}.\nReplacing it removes the old account registration and revokes its linked devices. The account service retires tunnel resources it knows; a migrated database may have no old resources to delete. Installation identities, agents and data are preserved.\n`);
   if (explicit) return true;
   if (!(effects.interactive ?? process.stdin.isTTY)) { write('Existing setup preserved. Run in a terminal to confirm, or pass --replace-registration to confirm explicitly.\n'); return false; }
@@ -58,7 +59,7 @@ export interface PendingWorkspaceReplacement {
   rootCid?: string; retired?: boolean; cleaned?: boolean; dispatchAttempted?:boolean; operationExpiresAt?:number;
 }
 export function saveWorkspaceReplacement(record: PendingWorkspaceReplacement): void {
-  replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600);
+  withSynchronousFileLock(workspaceBindingLock(), () => replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600));
 }
 export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefined {
   const file = replacementPath(); if (!existsSync(file)) return;
@@ -72,7 +73,7 @@ export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefi
   record.payload = decodeWorkspacePayload(Buffer.from(JSON.stringify(record.payload)).toString('base64url'), {allowExpired: true});
   return record;
 }
-export function clearWorkspaceReplacement(): void { rmSync(replacementPath(), {force: true}); }
+export function clearWorkspaceReplacement(): void { withSynchronousFileLock(workspaceBindingLock(), () => rmSync(replacementPath(), {force: true})); }
 /** Explicit recovery after the user removes an unsuccessful successor in the App. */
 export function discardRetiredWorkspaceReplacement():void{
   const record=readWorkspaceReplacement(),current=readWorkspaceBinding();
@@ -89,9 +90,23 @@ export async function beginWorkspaceReplacement(previous: WorkspaceBinding, payl
   checkWorkspaceConnector(payload);
   if(!requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,appOrigin:payload.appOrigin,serverCid:payload.serverCid}))throw Error('The same workspace must never be retired');
   checkReplacementService(configuration);
+  // The record is created only for the binding this decision was made on, and only if no other
+  // replacement or setup changed the binding or the record meanwhile; enrollment checks the same pair.
+  const bindingFile = join(workspaceDir(), 'binding.json'), current = () => existsSync(bindingFile) ? readFileSync(bindingFile, 'utf8') : null;
+  const unchanged = (bytes: string | null) => {
+    if (current() !== bytes) throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
+    if (existsSync(replacementPath())) throw Error('Another replacement started during setup; existing setup preserved. Review it with setup-tunnel --resume');
+  };
+  const before = withSynchronousFileLock(workspaceBindingLock(), () => {
+    const bytes = current(); unchanged(bytes);
+    const now = readWorkspaceBinding();
+    if (!now || now.workspaceId !== previous.workspaceId || now.hostWorkspaceId !== previous.hostWorkspaceId || now.appOrigin !== previous.appOrigin || now.serverCid?.toUpperCase() !== previous.serverCid?.toUpperCase()) throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
+    return bytes;
+  });
   const record: PendingWorkspaceReplacement = {version: 2, previous:previous as WorkspaceBinding & {serverCid:string}, payload, configuration: resolve(configuration), operationNonce: randomBytes(32).toString('base64url'),dispatchAttempted:false,operationExpiresAt:Date.now()+86400000-5*60000};
   record.rootCid=await (effects.preflight??unregisterWorkspace)(record.previous,payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt});
-  saveWorkspaceReplacement(record); return record;
+  withSynchronousFileLock(workspaceBindingLock(), () => { unchanged(before); replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600); });
+  return record;
 }
 /** Abandon only after a private receipt confirms no deletion and dispatch was unsent or terminally rejected. */
 export async function abandonWorkspaceReplacement(effects:{inspect?:typeof unregisterWorkspace;attach?:AttachDaemonClient}={}):Promise<void> {

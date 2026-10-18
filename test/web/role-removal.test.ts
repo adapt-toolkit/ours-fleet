@@ -147,7 +147,7 @@ it.each(['direct','web'])('queues canonical notification retirement only after a
   else await service.removeWeb({role:'Worker',confirmation:'Worker'});
   const dir=join(stateRoot(),'notifications','removed-targets');
   expect(readdirSync(dir)).toHaveLength(1);
-  expect(JSON.parse(readFileSync(join(dir,readdirSync(dir)[0]),'utf8'))).toEqual({url:'/fleet/chats/agents/Worker'});
+  expect(JSON.parse(readFileSync(join(dir,readdirSync(dir)[0]),'utf8'))).toEqual({target:{kind:'agent',agentId:'Worker'}});
  }finally{
   if(oldOrigin===undefined)delete process.env.OURS_NOTIFICATIONS_ORIGIN;else process.env.OURS_NOTIFICATIONS_ORIGIN=oldOrigin;
   if(oldToken===undefined)delete process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;else process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN=oldToken;

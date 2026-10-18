@@ -1,9 +1,9 @@
-import {validateAccountOrigin} from './account-origin.js';
+import {validateAccountOrigin,validateConfiguredAccountOrigin,validateConfiguredWorkspaceHost} from './account-origin.js';
 import { lstatSync, readFileSync, readdirSync, mkdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readClientProfile } from './client-profile.js';
-import { stateRoot,defaultConfigPath,workspaceOwnerInvite } from './paths.js';
-import { replaceFileAtomically } from './atomic-file.js';
+import { stateRoot,defaultConfigPath,workspaceOwnerInvite,workspaceBindingLock,workspaceReplacementFile } from './paths.js';
+import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
 import { loadConfig, splitRootFor } from './config.js';
 import { parse, parseDocument, stringify } from 'yaml';
 import { randomUUID } from 'node:crypto';
@@ -19,7 +19,8 @@ export function readWorkspacePayload(file:string):WorkspacePayload {
 }
 export function decodeWorkspacePayload(input:string,options:{allowExpired?:boolean}={}):WorkspacePayload {
   let p:WorkspacePayload;try{p=JSON.parse(Buffer.from(input.trim(),'base64url').toString());}catch{throw Error('Invalid workspace payload');}
-  if(!p || typeof p!=='object' || Array.isArray(p) || p.version!==1 || !['https://app.ours.network','https://app.ours-tunnel.com'].includes(p.appOrigin) || !/^[a-z0-9][a-z0-9-]{2,60}\.ours-tunnel\.com$/.test(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
+  try { validateConfiguredAccountOrigin(p?.appOrigin); } catch { throw Error('Workspace payload is invalid or expired'); }
+  if(!p || typeof p!=='object' || Array.isArray(p) || p.version!==1 || !validateConfiguredWorkspaceHost(p.hostname) || !/^[a-z0-9-]{2,30}@[a-z0-9-]{2,30}$/.test(p.rootName) || !/^[a-f0-9]{64}$/i.test(p.serverCid) || !p.challenge || !['nonce','accountId','workspaceId'].every(k=>/^[\w-]{43}$/.test(String(p.challenge[k as keyof typeof p.challenge]))) || (!options.allowExpired && p.challenge.expiresAt<=Date.now()) || !Number.isSafeInteger(p.challenge.expiresAt) || p.challenge.expiresAt>Date.now()+16*60000)throw Error('Workspace payload is invalid or expired');
   for(const k of ['connectorToken','invitation'] as const){if(k==='connectorToken' && p[k]===undefined)continue;if(typeof p[k]!=='string' || !p[k] || p[k].length>8192 || /[\x00-\x1f\x7f]/.test(p[k]))throw Error('Invalid workspace payload');}
   for(const k of ['fullName','name','surname'] as const){const value=p[k];if(value==null || value===''){p[k]=null;continue;}if(typeof value!=='string' || value.length>8192 || /[\x00-\x1f\x7f]/.test(value))throw Error('Invalid workspace profile');p[k]=value.trim()||null;}
   return p;
@@ -31,7 +32,7 @@ export function checkWorkspaceConnector(payload:WorkspacePayload):void {
 
   const dir=join(stateRoot(),'workspace');let previous:any;
   try{previous=JSON.parse(readFileSync(join(dir,'binding.json'),'utf8'));}catch{reject();}
-  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin??'https://app.ours.network')!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
+  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin)!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
   try{
     const file=join(dir,'connector'),stat=lstatSync(file);
     if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>8193 || !readFileSync(file,'utf8').trim())reject();
@@ -182,7 +183,17 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   const appOrigin=validateAccountOrigin(payload.appOrigin);
   const previousFile=join(dir,'binding.json');
   let migrating=false;
-  if(existsSync(previousFile)) {const previous=JSON.parse(readFileSync(previousFile,'utf8'));if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin ?? 'https://app.ours.network');migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
+  // Every decision below rests on this binding and on the unfinished replacement record (none, or the
+  // one this setup completes); both are rechecked under the binding lock before the first change and
+  // again at the final write, so a concurrent setup or replacement is never overwritten.
+  const read=(file:string)=>existsSync(file)?readFileSync(file,'utf8'):null;
+  const priorBinding=read(previousFile),priorReplacement=read(workspaceReplacementFile());
+  if(priorReplacement!==null && options.replacingWorkspace===undefined)throw Error('An unfinished replacement exists; resume or abandon it before setup. Existing setup preserved');
+  const unchangedBinding=()=>{
+    if(read(previousFile)!==priorBinding)throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
+    if(read(workspaceReplacementFile())!==priorReplacement)throw Error('The unfinished replacement changed during setup; existing setup preserved. Review it with setup-tunnel --resume');
+  };
+  if(priorBinding!==null) {const previous=JSON.parse(priorBinding);if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin);migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
   const loaded=loadConfig(configuration,{deferredOwnerInviteFile:workspaceOwnerInvite()});
   // Decided before anything is sent or written: the Owner entry is replaced only when it records an enrollment this host has lost.
   const lost=Boolean(loaded.rooms) && recordsLostEnrollment(resolve(configuration));
@@ -191,7 +202,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   if(!/^[a-f0-9]{64}$/i.test(identity.cid))throw Error('Bound Messenger identity unavailable');
   // An installation that ran Messenger as the Human root and now runs it as the person's own identity keeps its managed Owner entry, moved to that identity.
   const moved=Boolean(loaded.rooms) && !lost && !!identity.root && !same(loaded.rooms!.owner.expected_cid,identity.cid) && managedRootOwner(resolve(configuration),loaded.rooms!,identity.root)
-    && (options.replacingWorkspace!==undefined || JSON.parse(readFileSync(previousFile,'utf8')).serverCid?.toUpperCase()===payload.serverCid.toUpperCase());
+    && (options.replacingWorkspace!==undefined || JSON.parse(priorBinding!).serverCid?.toUpperCase()===payload.serverCid.toUpperCase());
   if(options.preserveProfile && identity.preserveProfile!==true)throw Error('Existing-host setup requires Messenger profile-preservation support; update the host Messenger before retrying');
   if(!options.preserveProfile && (payload.fullName?.trim() || !payload.name?.trim() || !payload.surname?.trim()) && !identity.optionalWorkspaceProfileV1)throw Error('Optional workspace profile requires updated Messenger; update the host Messenger before retrying (the host is not enrolled)');
   if(loaded.rooms && !lost && !moved && loaded.rooms.owner.expected_cid.toLowerCase()!==identity.cid.toLowerCase())throw Error('Retained room owner CID conflicts with the Human root');
@@ -210,6 +221,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
     if(!response.ok){await response.body?.cancel();throw Error('Replacement proof status was rejected; request a fresh App command with --replace-registration');}
     try{proofAlreadyConfirmed=(await response.json() as {verified?:boolean}).verified===true;}catch{throw Error('Invalid replacement proof receipt');}
   }
+  withSynchronousFileLock(workspaceBindingLock(),unchangedBinding);
   if(identity.root){
     if(!options.preserveProfile)await request('identity/profile',{fullName:fullName??null,name:name??null,surname:surname??null});
     // The Human root signs the binding; the person's own Messenger identity is the room Owner and issues the Owner invitation.
@@ -241,6 +253,11 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
       await new Promise(resolve=>setTimeout(resolve,500));
     }
   }
+  const origin=`https://${payload.hostname}`;
+  // Local files commit together under the binding lock, after rechecking the binding this setup decided
+  // on, so a stale concurrent setup refuses before changing any of them.
+  withSynchronousFileLock(workspaceBindingLock(),()=>{
+  unchangedBinding();
   replaceFileAtomically(inviteFile,result.ownerInvite+'\n',0o600);options.afterInvitation?.();
   const split=splitRootFor(configuration);mkdirSync(split,{recursive:true,mode:0o700});
   if(!loaded.rooms)replaceFileAtomically(configuration,readFileSync(configuration,'utf8')+'\n'+stringify(generatedRooms(ownerCid,inviteFile)),0o600);
@@ -252,9 +269,9 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
     replaceFileAtomically(configuration,document.toString(),0o600);
   }
   if(payload.connectorToken!==undefined)replaceFileAtomically(join(dir,'connector'),payload.connectorToken+'\n',0o600);
-  const origin=`https://${payload.hostname}`;
   replaceFileAtomically(join(dir,'tunnel.json'),JSON.stringify({origin,tokenFile:join(dir,'connector')})+'\n',0o600);
   replaceFileAtomically(previousFile,JSON.stringify({workspaceId:payload.challenge.workspaceId,hostWorkspaceId,appOrigin,serverCid:payload.serverCid.toUpperCase(),...(identity.root?{proofRootCid:identity.root.cid}:{})})+'\n',0o600);
+  });
   loadConfig(configuration);return {origin,hostWorkspaceId,rootCid:result.rootCid};
 }
 
