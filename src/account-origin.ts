@@ -5,12 +5,6 @@ export function validateAccountOrigin(value:unknown):string {
   if(url.protocol!=='https:' || url.origin!==value || url.username || url.password)throw Error('Unsupported account origin');
   return value as string;
 }
-export const MISSING_ACCOUNT_ORIGIN='This host\'s workspace binding records no account origin. Run `ours-fleet adopt-account-origin <origin>` with the account origin this host was set up with';
-/** A binding written before account origins were recorded names none; it is never guessed. */
-export function recordedAccountOrigin(binding:{appOrigin?:unknown}):string {
-  if(binding.appOrigin===undefined)throw Error(MISSING_ACCOUNT_ORIGIN);
-  return validateAccountOrigin(binding.appOrigin);
-}
 /** Incoming grants/payloads must match explicit operator configuration before any network action. */
 export function validateConfiguredAccountOrigin(value:unknown):string {
   const configured=validateAccountOrigin(process.env.OURS_ACCOUNT_ORIGIN);

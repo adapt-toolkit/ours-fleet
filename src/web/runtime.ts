@@ -1,6 +1,6 @@
 import { ConversationRoleObserver, type ConversationRoleState } from '../application/conversation-role-observer.js';
 import { replaceFileAtomically } from '../atomic-file.js';
-import {MISSING_ACCOUNT_ORIGIN,validateAccountOrigin} from '../account-origin.js';
+import {validateAccountOrigin} from '../account-origin.js';
 import { startWorkspaceTunnel } from './workspace-tunnel.js';
 import {createPrefixGateway,type ServiceTarget} from './prefix-gateway.js';
 import {readClientProfile} from '../client-profile.js';
@@ -99,14 +99,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const access = options.access ?? new WebAccessStore(webDir).read();
   const bindingFile=resolve(stateRoot(),'workspace','binding.json');
   let appOrigin:string|undefined;
-  try {
-    if(existsSync(bindingFile)){
-      const recorded=JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin;
-      // The console stays available on its own origin; the account App is admitted only once its origin is recorded.
-      if(recorded===undefined)console.warn(`${MISSING_ACCOUNT_ORIGIN}, then restart the web service. Account App access is disabled until then.`);
-      else appOrigin=validateAccountOrigin(recorded);
-    }
-  }catch(error){lock.release();throw error;}
+  try {if(existsSync(bindingFile))appOrigin=validateAccountOrigin(JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin);}catch(error){lock.release();throw error;}
   const auth = new WebAuth(
     publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
     publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,

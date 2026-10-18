@@ -2,11 +2,11 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { recordedAccountOrigin, validateAccountOrigin } from './account-origin.js';
+import { validateAccountOrigin } from './account-origin.js';
 import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
 import { stateRoot, workspaceBindingLock, workspaceReplacementFile } from './paths.js';
 import { decodeWorkspacePayload, enrollWorkspace, unregisterWorkspace, checkWorkspaceConnector, type AttachDaemonClient, type WorkspacePayload } from './workspace-enrollment.js';
-import { WorkspaceDeviceStore, recordedHostWorkspaceId } from './web/workspace-devices.js';
+import { WorkspaceDeviceStore } from './web/workspace-devices.js';
 import { webControlPath } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 
@@ -18,29 +18,7 @@ function binding(value: WorkspaceBinding): WorkspaceBinding {
   const text = (id: unknown, pattern: RegExp) => typeof id === 'string' && pattern.test(id);
   if (!value || typeof value !== 'object' || !text(value.workspaceId, opaque) || !text(value.hostWorkspaceId, opaque) || (value.serverCid!==undefined && !text(value.serverCid, /^[a-f0-9]{64}$/i))
     || (value.proofRootCid !== undefined && !text(value.proofRootCid, /^[a-f0-9]{64}$/i))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
-  return {...value, appOrigin: recordedAccountOrigin(value)};
-}
-/**
- * Records the account origin of a binding written before origins were stored. The origin is the
- * operator's explicit statement of the account this host was set up with; every other field is kept.
- */
-export function adoptAccountOrigin(origin: string): WorkspaceBinding {
-  const appOrigin = validateAccountOrigin(origin), file = join(workspaceDir(), 'binding.json');
-  return withSynchronousFileLock(workspaceBindingLock(), () => {
-    if (existsSync(replacementPath())) throw Error('An unfinished replacement exists; resume or abandon it before adopting an account origin');
-    let stat; try { stat = lstatSync(file); } catch { throw Error('This host has no workspace binding'); }
-    if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) throw Error('Workspace binding must be a private regular file owned by this user');
-    const before = readFileSync(file, 'utf8');
-    let value: Record<string, unknown>; try { value = JSON.parse(before); } catch { throw Error('Existing workspace binding is invalid'); }
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Existing workspace binding is invalid');
-    if (value.appOrigin !== undefined) throw Error('This workspace binding already records its account origin; changing it requires setup-tunnel --migrate-app-origin');
-    const adopted = binding({ ...value, appOrigin } as unknown as WorkspaceBinding);
-    if (adopted.hostWorkspaceId !== recordedHostWorkspaceId()) throw Error('Workspace binding names a different host identity than this host; restore this host\'s own state before adopting an origin');
-    replaceFileAtomically(file, JSON.stringify({ ...value, appOrigin }) + '\n', 0o600, {}, { durable: true });
-    const saved = readWorkspaceBinding();
-    if (JSON.stringify(saved) !== JSON.stringify(adopted)) throw Error('Workspace binding readback differs; inspect it before continuing');
-    return saved!;
-  });
+  return {...value, appOrigin: validateAccountOrigin(value.appOrigin)};
 }
 export function readWorkspaceBinding(): WorkspaceBinding | undefined {
   const file = join(workspaceDir(), 'binding.json');

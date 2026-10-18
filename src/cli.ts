@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { adoptAccountOrigin, beginWorkspaceReplacement, abandonWorkspaceReplacement, discardRetiredWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
+import { beginWorkspaceReplacement, abandonWorkspaceReplacement, discardRetiredWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
 import { completeTunnelSetup } from './tunnel-setup-completion.js';
 import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup, inspectTunnelSetup, verifyTunnelSetupTarget } from './tunnel-setup-input.js';
 import { ensureMinimalSetup } from './minimal-setup.js';
@@ -1623,15 +1623,6 @@ cOpt(program.command('setup-tunnel').argument('[payload]', 'minimal one-use v2 A
   .option('--replace-registration', 'confirm retirement of the existing account registration when the new one differs')
   .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
   .action(async (payload, opts) => workspaceEnrollmentCommand(opts, true, payload));
-
-program.command('adopt-account-origin').argument('<origin>', 'account origin this host was set up with, for example https://app.example.com')
-  .description('record the account origin of a host set up before origins were stored; changes nothing else')
-  .action(origin => {
-    try {
-      const binding = adoptAccountOrigin(origin);
-      process.stdout.write(`Workspace ${binding.workspaceId} now records account origin ${binding.appOrigin}. Restart the web service to admit the account App.\n`);
-    } catch (e) { die(e); }
-  });
 
 program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
   .action(async () => {
