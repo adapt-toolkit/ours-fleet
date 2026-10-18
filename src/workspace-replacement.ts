@@ -2,22 +2,45 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import { validateAccountOrigin } from './account-origin.js';
-import { replaceFileAtomically } from './atomic-file.js';
-import { stateRoot } from './paths.js';
+import { recordedAccountOrigin, validateAccountOrigin } from './account-origin.js';
+import { replaceFileAtomically, withSynchronousFileLock } from './atomic-file.js';
+import { stateRoot, workspaceBindingLock, workspaceReplacementFile } from './paths.js';
 import { decodeWorkspacePayload, enrollWorkspace, unregisterWorkspace, checkWorkspaceConnector, type AttachDaemonClient, type WorkspacePayload } from './workspace-enrollment.js';
-import { WorkspaceDeviceStore } from './web/workspace-devices.js';
+import { WorkspaceDeviceStore, recordedHostWorkspaceId } from './web/workspace-devices.js';
 import { webControlPath } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 
 export interface WorkspaceBinding { workspaceId: string; hostWorkspaceId: string; appOrigin: string; serverCid?: string; proofRootCid?: string }
 const workspaceDir = () => join(stateRoot(), 'workspace');
-const replacementPath = () => join(workspaceDir(), 'replacement.json');
+const replacementPath = workspaceReplacementFile;
 const opaque = /^[\w-]{43}$/;
 function binding(value: WorkspaceBinding): WorkspaceBinding {
-  if (!value || !opaque.test(value.workspaceId) || !opaque.test(value.hostWorkspaceId) || (value.serverCid!==undefined && !/^[a-f0-9]{64}$/i.test(value.serverCid))
-    || (value.proofRootCid !== undefined && !/^[a-f0-9]{64}$/i.test(value.proofRootCid))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
-  return {...value, appOrigin: validateAccountOrigin(value.appOrigin)};
+  const text = (id: unknown, pattern: RegExp) => typeof id === 'string' && pattern.test(id);
+  if (!value || typeof value !== 'object' || !text(value.workspaceId, opaque) || !text(value.hostWorkspaceId, opaque) || (value.serverCid!==undefined && !text(value.serverCid, /^[a-f0-9]{64}$/i))
+    || (value.proofRootCid !== undefined && !text(value.proofRootCid, /^[a-f0-9]{64}$/i))) throw Error('Existing workspace binding is invalid; restore it before tunnel setup');
+  return {...value, appOrigin: recordedAccountOrigin(value)};
+}
+/**
+ * Records the account origin of a binding written before origins were stored. The origin is the
+ * operator's explicit statement of the account this host was set up with; every other field is kept.
+ */
+export function adoptAccountOrigin(origin: string): WorkspaceBinding {
+  const appOrigin = validateAccountOrigin(origin), file = join(workspaceDir(), 'binding.json');
+  return withSynchronousFileLock(workspaceBindingLock(), () => {
+    if (existsSync(replacementPath())) throw Error('An unfinished replacement exists; resume or abandon it before adopting an account origin');
+    let stat; try { stat = lstatSync(file); } catch { throw Error('This host has no workspace binding'); }
+    if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) throw Error('Workspace binding must be a private regular file owned by this user');
+    const before = readFileSync(file, 'utf8');
+    let value: Record<string, unknown>; try { value = JSON.parse(before); } catch { throw Error('Existing workspace binding is invalid'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Existing workspace binding is invalid');
+    if (value.appOrigin !== undefined) throw Error('This workspace binding already records its account origin; changing it requires setup-tunnel --migrate-app-origin');
+    const adopted = binding({ ...value, appOrigin } as unknown as WorkspaceBinding);
+    if (adopted.hostWorkspaceId !== recordedHostWorkspaceId()) throw Error('Workspace binding names a different host identity than this host; restore this host\'s own state before adopting an origin');
+    replaceFileAtomically(file, JSON.stringify({ ...value, appOrigin }) + '\n', 0o600, {}, { durable: true });
+    const saved = readWorkspaceBinding();
+    if (JSON.stringify(saved) !== JSON.stringify(adopted)) throw Error('Workspace binding readback differs; inspect it before continuing');
+    return saved!;
+  });
 }
 export function readWorkspaceBinding(): WorkspaceBinding | undefined {
   const file = join(workspaceDir(), 'binding.json');
@@ -58,7 +81,7 @@ export interface PendingWorkspaceReplacement {
   rootCid?: string; retired?: boolean; cleaned?: boolean; dispatchAttempted?:boolean; operationExpiresAt?:number;
 }
 export function saveWorkspaceReplacement(record: PendingWorkspaceReplacement): void {
-  replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600);
+  withSynchronousFileLock(workspaceBindingLock(), () => replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600));
 }
 export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefined {
   const file = replacementPath(); if (!existsSync(file)) return;
@@ -72,7 +95,7 @@ export function readWorkspaceReplacement(): PendingWorkspaceReplacement | undefi
   record.payload = decodeWorkspacePayload(Buffer.from(JSON.stringify(record.payload)).toString('base64url'), {allowExpired: true});
   return record;
 }
-export function clearWorkspaceReplacement(): void { rmSync(replacementPath(), {force: true}); }
+export function clearWorkspaceReplacement(): void { withSynchronousFileLock(workspaceBindingLock(), () => rmSync(replacementPath(), {force: true})); }
 /** Explicit recovery after the user removes an unsuccessful successor in the App. */
 export function discardRetiredWorkspaceReplacement():void{
   const record=readWorkspaceReplacement(),current=readWorkspaceBinding();
@@ -89,9 +112,23 @@ export async function beginWorkspaceReplacement(previous: WorkspaceBinding, payl
   checkWorkspaceConnector(payload);
   if(!requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,appOrigin:payload.appOrigin,serverCid:payload.serverCid}))throw Error('The same workspace must never be retired');
   checkReplacementService(configuration);
+  // The record is created only for the binding this decision was made on, and only if no other
+  // replacement or setup changed the binding or the record meanwhile; enrollment checks the same pair.
+  const bindingFile = join(workspaceDir(), 'binding.json'), current = () => existsSync(bindingFile) ? readFileSync(bindingFile, 'utf8') : null;
+  const unchanged = (bytes: string | null) => {
+    if (current() !== bytes) throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
+    if (existsSync(replacementPath())) throw Error('Another replacement started during setup; existing setup preserved. Review it with setup-tunnel --resume');
+  };
+  const before = withSynchronousFileLock(workspaceBindingLock(), () => {
+    const bytes = current(); unchanged(bytes);
+    const now = readWorkspaceBinding();
+    if (!now || now.workspaceId !== previous.workspaceId || now.hostWorkspaceId !== previous.hostWorkspaceId || now.appOrigin !== previous.appOrigin || now.serverCid?.toUpperCase() !== previous.serverCid?.toUpperCase()) throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
+    return bytes;
+  });
   const record: PendingWorkspaceReplacement = {version: 2, previous:previous as WorkspaceBinding & {serverCid:string}, payload, configuration: resolve(configuration), operationNonce: randomBytes(32).toString('base64url'),dispatchAttempted:false,operationExpiresAt:Date.now()+86400000-5*60000};
   record.rootCid=await (effects.preflight??unregisterWorkspace)(record.previous,payload,record.operationNonce,effects.attach,{checkOnly:true,operationExpiresAt:record.operationExpiresAt});
-  saveWorkspaceReplacement(record); return record;
+  withSynchronousFileLock(workspaceBindingLock(), () => { unchanged(before); replaceFileAtomically(replacementPath(), JSON.stringify(record) + '\n', 0o600); });
+  return record;
 }
 /** Abandon only after a private receipt confirms no deletion and dispatch was unsent or terminally rejected. */
 export async function abandonWorkspaceReplacement(effects:{inspect?:typeof unregisterWorkspace;attach?:AttachDaemonClient}={}):Promise<void> {
