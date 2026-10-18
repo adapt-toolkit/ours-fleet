@@ -10,7 +10,7 @@ const object = (value: unknown): value is Record<string, unknown> => !!value && 
 const closed = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).every(key => keys.includes(key));
 const domainId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(id);
 const text = (value: unknown, max: number): value is string => typeof value === 'string' && !!value.trim() && value.length <= max;
-/** Old frozen URL payloads are retained; recognizing only the new closed contract never converts them. */
+/** Only the closed typed contract is sent; any other payload is never sent or converted. */
 export function isNotificationInput(value: unknown): value is NotificationInput {
   if (!object(value) || !closed(value, ['eventId', 'title', 'body', 'target', 'anchor', 'taskId'])
     || !text(value.eventId, 512) || !text(value.title, 160) || !text(value.body, 512) || !object(value.target)) return false;
@@ -23,14 +23,12 @@ export function isNotificationInput(value: unknown): value is NotificationInput 
   return value.anchor === undefined || (target.kind === 'agent' && object(value.anchor)
     && closed(value.anchor, ['kind', 'messageId']) && value.anchor.kind === 'fleet-message' && text(value.anchor.messageId, 1024) && !/[\x00-\x1f\x7f]/.test(value.anchor.messageId));
 }
-/** Recognizes a raw record queued before targetVersion existed and returns its current raw value. */
-export type LegacyRecord = (value: unknown, id: string) => object | undefined;
 const has = (entry: Entry, key: string) => Object.hasOwn(entry, key);
-// Earlier releases persisted the projected payload before any send, so only a record whose
-// envelope has no payload, operation or version at all, and that the producer recognizes,
-// was never sent. Anything else present but unrecognized stays retained and unsent.
-const supported = (entry: Entry, legacy?: LegacyRecord) => !has(entry, 'operation') && (has(entry, 'payload') ? isNotificationInput(entry.payload)
-  : entry.targetVersion === 1 || (Object.keys(entry).every(key => key === 'id' || key === 'value') && typeof entry.id === 'string' && !!legacy?.(entry.value, entry.id)));
+// An entry is sent only when its frozen payload is the closed typed contract or, with no payload
+// field at all, it carries the current version marker. Any present payload or operation that is
+// not the typed contract is never projected or sent.
+const supported = (entry: Entry) => !has(entry, 'operation')
+  && (has(entry, 'payload') ? isNotificationInput(entry.payload) : entry.targetVersion === 1);
 export interface ProducerConfig {
   /** Service base URL. With a gateway credential it is the server gateway's notifications route. */
   origin: string;
@@ -91,14 +89,14 @@ export class NotificationOutbox {
   private timer: ReturnType<typeof setInterval>;
   constructor(private readonly file: string, private readonly config: ProducerConfig,
     private readonly project: (value: unknown, id: string) => Promise<NotificationInput>,
-    private readonly warn: (message: string) => void = () => {},
-    private readonly legacy?: LegacyRecord) {
+    private readonly warn: (message: string) => void = () => {}) {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     const saved = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { entries: [] };
-    this.entries = Array.isArray(saved) ? saved : saved.entries;
+    // Only the current state shape is read; anything else is refused and left unchanged on disk.
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved) || !Array.isArray(saved.entries)) throw new Error('Unsupported notification outbox state');
+    this.entries = saved.entries;
     this.cursor = saved.cursor;
     this.checkpoint = saved.checkpoint;
-    if (!Array.isArray(this.entries)) throw new Error('invalid notification outbox');
     this.timer = setInterval(() => { void this.drain(); }, 3000); this.timer.unref();
   }
   private persist(entries: Entry[], cursor = this.cursor, checkpoint = this.checkpoint): void {
@@ -114,7 +112,7 @@ export class NotificationOutbox {
   enqueue(id: string, value: unknown, cursor = this.cursor): boolean {
     if(this.retired)return false;
     if (this.entries.some(e => e.id === id)) { if (cursor !== this.cursor) this.advance(cursor!); return true; }
-    if (this.entries.filter(entry => supported(entry, this.legacy)).length >= 2000) return false;
+    if (this.entries.filter(supported).length >= 2000) return false;
     this.persist([...this.entries, { id, value, targetVersion: 1 }], cursor);
     return true;
   }
@@ -125,11 +123,11 @@ export class NotificationOutbox {
   private async drainOnce(): Promise<void> {
     let attempts = 0;
     for (const entry of [...this.entries]) {
-      if (!supported(entry, this.legacy)) continue;
+      if (!supported(entry)) continue;
       if (attempts >= 32) break;
       if(this.retired)break;
       try {
-        const value = entry.payload ?? await this.project(entry.targetVersion === 1 ? entry.value : this.legacy!(entry.value, entry.id), entry.id);
+        const value = entry.payload ?? await this.project(entry.value, entry.id);
         if (!isNotificationInput(value)) continue;
         attempts++;
         // Freeze the canonical projection before any network attempt. A crash
@@ -149,6 +147,6 @@ export class NotificationOutbox {
     }
   }
   /** Wait for the current send before clearing queued sends and retiring its target. */
-  async retire():Promise<void>{this.retired=true;clearInterval(this.timer);await this.running;this.persist(this.entries.filter(entry => !supported(entry, this.legacy)));}
+  async retire():Promise<void>{this.retired=true;clearInterval(this.timer);await this.running;this.persist(this.entries.filter(entry => !supported(entry)));}
   async close(): Promise<void> { clearInterval(this.timer); await this.running; }
 }

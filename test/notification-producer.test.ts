@@ -126,7 +126,7 @@ it('delivers completions without optional task metadata when the room inventory 
   expect(accepted).toHaveLength(1);expect(accepted[0].eventId).toBe(`member:g:${done.seq}`);expect(accepted[0]).not.toHaveProperty('taskId');
 });
 
-it('retains historical unprojected and frozen URL entries without attempting or reprojecting them',async()=>{
+it('never sends, reprojects or converts unversioned and URL-shaped entries',async()=>{
   mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','pending-url-'));
   const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
   server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
@@ -141,6 +141,30 @@ it('retains historical unprojected and frozen URL entries without attempting or 
   writeFileSync(file,JSON.stringify(saved));
   producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());await producer.drain();
   expect(accepted).toEqual([]);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(saved.entries);
+});
+
+it('sends a typed entry past present but invalid payload or operation fields without projecting them', async () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','invalid-fields-'));
+  const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
+  const file=join(dir,'outbox.json'),config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)};
+  const invalid=[...[null,false,0,''].map((payload,i)=>({id:`payload-${i}`,value:{},targetVersion:1,payload})),
+    {id:'operation',value:{},targetVersion:1,operation:'delete-target'}];
+  writeFileSync(file,JSON.stringify({entries:[...invalid,{id:'typed',value:{},targetVersion:1}]}));
+  const outbox=new NotificationOutbox(file,config,async(_value,eventId)=>({eventId,title:'Done',body:'Finished',target:{kind:'agent',agentId:'a'}}));
+  cleanup.push(()=>outbox.close());await outbox.drain();
+  expect(accepted.map(row=>row.eventId)).toEqual(['typed']);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(invalid);
+  expect(outbox.enqueue('next',{})).toBe(true);
+});
+
+it('refuses an outbox file that is not the current state shape and leaves it unchanged', () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','outbox-shape-'));
+  const config={origin:'https://service.invalid',token:'t'.repeat(40)},project=async()=>({eventId:'e',title:'t',body:'b',target:{kind:'agent' as const,agentId:'a'}});
+  for(const contents of ['[]','[{"id":"x","value":{}}]','null','{"entries":{}}']){
+    const file=join(dir,'outbox.json');writeFileSync(file,contents);
+    expect(()=>new NotificationOutbox(file,config,project)).toThrow('Unsupported notification outbox state');
+    expect(readFileSync(file,'utf8')).toBe(contents);
+  }
 });
 
 it('retries transient ledger admission without a new mutation after the final committed completion', async () => {

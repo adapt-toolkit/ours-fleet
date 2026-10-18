@@ -122,11 +122,3 @@ it('retains unsupported task journal entries across typed delivery, acknowledgem
  expect(pendingTaskNotifications()).toEqual([]);
 });
 
-it('resumes a pre-upgrade prepared deletion without reprojecting its committed deleted event ID',()=>{
- const task=create();cancelTask(task.task_id);beginTaskDeletionIntent(task.task_id,{kind:'local_control',surface:'cli'});
- const file=join(tasksDir(),task.task_id+'.json'),stored=JSON.parse(readFileSync(file,'utf8'));
- const legacy=stored.notification_events.map(({target,...event}:any)=>({...event,url:`/fleet/tasks/${task.task_id}`}));stored.notification_events=legacy;writeFileSync(file,JSON.stringify(stored));
- const removed={eventId:`task:${task.task_id}:deleted`,taskId:task.task_id,title:'Old deleted',body:'Preserve',url:`/fleet/tasks?deletedTask=${task.task_id}`};
- const dir=join(tasksDir(),'.notification-retired');mkdirSync(dir,{recursive:true});const retired=join(dir,task.task_id+'.json');writeFileSync(retired,JSON.stringify({notification_events:[...legacy,removed]}));
- expect(unlinkDeletedTask(task.task_id)).toBe(true);expect(JSON.parse(readFileSync(retired,'utf8')).notification_events).toEqual([...legacy,removed]);expect(pendingTaskNotifications()).toEqual([]);
-});
