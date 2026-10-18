@@ -1,6 +1,6 @@
 import { observeFleetResources } from '../application/resource-observer.js';
 import { roomsDir } from '../rooms-tasks/room-state.js';
-import { cleanupDir, drainNotificationTargetCleanup, notificationAgentId } from './target-cleanup.js';
+import { cleanupDir, drainNotificationTargetCleanup, notificationAgentId, hasPendingNotificationTargetCleanup } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -52,8 +52,8 @@ export class FleetNotificationProducer {
   }
   poll(): void {
     if (this.stopped) return;
-    this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(url)=>{
-      const name=notificationAgentId(url);
+    this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(target)=>{
+      const name=notificationAgentId(target);
       if(!name || !/^[A-Za-z0-9_-]+$/.test(name))return false;
       // A recreated or retained role still has a valid target. Filesystem errors cannot prove removal.
       for(const root of this.roots){try{lstatSync(join(root,name));return false;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}
@@ -70,7 +70,7 @@ export class FleetNotificationProducer {
       }
       return true;
     }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;
-      try{if(readdirSync(cleanupDir()).some(name=>/^[a-f0-9]{64}\.json$/.test(name)))this.resume(3000);}catch{}
+      try{if(hasPendingNotificationTargetCleanup())this.resume(3000);}catch{}
     });
     let taskRoles:Map<string,string>|undefined;
     try{taskRoles=taskRoleAssociations();}
@@ -86,7 +86,7 @@ export class FleetNotificationProducer {
           const key = createHash('sha256').update(roleDir).digest('hex');
           outbox = new NotificationOutbox(join(this.stateDir, key + '.json'), this.config,
             async (value, eventId) => ({ eventId, title: `${roleId}: agent completed`, body: 'Your agent finished responding. Open the chat to view the result.',
-              url: `/fleet/chats/agents/${encodeURIComponent(roleId)}`, ...(value as object) }), this.warn);
+              ...(value as object), target: { kind: 'agent', agentId: roleId } }), this.warn);
           if (!outbox.checkpoint) {
             const segment = this.existing.has(roleDir) ? segments.at(-1)! : segments[0];
             outbox.saveCheckpoint({ segment, offset: this.existing.has(roleDir) ? statSync(join(dir, segment)).size : 0, prompts: [] });
@@ -129,7 +129,7 @@ export class FleetNotificationProducer {
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), url: `/fleet/chats/agents/${encodeURIComponent(roleId)}#fleet-message-${encodeURIComponent(current.messages[prompt] ?? event.promptId)}` })) {this.resume(1000);break;}
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {this.resume(1000);break;}
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;

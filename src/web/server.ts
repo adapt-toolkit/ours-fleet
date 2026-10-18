@@ -124,7 +124,7 @@ export async function buildWebServer(
     // Fleet serves an API only: nothing it returns may run, load or be framed as a page.
     reply.header('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
-    if (request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
+    if (auth.appOrigin && request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
       reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
       reply.header('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');
       reply.header('Access-Control-Expose-Headers','X-Ours-Workspace-Auth, X-Ours-Request-Id');

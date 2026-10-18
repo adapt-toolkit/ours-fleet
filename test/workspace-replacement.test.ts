@@ -7,7 +7,7 @@ import { WorkspaceDeviceStore } from '../src/web/workspace-devices.js';
 import type { WorkspacePayload } from '../src/workspace-enrollment.js';
 const ROOT='a'.repeat(64), SERVER='b'.repeat(64);
 const undo:Array<()=>void>=[];
-afterEach(()=>{for(const step of undo.splice(0).reverse())step();});
+afterEach(()=>{for(const step of undo.splice(0).reverse())step();vi.unstubAllEnvs();});
 function host(){
  const dir=mkdtempSync(join(tmpdir(),'replacement-')),prior=process.env.OURS_FLEET_HOME;process.env.OURS_FLEET_HOME=dir;
  undo.push(()=>{if(prior===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=prior;rmSync(dir,{recursive:true,force:true});});
@@ -16,6 +16,7 @@ function host(){
  const previous={workspaceId:'o'.repeat(43),hostWorkspaceId,appOrigin:'https://app.ours-tunnel.com',serverCid:SERVER,proofRootCid:ROOT};
  writeFileSync(join(workspace,'binding.json'),JSON.stringify(previous),{mode:0o600});
  const payload:WorkspacePayload={version:1,appOrigin:previous.appOrigin,hostname:'new-home.ours-tunnel.com',rootName:'alice@home',name:'Alice',surname:'Tester',connectorToken:'fixture-private-token',invitation:'fixture-invitation',serverCid:SERVER,challenge:{workspaceId:'w'.repeat(43),accountId:'c'.repeat(43),nonce:'n'.repeat(43),expiresAt:Date.now()+600000}};
+ vi.stubEnv('OURS_ACCOUNT_ORIGIN',payload.appOrigin);vi.stubEnv('OURS_WORKSPACE_HOST',payload.hostname);
  return {dir,workspace,previous,payload,config:join(dir,'fleet.yaml')};
 }
 describe('registration replacement consent and recovery',()=>{
@@ -142,4 +143,11 @@ describe('registration replacement consent and recovery',()=>{
    expect(enroll).toHaveBeenCalledOnce();expect(enroll.mock.calls[0][0].challenge.nonce).toBe(fresh.challenge.nonce);expect(unregister).not.toHaveBeenCalled();expect(cleanup).not.toHaveBeenCalled();
  });
  it('revokes only account links and pending link codes; preserves host ID, local data and owner invite',async()=>{const h=host();writeFileSync(h.config,'retained agents config');writeFileSync(join(h.workspace,'owner.invite'),'retained owner');for(const file of ['connector','tunnel.json','pending-setup.json'])writeFileSync(join(h.workspace,file),'old');const devices=new WorkspaceDeviceStore();const code=devices.mint(),link=devices.enroll(code.enrollment,code.workspaceId,'old browser'),pending=devices.mint();devices.close();await clearReplacedWorkspaceLocalState();const after=new WorkspaceDeviceStore();try{expect(after.workspaceId).toBe(h.previous.hostWorkspaceId);expect(()=>after.authenticate(link.token)).toThrow();expect(()=>after.enroll(pending.enrollment,pending.workspaceId,'late old browser')).toThrow();}finally{after.close();}expect(readFileSync(h.config,'utf8')).toBe('retained agents config');expect(readFileSync(join(h.workspace,'owner.invite'),'utf8')).toBe('retained owner');expect(existsSync(join(h.workspace,'binding.json'))).toBe(true);for(const file of ['connector','tunnel.json','pending-setup.json'])expect(existsSync(join(h.workspace,file))).toBe(false);});
+});
+
+it('requires an explicit account origin in the existing private binding',()=>{
+ const h=host();
+ const {appOrigin,...missing}=h.previous;
+ writeFileSync(join(h.workspace,'binding.json'),JSON.stringify(missing),{mode:0o600});
+ expect(()=>readWorkspaceBinding()).toThrow();
 });

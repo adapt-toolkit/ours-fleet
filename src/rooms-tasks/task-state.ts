@@ -100,7 +100,7 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
     pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
       title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
       body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
-      url: `/fleet/tasks/${record.task_id}` });
+      target: { kind: 'task', taskId: record.task_id } });
   }
   if (pending.length) persisted.notification_events = pending;
   else delete persisted.notification_events;
@@ -109,6 +109,17 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
 }
 
 const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
+
+function typedTaskNotification(value: TaskNotificationEvent, id: string): boolean {
+  if (!value || typeof value !== 'object' || Object.keys(value).some(key => !['eventId', 'title', 'body', 'target', 'taskId'].includes(key))) return false;
+  const target = value.target;
+  return typeof value.eventId === 'string' && value.eventId.startsWith(`task:${id}:`) && value.eventId.length <= 512
+    && value.taskId === id && !!target && typeof target === 'object' && !Array.isArray(target)
+    && Object.keys(target).every(key => ['kind', 'taskId'].includes(key)) && target.taskId === id
+    && (target.kind === 'task' || (target.kind === 'task-deleted' && value.eventId === `task:${id}:deleted`))
+    && typeof value.title === 'string' && !!value.title.trim() && value.title.length <= 160
+    && typeof value.body === 'string' && !!value.body.trim() && value.body.length <= 512;
+}
 
 /** Atomic snapshots contain the events, including intermediate states between polls. */
 export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[] }> {
@@ -124,11 +135,11 @@ export function pendingTaskNotifications(warn: (line: string) => void = () => {}
         // A prepared deletion copy has no authority while the original still exists.
         if (dir === retiredNotificationsDir() && existsSync(taskPath(id))) continue;
         if (value.notification_events === undefined) continue;
-        if (!Array.isArray(value.notification_events) || value.notification_events.some(e => !e
-          || typeof e.eventId !== 'string' || !e.eventId.startsWith(`task:${id}:`) || e.eventId.length > 512
-          || e.taskId !== id || (e.url !== `/fleet/tasks/${id}` && !(e.eventId === `task:${id}:deleted` && e.url === `/fleet/tasks?deletedTask=${id}`)) || typeof e.title !== 'string' || !e.title.trim() || e.title.length > 160
-          || typeof e.body !== 'string' || !e.body.trim() || e.body.length > 512)) throw new Error('invalid notification events');
-        if (value.notification_events.length) result.push({ taskId: id, events: value.notification_events });
+        if (!Array.isArray(value.notification_events)) throw new Error('invalid notification events');
+        // Only typed task events are delivered. Unsupported entries are never sent or converted,
+        // and they do not block later lifecycle events.
+        const events = value.notification_events.filter(event => typedTaskNotification(event, id));
+        if (events.length) result.push({ taskId: id, events });
       } catch (error) {
         if (!isNotFoundError(error)) warn('Task notification record unavailable; other task deliveries continue');
       }
@@ -144,8 +155,8 @@ export function acknowledgeTaskNotification(id: string, eventId: string): void {
     for (const path of [taskPath(id), join(retiredNotificationsDir(), `${id}.json`)]) {
       if (!existsSync(path)) continue;
       const value = JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord;
-      if (!value.notification_events?.some(event => event.eventId === eventId)) continue;
-      value.notification_events = value.notification_events.filter(event => event.eventId !== eventId);
+      if (!value.notification_events?.some(event => typedTaskNotification(event, id) && event.eventId === eventId)) continue;
+      value.notification_events = value.notification_events.filter(event => !typedTaskNotification(event, id) || event.eventId !== eventId);
       replaceFileAtomically(path, JSON.stringify(value, null, 2) + '\n');
       if (path.startsWith(retiredNotificationsDir() + '/') && !value.notification_events.length) unlinkSync(path);
     }
@@ -984,7 +995,7 @@ export function unlinkDeletedTask(id: string): boolean {
   // before unlink may replay two copies; both carry identical service dedupe IDs.
   const removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
     title: `Task deleted: ${stored.title}`.slice(0, 160), body: `Task ${id}: deleting → deleted.`,
-    url: `/fleet/tasks?deletedTask=${id}` };
+    target: { kind: 'task-deleted', taskId: id } };
   replaceFileAtomically(join(retiredNotificationsDir(), `${id}.json`),
     JSON.stringify({ notification_events: [...(stored.notification_events ?? []), removed] }) + '\n');
   try {

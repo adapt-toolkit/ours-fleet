@@ -33,7 +33,7 @@ it('produces only user-correlated completions, retries, and recovers delivery af
   const restarted = new FleetNotificationProducer([root], join(dir, 'outboxes'), config);
   cleanup.push(() => restarted.close()); fail = false; await restarted.drain();
   expect(accepted).toHaveLength(1); expect(accepted[0].eventId).toBe(`agent-one:g:${done.seq}`);
-  expect(accepted[0].url).toBe('/fleet/chats/agents/agent-one#fleet-message-reply-human');expect(accepted[0].taskId).toBeNull();
+  expect(accepted[0].target).toEqual({kind:'agent',agentId:'agent-one'});expect(accepted[0].anchor).toEqual({kind:'fleet-message',messageId:'reply-human'});expect(accepted[0]).not.toHaveProperty('url');expect(accepted[0].taskId).toBeNull();
 
 });
 
@@ -72,7 +72,7 @@ it('does not advance over a completion when the durable outbox is full', async (
   const admitted = { schemaVersion: 1, roleId: 'agent', seq: 1, sessionGeneration: 'g', promptId: 'p', kind: 'prompt.admitted', source: 'browser', payload: {} };
   const file = join(ledger, 'events-000001.jsonl'); writeFileSync(file, JSON.stringify(admitted) + '\n'); producer.poll(); await producer.close();
   const queueFile = join(dir, 'outboxes', readdirSync(join(dir, 'outboxes'))[0]), state = JSON.parse(readFileSync(queueFile, 'utf8'));
-  state.entries = Array.from({ length: 2000 }, (_, i) => ({ id: `pending-${i}`, value: {} })); writeFileSync(queueFile, JSON.stringify(state));
+  state.entries = Array.from({ length: 2000 }, (_, i) => ({ id: `pending-${i}`, value: {}, targetVersion: 1 })); writeFileSync(queueFile, JSON.stringify(state));
   appendFileSync(file, JSON.stringify({ ...admitted, seq: 2, kind: 'turn.completed' }) + '\n');
   producer = new FleetNotificationProducer([root], join(dir, 'outboxes'), config); producer.poll(); await producer.close();
   const full = JSON.parse(readFileSync(queueFile, 'utf8')); expect(full.checkpoint.offset).toBe(state.checkpoint.offset);
@@ -92,7 +92,7 @@ it('retires a deleted target after the in-flight send and clears persisted pendi
   const root=join(dir,'agents');mkdirSync(root);const state=join(dir,'outboxes');const producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());
   const roleDir=join(root,'removed-agent');const store=new ConversationEventStore(join(roleDir,'.conversation'),{roleId:'removed-agent'});cleanup.push(async()=>store.close());
   store.append({kind:'prompt.admitted',promptId:'p',source:'owner_admin_console',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});producer.poll();const draining=producer.drain();await sent;
-  store.close();rmSync(roleDir,{recursive:true,force:true});await retireNotificationTarget('/fleet/chats/agents/removed-agent',config);expect(events).toEqual(['send-start','delete']);
+  store.close();rmSync(roleDir,{recursive:true,force:true});await retireNotificationTarget({kind:'agent',agentId:'removed-agent'},config);expect(events).toEqual(['send-start','delete']);
   producer.poll();release();await draining;await producer.close();expect(events).toEqual(['send-start','delete','send-end','delete']);
   const saved=JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8'));expect(saved.entries).toEqual([]);
 });
@@ -109,7 +109,7 @@ it('freezes task association before delivery and preserves it across a retry aft
   store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
   producer.poll();await producer.drain();await producer.close();writeFileSync(room,JSON.stringify({room_id:'room-one',member_seats:[]}));
   producer=new FleetNotificationProducer([root],state,config);fail=false;await producer.drain();await producer.close();
-  expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].url).toContain('/fleet/chats/agents/task-member');
+  expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].target).toEqual({kind:'agent',agentId:'task-member'});
 });
 
 it('delivers completions without optional task metadata when the room inventory is corrupt',async()=>{
@@ -126,7 +126,7 @@ it('delivers completions without optional task metadata when the room inventory 
   expect(accepted).toHaveLength(1);expect(accepted[0].eventId).toBe(`member:g:${done.seq}`);expect(accepted[0]).not.toHaveProperty('taskId');
 });
 
-it('uses canonical defaults while replaying pending value overrides and frozen payload URLs unchanged',async()=>{
+it('never sends, reprojects or converts unversioned and URL-shaped entries',async()=>{
   mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','pending-url-'));
   const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
   server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
@@ -140,7 +140,44 @@ it('uses canonical defaults while replaying pending value overrides and frozen p
   saved.entries=[{id:'default',value:{}},{id:'override',value:{url:legacy}},{id:'frozen',value:{url:'/fleet/chats/agents/other'},payload}];
   writeFileSync(file,JSON.stringify(saved));
   producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());await producer.drain();
-  expect(accepted.map(row=>row.url)).toEqual(['/fleet/chats/agents/new',legacy,legacy]);expect(accepted[2]).toEqual(payload);
+  expect(accepted).toEqual([]);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(saved.entries);
+});
+
+it('sends a typed entry past present but invalid payload or operation fields without projecting them', async () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','invalid-fields-'));
+  const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
+  server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
+  const file=join(dir,'outbox.json'),config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)};
+  const invalid=[...[null,false,0,''].map((payload,i)=>({id:`payload-${i}`,value:{},targetVersion:1,payload})),
+    {id:'operation',value:{},targetVersion:1,operation:'delete-target'},null,7,'typed',[],{id:5,value:{},targetVersion:1},{id:'typed',value:{}}];
+  writeFileSync(file,JSON.stringify({entries:[...invalid,{id:'typed',value:{},targetVersion:1}]}));
+  const project=async(_value:unknown,eventId:string)=>({eventId,title:'Done',body:'Finished',target:{kind:'agent' as const,agentId:'a'}});
+  const outbox=new NotificationOutbox(file,config,project);
+  cleanup.push(()=>outbox.close());await outbox.drain();
+  expect(accepted.map(row=>row.eventId)).toEqual(['typed']);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(invalid);
+  // Unsupported entries neither hold an ID nor block later typed work, also after a restart.
+  expect(outbox.enqueue('typed',{})).toBe(true);expect(outbox.enqueue('next',{})).toBe(true);await outbox.close();
+  const restarted=new NotificationOutbox(file,config,project);cleanup.push(()=>restarted.close());await restarted.drain();
+  expect(accepted.map(row=>row.eventId)).toEqual(['typed','typed','next']);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(invalid);
+});
+
+it('counts only typed entries toward the queue capacity', () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','outbox-capacity-'));
+  const file=join(dir,'outbox.json'),config={origin:'https://service.invalid',token:'t'.repeat(40)};
+  const typed=Array.from({length:1999},(_,i)=>({id:`typed-${i}`,value:{},targetVersion:1}));
+  writeFileSync(file,JSON.stringify({entries:[...Array.from({length:50},()=>null),{id:'raw',value:{}},...typed]}));
+  const outbox=new NotificationOutbox(file,config,async(_value,eventId)=>({eventId,title:'t',body:'b',target:{kind:'agent' as const,agentId:'a'}}));
+  try { expect(outbox.enqueue('last',{})).toBe(true);expect(outbox.enqueue('over',{})).toBe(false); } finally { void outbox.close(); }
+});
+
+it('refuses an outbox file that is not the current state shape and leaves it unchanged', () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','outbox-shape-'));
+  const config={origin:'https://service.invalid',token:'t'.repeat(40)},project=async()=>({eventId:'e',title:'t',body:'b',target:{kind:'agent' as const,agentId:'a'}});
+  for(const contents of ['[]','[{"id":"x","value":{}}]','null','{"entries":{}}']){
+    const file=join(dir,'outbox.json');writeFileSync(file,contents);
+    expect(()=>new NotificationOutbox(file,config,project)).toThrow('Unsupported notification outbox state');
+    expect(readFileSync(file,'utf8')).toBe(contents);
+  }
 });
 
 it('retries transient ledger admission without a new mutation after the final committed completion', async () => {
