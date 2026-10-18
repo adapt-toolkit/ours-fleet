@@ -56,6 +56,14 @@ function identity(path: string, followLink = false): string | undefined {
   } catch (error) { if (directoryGone(error)) return; throw error; }
 }
 function within(path: string, root: string) { return path === root || path.startsWith(root + sep); }
+/** Lock directories and the claim/reclaim entries derived from their names
+ * (`<lock>.claim.<pid>.<uuid>`, `<lock>.reclaim`) are never resources. */
+const lockClaim = /\.claim\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$|\.reclaim$/;
+function lockName(name: string) { return name === '.locks' || name.endsWith('.lock'); }
+function lockArtifact(name: string) { return lockName(name) || (lockClaim.test(name) && lockName(name.replace(lockClaim, ''))); }
+/** Full discovery is synchronous and lstats every covered directory. Wakes are
+ * still delivered promptly, but discovery runs at most once per window. */
+const DISCOVERY_WINDOW_MS = 100;
 
 /** Native notifications cover supported local mounts. No idle content scan or
  * silent claim of coverage after watch failure. Parents survive atomic rename.
@@ -77,9 +85,11 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
     for (let depth = 0; depth < 4 && dirname(parent) !== parent; depth++, parent = dirname(parent)) trustedPaths.add(parent);
   }
   const resourceIdentity = (path: string) => identity(path, trustedPaths.has(path));
+  const locks = resolve(stateRoot(), 'locks');
+  const ignored = (path: string) => within(path, locks) || path.split(sep).some(name => lockArtifact(name) || name.endsWith('.tmp'));
   let state: FleetResourceState = { protocolVersion: 1, producerGeneration: randomUUID(), position: 0, health: 'healthy' };
-  let disposed = signal.aborted, queued = false;
-  let recovery: ReturnType<typeof setTimeout> | undefined;
+  let disposed = signal.aborted, queued = false, discoveredAt = -Infinity;
+  let recovery: ReturnType<typeof setTimeout> | undefined, discovery: ReturnType<typeof setTimeout> | undefined;
   let installing = false, installFailure: NodeJS.ErrnoException | undefined;
   const cursors = new Set<{ accepts(path: string): boolean; position: number; dispose(): void }>();
   const watchers = new Map<string, { identity: string; handle: Pick<FSWatcher, 'on' | 'close'> }>();
@@ -93,6 +103,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
   };
   const install = () => {
     installing = true; installFailure = undefined;
+    let added = 0;
     try {
       const wanted = new Set<string>();
       const cover = (dir: string) => {
@@ -106,7 +117,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
           if (watchers.get(dir)?.handle !== handle) return;
           // Ignore sibling noise from ancestor coverage, lock churn and delivery acknowledgements.
           const changed = filename === null ? dir : resolve(dir, String(filename));
-          if (changed.split(sep).some(name=>name === '.locks' || name.endsWith('.lock') || name.endsWith('.tmp'))) return;
+          if (ignored(changed)) return;
           if (paths.some(path => within(changed, path) || within(path, changed)) || (configEnabled && changed === config) || filename === null) wake(filename === null ? undefined : changed);
         }); } catch (error) {
           // Parent coverage owns removal/recreation. Only verified disappearance
@@ -114,12 +125,13 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
           if (directoryGone(error) && !resourceIdentity(dir)) return;
           throw error;
         }
-        watchers.set(dir, { identity: id, handle });
+        watchers.set(dir, { identity: id, handle }); added++;
         handle.on('error', (error: NodeJS.ErrnoException) => { if (watchers.get(dir)?.handle === handle) fail(error); });
         handle.on('close', () => { if (watchers.get(dir)?.handle === handle) fail(Error('resource watch closed')); });
         if (installFailure) throw installFailure;
       };
       const visit = (dir: string, depth: number) => {
+        if (within(dir, locks)) return;
         const id = resourceIdentity(dir); if (!id) return;
         // Watch before enumerating children: creation before watch is covered by
         // this scan; creation after watch schedules another discovery pass.
@@ -129,7 +141,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
         try { entries = readdirSync(dir, { withFileTypes: true }); }
         catch (error) { if (directoryGone(error) && !resourceIdentity(dir)) return; throw error; }
         for (const entry of entries) {
-          if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === '.locks' || entry.name.endsWith('.lock')) continue;
+          if (!entry.isDirectory() || entry.isSymbolicLink() || lockArtifact(entry.name)) continue;
           visit(join(dir, entry.name), depth - 1);
         }
       };
@@ -145,6 +157,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
         if (!wanted.has(dir) || resourceIdentity(dir) !== entry.identity) { watchers.delete(dir); entry.handle.close(); }
       }
       if (installFailure) throw installFailure;
+      return added;
     } finally { installing = false; }
   };
   const recover = () => {
@@ -170,13 +183,33 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
     queueMicrotask(() => {
       queued = false;
       if (disposed || state.health !== 'healthy') return;
-      try { install(); } catch (error) { fail(error as NodeJS.ErrnoException); return; }
+      if (!discovery) {
+        const wait = discoveredAt + DISCOVERY_WINDOW_MS - performance.now();
+        if (wait <= 0) { discover(false); return; }
+        discovery = setTimeout(() => { discovery = undefined; discover(true); }, wait); discovery.unref();
+      }
+      // Covered directories were watched before this wake; directories created
+      // since the last pass are covered by the pending one.
       onCommitted({ ...state });
     });
   };
+  const discover = (deferred: boolean) => {
+    if (disposed || state.health !== 'healthy') return;
+    discoveredAt = performance.now();
+    let added: number;
+    try { added = install(); } catch (error) { fail(error as NodeJS.ErrnoException); return; }
+    // Every wake before a deferred pass was already delivered. Writes into
+    // directories it newly covers have no event of their own: treat as unknown.
+    if (deferred) {
+      if (!added) return;
+      state = { ...state, position: state.position + 1 };
+      for (const cursor of cursors) cursor.position = state.position;
+    }
+    onCommitted({ ...state });
+  };
   const direct = (path: string) => { if (paths.some(root => within(path, root)) || (configEnabled && path === config)) wake(path); };
   let detach:(()=>void)|undefined;
-  const dispose = () => { if (disposed) return; disposed = true; clearTimeout(recovery); recovery = undefined; detach?.(); for (const cursor of [...cursors]) cursor.dispose(); commits.delete(direct); signal.removeEventListener('abort', dispose); release(); };
+  const dispose = () => { if (disposed) return; disposed = true; clearTimeout(recovery); recovery = undefined; clearTimeout(discovery); discovery = undefined; detach?.(); for (const cursor of [...cursors]) cursor.dispose(); commits.delete(direct); signal.removeEventListener('abort', dispose); release(); };
   if (!disposed) {
     commits.add(direct); detach=scope.subscribeMutations?.(wake); signal.addEventListener('abort', dispose, { once: true });
     try { install(); } catch (error) { fail(error as NodeJS.ErrnoException); }
