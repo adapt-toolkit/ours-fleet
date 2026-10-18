@@ -127,8 +127,9 @@ export async function buildWebServer(
     if (auth.appOrigin && request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
       reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
       reply.header('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');
-      reply.header('Access-Control-Expose-Headers','X-Ours-Workspace-Auth, X-Ours-Request-Id');
-      reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key');
+      // The App binds resource reads by these headers; it must be able to send and read them cross-origin.
+      reply.header('Access-Control-Expose-Headers','X-Ours-Workspace-Auth, X-Ours-Request-Id, X-Resource-Producer, X-Resource-Revision, X-Resource-Source-Generation, X-Resource-Source-Position, X-Resource-Connection, X-Resource-View, X-Resource-Epoch, X-Resource-Baseline');
+      reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key,X-Ours-Messenger-CSRF,X-Resource-Connection,X-Resource-View,X-Resource-Epoch,X-Resource-Baseline');
       if (request.method === 'OPTIONS') {auth.validateBoundary(request,false);return reply.code(204).send();}
     }
     auth.validateBoundary(request, false);
@@ -460,7 +461,10 @@ export async function buildWebServer(
   app.addHook('preClose',async()=>resources.close());
   app.get('/api/v1/resource-events', async (request,reply)=>{
     const browser=auth.authenticate(request);
-    reply.hijack(); reply.raw.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform',Connection:'keep-alive','X-Accel-Buffering':'no'});reply.raw.flushHeaders();
+    reply.hijack();
+    // A hijacked reply bypasses Fastify headers: keep the exact-origin CORS and security headers.
+    for (const [name, value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name, Array.isArray(value) ? value : String(value));
+    reply.raw.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform',Connection:'keep-alive','X-Accel-Buffering':'no'});reply.raw.flushHeaders();
     const opened=resources.open(reply.raw,browser.id,()=>auth.sessionValid(browser));
     const binding=auth.bindTransport(browser,opened.close);
     reply.raw.once('close',()=>binding());
