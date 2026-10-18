@@ -23,12 +23,13 @@ export function isNotificationInput(value: unknown): value is NotificationInput 
   return value.anchor === undefined || (target.kind === 'agent' && object(value.anchor)
     && closed(value.anchor, ['kind', 'messageId']) && value.anchor.kind === 'fleet-message' && text(value.anchor.messageId, 1024) && !/[\x00-\x1f\x7f]/.test(value.anchor.messageId));
 }
-const has = (entry: Entry, key: string) => Object.hasOwn(entry, key);
-// An entry is sent only when its frozen payload is the closed typed contract or, with no payload
-// field at all, it carries the current version marker. Any present payload or operation that is
-// not the typed contract is never projected or sent.
-const supported = (entry: Entry) => !has(entry, 'operation')
+const has = (entry: object, key: string) => Object.hasOwn(entry, key);
+// An entry is sent only when it is an object with a string ID and its frozen payload is the closed
+// typed contract or, with no payload field at all, it carries the current version marker. Anything
+// else, including null or scalar entries, is never read further, projected, sent or changed.
+const supported = (entry: unknown): entry is Entry => object(entry) && typeof entry.id === 'string' && !has(entry, 'operation')
   && (has(entry, 'payload') ? isNotificationInput(entry.payload) : entry.targetVersion === 1);
+const same = (id: string) => (entry: unknown) => supported(entry) && entry.id === id;
 export interface ProducerConfig {
   /** Service base URL. With a gateway credential it is the server gateway's notifications route. */
   origin: string;
@@ -111,7 +112,7 @@ export class NotificationOutbox {
   saveCheckpoint(checkpoint: unknown): void { this.persist(this.entries, this.cursor, checkpoint); }
   enqueue(id: string, value: unknown, cursor = this.cursor): boolean {
     if(this.retired)return false;
-    if (this.entries.some(e => e.id === id)) { if (cursor !== this.cursor) this.advance(cursor!); return true; }
+    if (this.entries.some(same(id))) { if (cursor !== this.cursor) this.advance(cursor!); return true; }
     if (this.entries.filter(supported).length >= 2000) return false;
     this.persist([...this.entries, { id, value, targetVersion: 1 }], cursor);
     return true;
@@ -132,7 +133,7 @@ export class NotificationOutbox {
         attempts++;
         // Freeze the canonical projection before any network attempt. A crash
         // after service acceptance must replay the identical dedupe payload.
-        if (!entry.payload) this.persist(this.entries.map(e => e.id === entry.id ? { ...e, payload: value } : e));
+        if (!entry.payload) this.persist(this.entries.map(e => same(entry.id)(e) ? { ...e, payload: value } : e));
         const response = await fetch(this.config.origin + '/api/v1/send', {
           method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10_000),
           headers: { ...(this.config.gatewayCredential
@@ -142,7 +143,7 @@ export class NotificationOutbox {
         });
         await response.body?.cancel();
         if (!response.ok) throw new Error('notification service rejected event');
-        this.persist(this.entries.filter(e => e.id !== entry.id));
+        this.persist(this.entries.filter(e => !same(entry.id)(e)));
       } catch { this.warn('Notification producer delivery pending; retrying from durable outbox'); break; }
     }
   }
