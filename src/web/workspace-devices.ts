@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import type { DatabaseSync as SQLiteDatabase } from 'node:sqlite';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { stateRoot } from '../paths.js';
 import { FleetError } from '../application/errors.js';
@@ -36,6 +36,16 @@ export interface WorkspaceCredentials {
 /** An authenticated device and the moment the presented credential stops authorizing anything. */
 export type AuthenticatedWorkspaceDevice = WorkspaceDevice & { authorizedUntil: number; rotating: boolean };
 interface LiveDevice extends WorkspaceDevice { hash: string; familyExpiresAt: number | null }
+/** This host's workspace identity as already recorded, read without creating or changing the store. */
+export function recordedHostWorkspaceId(dir = join(stateRoot(), 'web')): string | undefined {
+  const path = join(dir, 'workspace-devices.db');
+  if (!existsSync(path)) return;
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+  const db = new DatabaseSync(path, { readOnly: true });
+  try { const row = db.prepare("SELECT value FROM metadata WHERE key='workspaceId'").get(); return typeof row?.value === 'string' ? row.value : undefined; }
+  catch { return; }
+  finally { db.close(); }
+}
 export class WorkspaceDeviceStore {
   private readonly db: SQLiteDatabase;
   readonly workspaceId: string;
