@@ -1,4 +1,4 @@
-import {recordedAccountOrigin,validateAccountOrigin,validateConfiguredAccountOrigin,validateConfiguredWorkspaceHost} from './account-origin.js';
+import {validateAccountOrigin,validateConfiguredAccountOrigin,validateConfiguredWorkspaceHost} from './account-origin.js';
 import { lstatSync, readFileSync, readdirSync, mkdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { readClientProfile } from './client-profile.js';
@@ -32,7 +32,7 @@ export function checkWorkspaceConnector(payload:WorkspacePayload):void {
 
   const dir=join(stateRoot(),'workspace');let previous:any;
   try{previous=JSON.parse(readFileSync(join(dir,'binding.json'),'utf8'));}catch{reject();}
-  if(previous.workspaceId!==payload.challenge.workspaceId || recordedAccountOrigin(previous)!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
+  if(previous.workspaceId!==payload.challenge.workspaceId || validateAccountOrigin(previous.appOrigin)!==payload.appOrigin || (previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase()))reject();
   try{
     const file=join(dir,'connector'),stat=lstatSync(file);
     if(!stat.isFile() || stat.isSymbolicLink() || stat.nlink!==1 || stat.uid!==process.getuid?.() || (stat.mode&0o077)!==0 || stat.size>8193 || !readFileSync(file,'utf8').trim())reject();
@@ -185,7 +185,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
   let migrating=false;
   // Every decision below rests on this binding and on the unfinished replacement record (none, or the
   // one this setup completes); both are rechecked under the binding lock before the first change and
-  // again at the final write, so a concurrent setup, replacement or adoption is never overwritten.
+  // again at the final write, so a concurrent setup or replacement is never overwritten.
   const read=(file:string)=>existsSync(file)?readFileSync(file,'utf8'):null;
   const priorBinding=read(previousFile),priorReplacement=read(workspaceReplacementFile());
   if(priorReplacement!==null && options.replacingWorkspace===undefined)throw Error('An unfinished replacement exists; resume or abandon it before setup. Existing setup preserved');
@@ -193,7 +193,7 @@ export async function enrollWorkspace(payload:WorkspacePayload,configuration=def
     if(read(previousFile)!==priorBinding)throw Error('The workspace binding changed during setup; existing setup preserved. Run the setup command again');
     if(read(workspaceReplacementFile())!==priorReplacement)throw Error('The unfinished replacement changed during setup; existing setup preserved. Review it with setup-tunnel --resume');
   };
-  if(priorBinding!==null) {const previous=JSON.parse(priorBinding);if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=recordedAccountOrigin(previous);migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
+  if(priorBinding!==null) {const previous=JSON.parse(priorBinding);if(previous.workspaceId!==payload.challenge.workspaceId && options.replacingWorkspace!==previous.workspaceId)throw Error('This host is already associated with another workspace');const priorOrigin=validateAccountOrigin(previous.appOrigin);migrating=priorOrigin!==appOrigin && options.replacingWorkspace!==previous.workspaceId;if(migrating && !options.migrateAppOrigin)throw Error('Account origin change requires explicit --migrate-app-origin and a fresh setup payload');if(migrating && previous.serverCid && previous.serverCid.toUpperCase()!==payload.serverCid.toUpperCase())throw Error('Account origin migration must retain the enrollment server identity');}
   const loaded=loadConfig(configuration,{deferredOwnerInviteFile:workspaceOwnerInvite()});
   // Decided before anything is sent or written: the Owner entry is replaced only when it records an enrollment this host has lost.
   const lost=Boolean(loaded.rooms) && recordsLostEnrollment(resolve(configuration));
