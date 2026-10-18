@@ -143,3 +143,49 @@ it('streams hosted conversation role events through the existing Fleet prefix wi
     await expect.poll(()=>disposed).toBe(1);
   } finally {abort.abort();await gateway.close();web.app.server.closeAllConnections();await web.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+it('serves the resource protocol to the configured App cross-origin through the Fleet prefix, never to a foreign origin',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'resource-cors-')),store=new WorkspaceDeviceStore(dir);
+  const auth=new WebAuth('http://localhost','localhost',Date.now,new TrustedDeviceStore(join(dir,'trusted')),undefined,store,'https://accounts.example.test');
+  const link=store.mint(),device=store.enroll(link.enrollment,link.workspaceId,'hosted');
+  const web=await buildWebServer({audit:new AuditSink(join(dir,'audit')),configuration:{read:()=>({revision:'r',model:{agents:{}}})},presetProvenance:{read:()=>({role:{},brain:{},template:{},layout:{}})},resourceScope:{paths:[dir],roots:[]}} as any,{origin:'http://localhost',host:'localhost'},{auth});
+  await web.app.listen({host:'127.0.0.1',port:0});const upstream=web.app.listeningOrigin;
+  const gateway=createPrefixGateway({auth,fleetOrigin:upstream,services:[]});
+  gateway.server.listen(0,'127.0.0.1');await once(gateway.server,'listening');
+  const origin=`http://127.0.0.1:${(gateway.server.address() as {port:number}).port}`,appOrigin=auth.appOrigin!;
+  auth.setBoundary(origin,new URL(origin).host,{hosts:[new URL(upstream).host]});
+  const bearer={origin:appOrigin,authorization:`Bearer ${device.token}`},abort=new AbortController();
+  const preflight=(path:string,method:string,headers:string,from=appOrigin)=>fetch(origin+'/fleet/api/v1'+path,{method:'OPTIONS',headers:{origin:from,'access-control-request-method':method,'access-control-request-headers':headers}});
+  const listed=(response:Response,name:string)=>(response.headers.get(name)??'').toLowerCase().split(',').map(value=>value.trim());
+  try {
+    const events=await fetch(origin+'/fleet/api/v1/resource-events',{headers:bearer,signal:abort.signal});
+    expect(events.status).toBe(200);expect(events.headers.get('access-control-allow-origin')).toBe(appOrigin);
+    expect(events.headers.get('content-type')).toContain('text/event-stream');expect(events.headers.get('x-content-type-options')).toBe('nosniff');
+    const reader=events.body!.getReader(),decoder=new TextDecoder();let records='';
+    const until=async(test:(text:string)=>boolean)=>{while(!test(records)){const next=await reader.read();if(next.done)throw Error('unexpected close');records+=decoder.decode(next.value,{stream:true});}};
+    await until(text=>text.includes('resource-connection'));
+    const connection=JSON.parse(records.split('data: ')[1].split('\n')[0]);
+    const post=await preflight('/resource-subscriptions','POST','authorization,content-type,x-ours-messenger-csrf');
+    expect(post.status).toBe(204);expect(post.headers.get('access-control-allow-origin')).toBe(appOrigin);
+    for(const name of ['authorization','content-type','x-ours-messenger-csrf'])expect(listed(post,'access-control-allow-headers')).toContain(name);
+    const registered=await fetch(origin+'/fleet/api/v1/resource-subscriptions',{method:'POST',headers:{...bearer,'content-type':'application/json','x-ours-messenger-csrf':'1'},body:JSON.stringify({connectionId:connection.connectionId,viewId:'config',subscriptionEpoch:1,descriptor:{viewId:'config',resource:'configuration'}})});
+    expect(registered.status).toBe(200);expect(registered.headers.get('access-control-allow-origin')).toBe(appOrigin);
+    const binding=await registered.json() as {baselineId:string};
+    const bound={'x-resource-connection':connection.connectionId,'x-resource-view':'config','x-resource-epoch':'1','x-resource-baseline':binding.baselineId};
+    const get=await preflight('/configuration','GET','authorization,'+Object.keys(bound).join(','));
+    expect(get.status).toBe(204);for(const name of Object.keys(bound))expect(listed(get,'access-control-allow-headers')).toContain(name);
+    const read=await fetch(origin+'/fleet/api/v1/configuration',{headers:{...bearer,...bound}});
+    expect(read.status).toBe(200);expect(read.headers.get('access-control-allow-origin')).toBe(appOrigin);await read.json();
+    for(const name of [...Object.keys(bound),'x-resource-producer','x-resource-revision','x-resource-source-generation','x-resource-source-position']) {
+      expect(read.headers.get(name)).toBeTruthy();expect(listed(read,'access-control-expose-headers')).toContain(name);
+    }
+    await reader.cancel();
+    // The exact configured App origin is the only one answered; credentials are still required.
+    const foreignPreflight=await preflight('/resource-subscriptions','POST','authorization,content-type,x-ours-messenger-csrf','https://foreign.example');
+    expect(foreignPreflight.headers.get('access-control-allow-origin')).toBeNull();await foreignPreflight.text();
+    const foreign=await fetch(origin+'/fleet/api/v1/resource-events',{headers:{...bearer,origin:'https://foreign.example'}});
+    expect(foreign.status).toBe(403);expect(foreign.headers.get('access-control-allow-origin')).toBeNull();await foreign.text();
+    const anonymous=await fetch(origin+'/fleet/api/v1/resource-events',{headers:{origin:appOrigin}});
+    expect(anonymous.status).toBe(401);expect(anonymous.headers.get('content-type')).not.toContain('text/event-stream');await anonymous.text();
+  } finally {abort.abort();await gateway.close();web.app.server.closeAllConnections();await web.close();rmSync(dir,{recursive:true,force:true});}
+});
