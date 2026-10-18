@@ -149,12 +149,25 @@ it('sends a typed entry past present but invalid payload or operation fields wit
   server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
   const file=join(dir,'outbox.json'),config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)};
   const invalid=[...[null,false,0,''].map((payload,i)=>({id:`payload-${i}`,value:{},targetVersion:1,payload})),
-    {id:'operation',value:{},targetVersion:1,operation:'delete-target'}];
+    {id:'operation',value:{},targetVersion:1,operation:'delete-target'},null,7,'typed',[],{id:5,value:{},targetVersion:1},{id:'typed',value:{}}];
   writeFileSync(file,JSON.stringify({entries:[...invalid,{id:'typed',value:{},targetVersion:1}]}));
-  const outbox=new NotificationOutbox(file,config,async(_value,eventId)=>({eventId,title:'Done',body:'Finished',target:{kind:'agent',agentId:'a'}}));
+  const project=async(_value:unknown,eventId:string)=>({eventId,title:'Done',body:'Finished',target:{kind:'agent' as const,agentId:'a'}});
+  const outbox=new NotificationOutbox(file,config,project);
   cleanup.push(()=>outbox.close());await outbox.drain();
   expect(accepted.map(row=>row.eventId)).toEqual(['typed']);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(invalid);
-  expect(outbox.enqueue('next',{})).toBe(true);
+  // Unsupported entries neither hold an ID nor block later typed work, also after a restart.
+  expect(outbox.enqueue('typed',{})).toBe(true);expect(outbox.enqueue('next',{})).toBe(true);await outbox.close();
+  const restarted=new NotificationOutbox(file,config,project);cleanup.push(()=>restarted.close());await restarted.drain();
+  expect(accepted.map(row=>row.eventId)).toEqual(['typed','typed','next']);expect(JSON.parse(readFileSync(file,'utf8')).entries).toEqual(invalid);
+});
+
+it('counts only typed entries toward the queue capacity', () => {
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','outbox-capacity-'));
+  const file=join(dir,'outbox.json'),config={origin:'https://service.invalid',token:'t'.repeat(40)};
+  const typed=Array.from({length:1999},(_,i)=>({id:`typed-${i}`,value:{},targetVersion:1}));
+  writeFileSync(file,JSON.stringify({entries:[...Array.from({length:50},()=>null),{id:'raw',value:{}},...typed]}));
+  const outbox=new NotificationOutbox(file,config,async(_value,eventId)=>({eventId,title:'t',body:'b',target:{kind:'agent' as const,agentId:'a'}}));
+  try { expect(outbox.enqueue('last',{})).toBe(true);expect(outbox.enqueue('over',{})).toBe(false); } finally { void outbox.close(); }
 });
 
 it('refuses an outbox file that is not the current state shape and leaves it unchanged', () => {
