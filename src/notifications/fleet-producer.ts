@@ -27,6 +27,28 @@ function taskRoleAssociations():Map<string,string>{
   }
   return result;
 }
+// Records queued by earlier releases for this role, under the event ID they derived from the
+// ledger: `<role>:<session generation (randomUUID(), a version 4 UUID)>:<sequence>`. The value is exactly {}
+// (no message link), or { taskId?, url } where url is one of the two forms those releases wrote,
+// with the message ID encoded by encodeURIComponent. Only that canonical serialization is read
+// back; anything else is retained.
+const generationSequence = /^:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:([1-9][0-9]*)$/;
+export const legacyRecord = (roleId: string) => (value: unknown, id: string) => {
+  const sequence = id.startsWith(roleId) ? generationSequence.exec(id.slice(roleId.length))?.[1] : undefined;
+  if (!sequence || !Number.isSafeInteger(Number(sequence)) || id.length > 512) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+  const { taskId, url, ...rest } = value as Record<string, unknown>, role = encodeURIComponent(roleId);
+  if (Object.keys(rest).length) return;
+  if (!Object.keys(value).length) return {};
+  if (typeof url !== 'string' || (taskId !== undefined && taskId !== null && !(typeof taskId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(taskId)))) return;
+  const prefix = [`/fleet/chats?chat=${role}&detail=1#fleet-message-`, `/fleet/chats/agents/${role}#fleet-message-`].find(prefix => url.startsWith(prefix));
+  if (!prefix) return;
+  const encoded = url.slice(prefix.length);
+  let messageId: string;
+  try { messageId = decodeURIComponent(encoded); if (encodeURIComponent(messageId) !== encoded) return; } catch { return; }
+  if (!messageId.trim() || messageId.length > 1024 || /[\x00-\x1f\x7f]/.test(messageId)) return;
+  return { ...(taskId === undefined ? {} : { taskId }), anchor: { kind: 'fleet-message', messageId } };
+};
 /** Read durable supervisor ledgers without restarting agents or attaching a
  * conversation controller. Each tick reads at most 256 KiB per role, from its
  * checkpoint; it never loads a complete transcript or requests model history. */
@@ -63,7 +85,7 @@ export class FleetNotificationProducer {
         else {
           const file=join(this.stateDir,createHash('sha256').update(roleDir).digest('hex')+'.json');
           if(existsSync(file)){
-            const queue=new NotificationOutbox(file,this.config,async()=>{throw Error('retired target');});
+            const queue=new NotificationOutbox(file,this.config,async()=>{throw Error('retired target');},undefined,legacyRecord(name));
             try{await queue.retire();}finally{await queue.close();}
           }
         }
@@ -86,7 +108,7 @@ export class FleetNotificationProducer {
           const key = createHash('sha256').update(roleDir).digest('hex');
           outbox = new NotificationOutbox(join(this.stateDir, key + '.json'), this.config,
             async (value, eventId) => ({ eventId, title: `${roleId}: agent completed`, body: 'Your agent finished responding. Open the chat to view the result.',
-              ...(value as object), target: { kind: 'agent', agentId: roleId } }), this.warn);
+              ...(value as object), target: { kind: 'agent', agentId: roleId } }), this.warn, legacyRecord(roleId));
           if (!outbox.checkpoint) {
             const segment = this.existing.has(roleDir) ? segments.at(-1)! : segments[0];
             outbox.saveCheckpoint({ segment, offset: this.existing.has(roleDir) ? statSync(join(dir, segment)).size : 0, prompts: [] });
