@@ -136,8 +136,8 @@ export function pendingTaskNotifications(warn: (line: string) => void = () => {}
         if (dir === retiredNotificationsDir() && existsSync(taskPath(id))) continue;
         if (value.notification_events === undefined) continue;
         if (!Array.isArray(value.notification_events)) throw new Error('invalid notification events');
-        // Unsupported committed journal entries may already have been attempted. Keep them intact,
-        // and expose only typed deliveries so they neither retry nor block later lifecycle events.
+        // Only typed task events are delivered. Unsupported entries are never sent or converted,
+        // and they do not block later lifecycle events.
         const events = value.notification_events.filter(event => typedTaskNotification(event, id));
         if (events.length) result.push({ taskId: id, events });
       } catch (error) {
@@ -993,20 +993,10 @@ export function unlinkDeletedTask(id: string): boolean {
     throw new TaskStateError(`task ${id} has no pending deletion`);
   // Preserve committed deliveries outside the record before deletion. A crash
   // before unlink may replay two copies; both carry identical service dedupe IDs.
-  let removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
+  const removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
     title: `Task deleted: ${stored.title}`.slice(0, 160), body: `Task ${id}: deleting → deleted.`,
     target: { kind: 'task-deleted', taskId: id } };
-  const retiredPath = join(retiredNotificationsDir(), `${id}.json`);
-  if (existsSync(retiredPath)) {
-    const stat = lstatSync(retiredPath);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new TaskStateError('Task notification deletion copy is unavailable');
-    const prepared = JSON.parse(readFileSync(retiredPath, 'utf8')) as StoredTaskRecord;
-    if (!Array.isArray(prepared.notification_events)) throw new TaskStateError('Task notification deletion copy is invalid');
-    // A failed unlink can leave a pre-upgrade final event. Its ID/payload are already
-    // committed: retain that exact event, never project a typed replacement under its ID.
-    removed = prepared.notification_events.find(event => event?.eventId === removed.eventId) ?? removed;
-  }
-  replaceFileAtomically(retiredPath,
+  replaceFileAtomically(join(retiredNotificationsDir(), `${id}.json`),
     JSON.stringify({ notification_events: [...(stored.notification_events ?? []), removed] }) + '\n');
   try {
     unlinkSync(taskPath(id));
