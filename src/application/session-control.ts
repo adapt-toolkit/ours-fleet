@@ -69,7 +69,7 @@ export interface RoleSessionControl {
   // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
   /** The newest visible events (or those before `before`), read backwards from the ledger. */
-  conversationTail?(request: { before?: string; limit?: number }): Promise<ConversationTailPage>;
+  conversationTail?(request: { before?: string; limit?: number; signal?: AbortSignal }): Promise<ConversationTailPage>;
   submitPromptV2?(request: {
     commandId: string; text: string; actorBrowserSession: string; expectedSessionGeneration?: string; requireIdle?: boolean;
     source: 'owner_admin_console';
@@ -177,10 +177,12 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     }catch{return live;}
   }
 
-  async conversationTail(request: { before?: string; limit?: number } = {}): Promise<ConversationTailPage> {
+  async conversationTail(request: { before?: string; limit?: number; signal?: AbortSignal } = {}): Promise<ConversationTailPage> {
     // A replacement while reading disk invalidates both the tail and its snapshot.
     for (let attempt = 0; attempt < 3; attempt++) {
+      request.signal?.throwIfAborted();
       const live = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+      request.signal?.throwIfAborted();
       const snapshot = await this.snapshot();
       let resumed: string | undefined;
       if (snapshot.backend === 'acp' && snapshot.sessionId) {
@@ -189,9 +191,11 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
         } catch { /* no resumed history: live generation only */ }
       }
       let page: ConversationTailPage;
-      try { page = await conversationTailPage(this.stateDir, request, live.snapshot, resumed); }
-      catch (error) { throw new FleetError('invalid_request', (error as Error).message); }
+      try { page = await conversationTailPage(this.stateDir, request, live.snapshot, resumed, request.signal); }
+      catch (error) { request.signal?.throwIfAborted(); throw new FleetError('invalid_request', (error as Error).message); }
+      request.signal?.throwIfAborted();
       const check = await this.call('conversation_page', { limit: 1 }) as ConversationPageView;
+      request.signal?.throwIfAborted();
       if (check.snapshot.sessionGeneration === live.snapshot.sessionGeneration) return page;
     }
     throw new FleetError('stale_state', 'Session generation changed during conversation baseline; explicit recovery required.');

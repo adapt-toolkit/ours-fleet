@@ -1,5 +1,20 @@
 # Conversation event stream (wire version 1)
 
+Initial `conversation?latest=1&limit=200` history uses the captured command and
+pending-permission inventories when the supervisor supplies a complete observation
+snapshot with its revision and ledger barrier. Empty inventories are authoritative.
+This avoids scanning the current generation for old context events after the
+latest page is full. Legacy, failed or incomplete captures retain ledger context
+recovery. Generation checks, resumed-session filtering and event cursors still apply.
+Older pages can scan intervening newer ledger segments; the event count alone is
+not a disk-read byte bound.
+
+Disconnecting a latest/before HTTP history request cancels its disk tail reader
+at asynchronous read boundaries and prevents further orchestration or publication.
+An already admitted private-control RPC retains its existing timeout; disconnect
+does not interrupt the agent or its work. Forward-history reads and passive SSE
+retain their separate lifetimes.
+
 `GET /api/v1/roles/:id/conversation/events?expectedGeneration=GENERATION&after=CURSOR`
 uses the existing Fleet route boundary, including `/fleet/api/v1/...` through the
 prefix gateway. Use authenticated `fetch`, then read the response body. Cookies
