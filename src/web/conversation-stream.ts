@@ -69,6 +69,8 @@ import type { WebAuth } from './auth.js';
 import { FleetError } from '../application/errors.js';
 import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
 import type { ConversationFollowHandle } from '../application/session-control.js';
+import type { ConversationEventV1 } from '../session/conversation-types.js';
+import { presentAttachmentEvent } from './agent-attachments.js';
 
 export function registerConversationStream(app: FastifyInstance, services: WebServices, auth: WebAuth): void {
   const connections=new Set<()=>void>();
@@ -101,14 +103,16 @@ export function registerConversationStream(app: FastifyInstance, services: WebSe
         const descriptor=await control.describe(owner);
         if(!active() || !valid())return;
         if(!control.followConversation || !descriptor.features.includes('conversation_live_complete')) {resync('capability-unavailable',false);return;}
+        const stateDir=owner?.snapshot().stateDir;
+        const present=(event:ConversationEventV1)=>presentAttachmentEvent(stateDir,request.params.id,event);
         const handle=await control.followConversation({controller:false,expectedGeneration:generation,after,signal,roleObservation:owner,
-          onReplay:page=>{if(active() && valid()){for(const event of page.events)writer.send('ledger',event);writer.send('ledger',{coveredThrough:page.coveredThrough});}},
+          onReplay:page=>{if(active() && valid()){for(const event of page.events)writer.send('ledger',present(event));writer.send('ledger',{coveredThrough:page.coveredThrough});}},
           onReady:ready=>{if(active() && valid()){
             writer.send('state',ready.snapshot);
             writer.send('ready',{sessionGeneration:ready.snapshot.sessionGeneration,stateRevision:ready.snapshot.stateRevision,
               ledgerBarrier:ready.snapshot.ledgerBarrier,coveredThrough:ready.coveredThrough,capability:'complete',authorizedUntil:browser.absoluteExpiresAt});
           }},
-          onEvent:event=>{if(active() && valid()){writer.send('ledger',event);writer.send('ledger',{coveredThrough:event.seq});}},
+          onEvent:event=>{if(active() && valid()){writer.send('ledger',present(event));writer.send('ledger',{coveredThrough:event.seq});}},
           onState:state=>{if(active() && valid())writer.send('state',state);},
           onClose:reason=>{if(active()){epoch++;abort.abort();follow=undefined;resync(reason ?? 'control-closed',!reason?.includes('assembly limit'));}},
         });
