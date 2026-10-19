@@ -28,7 +28,7 @@ for(const changed of ['history.jsonl','models_cache.json','state_5.sqlite','logs
  const f=fixture(changed);expect((await f.bound()).payload).toEqual({value:'initial'});expect(f.reads()).toBe(1);
  for(let n=0;n<5;n++)f.callbacks.get(f.adopted)!('change',changed);
  await new Promise(setImmediate);expect(f.reads()).toBe(1);
- f.update();await new Promise(setImmediate);expect(f.frames().filter(frame=>frame.kind==='snapshot').at(-1).payload).toEqual({value:'committed'});expect(f.reads()).toBe(2);expect(f.frames().some(frame=>['resync','health'].includes(frame.kind))).toBe(false);
+ f.update();await expect.poll(()=>f.frames().filter(frame=>frame.kind==='snapshot').at(-1).payload).toEqual({value:'committed'});expect(f.reads()).toBe(2);expect(f.frames().some(frame=>['resync','health'].includes(frame.kind))).toBe(false);
 });
 for(const [resource,changed,explicit]of [['previews','auth.json',false],['previews','config.toml',false],['previews','unknown.sqlite-wal',false],['previews','nested/state_5.sqlite-wal',false],['previews','history.jsonl',true],['subscriptions','state_5.sqlite-wal',false],['directory','logs_2.sqlite-wal',false]]as const)it(`retains three-attempt capture fence for ${resource} ${changed} explicit=${explicit}`,async()=>{
  const f=fixture(changed,resource,explicit);await expect(f.bound()).rejects.toThrow('projection unstable');expect(f.reads()).toBe(3);expect(f.frames().some(frame=>frame.kind==='snapshot')).toBe(false);

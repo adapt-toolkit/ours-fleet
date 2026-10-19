@@ -9,11 +9,11 @@ import { conversationPreview } from '../src/application/conversation-history.js'
 import { stateRoot } from '../src/paths.js';
 const clean:Array<()=>void>=[];
 afterEach(()=>{for(const fn of clean.splice(0).reverse())fn();});
-function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true,configPath?:string){
+function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true,configPath?:string|((root:string)=>string)){
   const root=mkdtempSync(join(tmpdir(),'resource-views-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));
   const response=new EventEmitter() as any;response.write=vi.fn(()=>true);response.end=vi.fn();
   const handles:any[]=[];
-  const resources=new FleetResourceViews({paths:[root],roots:[root],...(configPath?{configPath}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
+  const resources=new FleetResourceViews({paths:[root],roots:[root],...(configPath?{configPath:typeof configPath==='function'?configPath(root):configPath}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
   const connection=resources.open(response,'owner',authorized);clean.push(()=>resources.close());
   const frames=()=>response.write.mock.calls.map(([s]:[string])=>String(s)).filter((s:string)=>s.startsWith('event: resource\n')).map((s:string)=>JSON.parse(s.split('data: ')[1]));
   const register=(epoch=1,resource='directory',extra={})=>resources.register('owner',connection.connectionId,'view',epoch,{viewId:'view',resource,...extra});
@@ -33,7 +33,7 @@ it('publishes atomic ordered replacement snapshots, coalesces unchanged observed
 it('fences invalidation during projection and a replaced filter/window even when old projection ignores abort',async()=>{
   let release!:(value:any)=>void;let calls=0;
   const f=fixture(async descriptor=>{if(++calls===1)return new Promise(resolve=>release=resolve);return {state:descriptor.state,rows:['new']};});
-  const old=f.register(1,'tasks',{state:'active'});await Promise.resolve();
+  const old=f.register(1,'tasks',{state:'active'});await expect.poll(()=>typeof release).toBe('function');
   const fresh=f.register(2,'tasks',{state:'done'});
   const baseline=await f.resources.bound('owner',f.connection.connectionId,'view',2,fresh.baselineId);
   expect(baseline.payload).toEqual({state:'done',rows:['new']});
@@ -44,12 +44,12 @@ it('fences invalidation during projection and a replaced filter/window even when
 it('rereads a capture invalidated during projection and never publishes partial/error as removal',async()=>{
   let release!:(value:any)=>void,calls=0,fail=false;
   const f=fixture(async()=>{if(fail)throw Error('partial parse');if(++calls===1)return new Promise(resolve=>release=resolve);return {rows:['committed']};});
-  const binding=f.register();await Promise.resolve();publishFleetResourceCommit(f.root);release({rows:[]});
+  const binding=f.register();await expect.poll(()=>typeof release).toBe('function');publishFleetResourceCommit(f.root);release({rows:[]});
   const baseline=await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
   expect(baseline.payload).toEqual({rows:['committed']});
   fail=true;publishFleetResourceCommit(f.root);await new Promise(setImmediate);
   expect(f.frames().filter(f=>f.kind==='snapshot')).toHaveLength(1);
-  expect(f.frames().at(-1).kind).toBe('resync');
+  await expect.poll(()=>f.frames().at(-1).kind).toBe('resync');
 });
 it('fails covered views on watch failure and fences callbacks after disposal',async()=>{
   const project=vi.fn(async()=>({rows:[]})),f=fixture(project),binding=f.register();
@@ -207,7 +207,7 @@ for (const resource of ['configuration', 'previews']) it(`keeps ${resource} read
     // A different role continues committing during every canonical capture.
     publishFleetResourceCommit(join(f.root, 'other', '.conversation', 'events-000001.jsonl'));
     return {value};
-  });
+  },()=>true,resource==='configuration'?root=>join(root,'fleet.yaml'):undefined);
   const binding = f.register(1, resource, resource === 'previews' ? {ids:['selected']} : {});
   const initial = await f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId);
   expect(initial.payload).toEqual({value:'initial'});
@@ -215,7 +215,7 @@ for (const resource of ['configuration', 'previews']) it(`keeps ${resource} read
   publishFleetResourceCommit(resource === 'previews'
     ? join(f.root, 'selected', '.conversation', 'events-000001.jsonl') : join(f.root, 'fleet.yaml'));
   await new Promise(setImmediate);
-  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'updated'});
+  await expect.poll(()=>f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'updated'});
   expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).source).toMatchObject({protocolVersion:1});
   expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
   const settled = reads;
@@ -260,7 +260,7 @@ it('keeps selected previews live while independent task layout receipts commit d
   value = 'committed';
   publishFleetResourceCommit(join(f.root, 'selected', '.conversation', 'events-000001.jsonl'));
   await new Promise(setImmediate);
-  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'committed'});
+  await expect.poll(()=>f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'committed'});
   expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
   expect(reads).toBe(2);
 });
@@ -347,7 +347,7 @@ for (const resource of ['directory', 'roles']) it.each(['.conversation/events-00
   expect(initial.source.position).toBe(0); // The commit during this capture is still queued.
   expect((initial.payload as any).roles.map((row:any) => row.status.sequence)).toEqual([0,0]);
   await new Promise(setImmediate);
-  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1)?.payload.roles.map((row:any) => row.status.sequence)).toEqual([4,4]);
+  await expect.poll(()=>f.frames().filter(frame => frame.kind === 'snapshot').at(-1)?.payload.roles.map((row:any) => row.status.sequence)).toEqual([4,4]);
   let accepted = [0,0];
   for (const frame of f.frames()) {
     if (frame.kind === 'snapshot') {
@@ -463,7 +463,7 @@ it('qualifies changed data with captured source and suppresses its immediate cov
   let rows=['old'];const f=fixture(async()=>({rows})),binding=f.register();
   await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
   f.response.write.mockClear();rows=['new'];publishFleetResourceCommit(f.root);await new Promise(setImmediate);
-  expect(f.frames()).toHaveLength(1);
+  await expect.poll(()=>f.frames()).toHaveLength(1);
   expect(f.frames()[0]).toMatchObject({kind:'snapshot',source:{protocolVersion:1,position:1},payload:{rows:['new']}});
 });
 it('excludes pending, failed and replaced registrations while an unchanged sibling stays covered',async()=>{
