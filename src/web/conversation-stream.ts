@@ -8,6 +8,7 @@ export class ConversationStreamWriter {
   private waiting = false;
   private ended = false;
   private sequence = 0;
+  private lastQualifyingOutputAt = Date.now();
   pendingBytes = 0;
   get busy() { return Boolean(this.active); }
   constructor(private readonly output: Writable, private readonly failed: (reason:string) => void) {
@@ -17,6 +18,7 @@ export class ConversationStreamWriter {
   private drain = () => { this.waiting=false; this.flush(); };
   send(type: ConversationRecordType, payload: unknown): boolean {
     if (this.ended) return false;
+    if (type === 'keepalive' && Date.now() - this.lastQualifyingOutputAt < 15_000) return true;
     const id=String(++this.sequence);
     try {
       if (!this.active) {
@@ -27,6 +29,7 @@ export class ConversationStreamWriter {
         if (this.pendingBytes+bytes>MAX_PENDING_BYTES) { this.fail('output-overflow'); return false; }
         this.queue.push({type,payload,id,bytes}); this.pendingBytes+=bytes;
       }
+      if (!this.ended) this.lastQualifyingOutputAt = Date.now();
       return !this.ended;
     } catch { this.fail('record-too-large'); return false; }
   }

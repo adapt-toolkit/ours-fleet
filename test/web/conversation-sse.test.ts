@@ -73,14 +73,14 @@ describe('bounded conversation SSE', () => {
 import { buildWebServer, type WebServices } from '../../src/web/server.js';
 import type { PassiveConversationFollow } from '../../src/application/session-control.js';
 import type { ConversationRoleState } from '../../src/application/conversation-role-observer.js';
-async function streamFixture(delayed = false, closeBeforeReturn = false, initialSnapshot:any={sessionGeneration:'g',stateRevision:1,ledgerBarrier:0}) {
+async function streamFixture(delayed = false, closeBeforeReturn = false, initialSnapshot:any={sessionGeneration:'g',stateRevision:1,ledgerBarrier:0}, adapter?:RoleSessionControlAdapter) {
   const role: ConversationRoleState={roleId:'A',roleRevision:1,roleLifetime:'life',availability:'available',health:'healthy',stateDir:'/private/not-public'};
   let callback: ((state:ConversationRoleState)=>void) | undefined, disposed=0, closed=0;
   let follow: PassiveConversationFollow | undefined;
   let release!:()=>void;
   const gate = delayed ? new Promise<void>(resolve=>{release=resolve;}) : Promise.resolve();
   const control={describe:async()=>({features:['conversation_live_complete']}),followConversation:async(request:PassiveConversationFollow)=>{
-    follow=request; if(closeBeforeReturn)request.onClose('control-silent'); await gate;
+    follow=request; if(adapter)return adapter.followConversation(request); if(closeBeforeReturn)request.onClose('control-silent'); await gate;
     if (!request.signal?.aborted) request.onReady({snapshot:initialSnapshot,coveredThrough:0});
     return {close:()=>{closed++;}};
   }};
@@ -271,4 +271,69 @@ it('rejects empty chunks before they can accumulate without consuming assembly b
   expect(()=>push({version:1,type:'chunk',id:'empty',index:0,data:''})).toThrow(/empty chunk/);
   expect(published).toEqual([]);
   expect(()=>push({version:1,type:'commit',id:'empty',totalBytes:2})).toThrow(/identity/);
+});
+
+it('admits at most four idle keepalives per minute and suppresses health after data',()=>{
+  vi.useFakeTimers();
+  try {
+    const frames:string[]=[],output=new Writable({write(chunk,_encoding,done){frames.push(chunk.toString());done();}});
+    const writer=new ConversationStreamWriter(output,()=>{});
+    writer.send('ready',{});
+    for(let second=1;second<=60;second++) {vi.advanceTimersByTime(1000);writer.send('keepalive',{at:Date.now()});}
+    const records:any[]=[],decoder=new ConversationStreamDecoder(record=>records.push(record));
+    frames.forEach(frame=>decoder.push(Buffer.from(frame)));
+    expect(records.filter(record=>record.type==='keepalive')).toHaveLength(4);
+    vi.advanceTimersByTime(14000);writer.send('ledger',{seq:1});
+    vi.advanceTimersByTime(1000);writer.send('keepalive',{at:Date.now()});
+    expect(frames).toHaveLength(6);
+    writer.close();
+  }finally{vi.useRealTimers();}
+});
+it('expires held private-control input at 45 seconds even while the socket stays open',async()=>{
+  vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout']});
+  const socket=new (await import('node:events')).EventEmitter() as any;
+  socket.destroyed=false;
+  const close=vi.fn(),closed=vi.fn();
+  const adapter=new RoleSessionControlAdapter('unused',undefined,async()=>({socket,close}) as any);
+  const handle=await adapter.followConversation({controller:false,expectedGeneration:'g',onReplay(){},onReady(){},onEvent(){},onState(){},onClose:closed});
+  try {
+    vi.advanceTimersByTime(44999);expect(closed).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);expect(closed).toHaveBeenCalledWith('control-silent');expect(close).toHaveBeenCalledOnce();
+  }finally{handle.close();vi.useRealTimers();}
+});
+it('counts real private output as source activity and fences late queued heartbeats',async()=>{
+  vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout']});
+  let receive:(message:any)=>void=()=>{};
+  const socket=new (await import('node:events')).EventEmitter() as any;
+  socket.destroyed=false;
+  const closed=vi.fn(),events=vi.fn();
+  const adapter=new RoleSessionControlAdapter('unused',undefined,async(_dir,_request,onMessage)=>{receive=onMessage;return {socket,close(){}} as any;});
+  const handle=await adapter.followConversation({controller:false,expectedGeneration:'g',onReplay(){},onReady(){},onEvent:events,onState(){},onClose:closed});
+  try {
+    vi.advanceTimersByTime(40000);receive({conversationEvent:{seq:1}});
+    expect(events).toHaveBeenCalledOnce();
+    vi.advanceTimersByTime(44999);expect(closed).not.toHaveBeenCalled();
+    // Advance wall time without executing timers to model delayed queued delivery.
+    vi.setSystemTime(Date.now()+1);receive({controlHeartbeat:true});
+    expect(closed).toHaveBeenCalledWith('control-silent');
+    receive({conversationEvent:{seq:2}});expect(events).toHaveBeenCalledOnce();
+  }finally{handle.close();vi.useRealTimers();}
+});
+
+it('publishes private-control silence immediately while the authorized HTTP stream remains open',async()=>{
+  vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout']});
+  const socket=new (await import('node:events')).EventEmitter() as any;
+  socket.destroyed=false;
+  const adapter=new RoleSessionControlAdapter('/private/not-public',undefined,async()=>({socket,close(){}}) as any);
+  const f=await streamFixture(false,false,undefined,adapter),abort=new AbortController();
+  try {
+    const response=await fetch(f.origin+'/api/v1/roles/A/conversation/events?expectedGeneration=g',{headers:{cookie:`ofs_session=${f.session.id}`},signal:abort.signal});
+    const reader=response.body!.getReader();await readRecord(reader);
+    expect(f.follow?.controller).toBe(false);
+    vi.advanceTimersByTime(44999);expect(socket.destroyed).toBe(false);
+    vi.advanceTimersByTime(1);
+    const records=await readRecord(reader);
+    expect(records).toContainEqual(expect.objectContaining({type:'resync',payload:expect.objectContaining({reason:'control-silent'})}));
+    expect(f.disposed).toBe(0); // Outer HTTP owner is still present; upstream failure is explicit.
+  }finally{abort.abort();vi.useRealTimers();f.web.app.server.closeAllConnections();await f.web.close();}
 });
