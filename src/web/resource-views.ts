@@ -320,6 +320,11 @@ export class FleetResourceViews {
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
   }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
+    // Preview selection reads role config/state and conversation ledgers, never
+    // task layout run/operation/brief receipts. A worker may commit several of
+    // these while that independent canonical preview read is in flight.
+    // Unknown paths and directory-level events retain full invalidation.
+    if (descriptor.resource === 'previews' && /^task-[A-Za-z0-9_-]+(?:\.op\.json|\.json|\.brief\.md)$/.test(relative(resolve(stateRoot(), 'layouts'), path))) return false;
     // Only classify known activity writes under the configured role roots.
     // Parent/unknown events and every other file retain full invalidation.
     // The canonical web producer atomically replaces hashed checkpoint files.
