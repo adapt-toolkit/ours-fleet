@@ -8,12 +8,12 @@ import { publishFleetResourceCommit } from '../src/application/resource-observer
 import { conversationPreview } from '../src/application/conversation-history.js';
 const clean:Array<()=>void>=[];
 afterEach(()=>{for(const fn of clean.splice(0).reverse())fn();});
-function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>){
+function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true){
   const root=mkdtempSync(join(tmpdir(),'resource-views-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));
   const response=new EventEmitter() as any;response.write=vi.fn(()=>true);response.end=vi.fn();
   const handles:any[]=[];
   const resources=new FleetResourceViews({paths:[root],roots:[root],watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
-  const connection=resources.open(response,'owner',()=>true);clean.push(()=>resources.close());
+  const connection=resources.open(response,'owner',authorized);clean.push(()=>resources.close());
   const frames=()=>response.write.mock.calls.map(([s]:[string])=>String(s)).filter((s:string)=>s.startsWith('event: resource\n')).map((s:string)=>JSON.parse(s.split('data: ')[1]));
   const register=(epoch=1,resource='directory',extra={})=>resources.register('owner',connection.connectionId,'view',epoch,{viewId:'view',resource,...extra});
   return {root,response,resources,connection,frames,register,handles};
@@ -199,7 +199,7 @@ it('retires registration when its control response is aborted before finish',asy
 });
 
 for (const resource of ['configuration', 'previews']) it(`keeps ${resource} ready and live during unrelated role ledger churn`, async () => {
-  vi.useFakeTimers({toFake:['setInterval', 'clearInterval']}); clean.push(() => vi.useRealTimers());
+  vi.useFakeTimers({toFake:['setInterval', 'clearInterval', 'Date']}); clean.push(() => vi.useRealTimers());
   let value = 'initial', reads = 0;
   const f = fixture(async () => {
     reads++;
@@ -215,15 +215,17 @@ for (const resource of ['configuration', 'previews']) it(`keeps ${resource} read
     ? join(f.root, 'selected', '.conversation', 'events-000001.jsonl') : join(f.root, 'fleet.yaml'));
   await new Promise(setImmediate);
   expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'updated'});
-  expect(f.frames().some(frame => frame.kind === 'coverage')).toBe(true);
+  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).source).toMatchObject({protocolVersion:1});
   expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
   const settled = reads;
   for (let n = 0; n < 12; n++) publishFleetResourceCommit(join(f.root, 'other', '.conversation', 'events-000001.jsonl'));
   await new Promise(setImmediate);
   expect(reads).toBe(settled);
-  const coverage = f.frames().filter(frame => frame.kind === 'coverage').length;
-  await vi.advanceTimersByTimeAsync(2000);
-  expect(f.frames().filter(frame => frame.kind === 'coverage')).toHaveLength(coverage + 1);
+  const captured = f.frames().filter(frame => frame.kind === 'snapshot').at(-1).source;
+  await vi.advanceTimersByTimeAsync(15000);
+  const batches = f.response.write.mock.calls.map(([s]:[string])=>s).filter(s=>s.startsWith('event: resource-coverage\n')).map(s=>JSON.parse(s.split('data: ')[1]));
+  expect(batches).toHaveLength(1);
+  expect(batches[0].views[0].source).toEqual(captured);
   expect(reads).toBe(settled);
 });
 it('retains the three capture limit for continuously changing selected preview data', async () => {
@@ -258,6 +260,7 @@ it('keeps committed previews live through an incomplete append and publishes its
 });
 
 for (const resource of ['directory', 'roles']) it.each(['.conversation/events-000001.jsonl', '.notify-cursor', '.monitor-state.json', '.monitor-status'])(`keeps ${resource} ready and ordered through sustained independent agent status commits (%s)`, async activityPath => {
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout','setInterval','clearInterval','Date','performance']});clean.push(()=>vi.useRealTimers());
   const status = { A: 0, B: 0 };
   let commits = 0, reads = 0, readyAt = -1;
   const f = fixture(async () => {
@@ -286,7 +289,8 @@ for (const resource of ['directory', 'roles']) it.each(['.conversation/events-00
   expect(readyAt).toBeLessThan(8); // Readiness must not wait for global quiet.
   expect(initial.source.position).toBe(0); // The commit during this capture is still queued.
   expect((initial.payload as any).roles.map((row:any) => row.status.sequence)).toEqual([0,0]);
-  await expect.poll(() => f.frames().filter(frame => frame.kind === 'snapshot').at(-1)?.payload.roles.map((row:any) => row.status.sequence)).toEqual([4,4]);
+  await new Promise(setImmediate);
+  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1)?.payload.roles.map((row:any) => row.status.sequence)).toEqual([4,4]);
   let accepted = [0,0];
   for (const frame of f.frames()) {
     if (frame.kind === 'snapshot') {
@@ -298,9 +302,17 @@ for (const resource of ['directory', 'roles']) it.each(['.conversation/events-00
       expect(frame.payload.source.position).toBe(accepted[0] + accepted[1]);
   }
   expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
-  const settled = reads;
+  // These commits created new role directories. The observer's deferred discovery
+  // installs their watches and requires one final capture even after [4,4] arrived.
+  const beforeDiscovery = reads;
+  const snapshots = f.frames().filter(frame => frame.kind === 'snapshot').length;
+  await vi.advanceTimersByTimeAsync(100);
   await new Promise(setImmediate);
-  expect(reads).toBe(settled); // No content work once commits stop.
+  expect(reads).toBe(beforeDiscovery + 1);
+  expect(f.frames().filter(frame => frame.kind === 'snapshot')).toHaveLength(snapshots);
+  const settled = reads;
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(reads).toBe(settled); // No content work during four settled health periods.
 });
 
 it('fences an in-flight old agent row on structural removal and replacement while retaining status wakes', async () => {
@@ -372,4 +384,74 @@ it('accepts canonical query activity with actual conversation, diagnostic and us
   expect(initial.source.position).toBe(0);
   await expect.poll(()=>f.frames().filter(frame=>frame.kind==='snapshot').at(-1)?.payload.roles[0].status.session.activity.activeToolCalls).toBe(5);
   expect(f.frames().some(frame=>frame.kind==='resync')).toBe(false);
+});
+
+it('shares sparse idle coverage without reprojection or snapshots across current views',async()=>{
+  vi.useFakeTimers();clean.push(()=>vi.useRealTimers());
+  const project=vi.fn(async()=>({rows:[]})),f=fixture(project);
+  for(const viewId of ['one','two']) {
+    const binding=f.resources.register('owner',f.connection.connectionId,viewId,1,{viewId,resource:'directory'});
+    await f.resources.bound('owner',f.connection.connectionId,viewId,1,binding.baselineId);
+  }
+  f.response.write.mockClear();project.mockClear();
+  await vi.advanceTimersByTimeAsync(60000);
+  const writes=f.response.write.mock.calls.map(([s]:[string])=>s);
+  const batches=writes.filter(s=>s.startsWith('event: resource-coverage\n')).map(s=>JSON.parse(s.split('data: ')[1]));
+  expect(batches.length).toBeGreaterThanOrEqual(4);expect(batches.length).toBeLessThanOrEqual(5);
+  expect(batches.flatMap(b=>b.views)).toHaveLength(8);
+  expect(batches[0].views.map((v:any)=>[v.viewId,v.sequence])).toEqual([['one',3],['two',3]]);
+  expect(f.frames()).toHaveLength(0);expect(project).not.toHaveBeenCalled();
+});
+it('qualifies changed data with captured source and suppresses its immediate coverage',async()=>{
+  let rows=['old'];const f=fixture(async()=>({rows})),binding=f.register();
+  await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  f.response.write.mockClear();rows=['new'];publishFleetResourceCommit(f.root);await new Promise(setImmediate);
+  expect(f.frames()).toHaveLength(1);
+  expect(f.frames()[0]).toMatchObject({kind:'snapshot',source:{protocolVersion:1,position:1},payload:{rows:['new']}});
+});
+it('excludes pending, failed and replaced registrations while an unchanged sibling stays covered',async()=>{
+  vi.useFakeTimers({toFake:['setInterval','clearInterval','Date']});clean.push(()=>vi.useRealTimers());
+  let hold=false,release!:(payload:unknown)=>void;
+  const f=fixture(async d=>d.viewId==='pending'&&hold?new Promise(r=>release=r):({rows:[d.viewId]}));
+  for(const viewId of ['quiet','pending']){
+    const binding=f.resources.register('owner',f.connection.connectionId,viewId,1,{viewId,resource:'previews',ids:[viewId]});
+    await f.resources.bound('owner',f.connection.connectionId,viewId,1,binding.baselineId);
+  }
+  hold=true;publishFleetResourceCommit(join(f.root,'pending','.conversation','events-000001.jsonl'));await new Promise(setImmediate);
+  f.response.write.mockClear();await vi.advanceTimersByTimeAsync(15000);
+  const batches=()=>f.response.write.mock.calls.map(([s]:[string])=>s).filter(s=>s.startsWith('event: resource-coverage\n')).map(s=>JSON.parse(s.split('data: ')[1]));
+  expect(batches().at(-1).views.map((v:any)=>v.viewId)).toEqual(['quiet']);
+  hold=false;const replacement=f.resources.register('owner',f.connection.connectionId,'pending',2,{viewId:'pending',resource:'previews',ids:['pending']});
+  await f.resources.bound('owner',f.connection.connectionId,'pending',2,replacement.baselineId);release({rows:['obsolete']});await new Promise(setImmediate);
+  expect(f.frames().filter(f=>f.kind==='snapshot').every(f=>f.subscriptionEpoch===2)).toBe(true);
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(batches().at(-1).views.map((v:any)=>[v.viewId,v.subscriptionEpoch])).toEqual([['quiet',1],['pending',2]]);
+  f.handles[0].emit('error',Error('failed'));await new Promise(setImmediate);const count=batches().length;
+  await vi.advanceTimersByTimeAsync(30000);expect(batches()).toHaveLength(count);
+});
+it('keeps a shared coverage batch behind the complete chunked record under backpressure',async()=>{
+  vi.useFakeTimers({toFake:['setInterval','clearInterval','Date']});clean.push(()=>vi.useRealTimers());
+  const f=fixture(async d=>({rows:[d.viewId==='large'?'x'.repeat(900000):'quiet']}));
+  const quiet=f.resources.register('owner',f.connection.connectionId,'quiet',1,{viewId:'quiet',resource:'directory'});
+  await f.resources.bound('owner',f.connection.connectionId,'quiet',1,quiet.baselineId);
+  f.response.write.mockClear();f.response.write.mockImplementationOnce(()=>false);
+  const large=f.resources.register('owner',f.connection.connectionId,'large',1,{viewId:'large',resource:'directory'});
+  await new Promise(setImmediate);await vi.advanceTimersByTimeAsync(15000);
+  expect(f.response.write.mock.calls).toHaveLength(1);
+  f.response.emit('drain');await f.resources.bound('owner',f.connection.connectionId,'large',1,large.baselineId);
+  const writes=f.response.write.mock.calls.map(([s]:[string])=>s);
+  const commit=writes.findIndex(s=>s.startsWith('event: resource-chunk\n')&&JSON.parse(s.split('data: ')[1]).type==='commit');
+  const batch=writes.findIndex(s=>s.startsWith('event: resource-coverage\n'));
+  expect(commit).toBeGreaterThan(0);expect(batch).toBeGreaterThan(commit);
+  expect(JSON.parse(writes[batch].split('data: ')[1]).views.map((v:any)=>[v.viewId,v.sequence])).toEqual([['quiet',3]]);
+});
+
+it('retains two-second idle authorization enforcement independently of sparse wire health',async()=>{
+  vi.useFakeTimers();clean.push(()=>vi.useRealTimers());
+  let valid=true;const authorized=vi.fn(()=>valid),f=fixture(async()=>({rows:[]}),authorized),binding=f.register();
+  await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  f.response.write.mockClear();await vi.advanceTimersByTimeAsync(60000);
+  expect(authorized).toHaveBeenCalledTimes(34); // 30 admission checks + four health-send checks.
+  expect(f.response.write.mock.calls).toHaveLength(4);
+  valid=false;await vi.advanceTimersByTimeAsync(2000);expect(f.response.end).toHaveBeenCalledTimes(1);
 });

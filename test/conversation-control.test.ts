@@ -421,21 +421,22 @@ describe('private observation health', () => {
     const followRequest = { controller: false as const, expectedGeneration: 'g', onReplay: vi.fn(), onReady: vi.fn(), onEvent: vi.fn(), onState, onRole, onClose };
     return { adapter, followRequest, onClose, onRole, onState, close, dispose, request, socket, deliver: (message: Record<string, unknown>) => deliver(message), change: (value: any) => changed({ ...state, ...value }) };
   }
-  it('ends at six seconds of private silence even while state and web traffic remain active', async () => {
+  it('ends at forty-five seconds of private silence even while unrelated traffic remains active', async () => {
     vi.useFakeTimers();
     const f = adapterFixture(); await f.adapter.followConversation(f.followRequest);
-    await vi.advanceTimersByTimeAsync(5_999);
-    f.deliver({ conversationState: { sessionGeneration: 'g' } });
+    await vi.advanceTimersByTimeAsync(44_999);
+    f.deliver({ unrelated: true });
+    f.change({});
     expect(f.onClose).not.toHaveBeenCalled(); expect(f.socket.destroyed).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(f.onClose).toHaveBeenCalledOnce(); expect(f.onClose).toHaveBeenCalledWith('control-silent');
     expect(f.close).toHaveBeenCalledOnce(); expect(f.dispose).toHaveBeenCalledOnce();
     expect(f.request).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
   });
-  it('only a private heartbeat renews liveness and owner close clears its timer', async () => {
+  it.each([{ controlHeartbeat: true }, { conversationState: { sessionGeneration: 'g' } }])('private evidence %j renews liveness and owner close clears its timer', async evidence => {
     vi.useFakeTimers(); const f = adapterFixture(); const handle = await f.adapter.followConversation(f.followRequest);
-    await vi.advanceTimersByTimeAsync(4_000); f.deliver({ controlHeartbeat: true });
-    await vi.advanceTimersByTimeAsync(5_999); expect(f.onClose).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(44_000); f.deliver(evidence);
+    await vi.advanceTimersByTimeAsync(44_999); expect(f.onClose).not.toHaveBeenCalled();
     handle.close(); expect(f.dispose).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
   });
   it('orders role replacement before closing the old session and drops later session data', async () => {
@@ -501,13 +502,20 @@ describe('private observation health', () => {
     session.observeConversation = () => { throw new Error('unavailable initial capture'); };
     expect((await controlRequest(stateDir, { command: 'snapshot' })).ok).toBe(true);
   });
-  it('emits supervisor heartbeats every two seconds without attaching a controller', async () => {
+  it('emits supervisor heartbeats every fifteen seconds without attaching a controller', async () => {
     const { stateDir, session } = await startArbiterServer();
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
     const messages: any[] = [];
     const follow = await followConversation(stateDir, { controller: false, expectedGeneration: session.conversationSnapshot().sessionGeneration }, m => messages.push(m));
     cleanups.push(() => follow.close());
     await expect.poll(() => messages.some(m => m.conversationReady)).toBe(true);
-    await expect.poll(() => messages.filter(m => m.controlHeartbeat).length, { timeout: 4_800 }).toBeGreaterThanOrEqual(2);
+    await vi.advanceTimersByTimeAsync(14_999);
+    await new Promise(setImmediate);
+    expect(messages.filter(m => m.controlHeartbeat)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect.poll(() => messages.filter(m => m.controlHeartbeat).length).toBe(1);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect.poll(() => messages.filter(m => m.controlHeartbeat).length).toBe(2);
     const descriptor = await controlRequest(stateDir, { command: 'snapshot' });
     expect((descriptor.result as any).features).toEqual(expect.arrayContaining(['conversation_observation', 'control_heartbeat']));
   }, 8_000);
