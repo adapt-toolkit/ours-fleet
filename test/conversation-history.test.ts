@@ -72,6 +72,41 @@ describe('conversationTailPage',()=>{
    expect(inPage.context).toEqual([]);
   });
  });
+ it('uses complete barrier-bound inventories without opening older context segments',async()=>{
+  const tail=Array.from({length:202},(_,i)=>ev(i+10));
+  await withLedger({'events-000002.jsonl':tail},async dir=>{
+   // This segment would fail if the reader sought capabilities or permissions
+   // after filling the page. A legacy reader must still attempt that search.
+   mkdirSync(join(dir,'.conversation','events-000001.jsonl'));
+   const pending={permissionId:'pending',title:'Presented permission',options:[]};
+   const snapshot={...snap(['pending']),ledgerBarrier:211,stateRevision:2,
+    commands:[{name:'current'}],pendingPermissions:[pending]};
+   const page=await conversationTailPage(dir,{limit:200},snapshot);
+   expect(page.events.map(e=>e.seq)).toEqual(tail.slice(-200).map(e=>e.seq));
+   expect(page.context).toEqual([]);expect(page.hasOlder).toBe(true);
+   expect(page.nextCursor).toBe('211');expect(page.snapshot).toBe(snapshot);
+   // Empty inventories are equally authoritative: absence is not a reason
+   // to search all prior events for a command that was never offered.
+   expect((await conversationTailPage(dir,{limit:200},{...snapshot,
+    pendingPermissionIds:[],commands:[],pendingPermissions:[]})).context).toEqual([]);
+  });
+ });
+ it('preserves context recovery for incomplete and failed captures',async()=>{
+  const events=[ev(1,{kind:'capabilities.updated',payload:{commands:[{name:'legacy'}]}}),
+   ev(2,{kind:'permission.requested',permissionId:'pending',payload:{title:'Presented permission',options:[]}}),
+   ...Array.from({length:10},(_,i)=>ev(i+3))];
+  await withLedger({'events-000001.jsonl':events},async dir=>{
+   const position={ledgerBarrier:12,stateRevision:2};
+   for(const snapshot of [
+    {...snap(['pending']),...position},
+    {...snap(['pending']),commands:[],pendingPermissions:[]},
+    {...snap(['pending']),...position,commands:[],pendingPermissions:[],observationFailure:'capture_failed' as const},
+   ])expect((await conversationTailPage(dir,{limit:3},snapshot)).context.map(e=>e.seq)).toEqual([1,2]);
+   // An incomplete permission inventory cannot hide a still-pending request.
+   expect((await conversationTailPage(dir,{limit:3},{...snap(['pending']),...position,
+    commands:[],pendingPermissions:[]})).context.some(e=>e.permissionId==='pending')).toBe(true);
+  });
+ });
  it('stops searching for context at the first older generation',async()=>{
   await withLedger({'events-000002.jsonl':[ev(10,{sessionGeneration:'old'}),ev(11,{kind:'capabilities.updated'}),ev(12),ev(13)]},async dir=>{
    mkdirSync(join(dir,'.conversation','events-000001.jsonl'));
@@ -82,6 +117,26 @@ describe('conversationTailPage',()=>{
  it('rejects a malformed cursor',async()=>{
   await withLedger({'events-000001.jsonl':[ev(1)]},async dir=>{await expect(conversationTailPage(dir,{before:'abc'},snap())).rejects.toThrow(/cursor/);});
  });
+ it('retires a cancelled tail before opening ledger segments',async()=>{
+  await withLedger({'events-000001.jsonl':[ev(1)]},async dir=>{
+   const owner=new AbortController();
+   const read=conversationTailPage(dir,{limit:1},snap(),undefined,owner.signal);
+   owner.abort();
+   await expect(read).rejects.toMatchObject({name:'AbortError'});
+   await expect(conversationTailPage(dir,{limit:1},snap(),undefined,owner.signal)).rejects.toMatchObject({name:'AbortError'});
+  });
+ });
+});
+
+it('stops tail orchestration after a cancelled private-control read settles',async()=>{
+ const {RoleSessionControlAdapter}=await import('../src/application/session-control.js');
+ const owner=new AbortController();const commands:string[]=[];
+ const adapter=new RoleSessionControlAdapter('/unused',async(_dir,request)=>{
+  commands.push(request.command);owner.abort();
+  return {version:1,id:'x',ok:true,result:{events:[],hasMore:false,snapshot:{sessionGeneration:'g',pendingPermissionIds:[],queueDepth:0,readiness:'idle'}}};
+ });
+ await expect(adapter.conversationTail({signal:owner.signal})).rejects.toMatchObject({name:'AbortError'});
+ expect(commands).toEqual(['conversation_page']);
 });
 
 it('rechecks generation after asynchronous latest-tail work and limits unstable baselines to three attempts', async()=>{

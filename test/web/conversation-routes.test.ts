@@ -106,6 +106,32 @@ async function authenticated(control: unknown = conversationControl()) {
 }
 
 describe('conversation web routes', () => {
+  it('cancels a pending backward history read when the browser disconnects', async () => {
+    let entered!: () => void, cancelled!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const aborted = new Promise<void>(resolve => { cancelled = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), async conversationTail(request: { signal: AbortSignal }) {
+      request.signal.addEventListener('abort', cancelled, { once: true });
+      entered();
+      await gate;
+      request.signal.throwIfAborted();
+      throw Error('A retired read must not publish');
+    } };
+    const { server, cookie } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const owner = new AbortController();
+    const response = fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/conversation?latest=1&limit=200`,
+      { headers: headers(cookie), signal: owner.signal }).catch(error => error);
+    try {
+      await started;
+      owner.abort();
+      await aborted;
+      expect((await response).name).toBe('AbortError');
+    } finally { release(); owner.abort(); await server.close(); }
+  });
   it('requires authentication, CSRF and generation before Live controller attachment', async () => {
     let attached = 0;
     const control = { ...conversationControl(), followConversation: async () => { attached++; return { close() {} }; } };
@@ -211,7 +237,10 @@ describe('conversation web routes', () => {
     expect(latest.json()).toMatchObject({ hasOlder: true, olderCursor: '9', nextCursor: '12', context: [] });
     const older = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?before=9&limit=100', headers: headers(cookie) });
     expect(older.statusCode).toBe(200);
-    expect(calls).toEqual([{ before: undefined, limit: 100 }, { before: '9', limit: 100 }]);
+    expect(calls).toEqual([
+      { before: undefined, limit: 100, signal: expect.any(AbortSignal) },
+      { before: '9', limit: 100, signal: expect.any(AbortSignal) },
+    ]);
     const mixed = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1&after=3', headers: headers(cookie) });
     expect(mixed.statusCode).toBe(400);
     const forward = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?after=3', headers: headers(cookie) });

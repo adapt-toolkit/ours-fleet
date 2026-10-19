@@ -950,7 +950,7 @@ export async function buildWebServer(
     });
 
   app.get<{ Params: { id: string }; Querystring: { after?: string; before?: string; latest?: string; limit?: string } }>(
-    '/api/v1/roles/:id/conversation', async request => {
+    '/api/v1/roles/:id/conversation', async (request, reply) => {
       auth.authenticate(request);
       const control = await services.session(request.params.id);
       if (!control.conversationPage)
@@ -966,8 +966,19 @@ export async function buildWebServer(
       const stateDir = role ? services.repository.stateDir(role) : undefined;
       const present = (event: Parameters<typeof presentAttachmentEvent>[2]) => presentAttachmentEvent(stateDir, request.params.id, event);
       if (backward) {
-        const page = await control.conversationTail!({ before: request.query.before, limit });
-        return { ...page, events: page.events.map(present), context: page.context.map(present) };
+        const owner = new AbortController();
+        const cancel = () => owner.abort();
+        request.raw.once('aborted', cancel);
+        reply.raw.once('close', cancel);
+        if (request.raw.aborted || reply.raw.destroyed) cancel();
+        try {
+          const page = await control.conversationTail!({ before: request.query.before, limit, signal: owner.signal });
+          owner.signal.throwIfAborted();
+          return { ...page, events: page.events.map(present), context: page.context.map(present) };
+        } finally {
+          request.raw.off('aborted', cancel);
+          reply.raw.off('close', cancel);
+        }
       }
       const page = await control.conversationPage({ after: request.query.after, limit });
       return { ...page, events: page.events.map(present) };
