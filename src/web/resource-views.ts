@@ -1,6 +1,7 @@
 import { relative, resolve, sep } from 'node:path';
 import { agentsRoot, tmpRoot, stateRoot } from '../paths.js';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import type { ServerResponse } from 'node:http';
 import { observeFleetResources, type FleetResourceScope, type FleetResourceState } from '../application/resource-observer.js';
 
@@ -323,6 +324,13 @@ export class FleetResourceViews {
     // An explicitly selected manifest may use any pathname, including one
     // otherwise reserved for an independent task receipt.
     if (this.scope.configPath && resolve(path) === resolve(this.scope.configPath)) return true;
+    // Adopted Codex history, telemetry and cache commits are not canonical
+    // Fleet preview inputs. Keep credentials, unknown paths and directory-level
+    // events conservative, and never override explicit config or role roots.
+    const roots = this.scope.roots ?? [agentsRoot(), tmpRoot()];
+    if (descriptor.resource === 'previews'
+      && /^(?:history\.jsonl|models_cache\.json|(?:thread_history|state|logs|queue|goals)_\d+\.sqlite(?:-wal|-shm|-journal)?)$/.test(relative(resolve(homedir(), '.codex'), path))
+      && !roots.some(root => { const local = relative(resolve(root), path); return local === '' || (local !== '..' && !local.startsWith('..' + sep)); })) return false;
     // Preview selection reads role config/state and conversation ledgers, never
     // task layout run/operation/brief receipts. A worker may commit several of
     // these while that independent canonical preview read is in flight.
@@ -334,7 +342,6 @@ export class FleetResourceViews {
     // These delivery acknowledgements are not role/task/config membership;
     // retain full wakes without requiring an outbox-quiet capture window.
     if (structural && /^[a-f0-9]{64}\.json$/.test(relative(resolve(stateRoot(), 'web', 'notification-outboxes'), path))) return false;
-    const roots = this.scope.roots ?? [agentsRoot(), tmpRoot()];
     for (const root of roots) {
       const parts = relative(resolve(root), path).split(sep);
       if (parts[0] === '..') continue;
