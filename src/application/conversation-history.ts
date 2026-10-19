@@ -2,7 +2,7 @@ import {createReadStream} from 'node:fs';
 import {open,readFile,readdir} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
-import type {ConversationEventV1} from '../session/conversation-types.js';
+import type {ConversationEventV1,ConversationObservationState} from '../session/conversation-types.js';
 import type {ConversationPageView} from './session-control.js';
 
 const HISTORICAL_KINDS=['file.attached','fleet.task_created','prompt.admitted','message.chunk','message.replace','tool.upsert','tool.content_chunk','turn.completed'];
@@ -13,13 +13,16 @@ export function conversationEventVisible(event:ConversationEventV1,sessionGenera
 }
 
 /** Newest-first lines of a file, read in chunks from its end; `visit` returns false to stop. */
-async function readLinesBackward(path:string,visit:(line:string)=>boolean):Promise<boolean> {
+async function readLinesBackward(path:string,visit:(line:string)=>boolean,signal?:AbortSignal):Promise<boolean> {
+  signal?.throwIfAborted();
   const file=await open(path,'r');
   try {
     let position=(await file.stat()).size;let carry=Buffer.alloc(0);
     while(position>0){
+      signal?.throwIfAborted();
       const size=Math.min(256*1024,position);position-=size;
       const chunk=Buffer.alloc(size);await file.read(chunk,0,size,position);
+      signal?.throwIfAborted();
       let buffer=Buffer.concat([chunk,carry]);let end=buffer.length;
       for(let i=buffer.length-1;i>=0;i--){
         if(buffer[i]!==10)continue;
@@ -53,17 +56,29 @@ export interface ConversationTailPage extends ConversationPageView {
  * read backwards from the ledger so opening a long session costs one page.
  * `nextCursor` is the newest ledger position seen, for forward `after` paging.
  */
-export async function conversationTailPage(stateDir:string,request:{before?:string;limit?:number},snapshot:ConversationPageView['snapshot'],resumedSessionId?:string):Promise<ConversationTailPage> {
+export async function conversationTailPage(stateDir:string,request:{before?:string;limit?:number},snapshot:ConversationPageView['snapshot'],resumedSessionId?:string,signal?:AbortSignal):Promise<ConversationTailPage> {
+  signal?.throwIfAborted();
   const before=request.before===undefined?Infinity:Number(request.before);
   if(before!==Infinity&&(!Number.isSafeInteger(before)||before<0))throw new Error('before must be a ledger cursor');
   const limit=Math.min(1000,Math.max(1,Number.isFinite(request.limit)?Math.floor(request.limit!):200));
   let files:string[]=[];
   try{files=(await readdir(join(stateDir,'.conversation'))).filter(n=>/^events-\d{6}\.jsonl$/.test(n)).sort().reverse();}catch{}
   const events:ConversationEventV1[]=[];let newest:number|undefined;let hasOlder=false;
-  const barrier = (snapshot as Partial<import('../session/conversation-types.js').ObservationPosition>).ledgerBarrier;
-  const pending=new Set(snapshot.pendingPermissionIds);let capabilities:ConversationEventV1|undefined;const context:ConversationEventV1[]=[];
+  const observation = snapshot as Partial<ConversationObservationState>;
+  const barrier = observation.ledgerBarrier;
+  // Current supervisors capture these sanitized inventories together with the
+  // ledger barrier. The browser uses them directly, including authoritative
+  // empty arrays. Looking for their old ledger events would scan the entire
+  // generation on every open. Legacy/incomplete snapshots still need context.
+  const complete = !snapshot.observationFailure && Number.isSafeInteger(barrier) && barrier! >= 0
+    && Number.isSafeInteger(observation.stateRevision) && observation.stateRevision! >= 0;
+  const needsCapabilities = !complete || !Array.isArray(observation.commands);
+  const pending=new Set(complete && Array.isArray(observation.pendingPermissions)
+    && snapshot.pendingPermissionIds.every(id=>observation.pendingPermissions!.some(permission=>permission.permissionId===id))
+    ? [] : snapshot.pendingPermissionIds);
+  let capabilities:ConversationEventV1|undefined;const context:ConversationEventV1[]=[];
   // Context only accompanies the newest page; older pages stop as soon as they are full.
-  const wantsContext=()=>before===Infinity&&(!capabilities||pending.size>0);
+  const wantsContext=()=>before===Infinity&&((needsCapabilities&&!capabilities)||pending.size>0);
   const generation=`"sessionGeneration":${JSON.stringify(snapshot.sessionGeneration)}`;
   for(const file of files){
     const more=await readLinesBackward(join(stateDir,'.conversation',file),line=>{
@@ -86,7 +101,7 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
         if(inPage)events.push(event);else hasOlder=true;
       }
       return !hasOlder||wantsContext();
-    });
+    },signal);
     if(!more)break;
   }
   events.reverse();context.reverse();

@@ -509,6 +509,12 @@ export class ConversationEventStore {
       return this.tail.filter(event => event.seq > after).slice(0, limit);
     const events: ConversationEventV1[] = [];
     for (const segment of this.segments) {
+      // Recovery/append already indexed these single-writer segments. A page
+      // after a resumed generation's floor must not reread every older segment
+      // merely because the requested cursor is outside the memory tail.
+      // Degraded/unknown ranges retain the conservative recovery read path.
+      const range = this.segmentRanges.get(segment);
+      if (!this._degraded && range && !range.damaged && range.last !== undefined && range.last <= after) continue;
       for (const event of this.readSegment(segment)) {
         if (event.seq <= after) continue;
         events.push(event);
