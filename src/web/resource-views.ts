@@ -23,6 +23,7 @@ export interface ResourceFrameBinding {
   readonly sequence: number;
   readonly revision: number;
   readonly baselineId?: string;
+  readonly source?: FleetResourceState;
 }
 export type ResourceHealthReason = 'auth_required' | 'unsupported' | 'upstream_unavailable';
 export type ResourceEnvelope = ResourceFrameBinding & (
@@ -34,7 +35,9 @@ export type ResourceEnvelope = ResourceFrameBinding & (
   | { readonly kind: 'resync'; readonly payload: { readonly reason: 'capacity' | 'projection_unavailable' } }
   | { readonly kind: 'health'; readonly payload: { readonly healthy: false; readonly reason: ResourceHealthReason } }
 );
-export interface ResourceWireFrame { event: 'resource' | 'resource-chunk'; data: Record<string, unknown> }
+interface ResourceCoverage { protocolVersion: 1; producerGeneration: string; views: Array<ResourceFrameBinding & { source: FleetResourceState }> }
+type ResourceOutputRecord = ResourceEnvelope | ResourceCoverage;
+export interface ResourceWireFrame { event: 'resource' | 'resource-chunk' | 'resource-coverage'; data: Record<string, unknown> }
 export const RESOURCE_FRAME_BYTES = 512 * 1024;
 export const RESOURCE_PENDING_BYTES = 8 * 1024 * 1024;
 export const RESOURCE_ASSEMBLY_BYTES = 16 * 1024 * 1024;
@@ -61,7 +64,7 @@ export function* resourceFrames(envelope: ResourceEnvelope): Generator<ResourceW
 }
 
 interface PendingOutput {
-  envelope: ResourceEnvelope;
+  envelope: ResourceOutputRecord;
   bytes: number;
   resolve: () => void;
   reject: (error: Error) => void;
@@ -88,13 +91,14 @@ export class ResourceOutput {
     }
   }
 
-  send(envelope: ResourceEnvelope): Promise<void> {
+  send(envelope: ResourceOutputRecord, admitted?: () => void): Promise<void> {
     if (this.#closed) return Promise.reject(new Error('resource output closed'));
     const bytes = Buffer.byteLength(JSON.stringify(envelope));
     if (bytes > RESOURCE_ASSEMBLY_BYTES) return this.#fail(new Error('resource assembly limit exceeded'));
     if (this.#active && this.#pendingBytes + bytes > RESOURCE_PENDING_BYTES) {
       return this.#fail(new Error('resource pending limit exceeded'));
     }
+    admitted?.();
     return new Promise<void>((resolve, reject) => {
       const item = { envelope, bytes, resolve, reject };
       if (!this.#active) {
@@ -129,7 +133,7 @@ export class ResourceOutput {
     try {
       while (this.#active && !this.#closed) {
         const item = this.#active;
-        for (const frame of resourceFrames(item.envelope)) {
+        for (const frame of ('views' in item.envelope ? [{event:'resource-coverage' as const,data:item.envelope as unknown as Record<string,unknown>}] : resourceFrames(item.envelope))) {
           if (this.#closed) break;
           const writable = this.response.write(`event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`);
           if (!writable) await this.#drain();
@@ -193,7 +197,7 @@ interface View {
   descriptor: ResourceDescriptor; epoch: number; baselineId: string; controller: AbortController;
   revision: number; sequence: number; dirty: boolean; running: boolean; failed: boolean;
   initial: Promise<BoundProjection>; resolveInitial(value: BoundProjection): void; rejectInitial(error: Error): void;
-  payload?: unknown; covered?: FleetResourceState;
+  payload?: unknown; covered?: FleetResourceState; qualifiedAt?: number;
   source: ReturnType<ReturnType<typeof observeFleetResources>['cursor']>; scheduledPosition: number;
   captureSource: ReturnType<ReturnType<typeof observeFleetResources>['cursor']>;
 }
@@ -218,9 +222,10 @@ export class FleetResourceViews {
     const id = randomUUID(), controller = new AbortController();
     let connection: Connection | undefined;
     let timer: ReturnType<typeof setInterval> | undefined;
+    let healthTimer: ReturnType<typeof setInterval> | undefined;
     const close = () => {
       if (controller.signal.aborted) return;
-      controller.abort(); clearInterval(timer); this.connections.delete(id);
+      controller.abort(); clearInterval(timer); clearInterval(healthTimer); this.connections.delete(id);
       if (connection) {
         for (const view of connection.views.values()) this.retire(view);
         connection.views.clear(); connection.output.close();
@@ -245,12 +250,15 @@ export class FleetResourceViews {
     if (observer.snapshot().health !== 'healthy') {
       response.write(`event: resource-service-health\ndata: ${JSON.stringify({protocolVersion:1,healthy:false,reason:observer.snapshot().health === 'unsupported' ? 'unsupported':'upstream_unavailable'})}\n\n`); close();
     } else {
+      // Preserve credential retirement timing independently of sparse wire health.
       timer = setInterval(() => {
         if (!authorized()) { close(); return; }
-        for (const view of connection!.views.values()) if (!view.failed && view.covered && view.covered.position===view.source.snapshot().position) void this.emit(connection!, view, 'coverage', { source:view.covered }).catch(close);
-        // Keep the transport live with no subscribed views; never claim source coverage from bytes.
-        if (!connection!.views.size) response.write(': keepalive\n\n');
       }, 2000); timer.unref();
+      healthTimer = setInterval(() => {
+        if (!authorized()) { close(); return; }
+        this.coverage(connection!).catch(close);
+        if (!connection!.views.size) response.write(': keepalive\n\n');
+      }, 15000); healthTimer.unref();
     }
     return { connectionId:id, close };
   }
@@ -299,8 +307,17 @@ export class FleetResourceViews {
   }
   private current(connection:Connection,view:View) {return !connection.controller.signal.aborted && !view.controller.signal.aborted && connection.views.get(view.descriptor.viewId)===view;}
   private retire(view:View) {view.controller.abort();view.rejectInitial(new ResourceBindingError(409,'resource binding retired'));}
-  private emit(connection:Connection,view:View,kind:ResourceEnvelope['kind'],payload:unknown) {
-    return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:++view.sequence,revision:view.revision,kind,payload} as ResourceEnvelope);
+  private emit(connection:Connection,view:View,kind:ResourceEnvelope['kind'],payload:unknown,source?:FleetResourceState) {
+    return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,kind,payload,...(source?{source}:{})} as ResourceEnvelope,()=>{view.sequence++;if(source||kind==='ready')view.qualifiedAt=Date.now();});
+  }
+  // Admission allocates sequences atomically; the existing writer keeps this
+  // complete batch behind any active chunk assembly and earlier data records.
+  private coverage(connection:Connection) {
+    const now=Date.now();
+    const eligible=[...connection.views.values()].filter(view=>this.current(connection,view)&&!view.failed&&!view.running&&!view.dirty&&view.payload!==undefined&&view.covered&&view.covered.health==='healthy'&&view.covered.position===view.source.snapshot().position&&now-(view.qualifiedAt??0)>=15000);
+    if(!eligible.length)return Promise.resolve();
+    const views=eligible.map(view=>({protocolVersion:1 as const,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,source:view.covered!}));
+    return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
   }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
     // Only classify known activity writes under the configured role roots.
@@ -356,11 +373,11 @@ export class FleetResourceViews {
       if(!this.current(connection,view))return;
       const first=view.payload===undefined,changed=first||JSON.stringify(payload, (key,value)=>key==='observedAt'?undefined:value)!==JSON.stringify(view.payload, (key,value)=>key==='observedAt'?undefined:value);
       view.covered=source;
-      if(changed) {view.revision++;await this.emit(connection,view,'snapshot',payload);if(!this.current(connection,view))return;view.payload=payload;}
+      if(changed) {view.revision++;await this.emit(connection,view,'snapshot',payload,source);if(!this.current(connection,view))return;view.payload=payload;}
       if(first) {
         await this.emit(connection,view,'ready',{baselineId:view.baselineId,source});
         if(this.current(connection,view))view.resolveInitial({payload,source,producerGeneration:this.producerGeneration,revision:view.revision,baselineId:view.baselineId,descriptor:view.descriptor});
-      } else await this.emit(connection,view,'coverage',{source});
+      }
     } catch(error) {
       if(!this.current(connection,view))return;view.failed=true;
       view.rejectInitial(error instanceof Error?error:Error('projection failed'));

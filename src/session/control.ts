@@ -562,8 +562,13 @@ export class RoleControlServer {
             let stopped = false;
             let heartbeat: ReturnType<typeof setInterval> | undefined;
             let writing: Promise<void> = Promise.resolve();
+            let lastQualifyingOutputAt = Date.now();
             const send = (message: Record<string, unknown>): Promise<void> => {
-              const result = writing.then(() => writeMessage(message));
+              const result = writing.then(async () => {
+                if (message.controlHeartbeat === true && Date.now() - lastQualifyingOutputAt < 15_000) return;
+                await writeMessage(message);
+                lastQualifyingOutputAt = Date.now();
+              });
               writing = result.catch(() => {});
               return result;
             };
@@ -604,7 +609,7 @@ export class RoleControlServer {
                 heartbeatPending = true;
                 void send({ controlHeartbeat: true }).catch(() => { stop(); socket.destroy(); })
                   .finally(() => { heartbeatPending = false; });
-              }, 2_000);
+              }, 15_000);
               heartbeat.unref();
             }
             socket.once('close', stop);

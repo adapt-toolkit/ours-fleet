@@ -288,10 +288,10 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
       if (silence) clearTimeout(silence);
       silence = setTimeout(() => {
         // Liveness only: no role/session snapshots, regardless of web traffic.
-        if (Date.now() - lastControlHeartbeat >= 6_000) {
+        if (Date.now() - lastControlHeartbeat >= 45_000) {
           this.controlHealthy = false; finish('control-silent');
         } else armSilence();
-      }, Math.max(1, 6_000 - (Date.now() - lastControlHeartbeat)));
+      }, Math.max(1, 45_000 - (Date.now() - lastControlHeartbeat)));
       silence.unref?.();
     };
     let follow: Awaited<ReturnType<typeof followConversation>> | undefined;
@@ -332,7 +332,14 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
       }
       follow = await this.openFollow(this.stateDir, passive ? { controller: false, expectedGeneration: passive.expectedGeneration, after: passive.after, signal: passive.signal } : (request as LegacyConversationFollowRequest).after, message => {
         if (closed) return;
-        if (passive && message.controlHeartbeat === true) { lastControlHeartbeat = Date.now(); this.controlHealthy = true; armSilence(); return; }
+        if (passive) {
+          // A delayed callback must not revive an already elapsed source deadline.
+          if (Date.now() - lastControlHeartbeat >= 45_000) { this.controlHealthy = false; finish('control-silent'); return; }
+          if (message.controlHeartbeat === true || message.conversationReplay || message.conversationReady || message.conversationEvent || message.conversationState) {
+            lastControlHeartbeat = Date.now(); this.controlHealthy = true; armSilence();
+          }
+          if (message.controlHeartbeat === true) return;
+        }
         if (message.ok === false) { finish(String(message.error ?? 'conversation follow refused')); return; }
         if (message.conversationEvent) { request.onEvent(message.conversationEvent as ConversationEventV1); return; }
         if (passive) {
