@@ -80,18 +80,21 @@ export class FleetConfigService {
 
   read(includeDefinitions = false): ConfigReadResult {
     const sources = readSources(this.path);
-    const raw = modelFrom(sources, includeDefinitions);
-    const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-    const vars = record(raw.manifest.vars);
-    const expand = (value: string) => value.replace(/\$\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match);
-    const invite = record(record(raw.manifest.rooms).owner).public_invite_file;
-    const prompts = Object.values(record(raw.manifest.watchdogs)).map(value => record(value).prompt_file);
-    // Record even invalid/missing references before validation, so repairing an
-    // already observed dependency can never retain a certified stale capture.
-    this.validationInputs = [...(typeof invite === 'string' ? [expand(expand(invite))] : []),
-      ...prompts.filter((value): value is string => typeof value === 'string').map(expand)].map(value => resolve(value));
-    try { loadConfig(this.path, { yamlMode: 'strict' }); }
-    catch (error) { throw safeError(error, sourceSensitiveValues(sources)); }
+    let raw: EditableFleetModel;
+    try {
+      const manifest = parse(sources.documents.get(basename(sources.manifest))!, {prettyErrors:false}) as Record<string, unknown>;
+      const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      const vars = record(manifest.vars);
+      const expand = (value: string) => value.replace(/\$\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match);
+      const invite = record(record(manifest.rooms).owner).public_invite_file;
+      const prompts = Object.values(record(manifest.watchdogs)).map(value => record(value).prompt_file);
+      // Record even invalid/missing references before validation, so repairing an
+      // already observed dependency can never retain a certified stale capture.
+      this.validationInputs = [...(typeof invite === 'string' ? [expand(expand(invite))] : []),
+        ...prompts.filter((value): value is string => typeof value === 'string').map(expand)].map(value => resolve(value));
+      loadConfig(this.path, {yamlMode:'strict'});
+      raw = modelFrom(sources, includeDefinitions);
+    } catch (error) { throw safeError(error, sourceSensitiveValues(sources)); }
     const redacted = redactModel(raw);
     return {
       path: basename(this.path), exists: true, firstRun: false,
