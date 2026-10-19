@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { FleetResourceViews, canonicalResourceDescriptor, resourceFrames } from '../src/web/resource-views.js';
 import { publishFleetResourceCommit } from '../src/application/resource-observer.js';
 import { conversationPreview } from '../src/application/conversation-history.js';
+import { stateRoot } from '../src/paths.js';
 const clean:Array<()=>void>=[];
 afterEach(()=>{for(const fn of clean.splice(0).reverse())fn();});
 function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true){
@@ -240,6 +241,45 @@ it('retains the three capture limit for continuously changing selected preview d
   expect(reads).toBe(3);
   expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
 });
+
+it('keeps selected previews live while independent task layout receipts commit during every capture', async () => {
+  let value = 'initial', reads = 0;
+  const f = fixture(async () => {
+    reads++;
+    // A task worker writes its run and operation receipts independently of
+    // role membership/configuration and the selected conversation ledgers.
+    publishFleetResourceCommit(join(stateRoot(), 'layouts', 'task-observed.json'));
+    publishFleetResourceCommit(join(stateRoot(), 'layouts', 'task-observed.op.json'));
+    publishFleetResourceCommit(join(stateRoot(), 'layouts', 'task-observed.brief.md'));
+    return {value};
+  });
+  vi.stubEnv('OURS_FLEET_HOME', f.root); clean.push(() => vi.unstubAllEnvs());
+  const binding = f.register(1, 'previews', {ids:['selected']});
+  const initial = await f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId);
+  expect(initial.payload).toEqual({value:'initial'});
+  value = 'committed';
+  publishFleetResourceCommit(join(f.root, 'selected', '.conversation', 'events-000001.jsonl'));
+  await new Promise(setImmediate);
+  expect(f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'committed'});
+  expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
+  expect(reads).toBe(2);
+});
+
+for (const [resource, filename] of [['directory', 'task-observed.op.json'], ['previews', 'unknown.json']]) {
+  it(`retains capture fencing for ${resource} during ${filename} commits`, async () => {
+    let reads = 0;
+    const f = fixture(async () => {
+      reads++;
+      publishFleetResourceCommit(join(stateRoot(), 'layouts', filename));
+      return {value:'unstable'};
+    });
+    vi.stubEnv('OURS_FLEET_HOME', f.root); clean.push(() => vi.unstubAllEnvs());
+    const binding = f.register(1, resource, resource === 'previews' ? {ids:['selected']} : {});
+    await expect(f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId)).rejects.toThrow('unstable');
+    expect(reads).toBe(3);
+    expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
+  });
+}
 
 it('keeps committed previews live through an incomplete append and publishes its completed record', async () => {
   const f = fixture(async (_descriptor, signal) => ({previews:{selected:await conversationPreview(join(f.root, 'selected'), signal)}}));
