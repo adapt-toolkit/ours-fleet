@@ -457,7 +457,7 @@ export async function buildWebServer(
       }
     }
   };
-  const resources=new FleetResourceViews(services.resourceScope??{},project);
+  const resources=new FleetResourceViews(services.resourceScope??{},project,()=>services.configuration?.resourceValidationInputs?.()??[]);
   app.addHook('preClose',async()=>resources.close());
   app.get('/api/v1/resource-events', async (request,reply)=>{
     const browser=auth.authenticate(request);

@@ -1,5 +1,7 @@
 import { relative, resolve, sep } from 'node:path';
-import { agentsRoot, tmpRoot, stateRoot } from '../paths.js';
+import { agentsRoot, tmpRoot, stateRoot, defaultConfigPath, fleetDDir } from '../paths.js';
+import { splitRootFor } from '../config.js';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { ServerResponse } from 'node:http';
@@ -218,7 +220,8 @@ export class ResourceBindingError extends Error {
 export class FleetResourceViews {
   readonly producerGeneration = randomUUID();
   private connections = new Map<string, Connection>();
-  constructor(private scope: FleetResourceScope, private project: (descriptor: ResourceDescriptor, signal: AbortSignal, owner: string) => Promise<unknown>) {}
+  constructor(private scope: FleetResourceScope, private project: (descriptor: ResourceDescriptor, signal: AbortSignal, owner: string) => Promise<unknown>,
+    private configurationInputs: () => readonly string[] = () => []) {}
   open(response: ServerResponse, owner: string, authorized: () => boolean) {
     const id = randomUUID(), controller = new AbortController();
     let connection: Connection | undefined;
@@ -321,6 +324,21 @@ export class FleetResourceViews {
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
   }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
+    if (descriptor.resource === 'configuration') {
+      const manifest = resolve(this.scope.configPath ?? defaultConfigPath());
+      const root = resolve(splitRootFor(manifest)), changed = resolve(path);
+      const within = (candidate: string, parent: string) => {
+        const local = relative(parent, candidate);
+        return local === '' || (local !== '..' && !local.startsWith('..' + sep));
+      };
+      // Configuration and provenance read the manifest and split definitions;
+      // loadConfig also rejects legacy YAML files in the global fleet.d root.
+      // Ancestor replacement/unknown directory wakes remain conservative.
+      const legacy = resolve(fleetDDir());
+      return within(changed, root) || within(root, changed) || within(manifest, changed)
+        || within(changed, legacy) || within(legacy, changed)
+        || this.configurationInputs().some(input => within(resolve(input), changed));
+    }
     // An explicitly selected manifest may use any pathname, including one
     // otherwise reserved for an independent task receipt.
     if (this.scope.configPath && resolve(path) === resolve(this.scope.configPath)) return true;
@@ -353,9 +371,8 @@ export class FleetResourceViews {
       if (parts.length < 3 || parts[1] !== '.conversation') continue;
       if (structural && (descriptor.resource === 'directory' || descriptor.resource === 'roles')) return false;
       if (descriptor.resource === 'previews') return (descriptor.ids ?? []).includes(parts[0]);
-      // Configuration/provenance reads no conversation data. Directory and
-      // roles intentionally remain conservative: live status includes activity.
-      if (descriptor.resource === 'configuration') return false;
+      // Directory and roles intentionally remain conservative: live status
+      // includes activity. Configuration was classified by its inputs above.
     }
     return true;
   }
@@ -363,7 +380,13 @@ export class FleetResourceViews {
     if(!this.current(connection,view)||view.failed)return;
     view.scheduledPosition=view.source.snapshot().position;
     view.dirty=true;if(view.running)return;view.running=true;
-    const task=connection.tail.then(()=>this.refresh(connection,view));connection.tail=task.catch(()=>{});
+    const task=connection.tail.then(async()=>{
+      // Resolved projection promises must not starve HTTP, timers or native
+      // watch delivery. Preserve serialization and coalesce this event batch.
+      await yieldToEventLoop();
+      if(!this.current(connection,view)||view.failed)return;
+      await this.refresh(connection,view);
+    });connection.tail=task.catch(()=>{});
     void task.finally(()=>{view.running=false;if(view.dirty)this.schedule(connection,view);}).catch(connection.close);
   }
   private async refresh(connection:Connection,view:View) {

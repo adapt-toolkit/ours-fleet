@@ -3,7 +3,7 @@ import {
   chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
   readdirSync, rmSync,
 } from 'node:fs';
-import { basename, dirname, extname, join } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { parse, stringify } from 'yaml';
 
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
@@ -67,6 +67,10 @@ export class FleetConfigService {
   readonly path: string;
   private readonly preflight: (path: string) => Promise<PrereqReport>;
   private readonly beforeMutation?: (relativePath: string, index: number) => void;
+  private validationInputs: string[] = [];
+
+  /** Cached during canonical reads; observer filtering must never parse YAML. */
+  resourceValidationInputs(): readonly string[] { return this.validationInputs; }
 
   constructor(options: FleetConfigServiceOptions = {}) {
     this.path = options.configPath ?? defaultConfigPath();
@@ -76,9 +80,18 @@ export class FleetConfigService {
 
   read(includeDefinitions = false): ConfigReadResult {
     const sources = readSources(this.path);
+    const raw = modelFrom(sources, includeDefinitions);
+    const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+    const vars = record(raw.manifest.vars);
+    const expand = (value: string) => value.replace(/\$\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match);
+    const invite = record(record(raw.manifest.rooms).owner).public_invite_file;
+    const prompts = Object.values(record(raw.manifest.watchdogs)).map(value => record(value).prompt_file);
+    // Record even invalid/missing references before validation, so repairing an
+    // already observed dependency can never retain a certified stale capture.
+    this.validationInputs = [...(typeof invite === 'string' ? [expand(expand(invite))] : []),
+      ...prompts.filter((value): value is string => typeof value === 'string').map(expand)].map(value => resolve(value));
     try { loadConfig(this.path, { yamlMode: 'strict' }); }
     catch (error) { throw safeError(error, sourceSensitiveValues(sources)); }
-    const raw = modelFrom(sources, includeDefinitions);
     const redacted = redactModel(raw);
     return {
       path: basename(this.path), exists: true, firstRun: false,
