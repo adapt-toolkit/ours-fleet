@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -122,6 +122,47 @@ describe('ConversationEventStore', () => {
     expect(recovered.page().firstAvailableCursor).toBe('7');
     expect(recovered.page().events.map(e => e.seq)).toEqual([7]);
     expect(recovered.degraded).toBe(true); recovered.close();
+  });
+
+  it('skips indexed old segments when paging after a generation floor outside the memory tail', () => {
+    const dir = makeDir(), root = join(dir, '.conversation');
+    mkdirSync(root);
+    const event = (seq: number) => ({ schemaVersion: 1, roleId: 'role-a', eventId: `e${seq}`,
+      seq, at: '2026-10-19T00:00:00Z', kind: 'session.state', source: 'agent',
+      sessionGeneration: seq <= 1500 ? 'prior' : 'current', payload: {} });
+    for (let segment = 0; segment < 6; segment++) writeFileSync(
+      join(root, `events-${String(segment + 1).padStart(6, '0')}.jsonl`),
+      Array.from({ length: 500 }, (_, i) => JSON.stringify(event(segment * 500 + i + 1))).join('\n') + '\n');
+    for (let reopen = 0; reopen < 2; reopen++) {
+      const store = new ConversationEventStore(root, { roleId: 'role-a' });
+      const disk = vi.spyOn(store as any, 'readSegment');
+      const page = store.page({ after: '1500', limit: 1 });
+      expect(page.events.map(e => e.seq)).toEqual([1501]);
+      expect(page.firstAvailableCursor).toBe('1'); expect(page.hasMore).toBe(true);
+      expect(disk.mock.calls.map(call => call[0])).toEqual(['events-000004.jsonl']);
+      disk.mockClear();
+      // A generation floor can fall inside a segment shared with its predecessor.
+      expect(store.page({ after: '1600', limit: 1 }).events.map(e => e.seq)).toEqual([1601]);
+      expect(disk.mock.calls.map(call => call[0])).toEqual(['events-000004.jsonl']);
+      disk.mockClear();
+      expect(store.page({ after: '1999', limit: 2 }).events.map(e => e.seq)).toEqual([2000, 2001]);
+      expect(disk.mock.calls.map(call => call[0])).toEqual(['events-000004.jsonl', 'events-000005.jsonl']);
+      disk.mockRestore(); store.close();
+    }
+  });
+
+  it('does not trust range endpoints to skip a degraded nonmonotonic segment', () => {
+    const dir = makeDir(), root = join(dir, '.conversation');
+    mkdirSync(root);
+    const event = (seq: number) => ({ schemaVersion: 1, roleId: 'role-a', eventId: `e${seq}`,
+      seq, at: '2026-10-19T00:00:00Z', kind: 'session.state', source: 'agent',
+      sessionGeneration: 'g', payload: {} });
+    writeFileSync(join(root, 'events-000001.jsonl'), [event(500), event(1)].map(e => JSON.stringify(e)).join('\n') + '\n');
+    writeFileSync(join(root, 'events-000002.jsonl'), Array.from({ length: 1200 }, (_, i) => JSON.stringify(event(i + 501))).join('\n') + '\n');
+    const store = new ConversationEventStore(root, { roleId: 'role-a' });
+    expect(store.degraded).toBe(true);
+    expect(store.page({ after: '100', limit: 1 }).events.map(e => e.seq)).toEqual([500]);
+    store.close();
   });
 
   it('notifies subscribers of each appended event in order', () => {

@@ -6,6 +6,11 @@ snapshot with its revision and ledger barrier. Empty inventories are authoritati
 This avoids scanning the current generation for old context events after the
 latest page is full. Legacy, failed or incomplete captures retain ledger context
 recovery. Generation checks, resumed-session filtering and event cursors still apply.
+The private snapshot checks also use the store's recovered/appended segment ranges
+to skip healthy segments ending at or before their cursor. A retained prior
+generation therefore does not require rereading its whole prefix merely because
+the current-generation cursor is outside the in-memory tail. Degraded stores and
+unknown or damaged ranges retain conservative reads.
 Older pages can scan intervening newer ledger segments; the event count alone is
 not a disk-read byte bound.
 
