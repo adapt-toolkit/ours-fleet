@@ -20,6 +20,9 @@ export interface FleetResourceScope {
   roots?: string[];
   /** Overrides full Fleet discovery for narrow owners such as task delivery. */
   paths?: string[];
+  /** Path routing precedes a coalesced committed callback. Undefined means
+   * unknown/recovered coverage and requires conservative discovery. */
+  onInvalidated?: (path: string | undefined) => void;
   watch?: (path: string, listener: (event: string, filename: string | null) => void) => Pick<FSWatcher, 'on' | 'close'>;
 }
 // Directory discovery is shared by payload and notification owners. Each owner
@@ -168,6 +171,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
       try { install(); }
       catch { release(); recover(); return; }
       state = { ...state, position: state.position + 1, health: 'healthy' };
+      scope.onInvalidated?.(undefined);
       // Reinstallation precedes one checkpoint recovery pass; later work is
       // event driven again. Degraded retries inspect directory metadata only.
       onCommitted({ ...state });
@@ -176,6 +180,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
   };
   const wake = (path?: string) => {
     if (disposed || state.health !== 'healthy') return;
+    scope.onInvalidated?.(path);
     state = { ...state, position: state.position + 1 };
     for (const cursor of cursors) if (path === undefined || cursor.accepts(path)) cursor.position = state.position;
     if (queued) return;
@@ -203,6 +208,7 @@ export function observeFleetResources(scope: FleetResourceScope, onCommitted: (s
     if (deferred) {
       if (!added) return;
       state = { ...state, position: state.position + 1 };
+      scope.onInvalidated?.(undefined);
       for (const cursor of cursors) cursor.position = state.position;
     }
     onCommitted({ ...state });

@@ -2,12 +2,15 @@ import { observeFleetResources } from '../application/resource-observer.js';
 import { roomsDir } from '../rooms-tasks/room-state.js';
 import { cleanupDir, drainNotificationTargetCleanup, notificationAgentId, hasPendingNotificationTargetCleanup } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { NotificationOutbox, type ProducerConfig } from './outbox.js';
 import type { ConversationEventV1 } from '../session/conversation-types.js';
 
 interface Checkpoint { segment: string; offset: number; prompts: string[]; discarding?: boolean; messages?: Record<string, string>; }
+const BATCH_BYTES = 256 * 1024;
+const TURN_ROLES = 4, TURN_MS = 8;
+const RUNTIME_FILES = new Set(['.monitor-status', '.monitor-state.json', '.notify-cursor', '.session-events.jsonl', '.session-events.jsonl.1', '.subscription-usage.json']);
 /** Unlike a UI inventory, unread classification must not treat unreadable records as absence. */
 function taskRoleAssociations():Map<string,string>{
   const dir=roomsDir(),result=new Map<string,string>();let files:string[];
@@ -34,14 +37,30 @@ export class FleetNotificationProducer {
   private readonly queues = new Map<string, NotificationOutbox>();
   private readonly observation = new AbortController();
   private continuation?: ReturnType<typeof setTimeout>;
+  private continuationAt = Infinity;
+  private readonly dirty = new Set<string>();
+  private readonly retryAt = new Map<string, number>();
+  private discoveryNeeded = true;
+  private taskRoles?: Map<string, string>;
   private stopped = false;
   private readonly existing = new Set<string>();
   private cleanup?: Promise<void>;
   constructor(private readonly roots: string[], private readonly stateDir: string,
     private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {}) {
-    observeFleetResources({ retryWatchFailures: true, roots, paths:[...roots,roomsDir(),cleanupDir()] }, state => {
-      if (state.health === 'healthy') this.poll();
-      else this.warn('Notification discovery observation unavailable; checkpoint retained');
+    let healthy = true;
+    observeFleetResources({ retryWatchFailures: true, roots, paths:[...roots,roomsDir(),cleanupDir()],
+      onInvalidated:path=>this.accept(path) }, state => {
+      if (state.health !== 'healthy') {
+        healthy = false;
+        this.warn('Notification discovery observation unavailable; checkpoint retained');
+        return;
+      }
+      if (!healthy || this.dirty.size || this.discoveryNeeded) {
+        // Unknown wakes and watch reinstallation advance coverage without a
+        // pathname. Keep one conservative discovery pass for those barriers.
+        if (!healthy) this.discoveryNeeded = true;
+        healthy = true; this.resume();
+      }
     }, this.observation.signal);
     for (const root of roots) for (const name of this.names(root)) this.existing.add(join(root, name));
     this.poll();
@@ -51,6 +70,26 @@ export class FleetNotificationProducer {
     catch { return []; }
   }
   poll(): void {
+    if (this.stopped) return;
+    this.discoveryNeeded = true;
+    this.flush();
+  }
+  private accept(path?: string): boolean {
+    if (path === undefined) { this.discoveryNeeded = true; return true; }
+    for (const root of this.roots) {
+      const local = relative(resolve(root), path), parts = local.split(sep);
+      if (local === '..' || local.startsWith('..' + sep)) continue;
+      if (parts.length === 2 && RUNTIME_FILES.has(parts[1])) return false;
+      if (parts.length >= 2 && parts[1] === '.conversation') {
+        if (parts.length <= 3) { this.dirty.add(join(root, parts[0])); return true; }
+      }
+      // Role replacement, unknown paths and metadata retain discovery. Room
+      // association and target-cleanup paths take the same conservative route.
+      this.discoveryNeeded = true; return true;
+    }
+    this.discoveryNeeded = true; return true;
+  }
+  private flush(): void {
     if (this.stopped) return;
     this.cleanup ??= drainNotificationTargetCleanup(this.config,undefined,undefined,{beforeDelete:async(target)=>{
       const name=notificationAgentId(target);
@@ -72,15 +111,33 @@ export class FleetNotificationProducer {
     }}).catch(()=>{}).finally(()=>{this.cleanup=undefined;
       try{if(hasPendingNotificationTargetCleanup())this.resume(3000);}catch{}
     });
-    let taskRoles:Map<string,string>|undefined;
-    try{taskRoles=taskRoleAssociations();}
-    catch{this.warn('Notification task association unavailable; delivering unclassified events');}
-    for (const root of this.roots) for (const roleId of this.names(root)) {
-      const roleDir = join(root, roleId), dir = join(roleDir, '.conversation');
+    if (this.discoveryNeeded) {
+      this.discoveryNeeded = false;
+      try { this.taskRoles = taskRoleAssociations(); }
+      catch { this.taskRoles = undefined; this.warn('Notification task association unavailable; delivering unclassified events'); }
+      for (const root of this.roots) for (const name of this.names(root)) this.dirty.add(join(root, name));
+    }
+    // A turn reads at most four 256KiB batches (1MiB). The time bound is checked
+    // between roles; a synchronous filesystem operation cannot be preempted.
+    const started = performance.now(); let roles = 0;
+    for (const roleDir of this.dirty) {
+      if (roles >= TURN_ROLES || (roles && performance.now() - started >= TURN_MS)) break;
+      if ((this.retryAt.get(roleDir) ?? 0) > Date.now()) continue;
+      this.dirty.delete(roleDir); this.retryAt.delete(roleDir); roles++;
+      this.scanRole(roleDir, started + TURN_MS);
+    }
+    if (this.dirty.size) {
+      let next = Infinity;
+      for (const roleDir of this.dirty) next = Math.min(next, this.retryAt.get(roleDir) ?? Date.now());
+      this.resume(Math.max(0, next - Date.now()));
+    }
+  }
+  private scanRole(roleDir: string, deadline: number): void {
+      const roleId = basename(roleDir), dir = join(roleDir, '.conversation');
       try {
-        if (!existsSync(dir) || lstatSync(dir).isSymbolicLink()) continue;
+        if (!existsSync(dir) || lstatSync(dir).isSymbolicLink()) return;
         const segments = readdirSync(dir).filter(n => /^events-\d{6}\.jsonl$/.test(n) && !lstatSync(join(dir, n)).isSymbolicLink()).sort();
-        if (!segments.length) continue;
+        if (!segments.length) return;
         let outbox = this.queues.get(roleDir);
         if (!outbox) {
           const key = createHash('sha256').update(roleDir).digest('hex');
@@ -96,23 +153,28 @@ export class FleetNotificationProducer {
         const saved = outbox.checkpoint as Checkpoint;
         const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages } };
         let index = segments.indexOf(current.segment);
-        if (index < 0) { this.warn('Notification ledger segment unavailable; checkpoint retained'); continue; }
+        if (index < 0) { this.warn('Notification ledger segment unavailable; checkpoint retained'); return; }
         const file = join(dir, current.segment), size = statSync(file).size;
-        if (size < current.offset) { this.warn('Notification ledger truncated; checkpoint retained'); continue; }
-        if (size === current.offset && index < segments.length - 1) {
+        if (size < current.offset) { this.warn('Notification ledger truncated; checkpoint retained'); return; }
+        let remaining = size - current.offset;
+        while (remaining === 0 && index < segments.length - 1) {
           current.segment = segments[++index]; current.offset = 0;
+          remaining = statSync(join(dir, current.segment)).size;
         }
-        const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(256 * 1024);
+        if (remaining === 0) {
+          if (current.segment !== saved.segment) outbox.saveCheckpoint(current);
+          return; // Latest EOF: no ledger open, allocation or read.
+        }
+        const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(Math.min(BATCH_BYTES, remaining));
         let count: number;
         try { count = readSync(fd, buffer, 0, buffer.length, current.offset); } finally { closeSync(fd); }
-        if (current.offset + count < statSync(join(dir, current.segment)).size || index < segments.length - 1) this.resume();
-        let position = 0;
+        let position = 0, blocked = false;
         while (position < count) {
           const end = buffer.indexOf(10, position);
           if (end < 0 || end >= count) {
             // Oversized model/media events are irrelevant to prompt/completion
             // correlation. Skip in bounded chunks; retain partial small lines.
-            if (current.discarding || (position === 0 && count === buffer.length)) {
+            if (current.discarding || (position === 0 && count === BATCH_BYTES)) {
               current.offset += count - position; current.discarding = true;
               this.warn('Notification observer skipping oversized ledger record');
             }
@@ -129,23 +191,30 @@ export class FleetNotificationProducer {
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(taskRoles?{taskId:taskRoles.get(roleId)??null}:{}), anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {this.resume(1000);break;}
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(this.taskRoles?{taskId:this.taskRoles.get(roleId)??null}:{}), anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {blocked=true;break;}
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
+          if (performance.now() >= deadline) break;
         }
         if (current.segment !== saved.segment || current.offset !== saved.offset) outbox.saveCheckpoint(current);
+        if (blocked) {
+          this.retryAt.set(roleDir, Date.now() + 1000); this.dirty.add(roleDir);
+        } else if ((current.segment !== saved.segment || current.offset !== saved.offset)
+          && (current.offset < statSync(join(dir, current.segment)).size || index < segments.length - 1)) this.dirty.add(roleDir);
       } catch {
         this.warn('Notification ledger admission pending; checkpoint will replay');
         // Retained, not-yet-admitted ledger work needs its own next-due wake;
         // the outbox sender can retry only events that were already admitted.
-        this.resume(1000);
+        this.retryAt.set(roleDir, Date.now() + 1000); this.dirty.add(roleDir);
       }
-    }
   }
   private resume(delay = 0) {
-    if (this.continuation || this.stopped) return;
-    this.continuation = setTimeout(() => { this.continuation = undefined; this.poll(); }, delay);
+    if (this.stopped) return;
+    const at = Date.now() + delay;
+    if (this.continuation && this.continuationAt <= at) return;
+    clearTimeout(this.continuation); this.continuationAt = at;
+    this.continuation = setTimeout(() => { this.continuation = undefined; this.continuationAt = Infinity; this.flush(); }, delay);
     this.continuation.unref();
   }
   async drain(): Promise<void> { await Promise.all([...this.queues.values()].map(q => q.drain())); }

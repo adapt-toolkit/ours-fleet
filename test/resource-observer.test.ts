@@ -13,6 +13,19 @@ function fixture() {
   const controller = new AbortController(); clean.push(() => controller.abort());
   return { root, roles, controller };
 }
+it('routes every known or unknown wake before batching and fences retired callbacks',async()=>{
+  const f=fixture(),routes:Array<string|undefined>=[],handles=new Map<string,any>(),committed=vi.fn();
+  observeFleetResources({roots:[f.roles],onInvalidated:path=>routes.push(path),watch:(path,listener)=>{
+    const handle=Object.assign(new EventEmitter(),{close(){}});handles.set(path,{handle,listener});return handle;
+  }},committed,f.controller.signal);
+  const known=join(f.roles,'A','.conversation','events-000001.jsonl');
+  publishFleetResourceCommit(known);handles.get(f.roles).listener('change',null);
+  expect(routes).toEqual([known,undefined]);expect(committed).not.toHaveBeenCalled();
+  await Promise.resolve();expect(committed).toHaveBeenCalled();
+  f.controller.abort();const count=routes.length;
+  publishFleetResourceCommit(known);handles.get(f.roles).listener('change',null);
+  await Promise.resolve();expect(routes).toHaveLength(count);
+});
 it('installs before startup read and observes atomic root recreation and detached ledger writers', async () => {
   const f = fixture(), events: any[] = [];
   const observer = observeFleetResources({ roots: [f.roles] }, e => events.push(e), f.controller.signal);
