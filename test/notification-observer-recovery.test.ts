@@ -2,12 +2,12 @@ import { afterEach, expect, it, vi } from 'vitest';
 const watches=vi.hoisted(()=>[]as Array<{path:string;handle:any;listener:Function}>);
 vi.mock('node:fs',async original=>{
  const fs=await original<typeof import('node:fs')>(),{EventEmitter}=await import('node:events');
- return {...fs,watch(path:string,_options:unknown,listener:Function){
+ return {...fs,openSync:vi.fn(fs.openSync),readSync:vi.fn(fs.readSync),readdirSync:vi.fn(fs.readdirSync),statSync:vi.fn(fs.statSync),lstatSync:vi.fn(fs.lstatSync),readFileSync:vi.fn(fs.readFileSync),watch(path:string,_options:unknown,listener:Function){
   const handle=new EventEmitter()as any;handle.close=vi.fn(()=>handle.emit('close'));
   watches.push({path,handle,listener});return handle;
  }};
 });
-import { mkdtempSync,mkdirSync,rmSync,readFileSync,readdirSync } from 'node:fs';
+import { mkdtempSync,mkdirSync,rmSync,readFileSync,readdirSync,openSync,readSync,statSync,lstatSync,existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { FleetNotificationProducer } from '../src/notifications/fleet-producer.js';
@@ -29,16 +29,34 @@ for(const code of ['EIO','ENOSYS'])for(const timing of ['during','after'])it(`Fl
  const producer=new FleetNotificationProducer([root],outboxes,config);clean.push(()=>producer.close());
  const store=new ConversationEventStore(join(root,'agent','.conversation'),{roleId:'agent'});clean.push(()=>store.close());
  const append=(p:string)=>{store.append({kind:'prompt.admitted',promptId:p,source:'browser',sessionGeneration:'g',payload:{}});const done=store.append({kind:'turn.completed',promptId:p,sessionGeneration:'g',payload:{outcome:'completed'}});watches.filter(row=>row.path===resolve(root)).at(-1)!.listener('change','agent');return done;};
- append('first');await flush();await producer.drain();expect(accepted).toHaveLength(1);
+ const admitted=async(seq:number)=>{
+  const id=`agent:g:${seq}`;await flush();
+  // Admission now yields to a timer turn. Advance a bounded number of phases
+  // until the actual durable event is queued (or its send already completed).
+  for(let turn=0;turn<10;turn++){
+   await vi.advanceTimersByTimeAsync(1);await flush();
+   const files=existsSync(outboxes)?readdirSync(outboxes):[];
+   if(accepted.some(row=>row.eventId===id)||files.some(file=>JSON.parse(readFileSync(join(outboxes,file),'utf8')).entries.some((entry:any)=>entry.id===id)))return;
+  }
+  throw Error(`Notification admission did not complete within ten timer turns: ${id}`);
+ };
+ const first=append('first');await admitted(first.seq);await producer.drain();expect(accepted).toHaveLength(1);
  const observed=watches.find(row=>row.path===resolve(root))!;observed.handle.emit('error',Object.assign(Error('watch unavailable'),{code}));
  // No mutation after restoration is needed to discover a commit made while degraded.
  const during=timing==='during'?append('during-degradation'):undefined;await flush();
  await vi.advanceTimersByTimeAsync(3000);await flush();
- const last=during??append('after-recovery');await flush();
+ const last=during??append('after-recovery');await admitted(last.seq);
  const file=join(outboxes,readdirSync(outboxes)[0]);
  expect(JSON.parse(readFileSync(file,'utf8')).checkpoint.prompts).toEqual([]);
  await producer.drain();expect(accepted.some(row=>row.eventId===`agent:g:${last.seq}`)).toBe(true);
- const polls=vi.spyOn(producer,'poll');await vi.advanceTimersByTimeAsync(15000);expect(polls).not.toHaveBeenCalled();polls.mockRestore();
+ // Settle the outstanding one-shot directory discovery before measuring idle.
+ await vi.advanceTimersByTimeAsync(100);await flush();
+ const polls=vi.spyOn(producer,'poll'),reads=[openSync,readSync,readdirSync,statSync,lstatSync,readFileSync];
+ for(const read of reads)vi.mocked(read).mockClear();
+ await vi.advanceTimersByTimeAsync(15000);expect(polls).not.toHaveBeenCalled();
+ for(const read of reads)expect(read).not.toHaveBeenCalled();
+ expect(accepted.map(row=>row.eventId)).toEqual([`agent:g:${first.seq}`,`agent:g:${last.seq}`]);
+ polls.mockRestore();
 });
 it('task notifications recover observation, discover a later commit and cancel degraded recovery on close',async()=>{
  const home=fixture(),sent:any[]=[];const first=createTask({title:'first',origin:{type:'cli'},start:false});
