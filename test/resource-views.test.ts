@@ -9,11 +9,11 @@ import { conversationPreview } from '../src/application/conversation-history.js'
 import { stateRoot } from '../src/paths.js';
 const clean:Array<()=>void>=[];
 afterEach(()=>{for(const fn of clean.splice(0).reverse())fn();});
-function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true){
+function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true,configPath?:string){
   const root=mkdtempSync(join(tmpdir(),'resource-views-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));
   const response=new EventEmitter() as any;response.write=vi.fn(()=>true);response.end=vi.fn();
   const handles:any[]=[];
-  const resources=new FleetResourceViews({paths:[root],roots:[root],watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
+  const resources=new FleetResourceViews({paths:[root],roots:[root],...(configPath?{configPath}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
   const connection=resources.open(response,'owner',authorized);clean.push(()=>resources.close());
   const frames=()=>response.write.mock.calls.map(([s]:[string])=>String(s)).filter((s:string)=>s.startsWith('event: resource\n')).map((s:string)=>JSON.parse(s.split('data: ')[1]));
   const register=(epoch=1,resource='directory',extra={})=>resources.register('owner',connection.connectionId,'view',epoch,{viewId:'view',resource,...extra});
@@ -280,6 +280,23 @@ for (const [resource, filename] of [['directory', 'task-observed.op.json'], ['pr
     expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
   });
 }
+
+it('fences a selected preview capture when its explicit config path resembles a task receipt', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'resource-custom-config-'));
+  clean.push(() => rmSync(home, {recursive:true,force:true}));
+  vi.stubEnv('OURS_FLEET_HOME', home); clean.push(() => vi.unstubAllEnvs());
+  const configPath = join(stateRoot(), 'layouts', 'task-config.json');
+  let reads = 0;
+  const f = fixture(async () => {
+    reads++;
+    publishFleetResourceCommit(configPath);
+    return {value:'unstable config'};
+  }, () => true, configPath);
+  const binding = f.register(1, 'previews', {ids:['selected']});
+  await expect(f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId)).rejects.toThrow('unstable');
+  expect(reads).toBe(3);
+  expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
+});
 
 it('keeps committed previews live through an incomplete append and publishes its completed record', async () => {
   const f = fixture(async (_descriptor, signal) => ({previews:{selected:await conversationPreview(join(f.root, 'selected'), signal)}}));
