@@ -320,6 +320,9 @@ export class FleetResourceViews {
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
   }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
+    // An explicitly selected manifest may use any pathname, including one
+    // otherwise reserved for an independent task receipt.
+    if (this.scope.configPath && resolve(path) === resolve(this.scope.configPath)) return true;
     // Preview selection reads role config/state and conversation ledgers, never
     // task layout run/operation/brief receipts. A worker may commit several of
     // these while that independent canonical preview read is in flight.
