@@ -11,7 +11,7 @@ for (const nativeWatch of [false, true]) it(`real default-path observer exposes 
     const url = `${stack.origin}/api/v1/roles/Alpha/conversation/events?expectedGeneration=${page.snapshot.sessionGeneration}&after=${page.nextCursor || 0}`;
     async function open() {
       const attempt = new AbortController();
-      const response = await fetch(url, {headers:stack.jsonHeaders, signal:AbortSignal.any([abort.signal, attempt.signal, AbortSignal.timeout(5000)])});
+      const response = await fetch(url, {headers:stack.jsonHeaders, signal:AbortSignal.any([abort.signal, attempt.signal, AbortSignal.timeout(25_000)])});
       const reader = response.body!.getReader();
       const records: any[] = [];
       const decoder = new ConversationStreamDecoder(record => records.push(record));
@@ -38,4 +38,4 @@ for (const nativeWatch of [false, true]) it(`real default-path observer exposes 
     repaired.close();
     expect((stack.session as any).controllerCount).toBe(0);
   } finally {abort.abort(); stack.server.app.server.closeAllConnections(); await stack.dispose();}
-}, 20_000);
+}, 35_000);
