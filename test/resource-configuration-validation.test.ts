@@ -62,3 +62,16 @@ for (const kind of ['invite', 'prompt']) it(`invalidates a currently observed ex
     const repaired = register(2); await bound(2, repaired.baselineId);
   } finally { resources.close(); vi.unstubAllEnvs(); rmSync(home, {recursive:true, force:true}); }
 });
+
+for (const malformed of ['API_KEY: [synthetic-canary-value\n', 'API_KEY: synthetic-canary-value\nAPI_KEY: duplicate-canary-value\n'])
+  it('normalizes malformed YAML without including sensitive source excerpts', () => {
+    const home=mkdtempSync(join(tmpdir(),'configuration-parse-error-')), file=join(home,'fleet.yaml');
+    try {
+      writeV2Fixture(file,{roles:{Alpha:{harness:'codex',session:'acp'}}});
+      writeFileSync(file,'api_version: ours.network/fleet/v2\nenv:\n  '+malformed.replaceAll('\n','\n  '));
+      let failure:any;try{new FleetConfigService({configPath:file}).read();}catch(error){failure=error;}
+      expect(failure).toMatchObject({code:'invalid_request'});
+      expect(failure.message).not.toContain('synthetic-canary-value');
+      expect(failure.message).not.toContain('duplicate-canary-value');
+    }finally{rmSync(home,{recursive:true,force:true});}
+  });
