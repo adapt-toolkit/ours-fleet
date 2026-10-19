@@ -43,7 +43,7 @@ export class FleetNotificationProducer {
   private discoveryNeeded = true;
   private taskRoles?: Map<string, string>;
   private stopped = false;
-  private readonly existing = new Set<string>();
+  private readonly existing = new Map<string, Checkpoint | null>();
   private cleanup?: Promise<void>;
   constructor(private readonly roots: string[], private readonly stateDir: string,
     private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {}) {
@@ -62,12 +62,25 @@ export class FleetNotificationProducer {
         healthy = true; this.resume();
       }
     }, this.observation.signal);
-    for (const root of roots) for (const name of this.names(root)) this.existing.add(join(root, name));
+    // Freeze startup history boundaries before deferring any role's content
+    // work. Later appends/segments must not become part of the ignored history.
+    // This pass reads directory/file metadata only, never ledger contents.
+    for (const root of roots) for (const name of this.names(root)) {
+      const roleDir = join(root, name), dir = join(roleDir, '.conversation');
+      try {
+        if (!existsSync(dir) || lstatSync(dir).isSymbolicLink()) continue;
+        const segment = this.segments(dir).at(-1);
+        if (segment) this.existing.set(roleDir, {segment, offset:statSync(join(dir, segment)).size, prompts:[]});
+      } catch { this.existing.set(roleDir, null); }
+    }
     this.poll();
   }
   private names(root: string): string[] {
     try { return readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory() && /^[a-zA-Z0-9_-]+$/.test(d.name)).map(d => d.name); }
     catch { return []; }
+  }
+  private segments(dir: string): string[] {
+    return readdirSync(dir).filter(n => /^events-\d{6}\.jsonl$/.test(n) && !lstatSync(join(dir, n)).isSymbolicLink()).sort();
   }
   poll(): void {
     if (this.stopped) return;
@@ -136,7 +149,7 @@ export class FleetNotificationProducer {
       const roleId = basename(roleDir), dir = join(roleDir, '.conversation');
       try {
         if (!existsSync(dir) || lstatSync(dir).isSymbolicLink()) return;
-        const segments = readdirSync(dir).filter(n => /^events-\d{6}\.jsonl$/.test(n) && !lstatSync(join(dir, n)).isSymbolicLink()).sort();
+        const segments = this.segments(dir);
         if (!segments.length) return;
         let outbox = this.queues.get(roleDir);
         if (!outbox) {
@@ -144,11 +157,12 @@ export class FleetNotificationProducer {
           outbox = new NotificationOutbox(join(this.stateDir, key + '.json'), this.config,
             async (value, eventId) => ({ eventId, title: `${roleId}: agent completed`, body: 'Your agent finished responding. Open the chat to view the result.',
               ...(value as object), target: { kind: 'agent', agentId: roleId } }), this.warn);
-          if (!outbox.checkpoint) {
-            const segment = this.existing.has(roleDir) ? segments.at(-1)! : segments[0];
-            outbox.saveCheckpoint({ segment, offset: this.existing.has(roleDir) ? statSync(join(dir, segment)).size : 0, prompts: [] });
-          }
           this.queues.set(roleDir, outbox);
+        }
+        if (!outbox.checkpoint) {
+          const initial = this.existing.get(roleDir);
+          if (initial === null) throw Error('Notification startup ledger boundary unavailable');
+          outbox.saveCheckpoint(initial ?? {segment:segments[0], offset:0, prompts:[]});
         }
         const saved = outbox.checkpoint as Checkpoint;
         const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages } };

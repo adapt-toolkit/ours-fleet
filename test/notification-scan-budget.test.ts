@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, lstatSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { FleetNotificationProducer } from '../src/notifications/fleet-producer.js';
@@ -13,7 +13,7 @@ vi.mock('../src/application/resource-observer.js', () => ({observeFleetResources
   }};
 }}));
 vi.mock('node:fs', async original => {
-  const fs=await original<typeof import('node:fs')>(); return {...fs,openSync:vi.fn(fs.openSync)};
+  const fs=await original<typeof import('node:fs')>(); return {...fs,openSync:vi.fn(fs.openSync),readdirSync:vi.fn(fs.readdirSync),statSync:vi.fn(fs.statSync),lstatSync:vi.fn(fs.lstatSync),readFileSync:vi.fn(fs.readFileSync)};
 });
 const close:Array<()=>Promise<void>|void>=[];
 beforeEach(() => {
@@ -27,13 +27,13 @@ function wake(path?:string, health='healthy') {
   if(path===undefined || observation.accepts?.(path))observation.selected=observation.position;
   observation.callback({position:observation.position,health});
 }
-function fixture(count=0) {
+function fixture(count=0, historicalCompletion=false) {
   const home=mkdtempSync(join(tmpdir(),'notification-scan-'));close.push(()=>rmSync(home,{recursive:true,force:true}));
   vi.stubEnv('OURS_FLEET_HOME',home);const root=join(home,'agents');mkdirSync(root);
   const event=(role:string,seq:number,kind='message.chunk')=>JSON.stringify({schemaVersion:1,roleId:role,sessionGeneration:'g',promptId:'p',source:'browser',kind,seq})+'\n';
   const ledger=(role:string,segment=1)=>join(root,role,'.conversation',`events-${String(segment).padStart(6,'0')}.jsonl`);
   const write=(role:string,text:string,segment=1)=>{const file=ledger(role,segment);mkdirSync(join(root,role,'.conversation'),{recursive:true});writeFileSync(file,text);return file;};
-  for(let n=0;n<count;n++)write('Role'+n,event('Role'+n,1));
+  for(let n=0;n<count;n++)write('Role'+n,historicalCompletion?event('Role'+n,1,'prompt.admitted')+event('Role'+n,2,'turn.completed'):event('Role'+n,1));
   const producer=new FleetNotificationProducer([root],join(home,'outboxes'),{origin:'http://127.0.0.1:1',token:'x'.repeat(40)});close.push(()=>producer.close());
   const queues=()=>(producer as any).queues as Map<string,any>;
   const opens=()=>vi.mocked(openSync).mock.calls.map(args=>String(args[0])).filter(path=>path.includes('/.conversation/'));
@@ -46,14 +46,23 @@ it('does not open caught-up ledgers or allocate a batch on an explicit discovery
   finally{allocate.mockRestore();}
 });
 it('ignores known unrelated runtime writes and queues only the changed ledger role',async()=>{
-  const f=fixture(3);await vi.advanceTimersByTimeAsync(50);vi.mocked(openSync).mockClear();
+  const f=fixture(3);await vi.advanceTimersByTimeAsync(50);
+  mkdirSync(roomsDir(),{recursive:true});const room=join(roomsDir(),'routing.json');
+  writeFileSync(room,JSON.stringify({room_id:'room',task_id:'task',member_seats:[{role_name:'Role0'}]}));
+  wake(room);await vi.advanceTimersByTimeAsync(20);
+  expect(vi.mocked(readFileSync).mock.calls.some(([path])=>String(path)===room)).toBe(true);
+  vi.mocked(openSync).mockClear();
+  const metadata=()=>[...vi.mocked(readdirSync).mock.calls,...vi.mocked(statSync).mock.calls,...vi.mocked(lstatSync).mock.calls,...vi.mocked(readFileSync).mock.calls].map(args=>String(args[0])).filter(path=>path===f.root||path.startsWith(f.root+'/')||path===roomsDir()||path.startsWith(roomsDir()+'/'));
+  for(const method of [readdirSync,statSync,lstatSync,readFileSync])vi.mocked(method).mockClear();
   for(let n=0;n<40;n++)wake(join(f.root,'Role0','.monitor-status'));
-  await vi.advanceTimersByTimeAsync(20);expect(f.opens()).toEqual([]);
+  await vi.advanceTimersByTimeAsync(20);expect(f.opens()).toEqual([]);expect(metadata()).toEqual([]);
   appendFileSync(f.ledger('Role0'),f.event('Role0',2));
   for(let n=0;n<40;n++)wake(f.ledger('Role0'));
   expect(f.opens()).toEqual([]); // Observer callbacks never synchronously scan content.
   await vi.advanceTimersByTimeAsync(20);
   expect(f.opens()).toEqual([f.ledger('Role0')]);
+  expect(metadata().length).toBeGreaterThan(0);
+  expect(metadata().every(path=>path.startsWith(join(f.root,'Role0')+'/'))).toBe(true);
 });
 it('bounds a discovery turn to four role batches and resumes remaining roles',async()=>{
   const f=fixture();
@@ -128,4 +137,17 @@ it('refreshes room association metadata on a room wake and freezes each admitted
   appendFileSync(f.ledger('Role0'),f.event('Role0',4,'prompt.admitted')+f.event('Role0',5,'turn.completed'));wake(f.ledger('Role0'));
   await vi.advanceTimersByTimeAsync(20);
   expect(queue.entries.map((entry:any)=>entry.value.taskId)).toEqual(['task-one','task-two']);
+});
+for(const rotate of [false,true])it(`retains the startup EOF boundary for a deferred existing role, rotation=${rotate}`,async()=>{
+  const f=fixture(8,true);
+  const role=Array.from({length:8},(_,n)=>'Role'+n).find(name=>!f.queues().has(join(f.root,name)))!;
+  expect(role,'the completion must arrive before this existing role is initialized').toBeDefined();
+  const later=f.event(role,3,'prompt.admitted')+f.event(role,4,'turn.completed');
+  const file=rotate?f.write(role,later,2):f.ledger(role);
+  if(!rotate)appendFileSync(file,later);
+  wake(file);await vi.advanceTimersByTimeAsync(50);
+  const queue=f.queues().get(join(f.root,role));
+  expect(queue.entries.map((entry:any)=>entry.id)).toEqual([`${role}:g:4`]);
+  f.producer.poll();await vi.advanceTimersByTimeAsync(20);
+  expect(queue.entries.map((entry:any)=>entry.id)).toEqual([`${role}:g:4`]);
 });
