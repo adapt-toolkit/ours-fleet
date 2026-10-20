@@ -1,9 +1,10 @@
 import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import type { ArchivedMemberAbsence } from './types.js';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
+import { incarnationEnded, processIncarnation, type ProcessIncarnation } from '../process-incarnation.js';
 import { stateRoot } from '../paths.js';
 import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
@@ -21,8 +22,8 @@ function taskLockPath(id: string): string { return join(tasksDir(), '.locks', id
 const localTaskLocks = new Set<string>();
 
 /**
- * Remove a lock directory atomically: rename it to a unique name first, so no
- * other process ever observes a half-removed lock (a lock without its owner file).
+ * Remove a lock atomically: rename it to a unique name first, so no other
+ * process ever observes a half-removed lock.
  */
 function retireLock(path: string): void {
   const retired = `${path}.retired.${process.pid}.${randomUUID()}`;
@@ -33,58 +34,74 @@ function retireLock(path: string): void {
   rmSync(retired, { recursive: true, force: true });
 }
 
-/** An ownerless lock younger than this may still be receiving its owner file. */
-const OWNERLESS_LOCK_GRACE_MS = 5_000;
+/** A legacy lock directory without an owner file younger than this may still be releasing. */
+const LEGACY_OWNERLESS_LOCK_GRACE_MS = 5_000;
 
+/**
+ * Hold a task's cross-process lock while `fn` runs.
+ *
+ * The lock is a file holding its owner record, published complete by hard-linking
+ * a written temporary file: link never replaces an existing lock, and there is no
+ * moment at which a live claimer has an ownerless lock that could look abandoned.
+ * A lock is reclaimed only when its owner process has provably ended; reclaimers
+ * take turns and remove only the lock they observed. Directory locks are left by
+ * earlier versions; they are honored, and an ownerless one is reclaimed once it is
+ * old enough, since this version never creates one.
+ */
 function withTaskLock<T>(id: string, fn: () => T): T {
   if (localTaskLocks.has(id)) return fn();
   const path = taskLockPath(id);
   const token = randomUUID(); mkdirSync(join(tasksDir(), '.locks'), { recursive: true });
-  const readOwner = () => {
-    try { return JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8')) as { token?: string; pid?: number }; }
-    catch { return undefined; }
-  };
-  /** Who holds the lock now: its owner token, or the age of an ownerless lock. */
-  const holder = () => {
-    const owner = readOwner();
-    if (owner) {
-      let alive = false;
-      if (typeof owner.pid === 'number') {
-        try { process.kill(owner.pid, 0); alive = true; } catch { /* dead */ }
-      }
-      return { token: owner.token, stale: !alive };
-    }
-    try { return { token: undefined, stale: Date.now() - lstatSync(path).mtimeMs > OWNERLESS_LOCK_GRACE_MS }; }
-    catch { return undefined; }
-  };
-  for (;;) {
-    // mkdir is the claim: unlike renaming a prepared directory, it never replaces an
-    // existing (even empty) lock directory. The owner file appears complete or not at all.
-    try { mkdirSync(path); }
+  type Owner = { token?: string; pid?: number } & ProcessIncarnation;
+  const readOwner = (): Owner | undefined => {
+    try { return JSON.parse(readFileSync(path, 'utf8')) as Owner; }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'EISDIR') return undefined;
+      try { return JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8')) as Owner; }
+      catch { return undefined; }
+    }
+  };
+  /** Who holds the lock now, and whether it can be proved abandoned. */
+  const holder = () => {
+    let stat;
+    try { stat = lstatSync(path); } catch { return undefined; }
+    const owner = readOwner();
+    if (owner && typeof owner.pid === 'number') {
+      let alive = false;
+      try { process.kill(owner.pid, 0); alive = true; }
+      catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      return { token: owner.token, stale: !alive || incarnationEnded(owner.pid, owner) };
+    }
+    return {
+      token: undefined,
+      stale: stat.isDirectory() && Date.now() - stat.mtimeMs > LEGACY_OWNERLESS_LOCK_GRACE_MS,
+    };
+  };
+  const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
+  writeFileSync(claimPath, JSON.stringify({ token, pid: process.pid, ...processIncarnation(process.pid) }));
+  try {
+    for (;;) {
+      try { linkSync(claimPath, path); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
       const observed = holder();
       if (observed?.stale) {
-        // Reclaimers of one lock take turns and remove it only if it is still the
-        // stale lock they observed, never a successor's.
-        withSynchronousFileLock(`${path}.reclaim`, () => {
-          const current = holder();
-          if (current?.stale && current.token === observed.token) retireLock(path);
-        });
+        try {
+          withSynchronousFileLock(`${path}.reclaim`, () => {
+            const current = holder();
+            if (current?.stale && current.token === observed.token) retireLock(path);
+          });
+        } catch (error) {
+          // A contender stalled inside the reclaim section: keep waiting like any other poll.
+          if (!(error instanceof Error) || !/^Timed out acquiring synchronous/.test(error.message)) throw error;
+        }
         continue;
       }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      continue;
     }
-    const ownerPath = join(path, `.owner.${randomUUID()}`);
-    try {
-      writeFileSync(ownerPath, JSON.stringify({ token, pid: process.pid }));
-      renameSync(ownerPath, join(path, 'owner.json'));
-    } catch (error) {
-      retireLock(path);
-      throw error;
-    }
-    break;
+  } finally {
+    rmSync(claimPath, { force: true });
   }
   localTaskLocks.add(id);
   try { return fn(); }
