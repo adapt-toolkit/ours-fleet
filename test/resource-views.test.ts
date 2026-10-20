@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FleetResourceViews, canonicalResourceDescriptor, resourceFrames } from '../src/web/resource-views.js';
@@ -239,7 +239,7 @@ it('readies committed selected previews during sustained appends and drains thei
     const preview = await conversationPreview(join(f.root, 'selected'), signal);
     if (commits < 8) {
       commits++;
-      writeFileSync(file, event(commits));
+      appendFileSync(file, event(commits));
       publishFleetResourceCommit(file);
       publishFleetResourceCommit(join(dir, 'manifest.json'));
     }
