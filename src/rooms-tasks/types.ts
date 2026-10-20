@@ -164,6 +164,8 @@ export interface TaskReviewArtifact {
 
 /** Self-contained material the Owner reviews: Markdown plus retained files. */
 export interface TaskReview {
+  /** Increases with every change to the Markdown or the files; absent on packages written before it. */
+  revision?: number;
   markdown: string;
   updated_at: string;
   updated_by: TaskContributionAuthor;

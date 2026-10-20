@@ -146,5 +146,5 @@ export function registerTaskTools(
   server.registerTool('fleet_task_review_detach', {
     description: 'Remove one file from your task\'s To review package by artifact_id (from fleet_task_review_show).',
     inputSchema: { artifact_id: z.string() },
-  }, async args => run(bound => ({ task_id: bound.taskId, detached: detachTaskReviewArtifact(bound.taskId, args.artifact_id) })));
+  }, async args => run((bound, author) => ({ task_id: bound.taskId, detached: detachTaskReviewArtifact(bound.taskId, args.artifact_id, { author }) })));
 }

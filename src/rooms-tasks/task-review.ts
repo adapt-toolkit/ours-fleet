@@ -121,6 +121,11 @@ export function appendTaskProgress(taskId: string, input: {
 
 // ── Review Markdown ────────────────────────────────────────────────────
 
+/** Every change to the package gets the next revision, so readers can tell any two states apart. */
+function nextRevision(review: TaskReview | undefined): number {
+  return (review?.revision ?? 0) + 1;
+}
+
 export function getTaskReview(taskId: string): TaskReview | undefined {
   assertTaskId(taskId);
   return getTask(taskId).review;
@@ -145,8 +150,8 @@ export function setTaskReviewMarkdown(taskId: string, input: {
     if (current !== input.expectedMarkdown)
       throw new TaskReviewError('conflict', 'The review package changed elsewhere. Read it again before replacing it.');
     task.review = {
-      markdown: input.markdown, updated_at: new Date().toISOString(), updated_by: input.author,
-      artifacts: task.review?.artifacts ?? [],
+      revision: nextRevision(task.review), markdown: input.markdown, updated_at: new Date().toISOString(),
+      updated_by: input.author, artifacts: task.review?.artifacts ?? [],
     };
     return { value: task.review, changed: true };
   });
@@ -345,7 +350,8 @@ export async function attachTaskReviewArtifact(taskId: string, input: {
         added_at: new Date().toISOString(), added_by: input.author,
         ...(input.requestKey ? { request_key: input.requestKey } : {}),
       };
-      task.review = { ...review, artifacts: [...review.artifacts, artifact] };
+      task.review = { ...review, revision: nextRevision(task.review), updated_at: artifact.added_at,
+        updated_by: input.author, artifacts: [...review.artifacts, artifact] };
       return { value: { artifact, replayed: false }, changed: true };
     });
     if (result.replayed) removeStoredFile(dir, stored.id);
@@ -357,12 +363,13 @@ export async function attachTaskReviewArtifact(taskId: string, input: {
 }
 
 /** Remove a file from the package; repeating it after success reports not found. */
-export function detachTaskReviewArtifact(taskId: string, artifactId: string): TaskReviewArtifact {
+export function detachTaskReviewArtifact(taskId: string, artifactId: string, input: { author: TaskContributionAuthor }): TaskReviewArtifact {
   const dir = reviewStoreDirectory(taskId);
   const removed = updateTaskContribution(taskId, task => {
     const artifact = task.review?.artifacts.find(item => item.id === artifactId);
     if (!artifact || !task.review) throw new TaskReviewError('not_found', 'review file not found');
-    task.review = { ...task.review, artifacts: task.review.artifacts.filter(item => item.id !== artifactId) };
+    task.review = { ...task.review, revision: nextRevision(task.review), updated_at: new Date().toISOString(),
+      updated_by: input.author, artifacts: task.review.artifacts.filter(item => item.id !== artifactId) };
     return { value: artifact, changed: true };
   });
   try { removeStoredFile(dir, removed.id); } catch { /* an unreferenced copy is swept later */ }
@@ -494,18 +501,20 @@ export function publicProgressEntry(entry: TaskProgressEntry): Omit<TaskProgress
   return rest;
 }
 export function publicReview(review: TaskReview): TaskReview {
-  return { ...review, artifacts: review.artifacts.map(({ request_key: _key, ...rest }) => rest) };
+  return { ...review, revision: review.revision ?? 1, artifacts: review.artifacts.map(({ request_key: _key, ...rest }) => rest) };
 }
 
 /** Compact summary for list and detail payloads; bodies are fetched separately. */
 export function taskContributionSummary(task: TaskRecord): {
-  progress_count: number; review: { has_markdown: boolean; artifact_count: number; updated_at?: string };
+  progress_count: number; review: { has_markdown: boolean; artifact_count: number; revision: number; updated_at?: string };
 } {
   return {
     progress_count: task.progress?.length ?? 0,
     review: {
       has_markdown: !!task.review?.markdown.trim(),
       artifact_count: task.review?.artifacts.length ?? 0,
+      // Packages written before revisions existed count as revision 1 until their next change.
+      revision: task.review ? task.review.revision ?? 1 : 0,
       ...(task.review ? { updated_at: task.review.updated_at } : {}),
     },
   };

@@ -3,7 +3,7 @@ import type { ArchivedMemberAbsence } from './types.js';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { replaceFileAtomically } from '../atomic-file.js';
+import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
@@ -20,38 +20,78 @@ function taskPath(id: string): string { return join(tasksDir(), `${id}.json`); }
 function taskLockPath(id: string): string { return join(tasksDir(), '.locks', id); }
 const localTaskLocks = new Set<string>();
 
+/**
+ * Remove a lock directory atomically: rename it to a unique name first, so no
+ * other process ever observes a half-removed lock (a lock without its owner file).
+ */
+function retireLock(path: string): void {
+  const retired = `${path}.retired.${process.pid}.${randomUUID()}`;
+  try { renameSync(path, retired); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  rmSync(retired, { recursive: true, force: true });
+}
+
+/** An ownerless lock younger than this may still be receiving its owner file. */
+const OWNERLESS_LOCK_GRACE_MS = 5_000;
+
 function withTaskLock<T>(id: string, fn: () => T): T {
   if (localTaskLocks.has(id)) return fn();
-  const path = taskLockPath(id); const ownerPath = join(path, 'owner.json');
+  const path = taskLockPath(id);
   const token = randomUUID(); mkdirSync(join(tasksDir(), '.locks'), { recursive: true });
-  for (;;) {
-    const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
-    try {
-      mkdirSync(claimPath);
-      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
-      renameSync(claimPath, path); break;
-    } catch (error) {
-      rmSync(claimPath, { recursive: true, force: true });
-      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+  const readOwner = () => {
+    try { return JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8')) as { token?: string; pid?: number }; }
+    catch { return undefined; }
+  };
+  /** Who holds the lock now: its owner token, or the age of an ownerless lock. */
+  const holder = () => {
+    const owner = readOwner();
+    if (owner) {
       let alive = false;
-      try {
-        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
-        if (typeof owner.pid === 'number') {
-          try { process.kill(owner.pid, 0); alive = true; } catch { /* dead */ }
-        }
-      } catch { /* corrupt legacy lock */ }
-      if (!alive) { rmSync(path, { recursive: true, force: true }); continue; }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      if (typeof owner.pid === 'number') {
+        try { process.kill(owner.pid, 0); alive = true; } catch { /* dead */ }
+      }
+      return { token: owner.token, stale: !alive };
     }
+    try { return { token: undefined, stale: Date.now() - lstatSync(path).mtimeMs > OWNERLESS_LOCK_GRACE_MS }; }
+    catch { return undefined; }
+  };
+  for (;;) {
+    // mkdir is the claim: unlike renaming a prepared directory, it never replaces an
+    // existing (even empty) lock directory. The owner file appears complete or not at all.
+    try { mkdirSync(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const observed = holder();
+      if (observed?.stale) {
+        // Reclaimers of one lock take turns and remove it only if it is still the
+        // stale lock they observed, never a successor's.
+        withSynchronousFileLock(`${path}.reclaim`, () => {
+          const current = holder();
+          if (current?.stale && current.token === observed.token) retireLock(path);
+        });
+        continue;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      continue;
+    }
+    const ownerPath = join(path, `.owner.${randomUUID()}`);
+    try {
+      writeFileSync(ownerPath, JSON.stringify({ token, pid: process.pid }));
+      renameSync(ownerPath, join(path, 'owner.json'));
+    } catch (error) {
+      retireLock(path);
+      throw error;
+    }
+    break;
   }
   localTaskLocks.add(id);
   try { return fn(); }
   finally {
     localTaskLocks.delete(id);
-    try {
-      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
-      if (owner.token === token) rmSync(path, { recursive: true, force: true });
-    } catch { /* ownership cannot be proved */ }
+    // Only this live owner removes its lock; reclaimers never take a live owner's lock.
+    if (readOwner()?.token === token) retireLock(path);
   }
 }
 

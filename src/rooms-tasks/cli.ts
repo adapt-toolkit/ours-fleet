@@ -62,7 +62,7 @@ import {
 import { TaskListError } from './task-lists.js';
 import {
   appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress,
-  openTaskWorkspaceFile, publicProgressEntry, publicReview, setTaskReviewMarkdown,
+  openTaskWorkspaceFile, publicProgressEntry, publicReview, setTaskReviewMarkdown, TaskReviewError,
 } from './task-review.js';
 import type { TaskContributionAuthor } from './types.js';
 import { verifiedFleetCaller } from '../fleet-command-audit.js';
@@ -263,6 +263,19 @@ function dieTaskRoom(e: unknown): never {
     const output = renderMarkdownFailure({
       kind: failure.kind, subject: 'ours-fleet task/room', detail: failure.detail,
       action: failure.action,
+    });
+    process.stderr.write(`${output}\n`);
+    recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
+    process.exit(1);
+  }
+  if (e instanceof TaskReviewError) {
+    const output = renderMarkdownFailure({
+      kind: e.code === 'not_found' ? 'not_found' : e.code === 'conflict' || e.code === 'idempotency_conflict' ? 'state' : 'usage',
+      subject: 'ours-fleet task progress/review-package',
+      detail: e.message,
+      action: e.code === 'conflict' ? 'Show the current review package and retry against it.'
+        : e.code === 'idempotency_conflict' ? 'Use a new --request-key for different content.'
+          : 'Correct the request and retry.',
     });
     process.stderr.write(`${output}\n`);
     recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
@@ -1062,7 +1075,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const result = appendTaskProgress(id, { text, requestKey: opts.requestKey, author: cliContributionAuthor(id) });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, entry: publicProgressEntry(result.entry), replayed: result.replayed }, null, 2)); return; }
         console.log(result.replayed ? `Progress entry ${result.entry.id} was already recorded.` : `Progress entry ${result.entry.id} added to task ${id}.`);
-      } catch (e) { die(e); }
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('review-package <id>')
@@ -1082,7 +1095,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const attached = [];
         if (markdown !== undefined)
           setTaskReviewMarkdown(id, { markdown, expectedMarkdown: getTaskReview(id)?.markdown ?? '', author: author! });
-        for (const artifactId of opts.detach) detachTaskReviewArtifact(id, artifactId);
+        for (const artifactId of opts.detach) detachTaskReviewArtifact(id, artifactId, { author: author! });
         for (const path of opts.attach) {
           const source = await openTaskWorkspaceFile(getTask(id), path);
           attached.push(await attachTaskReviewArtifact(id, { name: source.name, source, author: author!, requestKey: opts.requestKey }));
@@ -1093,7 +1106,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const files = review.artifacts.map(artifact => `- \`${artifact.id}\` ${artifact.name} (${artifact.mime}, ${artifact.size} bytes)`).join('\n');
         console.log(`## To review — task ${id}\n\n${review.markdown || '_No review Markdown yet._'}\n\n### Files\n\n${files || '_No files._'}`
           + (attached.some(item => item.replayed) ? '\n\n(The attached file was already recorded.)' : ''));
-      } catch (e) { die(e); }
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('done <id>'))
