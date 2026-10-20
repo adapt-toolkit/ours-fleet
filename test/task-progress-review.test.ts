@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createTask, getTask, tasksDir, activateTask, reviewTask } from '../src/rooms-tasks/task-state.js';
@@ -233,5 +233,91 @@ describe('task review package', () => {
     await settleTaskDeletion({ taskId: t.task_id, cowork: () => ({ closeRoom: async () => {}, deleteRoom: async () => {} }) as any });
     expect(existsSync(reviewStoreDirectory(t.task_id))).toBe(false);
     expect(reviewStoreFiles(keep.task_id)).toHaveLength(1);
+  });
+});
+
+describe('review file copy safety', () => {
+  it('rejects a source changed while it is read and keeps no bytes', async () => {
+    const t = task(), path = join(t.workspace!.path, 'big.bin');
+    writeFileSync(path, Buffer.alloc(3 * 1024 * 1024, 65));
+    const source = await openTaskWorkspaceFile(getTask(t.task_id), path);
+    const reader = source.body.getReader();
+    let chunks = 0;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await reader.read();
+        if (next.done) { controller.close(); return; }
+        // Change the file in place after the first chunk was read.
+        if (++chunks === 1) { const fd = openSync(path, 'r+'); writeSync(fd, Buffer.from('B'), 0, 1, 3 * 1024 * 1024 - 1); closeSync(fd); }
+        controller.enqueue(next.value);
+      },
+    });
+    await expect(attachTaskReviewArtifact(t.task_id, { name: 'big.bin', source: { ...source, body }, author: developer }))
+      .rejects.toThrow(/changed while it was being copied/);
+    expect(getTaskReview(t.task_id)).toBeUndefined();
+    expect(reviewStoreFiles(t.task_id)).toEqual([]);
+    // A change after the last read is caught by the final check too.
+    const late = await openTaskWorkspaceFile(getTask(t.task_id), path);
+    const lateReader = late.body.getReader();
+    const lateBody = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await lateReader.read();
+        if (next.done) { const fd = openSync(path, 'r+'); writeSync(fd, Buffer.from('C'), 0, 1, 0); closeSync(fd); controller.close(); return; }
+        controller.enqueue(next.value);
+      },
+    });
+    await expect(attachTaskReviewArtifact(t.task_id, { name: 'big.bin', source: { ...late, body: lateBody }, author: developer }))
+      .rejects.toThrow(/changed while it was being copied/);
+    expect(reviewStoreFiles(t.task_id)).toEqual([]);
+  });
+
+  it('makes the bytes durable and complete before the record references them, and drops them if the commit fails', async () => {
+    const t = task();
+    writeFileSync(join(t.workspace!.path, 'spec.md'), '# Spec');
+    let seen: string[] = [];
+    const source = await openTaskWorkspaceFile(getTask(t.task_id), join(t.workspace!.path, 'spec.md'));
+    const { artifact } = await attachTaskReviewArtifact(t.task_id, { name: 'spec.md', source, author: developer, beforeCommit: stored => {
+      seen = reviewStoreFiles(t.task_id);
+      const data = statSync(join(reviewStoreDirectory(t.task_id), `${stored.id}.data`));
+      expect(data.mode & 0o777).toBe(0o400);
+      expect(data.size).toBe(6);
+      expect(getTaskReview(t.task_id)).toBeUndefined();
+    } });
+    expect(seen).toEqual([`${artifact.id}.data`]);
+    const failing = await openTaskWorkspaceFile(getTask(t.task_id), join(t.workspace!.path, 'spec.md'));
+    await expect(attachTaskReviewArtifact(t.task_id, { name: 'again.md', source: failing, author: developer, beforeCommit: () => { throw new Error('crash before commit'); } }))
+      .rejects.toThrow(/crash before commit/);
+    expect(reviewStoreFiles(t.task_id)).toEqual([`${artifact.id}.data`]);
+    expect(getTaskReview(t.task_id)!.artifacts).toHaveLength(1);
+  });
+
+  it('answers a keyed retry by content without another copy, even when the store is full', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'stable.txt'), 'stable');
+    const first = await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable');
+    // A recent unreferenced reservation fills the quota.
+    const fd = openSync(join(reviewStoreDirectory(t.task_id), '00000000-0000-4000-8000-000000000000.part'), 'w', 0o600);
+    ftruncateSync(fd, 200 * 1024 * 1024); closeSync(fd);
+    writeFileSync(join(ws, 'new.txt'), 'new');
+    await expect(attachFile(t.task_id, join(ws, 'new.txt'))).rejects.toThrow(/store is full/);
+    expect(await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable')).toEqual({ artifact: first.artifact, replayed: true });
+    writeFileSync(join(ws, 'stable.txt'), 'edited');
+    await expect(attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable')).rejects.toThrow(/different review file/);
+    expect(getTaskReview(t.task_id)!.artifacts).toHaveLength(1);
+  });
+
+  it('scopes agent retry keys to the identity CID, falling back to the role name only without one', () => {
+    const t = task();
+    const a = { kind: 'agent', role: 'dev-1', identity_cid: 'A'.repeat(64), surface: 'mcp' } as const;
+    const first = appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: a });
+    // The same identity through the CLI replays.
+    expect(appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: { ...a, surface: 'cli' } })).toEqual({ entry: first.entry, replayed: true });
+    // A different identity reusing the role name does not inherit the entry.
+    expect(appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: { ...a, identity_cid: 'B'.repeat(64) } }).replayed).toBe(false);
+    const noCid = { kind: 'agent', role: 'dev-1', surface: 'cli' } as const;
+    const fallback = appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: noCid });
+    expect(fallback.replayed).toBe(false);
+    expect(appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: noCid })).toEqual({ entry: fallback.entry, replayed: true });
+    expect(listTaskProgress(t.task_id)).toHaveLength(3);
   });
 });

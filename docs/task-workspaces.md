@@ -32,7 +32,7 @@ complete internal worktree registries, including dirty and stale owned entries.
 | Complete, fail, cancel | Retained while Task is recorded | Retained in Fleet recovery archives |
 | Linked Room retirement or deletion | Task workspace retained | Retained |
 | Internal standalone Room retirement | Room workspace retained | Retained |
-| Explicit Task deletion | Removed after member retirement | All proven owned retired launches removed |
+| Explicit Task deletion | Removed after member retirement, with the task's retained To review files | All proven owned retired launches removed |
 | Explicit standalone Room deletion | Removed after member retirement | All proven owned retired launches removed |
 
 Internal room close means retirement, not destructive Task deletion.

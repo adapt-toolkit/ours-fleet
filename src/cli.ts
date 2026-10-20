@@ -1777,7 +1777,7 @@ async function runFleetCli(): Promise<void> {
   attempt = begun.result as FleetAuditAttempt;
   if (attempt.caller !== caller)
     throw new SessionControlError('rejected', `fleet audit caller mismatch: expected '${caller}', got '${attempt.caller}'`);
-  setVerifiedFleetCaller(attempt.caller);
+  setVerifiedFleetCaller(attempt.caller, stateDir);
   let exitCode = 0;
   let outcomeClass: FleetCommandOutcomeClass = 'success';
   let effect: 'not_started' | 'completed' | 'unknown' = 'completed';

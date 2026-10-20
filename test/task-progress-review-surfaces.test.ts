@@ -131,6 +131,42 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
   });
 });
 
+describe('agent MCP progress paging', { timeout: 60_000 }, () => {
+  it('returns every entry of a maximal log in order through the real bridge, in bounded pages', async () => {
+    const task = createTask({ title: 'paging', origin: { type: 'cli' } });
+    withMembers(task.task_id, [{ name: 'dev-1', identity_cid: CID }]);
+    const { appendTaskProgress, PROGRESS_MAX_ENTRIES, PROGRESS_TEXT_MAX } = await import('../src/rooms-tasks/task-review.js');
+    // Worst cases for serialized size: astral characters and control characters that JSON escapes.
+    const texts = Array.from({ length: PROGRESS_MAX_ENTRIES }, (_, index) => (index % 2
+      ? '😀'.repeat(PROGRESS_TEXT_MAX / 2)
+      : `${index}\u0001`.padEnd(PROGRESS_TEXT_MAX, '\u0001')).slice(0, PROGRESS_TEXT_MAX));
+    for (const text of texts) appendTaskProgress(task.task_id, { text, author: { kind: 'local_control', surface: 'cli' } });
+    const mcp = await bridge(() => ({ taskId: task.task_id, role: 'dev-1', identityCid: CID, taskOwned: false }));
+    try {
+      const read: string[] = [];
+      let after: string | undefined, pages = 0;
+      do {
+        const page = await mcp.call('fleet_task_progress_list', after ? { after } : {});
+        expect(page.isError, JSON.stringify(page).slice(0, 200)).toBe(false);
+        expect(page.structuredContent.total).toBe(PROGRESS_MAX_ENTRIES);
+        expect(page.structuredContent.progress.length).toBeGreaterThan(0);
+        read.push(...page.structuredContent.progress.map((entry: any) => entry.text));
+        after = page.structuredContent.next_after; pages++;
+      } while (after);
+      expect(read).toEqual(texts);
+      expect(pages).toBeGreaterThan(4);
+      expect(error(await mcp.call('fleet_task_progress_list', { after: 'missing' }))).toBe('invalid_request');
+      expect(error(await mcp.call('fleet_task_progress_list', { limit: 0 }))).toBe('invalid_request');
+      const two = await mcp.call('fleet_task_progress_list', { limit: 2 });
+      expect(two.structuredContent.progress).toHaveLength(2);
+      // The largest review Markdown also fits one response.
+      const markdown = '\u0001'.repeat(50_000);
+      expect((await mcp.call('fleet_task_review_set', { markdown, expected_markdown: '' })).isError).toBe(false);
+      expect((await mcp.call('fleet_task_review_show')).structuredContent.review.markdown).toBe(markdown);
+    } finally { await mcp.close(); }
+  });
+});
+
 describe('task CLI', { timeout: 120_000 }, () => {
   it('attributes a supervisor-verified managed agent and the local operator, and retains attached files', async () => {
     const task = createTask({ title: 'cli', origin: { type: 'cli' } });

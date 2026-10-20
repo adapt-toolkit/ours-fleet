@@ -68,6 +68,24 @@ function adminConsoleAuthority(session: ResolvedRole['session']): string[] {
   return [];
 }
 
+/** Task-room members: where review material and milestones live; the role charter says who writes them. */
+function taskReviewGuidance(taskId: string | undefined): string[] {
+  if (!taskId) return [];
+  return [
+    '', '## To review and Progress',
+    `This room works on Fleet task \`${taskId}\`. Its **To review** package is what the Owner reviews, without`,
+    'reading this room or the task description: concise outcome, clickable PR and specification links,',
+    'attached files, validation and required-CI results for the exact heads, the independent verdict where',
+    'one applies, material limits and any Owner decision. Before a Review handoff, make sure it is complete',
+    'and current: read it with `fleet_task_review_show`, write its Markdown with `fleet_task_review_set`, and',
+    `attach shared files from the task workspace with \`ours-fleet task review-package ${taskId} --attach <path>\`.`,
+    'Preparing it grants no lifecycle authority: move the task to Review only when your instructions grant',
+    'that; otherwise hand the complete package to your authorized coordinator.',
+    'The task **Progress** log (`fleet_task_progress_list`) holds significant verified milestones. Append to it',
+    'only when your role instructions make you its writer.',
+  ];
+}
+
 /** Common guidance for Fleet-owned boot and subsequent wakes; tools stay available. */
 function startupGuidance(v: BriefingVocab): string[] {
   return [
@@ -179,6 +197,7 @@ function generateRoomMemberBriefing(
     L.push('No Fleet Coordinator contact is configured. Put a secret-free blocker report in your final');
     L.push('assistant response for the Fleet supervisor, then stop BLOCKED.');
   }
+  L.push(...taskReviewGuidance(startup.task_id));
   L.push(...selfReminderGuidance(role));
   L.push('', '## Durable log');
   L.push('Append important commands / decisions / results to `' + opts.worklogPath + '` as you go —');

@@ -256,6 +256,39 @@ describe('packaged role-default adoption', () => {
     expect(readFileSync(path, 'utf8')).toBe(custom);
   });
 
+  it('adopts untouched revision-11 charters, which predate task Progress and the To review handoff', () => {
+    const config = join(dir, 'review-package-11.yaml');
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    const files = {
+      'roles/Developer.yaml': 'Developer.revision-11.yaml', 'roles/Critic.yaml': 'Critic.revision-11.yaml',
+      'roles/Engineer.yaml': 'Engineer.revision-11.yaml', 'roles/LocalCoordinator.yaml': 'LocalCoordinator.revision-11.yaml',
+      'roles/Coordinator.yaml': 'Coordinator.revision-11.yaml',
+      'agent_templates/LocalCoordinator.yaml': 'LocalCoordinator-template.revision-11.yaml',
+    };
+    for (const [relative, fixture] of Object.entries(files)) {
+      const previous = readFileSync(new URL(`./fixtures/presets/${fixture}`, import.meta.url), 'utf8');
+      expect(previous).not.toMatch(/To review|task Progress/);
+      writeFileSync(join(root, relative), previous, { mode: 0o600 });
+    }
+    expect(migratePackagedRoleDefaults(config).replacements).toEqual(Object.keys(files).map(relative => join(root, relative)).sort());
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: 'review-package-11' });
+    for (const relative of Object.keys(files))
+      expect(readFileSync(join(root, relative), 'utf8')).toBe(readFileSync(join(packagedPresetRoot(), 'fleet', relative), 'utf8'));
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'review-package-11-again' }).replacements).toEqual([]);
+  });
+
+  it('preserves an edited revision-11 Developer charter byte-for-byte', () => {
+    const config = join(dir, 'developer-custom-11.yaml');
+    bootstrapPresets(config);
+    const path = join(splitRootFor(config), 'roles', 'Developer.yaml');
+    const custom = readFileSync(new URL('./fixtures/presets/Developer.revision-11.yaml', import.meta.url), 'utf8')
+      .replace('Make the smallest coherent change', 'Make the smallest reviewed change');
+    writeFileSync(path, custom, { mode: 0o600 });
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'developer-custom-11' }).replacements).not.toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(custom);
+  });
+
   it('preserves an edited Coordinator role byte-for-byte', () => {
     const config = join(dir, 'coordinator-custom.yaml');
     bootstrapPresets(config);

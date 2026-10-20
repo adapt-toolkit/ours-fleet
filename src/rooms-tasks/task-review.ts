@@ -50,8 +50,14 @@ function assertTaskId(taskId: string): void {
   if (!TASK_ID.test(taskId)) throw new TaskStateError('invalid task ID: expected the canonical 17-character lowercase ID');
 }
 
+/**
+ * Retry keys are scoped to the author: an agent by its authenticated identity
+ * CID (stable across MCP and CLI), or by role name when no CID is known; the
+ * local operator by surface.
+ */
 function authorKey(author: TaskContributionAuthor): string {
-  return author.kind === 'agent' ? `agent:${author.role}` : `local_control:${author.surface}`;
+  if (author.kind !== 'agent') return `local_control:${author.surface}`;
+  return author.identity_cid ? `agent-cid:${author.identity_cid}` : `agent:${author.role}`;
 }
 
 function checkRequestKey(requestKey: string | undefined): void {
@@ -95,7 +101,7 @@ export function appendTaskProgress(taskId: string, input: {
     const progress = task.progress ?? [];
     if (input.requestKey) {
       const previous = progress.find(entry => entry.request_key === input.requestKey
-        && authorKey(entry.author) === authorKey(input.author));
+        && sameAuthor(entry.author, input.author));
       if (previous) {
         if (previous.text !== input.text)
           throw new TaskReviewError('idempotency_conflict', 'request_key was already used for a different progress entry');
@@ -175,59 +181,99 @@ function sweepOrphans(dir: string, referenced: ReadonlySet<string>, now = Date.n
   return { files, bytes };
 }
 
-type Source = { size: number; body: ReadableStream<Uint8Array>; close(): Promise<void> };
+/** A file being read; `verify` fails when it changed since it was opened. */
+export type Source = { size: number; body: ReadableStream<Uint8Array>; close(): Promise<void>; verify?(): Promise<void> };
+type Stored = { id: string; size: number; sha256: string };
 
-/**
- * Admit one copy under the task lock: the task exists and is not being
- * deleted, the quota holds, and the reservation is made at once by creating
- * the partial file at its declared size. A deletion accepted later removes the
- * whole store; this copy then only writes into an unlinked directory.
- */
-function reserveCopy(taskId: string, dir: string, size: number): { id: string; fd: number } {
-  return updateTaskContribution(taskId, task => {
-    privateDirectory(reviewStoreRoot()); privateDirectory(dir);
-    const used = sweepOrphans(dir, new Set((task.review?.artifacts ?? []).map(artifact => artifact.id)));
-    if (used.files >= REVIEW_STORE_MAX_FILES || used.bytes + size > REVIEW_STORE_MAX_BYTES)
-      throw new TaskReviewError('limit_exceeded', 'the task review store is full; detach files you no longer need');
-    const id = randomUUID();
-    const fd = openSync(join(dir, `${id}.part`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    try { ftruncateSync(fd, size); } catch (error) { closeSync(fd); unlinkSync(join(dir, `${id}.part`)); throw error; }
-    return { value: { id, fd }, changed: false };
-  });
-}
+const changed = () => new TaskReviewError('conflict', 'the file changed while it was being copied');
 
-async function copyIntoStore(taskId: string, dir: string, source: Source, signal?: AbortSignal): Promise<{ id: string; size: number; sha256: string }> {
+/** Read the whole source once, bounded by its declared size, then confirm it did not change. */
+async function consume(source: Source, signal: AbortSignal | undefined, sink: (chunk: Uint8Array, offset: number) => void): Promise<{ size: number; sha256: string }> {
   const reader = source.body.getReader();
-  let reservation: { id: string; fd: number } | undefined, renamed = false;
   try {
-    reservation = reserveCopy(taskId, dir, source.size);
     const hash = createHash('sha256'); let size = 0;
     for (;;) {
       signal?.throwIfAborted();
       const chunk = await reader.read();
       if (chunk.done) break;
-      if (size + chunk.value.length > source.size)
-        throw new TaskReviewError('conflict', 'the file changed while it was being copied');
-      hash.update(chunk.value);
+      if (size + chunk.value.length > source.size) throw changed();
+      hash.update(chunk.value); sink(chunk.value, size);
+      size += chunk.value.length;
+    }
+    if (size !== source.size) throw changed();
+    await source.verify?.();
+    return { size, sha256: hash.digest('hex') };
+  } finally {
+    await reader.cancel().catch(() => {});
+    await source.close();
+  }
+}
+
+function syncDirectory(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+interface Reservation { id: string; fd: number; dir: number }
+const inDir = (dir: number, name: string) => `/proc/self/fd/${dir}/${name}`;
+
+/**
+ * Admit one copy under the task lock: the task exists and is not being
+ * deleted, the quota holds, and the reservation is made at once by creating
+ * the partial file at its declared size in the pinned store directory. A
+ * deletion accepted later removes the whole store; this copy then only writes
+ * into an unlinked directory and its commit is refused.
+ */
+function reserveCopy(taskId: string, dir: string, size: number): Reservation {
+  return updateTaskContribution(taskId, task => {
+    privateDirectory(reviewStoreRoot()); privateDirectory(dir);
+    const pinned = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      const opened = fstatSync(pinned), named = lstatSync(dir);
+      if (opened.dev !== named.dev || opened.ino !== named.ino) throw new TaskReviewError('conflict', 'task review store moved');
+      const used = sweepOrphans(inDir(pinned, ''), new Set((task.review?.artifacts ?? []).map(artifact => artifact.id)));
+      if (used.files >= REVIEW_STORE_MAX_FILES || used.bytes + size > REVIEW_STORE_MAX_BYTES)
+        throw new TaskReviewError('limit_exceeded', 'the task review store is full; detach files you no longer need');
+      const id = randomUUID();
+      const fd = openSync(inDir(pinned, `${id}.part`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try { ftruncateSync(fd, size); } catch (error) { closeSync(fd); unlinkSync(inDir(pinned, `${id}.part`)); throw error; }
+      return { value: { id, fd, dir: pinned }, changed: false };
+    } catch (error) { closeSync(pinned); throw error; }
+  });
+}
+
+/**
+ * Copy into the pinned store, then make the bytes durable before any record
+ * can reference them: file fsync, rename, then fsync of the store directory
+ * and of the directories that may have been created for it.
+ */
+async function copyIntoStore(taskId: string, dir: string, source: Source, signal?: AbortSignal): Promise<Stored> {
+  let reservation: Reservation | undefined;
+  try {
+    reservation = reserveCopy(taskId, dir, source.size);
+    const target = reservation;
+    const digest = await consume(source, signal, (chunk, at) => {
       let offset = 0;
-      while (offset < chunk.value.length) {
-        const written = writeSync(reservation.fd, chunk.value, offset, chunk.value.length - offset, size + offset);
+      while (offset < chunk.length) {
+        const written = writeSync(target.fd, chunk, offset, chunk.length - offset, at + offset);
         if (!written) throw new Error('short review artifact write');
         offset += written;
       }
-      size += chunk.value.length;
-    }
-    if (size !== source.size) throw new TaskReviewError('conflict', 'the file changed while it was being copied');
-    fchmodSync(reservation.fd, 0o400); fsyncSync(reservation.fd);
-    renameSync(join(dir, `${reservation.id}.part`), join(dir, `${reservation.id}.data`)); renamed = true;
-    return { id: reservation.id, size, sha256: hash.digest('hex') };
-  } finally {
+    });
+    fchmodSync(target.fd, 0o400); fsyncSync(target.fd);
+    renameSync(inDir(target.dir, `${target.id}.part`), inDir(target.dir, `${target.id}.data`));
+    fsyncSync(target.dir);
+    syncDirectory(reviewStoreRoot()); syncDirectory(stateRoot());
+    return { id: target.id, ...digest };
+  } catch (error) {
     if (reservation) {
-      closeSync(reservation.fd);
-      if (!renamed) try { unlinkSync(join(dir, `${reservation.id}.part`)); } catch { /* removed with the store */ }
+      for (const name of [`${reservation.id}.part`, `${reservation.id}.data`])
+        try { unlinkSync(inDir(reservation.dir, name)); } catch { /* absent, or removed with the store */ }
     }
-    await reader.cancel().catch(() => {});
-    await source.close();
+    throw error;
+  } finally {
+    if (reservation) { closeSync(reservation.fd); closeSync(reservation.dir); }
+    else await source.close();
   }
 }
 
@@ -237,37 +283,49 @@ function removeStoredFile(dir: string, id: string): void {
   }
 }
 
+function sameAuthor(a: TaskContributionAuthor, b: TaskContributionAuthor): boolean {
+  return authorKey(a) === authorKey(b);
+}
+
 /**
  * Attach one file to the review package: reserve under the task lock, copy
  * into the private store, then commit metadata under the lock again; any
  * failure removes the copy. A retry with the same author-scoped request_key
- * and identical content returns the original artifact. Without a key an
- * interrupted call may or may not have attached: read the package before retrying.
+ * is compared by content without storing another copy: identical content
+ * returns the original artifact, different content is a conflict. Without a
+ * key an interrupted call may or may not have attached: read the package
+ * before retrying.
  */
 export async function attachTaskReviewArtifact(taskId: string, input: {
   name: string; source: Source; author: TaskContributionAuthor; requestKey?: string; signal?: AbortSignal;
+  /** Test seam: runs after the bytes are durable, before the record references them. */
+  beforeCommit?(stored: Stored): void;
 }): Promise<{ artifact: TaskReviewArtifact; replayed: boolean }> {
-  let dir: string, name: string;
+  let dir: string, name: string, previous: TaskReviewArtifact | undefined;
   try {
     dir = reviewStoreDirectory(taskId);
     name = checkArtifactName(input.name);
     checkRequestKey(input.requestKey);
     if (!Number.isSafeInteger(input.source.size) || input.source.size < 0 || input.source.size > REVIEW_ARTIFACT_MAX_BYTES)
       throw new TaskReviewError('limit_exceeded', 'review files are limited to 20 MiB');
+    previous = input.requestKey ? getTask(taskId).review?.artifacts.find(artifact =>
+      artifact.request_key === input.requestKey && sameAuthor(artifact.added_by, input.author)) : undefined;
   } catch (error) { await input.source.close(); throw error; }
+  const replay = (artifact: TaskReviewArtifact, digest: { sha256: string }) => {
+    if (artifact.name !== name || artifact.sha256 !== digest.sha256)
+      throw new TaskReviewError('idempotency_conflict', 'request_key was already used for a different review file');
+    return { artifact, replayed: true };
+  };
+  if (previous) return replay(previous, await consume(input.source, input.signal, () => {}));
   const stored = await copyIntoStore(taskId, dir, input.source, input.signal);
   try {
+    input.beforeCommit?.(stored);
     const result = updateTaskContribution<{ artifact: TaskReviewArtifact; replayed: boolean }>(taskId, task => {
       const review = task.review ?? { markdown: '', updated_at: new Date().toISOString(), updated_by: input.author, artifacts: [] };
-      if (input.requestKey) {
-        const previous = review.artifacts.find(artifact => artifact.request_key === input.requestKey
-          && authorKey(artifact.added_by) === authorKey(input.author));
-        if (previous) {
-          if (previous.name !== name || previous.sha256 !== stored.sha256)
-            throw new TaskReviewError('idempotency_conflict', 'request_key was already used for a different review file');
-          return { value: { artifact: previous, replayed: true }, changed: false };
-        }
-      }
+      // A concurrent attach with the same key may have committed meanwhile.
+      const raced = input.requestKey ? review.artifacts.find(artifact =>
+        artifact.request_key === input.requestKey && sameAuthor(artifact.added_by, input.author)) : undefined;
+      if (raced) return { value: replay(raced, stored), changed: false };
       if (review.artifacts.length >= REVIEW_MAX_ARTIFACTS)
         throw new TaskReviewError('limit_exceeded', `a review package holds at most ${REVIEW_MAX_ARTIFACTS} files`);
       const artifact: TaskReviewArtifact = {
@@ -351,12 +409,21 @@ export function taskWorkspaceRoot(task: TaskRecord): string {
   return task.workspace.path;
 }
 
-function fileStream(file: FileHandle, size: number): Source {
+/** Identity and change times of an opened file; any difference means it changed or was replaced. */
+async function fingerprint(file: FileHandle): Promise<string> {
+  const stat = await file.stat({ bigint: true });
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.nlink].join(':');
+}
+
+async function fileStream(file: FileHandle, size: number): Promise<Source> {
+  const opened = await fingerprint(file);
+  const verify = async () => { if (await fingerprint(file) !== opened) throw changed(); };
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await file.close(); } };
   let position = 0;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
+      await verify();
       const buffer = Buffer.alloc(Math.min(1024 * 1024, Math.max(1, size - position + 1)));
       const { bytesRead } = await file.read(buffer, 0, buffer.length, position);
       if (!bytesRead) { controller.close(); return; }
@@ -364,7 +431,7 @@ function fileStream(file: FileHandle, size: number): Source {
       controller.enqueue(buffer.subarray(0, bytesRead));
     },
   });
-  return { size, body, close };
+  return { size, body, close, verify };
 }
 
 /**
@@ -397,7 +464,7 @@ export async function openTaskWorkspaceFile(task: TaskRecord, input: string, cwd
       if (!stat.isFile()) throw new TaskReviewError('invalid_request', 'only regular files can be attached');
       if (stat.nlink !== 1) throw new TaskReviewError('invalid_request', 'hard-linked files cannot be attached');
       if (stat.size > REVIEW_ARTIFACT_MAX_BYTES) throw new TaskReviewError('limit_exceeded', 'review files are limited to 20 MiB');
-      return { ...fileStream(file, stat.size), name: basename(absolute) };
+      return { ...await fileStream(file, stat.size), name: basename(absolute) };
     } catch (error) { await file.close(); throw error; }
   } finally { await dir.close(); }
 }
