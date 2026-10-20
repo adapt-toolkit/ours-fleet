@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
+import { utimesSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask } from '../src/rooms-tasks/task-state.js';
@@ -106,7 +106,7 @@ describe('task progress', () => {
     writeFileSync(path, JSON.stringify(legacy));
     expect(listTaskProgress(t.task_id)).toEqual([]);
     expect(getTaskReview(t.task_id)).toBeUndefined();
-    expect(taskContributionSummary(getTask(t.task_id))).toEqual({ progress_count: 0, review: { has_markdown: false, artifact_count: 0 } });
+    expect(taskContributionSummary(getTask(t.task_id))).toEqual({ progress_count: 0, review: { has_markdown: false, artifact_count: 0, revision: 0 } });
     appendTaskProgress(t.task_id, { text: 'first milestone', author: developer });
     expect(taskContributionSummary(getTask(t.task_id)).progress_count).toBe(1);
   });
@@ -203,10 +203,10 @@ describe('task review package', () => {
     const otherAuthor = await attachFile(t.task_id, join(ws, 'report.pdf'), critic, 'report');
     expect(otherAuthor.replayed).toBe(false);
     expect(getTaskReview(t.task_id)!.artifacts.map(item => item.id)).toEqual([first.artifact.id, otherAuthor.artifact.id]);
-    detachTaskReviewArtifact(t.task_id, first.artifact.id);
+    detachTaskReviewArtifact(t.task_id, first.artifact.id, { author: developer });
     expect(reviewStoreFiles(t.task_id)).toEqual([`${otherAuthor.artifact.id}.data`]);
     await expect(readTaskReviewArtifact(t.task_id, first.artifact.id)).rejects.toThrow(/not found/);
-    expect(() => detachTaskReviewArtifact(t.task_id, first.artifact.id)).toThrow(/not found/);
+    expect(() => detachTaskReviewArtifact(t.task_id, first.artifact.id, { author: developer })).toThrow(/not found/);
     expect((await readTaskReviewArtifact(t.task_id, otherAuthor.artifact.id)).bytes.toString()).toBe('%PDF-1.4 changed');
   });
 
@@ -328,11 +328,103 @@ describe('review file copy safety', () => {
     const first = await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable');
     const retry = await openTaskWorkspaceFile(getTask(t.task_id), join(ws, 'stable.txt'));
     await expect(attachTaskReviewArtifact(t.task_id, { name: 'stable.txt', source: retry, author: developer, requestKey: 'stable',
-      beforeReplay: () => { detachTaskReviewArtifact(t.task_id, first.artifact.id); } })).rejects.toThrow(/removed meanwhile/);
+      beforeReplay: () => { detachTaskReviewArtifact(t.task_id, first.artifact.id, { author: developer }); } })).rejects.toThrow(/removed meanwhile/);
     const second = await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable-2');
     const late = await openTaskWorkspaceFile(getTask(t.task_id), join(ws, 'stable.txt'));
     await expect(attachTaskReviewArtifact(t.task_id, { name: 'stable.txt', source: late, author: developer, requestKey: 'stable-2',
       beforeReplay: () => { beginTaskDeletionIntent(t.task_id, operator); } })).rejects.toThrow(/pending deletion/);
     expect(second.replayed).toBe(false);
+  });
+});
+
+describe('task lock', () => {
+  const module = () => resolve('dist/rooms-tasks/task-review.js');
+  /** One writer process; resolves with its exit code. */
+  function writer(taskId: string, text: string) {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `
+      const { appendTaskProgress } = await import(${JSON.stringify(module())});
+      appendTaskProgress(${JSON.stringify(taskId)}, { text: ${JSON.stringify(text)}, author: { kind: 'local_control', surface: 'cli' } });
+    `], { env: { ...process.env, OURS_FLEET_HOME: root }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const done = new Promise<number>(resolveExit => child.on('exit', code => resolveExit(code ?? -1)));
+    return { done, stderr: () => stderr };
+  }
+  const lockDir = (taskId: string) => join(tasksDir(), '.locks', taskId);
+  const settle = (ms: number) => new Promise(resolveWait => setTimeout(resolveWait, ms));
+  // Read the stored record without the task lock, which these tests hold or break on purpose.
+  const stored = (taskId: string): string[] =>
+    (JSON.parse(readFileSync(join(tasksDir(), `${taskId}.json`), 'utf8')).progress ?? []).map((entry: { text: string }) => entry.text);
+
+  it('waits for a lock directory whose owner file is not yet or no longer present instead of reclaiming it', async () => {
+    // This is the state a lock passed through while it was being released, when the
+    // previous release deleted its owner file before the directory.
+    const t = task();
+    mkdirSync(lockDir(t.task_id), { recursive: true });
+    const blocked = writer(t.task_id, 'after the ownerless lock');
+    await settle(1_000);
+    expect(stored(t.task_id)).toEqual([]);
+    rmSync(lockDir(t.task_id), { recursive: true, force: true });
+    expect(await blocked.done).toBe(0);
+    expect(stored(t.task_id)).toEqual(['after the ownerless lock']);
+  });
+
+  it('waits for a live foreign owner and reclaims only a dead or long-abandoned one', async () => {
+    const t = task(), dir = lockDir(t.task_id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'owner.json'), JSON.stringify({ token: 'foreign', pid: process.pid }));
+    const blocked = writer(t.task_id, 'after the live owner');
+    await settle(1_000);
+    expect(stored(t.task_id)).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+    expect(await blocked.done).toBe(0);
+
+    // An owner process that has exited no longer holds the lock.
+    const exited = spawn(process.execPath, ['-e', '']);
+    const deadPid = await new Promise<number>(resolveExit => exited.on('exit', () => resolveExit(exited.pid!)));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'owner.json'), JSON.stringify({ token: 'dead', pid: deadPid }));
+    expect(await writer(t.task_id, 'after the dead owner').done).toBe(0);
+
+    // An ownerless directory left for longer than a claim can take is abandoned.
+    mkdirSync(dir, { recursive: true });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(dir, old, old);
+    expect(await writer(t.task_id, 'after the abandoned lock').done).toBe(0);
+    expect(stored(t.task_id)).toEqual(['after the live owner', 'after the dead owner', 'after the abandoned lock']);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  it('releases without ever exposing a half-removed lock, so heavy contention keeps every append', async () => {
+    const t = task();
+    const writers = Array.from({ length: 8 }, (_, index) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', `
+        const { appendTaskProgress } = await import(${JSON.stringify(module())});
+        for (let i = 0; i < 20; i++)
+          appendTaskProgress(${JSON.stringify(t.task_id)}, { text: 'w${index}-' + i, author: { kind: 'local_control', surface: 'cli' } });
+      `], { env: { ...process.env, OURS_FLEET_HOME: root }, stdio: ['ignore', 'ignore', 'inherit'] });
+      return new Promise<number>(resolveExit => child.on('exit', code => resolveExit(code ?? -1)));
+    });
+    expect(await Promise.all(writers)).toEqual(Array(8).fill(0));
+    expect(stored(t.task_id)).toHaveLength(160);
+  }, 60_000);
+});
+
+describe('review revision', () => {
+  it('changes with every change to the package, including a same-count file replacement', async () => {
+    const t = task(), ws = t.workspace!.path;
+    expect(taskContributionSummary(getTask(t.task_id)).review.revision).toBe(0);
+    writeFileSync(join(ws, 'spec.md'), 'v1');
+    const first = await attachFile(t.task_id, join(ws, 'spec.md'));
+    const before = taskContributionSummary(getTask(t.task_id)).review;
+    detachTaskReviewArtifact(t.task_id, first.artifact.id, { author: critic });
+    writeFileSync(join(ws, 'spec.md'), 'v2');
+    await attachFile(t.task_id, join(ws, 'spec.md'));
+    const after = taskContributionSummary(getTask(t.task_id)).review;
+    expect(after.artifact_count).toBe(before.artifact_count);
+    expect(after.revision).toBe(before.revision + 2);
+    setTaskReviewMarkdown(t.task_id, { markdown: 'x', expectedMarkdown: '', author: developer });
+    expect(taskContributionSummary(getTask(t.task_id)).review.revision).toBe(after.revision + 1);
+    expect(getTaskReview(t.task_id)!.updated_by).toEqual(developer);
   });
 });

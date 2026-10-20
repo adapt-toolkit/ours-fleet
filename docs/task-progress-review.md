@@ -90,7 +90,7 @@ workspace-device bearer. `GET /api/v1/meta` reports API minor version 1.
 
 | Route | Result |
 | --- | --- |
-| `GET /tasks`, `GET /tasks/:id` and other task payloads | `progress_count` and `review: {has_markdown, artifact_count, updated_at?}`; bodies are not inlined. |
+| `GET /tasks`, `GET /tasks/:id` and other task payloads | `progress_count` and `review: {has_markdown, artifact_count, revision, updated_at?}`; `revision` grows with every package change (0 without a package). Bodies are not inlined. |
 | `GET /tasks/:id/progress` | `{progress: [{id, at, author, text}]}`, oldest first. |
 | `POST /tasks/:id/progress` | `{text, requestKey?}` (or an `Idempotency-Key` header): 201 new, 200 replay, 409 conflicting replay. |
 | `GET /tasks/:id/review` | `{review: {markdown, updated_at, updated_by, artifacts: [{id, name, mime, size, sha256, added_at, added_by}]}}` or `{review: null}`. |
