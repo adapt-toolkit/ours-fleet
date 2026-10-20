@@ -280,9 +280,10 @@ export class FleetResourceViews {
     const initial = new Promise<BoundProjection>((resolve, reject) => {resolveInitial=resolve;rejectInitial=reject;}); void initial.catch(()=>{});
     const controller = new AbortController();
     const source = connection.observer.cursor(path => this.affects(descriptor, path), controller.signal);
-    // Independent agents contribute ordered, last-observed statuses. Their
-    // ledger commits wake the view but do not revoke its structural capture.
-    const captureSource = descriptor.resource === 'directory' || descriptor.resource === 'roles'
+    // Independent agents contribute ordered, last-observed statuses and completed
+    // preview records. Activity wakes follow-up reads without revoking structural
+    // capture; the read still certifies only its starting source watermark.
+    const captureSource = descriptor.resource === 'directory' || descriptor.resource === 'roles' || descriptor.resource === 'previews'
       ? connection.observer.cursor(path => this.affects(descriptor, path, true), controller.signal)
       : source;
     const view: View = {source,captureSource,scheduledPosition:-1,descriptor,epoch,baselineId:randomUUID(),controller,revision:0,sequence:0,dirty:false,running:false,failed:false,initial,resolveInitial,rejectInitial};
@@ -370,7 +371,14 @@ export class FleetResourceViews {
       if (structural && parts.length === 2 && ['.session-events.jsonl', '.session-events.jsonl.1', '.subscription-usage.json', '.notify-cursor', '.monitor-state.json', '.monitor-status'].includes(parts[1])) return false;
       if (parts.length < 3 || parts[1] !== '.conversation') continue;
       if (structural && (descriptor.resource === 'directory' || descriptor.resource === 'roles')) return false;
-      if (descriptor.resource === 'previews') return (descriptor.ids ?? []).includes(parts[0]);
+      if (descriptor.resource === 'previews') {
+        // conversationPreview reads bounded completed records, independently per
+        // role. These known writer paths still wake ordered follow-up captures.
+        // Unknown children, parent replacement and explicit config paths retain
+        // their capture fence; do not waive the whole conversation subtree.
+        if (structural && parts.length === 3 && /^(?:events-\d{6}\.jsonl|manifest\.json)$/.test(parts[2])) return false;
+        return (descriptor.ids ?? []).includes(parts[0]);
+      }
       // Directory and roles intentionally remain conservative: live status
       // includes activity. Configuration was classified by its inputs above.
     }
