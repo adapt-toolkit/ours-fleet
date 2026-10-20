@@ -442,7 +442,8 @@ if (process.argv[2] === 'parent') {
       const log = readFileSync(join(f.dir, 'supervisor.log'), 'utf8');
       console.error(f.name + ' worker diagnostic:', log.split('\n').filter(line => line && line.length < 1500).slice(-16).join('\n'));
     }
-    throw Error(error?.message ?? 'fixture failure');
+    // Keep the original error and stack: the message alone hides where the fixture failed.
+    throw Error(error?.message ?? 'fixture failure', { cause: error });
   } finally {
     clearTimeout(watchdog); try { await stopParent(); } catch { parent?.kill('SIGKILL'); }
     for (const pid of children) { try { process.kill(-pid, 'SIGKILL'); } catch {} }
