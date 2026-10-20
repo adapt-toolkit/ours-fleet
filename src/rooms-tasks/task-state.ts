@@ -1076,6 +1076,22 @@ export function updateTaskLayout(
   });
 }
 
+/**
+ * Progress and To review edits: one read-modify-write under the task lock, so
+ * concurrent writers never lose each other's changes. Lifecycle state is untouched.
+ */
+export function updateTaskContribution<T>(id: string, change: (task: TaskRecord) => { value: T; changed: boolean }): T {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    const { value, changed } = change(task);
+    if (changed) writeTask(task);
+    return value;
+  });
+}
+
 export function updateTaskBrief(id: string, brief: string, expectedBrief: string): TaskRecord {
   assertCanonicalTaskId(id);
   return withTaskLock(id, () => {

@@ -78,7 +78,7 @@ import {
 } from './fleet-proxy.js';
 import {
   beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
-  setFleetAuditLifecycleCheckpoint,
+  setFleetAuditLifecycleCheckpoint, setVerifiedFleetCaller,
   type FleetAuditAttempt, type FleetCommandOutcomeClass,
 } from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
@@ -1777,6 +1777,7 @@ async function runFleetCli(): Promise<void> {
   attempt = begun.result as FleetAuditAttempt;
   if (attempt.caller !== caller)
     throw new SessionControlError('rejected', `fleet audit caller mismatch: expected '${caller}', got '${attempt.caller}'`);
+  setVerifiedFleetCaller(attempt.caller);
   let exitCode = 0;
   let outcomeClass: FleetCommandOutcomeClass = 'success';
   let effect: 'not_started' | 'completed' | 'unknown' = 'completed';
