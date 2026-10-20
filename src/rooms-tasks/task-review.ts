@@ -300,6 +300,8 @@ export async function attachTaskReviewArtifact(taskId: string, input: {
   name: string; source: Source; author: TaskContributionAuthor; requestKey?: string; signal?: AbortSignal;
   /** Test seam: runs after the bytes are durable, before the record references them. */
   beforeCommit?(stored: Stored): void;
+  /** Test seam: runs after a keyed retry was read, before it is confirmed under the lock. */
+  beforeReplay?(): void;
 }): Promise<{ artifact: TaskReviewArtifact; replayed: boolean }> {
   let dir: string, name: string, previous: TaskReviewArtifact | undefined;
   try {
@@ -316,7 +318,17 @@ export async function attachTaskReviewArtifact(taskId: string, input: {
       throw new TaskReviewError('idempotency_conflict', 'request_key was already used for a different review file');
     return { artifact, replayed: true };
   };
-  if (previous) return replay(previous, await consume(input.source, input.signal, () => {}));
+  if (previous) {
+    const digest = await consume(input.source, input.signal, () => {});
+    input.beforeReplay?.();
+    // Confirm under the lock that the original is still part of the package and the task still accepts writes.
+    return updateTaskContribution(taskId, task => {
+      const current = task.review?.artifacts.find(artifact =>
+        artifact.request_key === input.requestKey && sameAuthor(artifact.added_by, input.author));
+      if (!current) throw new TaskReviewError('not_found', 'the file attached with this request_key was removed meanwhile; attach it again with a new key');
+      return { value: replay(current, digest), changed: false };
+    });
+  }
   const stored = await copyIntoStore(taskId, dir, input.source, input.signal);
   try {
     input.beforeCommit?.(stored);
@@ -443,6 +455,8 @@ export async function openTaskWorkspaceFile(task: TaskRecord, input: string, cwd
   const root = taskWorkspaceRoot(task);
   if (typeof input !== 'string' || !input || input.length > 4096 || /[\x00-\x1f]/.test(input))
     throw new TaskReviewError('invalid_request', 'invalid file path');
+  if (input.split(/[\\/]/).includes('..'))
+    throw new TaskReviewError('invalid_request', 'the file path must not contain ".." components');
   const absolute = resolve(cwd, input);
   if (!insideDirectory(root, absolute))
     throw new TaskReviewError('invalid_request', `review files must be inside the task workspace ${root}`);

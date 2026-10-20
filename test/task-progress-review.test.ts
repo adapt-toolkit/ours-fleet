@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { createTask, getTask, tasksDir, activateTask, reviewTask } from '../src/rooms-tasks/task-state.js';
+import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask } from '../src/rooms-tasks/task-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
 import {
   appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress,
@@ -173,7 +173,8 @@ describe('task review package', () => {
       expect(openTaskWorkspaceFile(getTask(t.task_id), path)).rejects.toThrow(message);
     await refused(outside, /inside the task workspace/);
     await refused(join(sibling, 'file.txt'), /inside the task workspace/);
-    await refused(join(ws, '..', 'secret.txt'), /inside the task workspace/);
+    await refused(`${ws}/../secret.txt`, /"\.\." components/);
+    await refused(`${ws}/real/../ok.txt`, /"\.\." components/);
     await refused(ws, /inside the task workspace/);
     await refused(join(ws, 'link.txt'), /symlink/);
     await refused(join(ws, 'linkdir', 'inner.txt'), /symlinks/);
@@ -319,5 +320,19 @@ describe('review file copy safety', () => {
     expect(fallback.replayed).toBe(false);
     expect(appendTaskProgress(t.task_id, { text: 'same', requestKey: 'k', author: noCid })).toEqual({ entry: fallback.entry, replayed: true });
     expect(listTaskProgress(t.task_id)).toHaveLength(3);
+  });
+
+  it('does not confirm a keyed retry whose original was detached or whose task is being deleted meanwhile', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'stable.txt'), 'stable');
+    const first = await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable');
+    const retry = await openTaskWorkspaceFile(getTask(t.task_id), join(ws, 'stable.txt'));
+    await expect(attachTaskReviewArtifact(t.task_id, { name: 'stable.txt', source: retry, author: developer, requestKey: 'stable',
+      beforeReplay: () => { detachTaskReviewArtifact(t.task_id, first.artifact.id); } })).rejects.toThrow(/removed meanwhile/);
+    const second = await attachFile(t.task_id, join(ws, 'stable.txt'), developer, 'stable-2');
+    const late = await openTaskWorkspaceFile(getTask(t.task_id), join(ws, 'stable.txt'));
+    await expect(attachTaskReviewArtifact(t.task_id, { name: 'stable.txt', source: late, author: developer, requestKey: 'stable-2',
+      beforeReplay: () => { beginTaskDeletionIntent(t.task_id, operator); } })).rejects.toThrow(/pending deletion/);
+    expect(second.replayed).toBe(false);
   });
 });
