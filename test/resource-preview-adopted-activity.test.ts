@@ -17,7 +17,7 @@ function fixture(changed:string, resource='previews', explicitConfig=false, role
  const response=Object.assign(new EventEmitter(),{write:vi.fn(()=>true),end:vi.fn()});
  const resources=new FleetResourceViews({paths:[roles,adopted],roots:roleRoot?[adopted]:[roles],configPath:explicitConfig?join(adopted,changed):join(root,'fleet.yaml'),watch:(path,callback)=>{callbacks.set(path,callback);return Object.assign(new EventEmitter(),{close(){}});}},async()=>{
   reads++;if(unknownWake)callbacks.get(adopted)!('change',null);else publishFleetResourceCommit(join(adopted,changed));return {value};
- });clean.push(()=>resources.close());
+ },()=>[],20);clean.push(()=>resources.close());
  const connection=resources.open(response as any,'owner',()=>true);
  const binding=resources.register('owner',connection.connectionId,'view',1,{viewId:'view',resource,...(resource==='previews'?{ids:['selected']}:{})});
  const bound=()=>resources.bound('owner',connection.connectionId,'view',1,binding.baselineId);
