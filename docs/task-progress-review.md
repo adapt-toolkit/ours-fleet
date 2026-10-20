@@ -120,7 +120,8 @@ The HTTP API has no upload route: the browser never submits a file path.
 
 An attached file must be one regular, singly linked file inside the task's owned
 workspace. Each path component below the workspace is opened without following
-symlinks, so symlinks, hard links, `..` and paths in sibling folders are refused.
+symlinks, so symlinks, hard links, any `..` component and paths outside the
+workspace (including sibling folders with a common name prefix) are refused.
 The file must not change while it is copied. The copy goes to Fleet's private
 store at `.ours-fleet/task-review-artifacts/<task-id>/`, outside the
 agent-writable workspace, with owner-only permissions. It is made durable before
