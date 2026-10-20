@@ -98,7 +98,11 @@ if (process.argv[2] === 'parent') {
       observeWorkers(); assert.equal(parent.exitCode, null, 'parent exited');
       const member = readMember(f.key); if (!member?.pid || !member.generation) return false;
       if ((await memberProcess(member)).state !== 'running') return false;
-      if (lines(f.wire).filter(row => row.method === 'session/load').length < observed.get(f.key).size - (f.firstFresh ? 1 : 0)) return false;
+      // An external worker can register between observeWorkers and readMember.
+      // Wait until this exact generation is observed before deriving its load floor.
+      const generations = observed.get(f.key);
+      if (!generations?.has(member.generation)) return false;
+      if (lines(f.wire).filter(row => row.method === 'session/load').length < generations.size - (f.firstFresh ? 1 : 0)) return false;
       try { const result = await controlRequest(f.dir, { command: 'snapshot' }, 1000); return result.ok; } catch { return false; }
     }, 'production control readiness: ' + f.name);
     const matches = execFileSync('ps', ['-ax', '-o', 'pid=', '-o', 'command='], { encoding: 'utf8' }).split('\n')
