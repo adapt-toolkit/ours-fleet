@@ -6,7 +6,7 @@ import {
   setTaskReviewMarkdown, TaskReviewError, PROGRESS_TEXT_MAX, REVIEW_MARKDOWN_MAX,
 } from './task-review.js';
 import { getTask, TaskStateError } from './task-state.js';
-import type { TaskContributionAuthor } from './types.js';
+import type { TaskContributionAuthor, TaskProgressEntry } from './types.js';
 
 /** The task this agent belongs to, from supervisor launch records; never from tool arguments. */
 export interface TaskToolBinding {
@@ -22,12 +22,40 @@ export const TASK_TOOL_NAMES = Object.freeze([
   'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_detach',
 ] as const);
 
+/** Compact JSON: a result is carried twice (text and structured) inside one bounded bridge frame. */
 function result(value: unknown) {
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
+    content: [{ type: 'text' as const, text: JSON.stringify(value) }],
     structuredContent: value as Record<string, unknown>,
     isError: false,
   };
+}
+
+export const PROGRESS_PAGE_MAX = 50;
+/** Serialized entry bytes per page, well inside the bridge's frame limit even at maximal escaping. */
+const PROGRESS_PAGE_BYTES = 200_000;
+
+/** One chronological page of the log; `next_after` continues after the last returned entry. */
+export function progressPage(entries: TaskProgressEntry[], input: { after?: string; limit?: number }): {
+  progress: ReturnType<typeof publicProgressEntry>[]; total: number; next_after?: string;
+} {
+  const limit = input.limit ?? PROGRESS_PAGE_MAX;
+  if (!Number.isInteger(limit) || limit < 1 || limit > PROGRESS_PAGE_MAX)
+    throw new TaskReviewError('invalid_request', `limit must be 1..${PROGRESS_PAGE_MAX}`);
+  let start = 0;
+  if (input.after !== undefined) {
+    start = entries.findIndex(entry => entry.id === input.after) + 1;
+    if (!start) throw new TaskReviewError('invalid_request', 'after must be the id of an entry in this log');
+  }
+  const page: ReturnType<typeof publicProgressEntry>[] = [];
+  let bytes = 0;
+  for (const entry of entries.slice(start, start + limit)) {
+    const visible = publicProgressEntry(entry), size = Buffer.byteLength(JSON.stringify(visible));
+    if (page.length && bytes + size > PROGRESS_PAGE_BYTES) break;
+    page.push(visible); bytes += size;
+  }
+  const end = start + page.length;
+  return { progress: page, total: entries.length, ...(end < entries.length ? { next_after: entries[end - 1]!.id } : {}) };
 }
 
 function failure(code: string, message: string) {
@@ -73,9 +101,13 @@ export function registerTaskTools(
   };
 
   server.registerTool('fleet_task_progress_list', {
-    description: 'Read the Progress milestone log of the task you were launched for, oldest first.',
-    inputSchema: {},
-  }, async () => run(bound => ({ task_id: bound.taskId, progress: listTaskProgress(bound.taskId).map(publicProgressEntry) })));
+    description: 'Read the Progress milestone log of the task you were launched for, oldest first, one page at a time. '
+      + 'When next_after is present, call again with after set to it for the following entries.',
+    inputSchema: {
+      after: z.string().optional().describe('Entry id from the previous page\'s next_after; omit for the first page.'),
+      limit: z.number().int().optional().describe(`Maximum entries per page (1..${PROGRESS_PAGE_MAX}, default ${PROGRESS_PAGE_MAX}). Pages are also bounded in size.`),
+    },
+  }, async args => run(bound => ({ task_id: bound.taskId, ...progressPage(listTaskProgress(bound.taskId), args) })));
 
   server.registerTool('fleet_task_progress_append', {
     description: 'Append ONE significant, verified milestone to your task\'s Progress log (e.g. root cause found, PR opened with link, '

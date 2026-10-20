@@ -104,6 +104,17 @@ const PEER_WAIT_REMINDER_FINGERPRINTS: Readonly<Record<string, readonly string[]
   'roles/Engineer.yaml': ['a361453ad32cde08797cf90fff17a35bde1871ccea17389448b44398b45ccfa5'],
 });
 
+// The packaged revision-11 charters before task Progress and the self-contained To review handoff.
+// Untouched copies adopt the current text; edited ones stay.
+const REVIEW_PACKAGE_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'roles/Developer.yaml': ['cd2da8c9fb4d56b08c618221e38b9c8a2568a59b7d7ee6e44d0f6f55f9dc42e9'],
+  'roles/Critic.yaml': ['b2576fe4b9501581e874daa40b77e0379220c855a76d0fd80945e9fc42e08131'],
+  'roles/Engineer.yaml': ['dc99a42f64c4bc2c5073917f4552a366a0ab95c24bdde9e13d66320d68edac1b'],
+  'roles/LocalCoordinator.yaml': ['1a4c7613de0c374ac49ede31b312fcfd3f4a08d31316cf8dda10e46f25844e03'],
+  'roles/Coordinator.yaml': ['1fa72470f37330a96debdfa6a64004280edcf318fafd5f6a5065a06ee7e87acc'],
+  'agent_templates/LocalCoordinator.yaml': ['931908da43df7c85dd2b106c99c765a3aeb4a97361fa00ce110e3ac93221ce32'],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'roles/Engineer.yaml',
@@ -260,6 +271,7 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS),
       ...Object.keys(REREADING_CONTINUITY_LOOP_FINGERPRINTS),
       ...Object.keys(PEER_WAIT_REMINDER_FINGERPRINTS),
+      ...Object.keys(REVIEW_PACKAGE_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -274,6 +286,7 @@ export function migratePackagedRoleDefaults(
         ...(OWNER_CHANNEL_COORDINATOR_FINGERPRINTS[relative] ?? []),
         ...(REREADING_CONTINUITY_LOOP_FINGERPRINTS[relative] ?? []),
         ...(PEER_WAIT_REMINDER_FINGERPRINTS[relative] ?? []),
+        ...(REVIEW_PACKAGE_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);

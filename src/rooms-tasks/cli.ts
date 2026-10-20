@@ -176,10 +176,19 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
 
 /** A supervisor-verified managed agent is attributed as itself; otherwise the local operator. */
 function cliContributionAuthor(taskId: string): TaskContributionAuthor {
-  const caller = verifiedFleetCaller();
-  if (!caller) return { kind: 'local_control', surface: 'cli' };
-  const member = getTask(taskId).member_roles.find(item => item.name === caller);
-  return { kind: 'agent', role: caller, ...(member ? { identity_cid: member.identity_cid } : {}), surface: 'cli' };
+  const verified = verifiedFleetCaller();
+  if (!verified) return { kind: 'local_control', surface: 'cli' };
+  // The same identity CID the agent's MCP tools use, so retries match across both surfaces.
+  const cid = getTask(taskId).member_roles.find(item => item.name === verified.caller)?.identity_cid ?? bridgeIdentityCid(verified.stateDir);
+  return { kind: 'agent', role: verified.caller, ...(cid ? { identity_cid: cid } : {}), surface: 'cli' };
+}
+
+/** The managed runtime CID its supervisor recorded for the agent's MCP bridge, when present. */
+function bridgeIdentityCid(stateDir: string): string | undefined {
+  try {
+    const cid = (JSON.parse(readFileSync(join(stateDir, '.ours-bridge', 'descriptor.json'), 'utf8')) as { cid?: unknown }).cid;
+    return typeof cid === 'string' && /^[A-Fa-f0-9]{64}$/.test(cid) ? cid : undefined;
+  } catch { return undefined; }
 }
 
 function contributionAuthorLabel(author: TaskContributionAuthor): string {
