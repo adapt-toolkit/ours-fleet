@@ -55,6 +55,11 @@ export function lifecycleEventDigestBasis(value: FleetAuditPresentation): string
   return `${resourceKind}\0${value.id}\0${value.eventId}`;
 }
 
+let verifiedCaller: { caller: string; stateDir: string } | undefined;
+/** The managed agent the supervisor authenticated for this CLI process (fleet_audit_begin) and its state directory. */
+export function setVerifiedFleetCaller(caller: string, stateDir: string): void { verifiedCaller = { caller, stateDir }; }
+export function verifiedFleetCaller(): { caller: string; stateDir: string } | undefined { return verifiedCaller; }
+
 let collection: { resourceIds: Record<string, string>; presentations: FleetAuditPresentation[];
   failure?: { class: FleetCommandOutcomeClass; effect: 'not_started' | 'completed' | 'unknown' } } | undefined;
 export function beginFleetAuditCollection(): void { collection = { resourceIds: {}, presentations: [] }; }
@@ -175,7 +180,8 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   ours: new Set(['tools', 'call']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
+    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish',
+    'progress', 'review-package']),
   room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
@@ -246,6 +252,7 @@ const sensitiveValueFlags = new Set([
   '--configuration', '-c', '--managed-configuration', '--public-invite', '--public-invite-file', '--invite-file',
   '--args-file', '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
   '--identity-cid', '--owner-cid', '--contact-cid', '--codex-config', '--add-dir',
+  '--text-file', '--markdown', '--markdown-file', '--attach',
 ]);
 
 function redactUrl(value: string): string {

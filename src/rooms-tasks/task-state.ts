@@ -1,9 +1,10 @@
 import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import type { ArchivedMemberAbsence } from './types.js';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { replaceFileAtomically } from '../atomic-file.js';
+import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
+import { incarnationEnded, processIncarnation, type ProcessIncarnation } from '../process-incarnation.js';
 import { stateRoot } from '../paths.js';
 import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
@@ -20,38 +21,94 @@ function taskPath(id: string): string { return join(tasksDir(), `${id}.json`); }
 function taskLockPath(id: string): string { return join(tasksDir(), '.locks', id); }
 const localTaskLocks = new Set<string>();
 
+/**
+ * Remove a lock atomically: rename it to a unique name first, so no other
+ * process ever observes a half-removed lock.
+ */
+function retireLock(path: string): void {
+  const retired = `${path}.retired.${process.pid}.${randomUUID()}`;
+  try { renameSync(path, retired); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  rmSync(retired, { recursive: true, force: true });
+}
+
+/** A legacy lock directory without an owner file younger than this may still be releasing. */
+const LEGACY_OWNERLESS_LOCK_GRACE_MS = 5_000;
+
+/**
+ * Hold a task's cross-process lock while `fn` runs.
+ *
+ * The lock is a file holding its owner record, published complete by hard-linking
+ * a written temporary file: link never replaces an existing lock, and there is no
+ * moment at which a live claimer has an ownerless lock that could look abandoned.
+ * A lock is reclaimed only when its owner process has provably ended; reclaimers
+ * take turns and remove only the lock they observed. Directory locks are left by
+ * earlier versions; they are honored, and an ownerless one is reclaimed once it is
+ * old enough, since this version never creates one.
+ */
 function withTaskLock<T>(id: string, fn: () => T): T {
   if (localTaskLocks.has(id)) return fn();
-  const path = taskLockPath(id); const ownerPath = join(path, 'owner.json');
+  const path = taskLockPath(id);
   const token = randomUUID(); mkdirSync(join(tasksDir(), '.locks'), { recursive: true });
-  for (;;) {
-    const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
-    try {
-      mkdirSync(claimPath);
-      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
-      renameSync(claimPath, path); break;
-    } catch (error) {
-      rmSync(claimPath, { recursive: true, force: true });
-      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+  type Owner = { token?: string; pid?: number } & ProcessIncarnation;
+  const readOwner = (): Owner | undefined => {
+    try { return JSON.parse(readFileSync(path, 'utf8')) as Owner; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EISDIR') return undefined;
+      try { return JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8')) as Owner; }
+      catch { return undefined; }
+    }
+  };
+  /** Who holds the lock now, and whether it can be proved abandoned. */
+  const holder = () => {
+    let stat;
+    try { stat = lstatSync(path); } catch { return undefined; }
+    const owner = readOwner();
+    if (owner && typeof owner.pid === 'number') {
       let alive = false;
-      try {
-        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
-        if (typeof owner.pid === 'number') {
-          try { process.kill(owner.pid, 0); alive = true; } catch { /* dead */ }
+      try { process.kill(owner.pid, 0); alive = true; }
+      catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      return { token: owner.token, stale: !alive || incarnationEnded(owner.pid, owner) };
+    }
+    return {
+      token: undefined,
+      stale: stat.isDirectory() && Date.now() - stat.mtimeMs > LEGACY_OWNERLESS_LOCK_GRACE_MS,
+    };
+  };
+  const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
+  writeFileSync(claimPath, JSON.stringify({ token, pid: process.pid, ...processIncarnation(process.pid) }));
+  try {
+    for (;;) {
+      try { linkSync(claimPath, path); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const observed = holder();
+      if (observed?.stale) {
+        try {
+          withSynchronousFileLock(`${path}.reclaim`, () => {
+            const current = holder();
+            if (current?.stale && current.token === observed.token) retireLock(path);
+          });
+        } catch (error) {
+          // A contender stalled inside the reclaim section: keep waiting like any other poll.
+          if (!(error instanceof Error) || !/^Timed out acquiring synchronous/.test(error.message)) throw error;
         }
-      } catch { /* corrupt legacy lock */ }
-      if (!alive) { rmSync(path, { recursive: true, force: true }); continue; }
+        continue;
+      }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
+  } finally {
+    rmSync(claimPath, { force: true });
   }
   localTaskLocks.add(id);
   try { return fn(); }
   finally {
     localTaskLocks.delete(id);
-    try {
-      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
-      if (owner.token === token) rmSync(path, { recursive: true, force: true });
-    } catch { /* ownership cannot be proved */ }
+    // Only this live owner removes its lock; reclaimers never take a live owner's lock.
+    if (readOwner()?.token === token) retireLock(path);
   }
 }
 
@@ -1073,6 +1130,22 @@ export function updateTaskLayout(
     task.room_plan_changed_at = new Date().toISOString();
     writeTask(task);
     return { task: readTask(id), ...(releasedSnapshot ? { releasedSnapshot } : {}) };
+  });
+}
+
+/**
+ * Progress and To review edits: one read-modify-write under the task lock, so
+ * concurrent writers never lose each other's changes. Lifecycle state is untouched.
+ */
+export function updateTaskContribution<T>(id: string, change: (task: TaskRecord) => { value: T; changed: boolean }): T {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    const { value, changed } = change(task);
+    if (changed) writeTask(task);
+    return value;
   });
 }
 

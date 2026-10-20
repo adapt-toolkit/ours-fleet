@@ -639,6 +639,26 @@ management API equivalent is \`DELETE /api/v1/tasks/<id>?confirm=<id>\` (200 whe
 settled, 202 while pending; \`GET /api/v1/tasks?includeDeleting=true\` exposes
 deletion-pending tasks to operators).
 
+### Task Progress and To review
+
+A task can carry an append-only **Progress** milestone log and a self-contained
+**To review** package (Markdown plus retained files). Agents launched for a task
+use \`fleet_task_progress_list\`, \`fleet_task_progress_append\`,
+\`fleet_task_review_show\`, \`fleet_task_review_set\` and
+\`fleet_task_review_detach\`; files are attached from the task workspace with the CLI:
+
+\`\`\`sh
+ours-fleet task progress TASK [--text TEXT | --text-file FILE] [--request-key KEY] [--json]
+ours-fleet task review-package TASK [--markdown-file FILE] [--attach PATH] [--detach ID] [--json]
+\`\`\`
+
+By default only the LocalCoordinator writes Progress, and every task role prepares
+the To review package before a Review handoff without gaining lifecycle authority.
+At Review the task description keeps only the clickable PR links, one per line (a task
+without PRs links its actual deliverables, never an invented PR); the package holds the
+rest, including the original description as an attached file.
+Full contract: \`docs/task-progress-review.md\` in the package.
+
 ## Permissions
 
 Prefer the harness-neutral \`permissions\` block:

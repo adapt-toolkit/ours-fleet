@@ -29,6 +29,7 @@ import type {
   RoomMemberSeat, TaskDeletionActor, TaskDeletionMemberCursor, TaskRecord,
 } from './types.js';
 
+import { deleteTaskReviewStore } from './task-review.js';
 export { DELETION_MEMBER_ABSENT_VERIFIED } from './task-state.js';
 import { DELETION_MEMBER_ABSENT_VERIFIED } from './task-state.js';
 
@@ -336,6 +337,8 @@ export async function settleTaskDeletion(input: {
         collectWorkspaceArchives(task.workspace);
         deleteWorkspace(task.workspace, 'task', taskId);
       }
+      // Retained To review files go with the task; the pending deletion already refuses new attachments.
+      deleteTaskReviewStore(taskId);
       unlinkDeletedTask(taskId);
     } catch (error) {
       setTaskDeletionError(taskId, errorText(error), recoveryHint);

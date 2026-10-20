@@ -13,6 +13,7 @@ import { FileCallbacks } from './file-rpc.js';
 import { Wire } from './wire.js';
 import type { AgentOursRuntime } from './runtime.js';
 import { registerReminderTools, type ReminderToolBackend } from '../reminders/tools.js';
+import { registerTaskTools, type TaskToolBinding } from '../rooms-tasks/task-tools.js';
 
 export interface EndpointOptions {
   socket: string;
@@ -25,6 +26,8 @@ export interface EndpointOptions {
   currentChatFile?: (input: FileDeliveryInput, extra: ToolRequestExtra, files: FileCallbacks) => Promise<DeliveredFile>;
   /** Fleet self-reminders, bound later by the runner; tools refuse until then. */
   reminders?: () => ReminderToolBackend | undefined;
+  /** Task Progress / To review tools for the task this agent was launched for. */
+  task?: () => TaskToolBinding | undefined;
 }
 const ORPHAN_PROBE_TIMEOUT_MS = 1_000;
 
@@ -148,6 +151,7 @@ export async function startMcpEndpoint(
       admit,
     });
     if (options.reminders) registerReminderTools(mcp, options.reminders, admit);
+    if (options.task) registerTaskTools(mcp, options.task, admit);
     wire.onClose = () => {
       clearTimeout(deadline);
       sockets.delete(wire);

@@ -87,6 +87,18 @@ describe('fleet command audit', () => {
     expect(classifyFleetArgv(argv)).toMatchObject({ decision, command });
   });
 
+  it('redacts task Progress and To review free text and file paths', () => {
+    const argv = ['task', 'review-package', '0mvggdtxfab05d11b', '--markdown', 'PRIVATE_REVIEW', '--markdown=PRIVATE_INLINE',
+      '--markdown-file', '/private/review.md', '--attach', '/private/spec.md', '--attach=/private/other.md'];
+    const redacted = JSON.stringify(redactFleetArgv(argv));
+    for (const secret of ['PRIVATE_REVIEW', 'PRIVATE_INLINE', '/private/review.md', '/private/spec.md', '/private/other.md'])
+      expect(redacted).not.toContain(secret);
+    expect(JSON.stringify(redactFleetArgv(['task', 'progress', '0mvggdtxfab05d11b', '--text', 'PRIVATE_NOTE', '--text-file', '/private/note.md'])))
+      .not.toMatch(/PRIVATE_NOTE|private\/note/);
+    expect(classifyFleetArgv(['task', 'review-package', '0mvggdtxfab05d11b'])).toMatchObject({ decision: 'allow', command: 'task review-package' });
+    expect(classifyFleetArgv(['task', 'progress', '0mvggdtxfab05d11b'])).toMatchObject({ decision: 'allow', command: 'task progress' });
+  });
+
   it('redacts private supervisor tool argument file paths', () => {
     expect(redactFleetArgv(['ours', 'call', 'Dev', 'add_contact', '--args-file', '/private/secret.json']))
       .toEqual(['ours', 'call', 'Dev', 'add_contact', '--args-file', '[REDACTED:value]']);

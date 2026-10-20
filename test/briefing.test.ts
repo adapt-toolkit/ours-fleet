@@ -33,6 +33,24 @@ describe('generateBriefing', () => {
     expect(generateBriefing(base, vocab, opts)).not.toContain('fleet_reminder_');
   });
 
+  it('tells task room members where the To review package and Progress log live, without making them Progress writers', () => {
+    const startup = {
+      room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: 'r', invite_id: 'i',
+      invite: 'x', role: 'Developer', task: 'Build.', owner_seat_cid: null,
+    };
+    const task = generateBriefing({ ...base, session: 'acp', roomMemberStartup: { ...startup, task_id: '0mvggdtxfab05d11b' } } as ResolvedRole, vocab, opts);
+    expect(task.match(/## To review and Progress/g)).toHaveLength(1);
+    expect(task).toContain('`ours-fleet task review-package 0mvggdtxfab05d11b --attach <path>`');
+    expect(task).toContain('`fleet_task_review_set`');
+    expect(task).toMatch(/grants no lifecycle authority/);
+    expect(task.replace(/\s+/g, ' ')).toMatch(/task description is replaced with only the clickable PR links, one per line \(a task without PRs links its actual deliverables instead; never invent a PR\): first save the current description \(the original requirements\) to a task-workspace file and attach it to the package, keep fuller evidence in task files, and never add status logs/);
+    expect(task).toMatch(/hand the complete package to your authorized coordinator/);
+    expect(task).toMatch(/only when your role instructions make you its writer/);
+    expect(task).not.toContain('fleet_task_progress_append');
+    const standalone = generateBriefing({ ...base, session: 'acp', roomMemberStartup: startup } as ResolvedRole, vocab, opts);
+    expect(standalone).not.toContain('To review');
+  });
+
   it('renders identity boot steps from the vocabulary', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('# Alice — Role Briefing');
