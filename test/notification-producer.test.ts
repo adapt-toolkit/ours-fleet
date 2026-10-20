@@ -107,7 +107,9 @@ it('freezes task association before delivery and preserves it across a retry aft
   let producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());
   const store=new ConversationEventStore(join(root,'task-member','.conversation'),{roleId:'task-member'});cleanup.push(async()=>store.close());
   store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
-  producer.poll();await producer.drain();await producer.close();writeFileSync(room,JSON.stringify({room_id:'room-one',member_seats:[]}));
+  // A slow turn can stop between prompt and completion; the association is frozen once the completion is queued.
+  await vi.waitFor(()=>{producer.poll();expect(JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8')).entries).toHaveLength(1);});
+  await producer.drain();await producer.close();writeFileSync(room,JSON.stringify({room_id:'room-one',member_seats:[]}));
   producer=new FleetNotificationProducer([root],state,config);fail=false;await producer.drain();await producer.close();
   expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].target).toEqual({kind:'agent',agentId:'task-member'});
 });

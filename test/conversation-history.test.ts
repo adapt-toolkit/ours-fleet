@@ -1,5 +1,6 @@
 import {describe,it,expect} from 'vitest';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,renameSync,statSync,utimesSync} from 'node:fs';
+import {open} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {conversationTailPage,resumedConversationPage} from '../src/application/conversation-history.js';
@@ -29,6 +30,49 @@ it('forward pages skip segments that end before the cursor without dropping boun
   for(const [after,expected] of [['5',[6,7,8]],['3',[4,5,6,7,8]],['8',[]],['0',[1,2,3,4,5,6,7,8]]] as const)
    expect((await resumedConversationPage(dir,{after,limit:100},live,'s')).events.map(x=>x.seq)).toEqual(expected);
  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+it('forward pages reuse unchanged segment ends and keep non-monotonic segments readable',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'fleet-history-'));
+ const handle=await open(dir,'r');const proto=Object.getPrototypeOf(handle);await handle.close();
+ const read=proto.read;let tails=0;
+ try{
+  mkdirSync(join(dir,'.conversation'));writeFileSync(join(dir,'.acp-session-id'),'s');
+  const e=(seq:number)=>JSON.stringify({version:1,seq,eventId:String(seq),roleId:'A',at:'2026-09-30T00:00:00Z',kind:'message.chunk',sessionGeneration:'g',acpSessionId:'s',source:'agent',payload:{}});
+  const segment=(n:number,seqs:number[])=>writeFileSync(join(dir,`.conversation/events-00000${n}.jsonl`),seqs.map(e).join('\n')+'\n');
+  for(let n=0;n<6;n++)segment(n+1,[1,2,3].map(k=>n*3+k));
+  const live={events:[],snapshot:{sessionGeneration:'g',readiness:'idle' as const,queueDepth:0,pendingPermissionIds:[]},hasMore:false};
+  const poll=async(after:string)=>(await resumedConversationPage(dir,{after,limit:100},live,'s')).events.map(x=>x.seq);
+  proto.read=function(this:unknown,...args:unknown[]){tails++;return read.apply(this,args);};
+  expect(await poll('18')).toEqual([]);
+  expect(tails).toBe(6);
+  // Unchanged segments are not read again by later polls.
+  tails=0;
+  expect(await poll('18')).toEqual([]);
+  expect(tails).toBe(0);
+  // The active segment grows: only its end is read again.
+  segment(6,[16,17,18,19]);
+  expect(await poll('18')).toEqual([19]);
+  expect(tails).toBe(1);
+  proto.read=read;
+  const seen:number[]=[];let after='0';
+  for(;;){
+   const page=await resumedConversationPage(dir,{after,limit:4},live,'s');
+   seen.push(...page.events.map(x=>x.seq));after=page.nextCursor!;
+   if(!page.hasMore)break;
+  }
+  expect(seen).toEqual(Array.from({length:19},(_,i)=>i+1));
+  // A pre-fix ledger whose later segment restarts below an earlier one still yields the earlier events.
+  for(let n=1;n<=6;n++)rmSync(join(dir,`.conversation/events-00000${n}.jsonl`));
+  segment(1,[1,2,100]);segment(2,[3,4,5]);
+  expect(await poll('50')).toEqual([100]);
+  // A segment replaced by rename, even with the same size and time, is not served from the cache.
+  const replaced=join(dir,'.conversation/events-00000.next');
+  writeFileSync(replaced,[1,2,200].map(e).join('\n')+'\n');
+  const before=statSync(join(dir,'.conversation/events-000001.jsonl'));utimesSync(replaced,before.atime,before.mtime);
+  renameSync(replaced,join(dir,'.conversation/events-000001.jsonl'));
+  expect(await poll('100')).toEqual([200]);
+ }finally{proto.read=read;rmSync(dir,{recursive:true,force:true});}
 });
 
 describe('conversationTailPage',()=>{

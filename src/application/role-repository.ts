@@ -118,6 +118,20 @@ export class RoleRepository {
   constructor(private readonly options: RoleRepositoryOptions = {}) {}
 
   async list(strict = false): Promise<RoleRecord[]> {
+    const scan = this.scan(strict);
+    const names = [...new Set([...scan.configuredByName.keys(), ...scan.permanent, ...scan.temporary])].sort();
+    return boundedMap(names, this.options.concurrency ?? 8, name => this.record(scan, name, strict));
+  }
+
+  // One role's record is built from its own state and probe; the other roles are never probed.
+  async get(id: string): Promise<RoleRecord | undefined> {
+    if (!ROLE_NAME_RE.test(id)) return undefined;
+    const scan = this.scan(false);
+    if (!scan.configuredByName.has(id) && !scan.permanent.has(id) && !scan.temporary.has(id)) return undefined;
+    return this.record(scan, id, false);
+  }
+
+  private scan(strict: boolean) {
     const permanentRoot = this.options.permanentRoot ?? agentsRoot();
     const temporaryRoot = this.options.temporaryRoot ?? tmpRoot();
     let configured: ResolvedRole[] = [];
@@ -127,57 +141,55 @@ export class RoleRepository {
       if (strict) throw error;
       configProblem = { code: 'config_invalid', severity: 'error', source: 'config', detail: (error as Error).message };
     }
-    const permanent = new Set(safeDirs(permanentRoot, strict));
-    const temporary = new Set(safeDirs(temporaryRoot, strict));
-    const configuredByName = new Map(configured.map(role => [role.name, role]));
-    const names = [...new Set([...configuredByName.keys(), ...permanent, ...temporary])].sort();
-
-    return boundedMap(names, this.options.concurrency ?? 8, async name => {
-      const config = configuredByName.get(name);
-      const inPermanent = permanent.has(name);
-      const inTemporary = temporary.has(name);
-      const problems: Problem[] = configProblem ? [configProblem] : [];
-      let tempRole: ResolvedRole | undefined;
-      let stateHealth: RoleRecord['stateHealth'] = inPermanent || inTemporary ? 'present' : 'missing';
-      if (inTemporary) {
-        const read = snapshot(join(temporaryRoot, name, 'role.yaml'), name);
-        tempRole = read.role;
-        if (strict && read.problem) throw new Error('temporary role snapshot unavailable');
-        if (read.problem) { problems.push(read.problem); stateHealth = 'corrupt'; }
-      }
-      if (inPermanent && inTemporary)
-        problems.push({ code: 'duplicate_state', severity: 'error', detail: 'both permanent and temporary state exist' });
-      const intended = config?.session ?? tempRole?.session;
-      const detected = await this.detect(name, intended);
-      if (intended && detected !== 'none' && detected !== intended && detected !== 'ambiguous')
-        problems.push({
-          code: 'backend_mismatch', severity: 'warning',
-          detail: `configured ${intended}, detected ${detected}`,
-        });
-      const stateRef = inTemporary ? { lifetime: 'temporary' as const }
-        : inPermanent ? { lifetime: 'permanent' as const } : undefined;
-      const tempStateDir = inTemporary ? join(temporaryRoot, name) : undefined;
-      const taskId = !config && tempStateDir ? retainedTaskId(tempStateDir, name) : undefined;
-      return {
-        id: name,
-        lifetime: config ? 'permanent' : inTemporary ? 'temporary' : 'orphan',
-        configured: Boolean(config),
-        ...(taskId ? { taskId } : {}),
-        config: config ? view(config) : tempRole ? view(tempRole) : undefined,
-        stateRef,
-        stateHealth,
-        configuredBackend: intended,
-        detectedBackend: detected,
-        compatibility: { compatible: true },
-        problems,
-        lineage: tempStateDir ? readSpawnLineage(tempStateDir) : undefined,
-      };
-    });
+    return {
+      temporaryRoot, configProblem,
+      permanent: new Set(safeDirs(permanentRoot, strict)),
+      temporary: new Set(safeDirs(temporaryRoot, strict)),
+      configuredByName: new Map(configured.map(role => [role.name, role])),
+    };
   }
 
-  async get(id: string): Promise<RoleRecord | undefined> {
-    if (!ROLE_NAME_RE.test(id)) return undefined;
-    return (await this.list()).find(role => role.id === id);
+  private async record(scan: ReturnType<RoleRepository['scan']>, name: string, strict: boolean): Promise<RoleRecord> {
+    const { temporaryRoot, configProblem } = scan;
+    const config = scan.configuredByName.get(name);
+    const inPermanent = scan.permanent.has(name);
+    const inTemporary = scan.temporary.has(name);
+    const problems: Problem[] = configProblem ? [configProblem] : [];
+    let tempRole: ResolvedRole | undefined;
+    let stateHealth: RoleRecord['stateHealth'] = inPermanent || inTemporary ? 'present' : 'missing';
+    if (inTemporary) {
+      const read = snapshot(join(temporaryRoot, name, 'role.yaml'), name);
+      tempRole = read.role;
+      if (strict && read.problem) throw new Error('temporary role snapshot unavailable');
+      if (read.problem) { problems.push(read.problem); stateHealth = 'corrupt'; }
+    }
+    if (inPermanent && inTemporary)
+      problems.push({ code: 'duplicate_state', severity: 'error', detail: 'both permanent and temporary state exist' });
+    const intended = config?.session ?? tempRole?.session;
+    const detected = await this.detect(name, intended);
+    if (intended && detected !== 'none' && detected !== intended && detected !== 'ambiguous')
+      problems.push({
+        code: 'backend_mismatch', severity: 'warning',
+        detail: `configured ${intended}, detected ${detected}`,
+      });
+    const stateRef = inTemporary ? { lifetime: 'temporary' as const }
+      : inPermanent ? { lifetime: 'permanent' as const } : undefined;
+    const tempStateDir = inTemporary ? join(temporaryRoot, name) : undefined;
+    const taskId = !config && tempStateDir ? retainedTaskId(tempStateDir, name) : undefined;
+    return {
+      id: name,
+      lifetime: config ? 'permanent' : inTemporary ? 'temporary' : 'orphan',
+      configured: Boolean(config),
+      ...(taskId ? { taskId } : {}),
+      config: config ? view(config) : tempRole ? view(tempRole) : undefined,
+      stateRef,
+      stateHealth,
+      configuredBackend: intended,
+      detectedBackend: detected,
+      compatibility: { compatible: true },
+      problems,
+      lineage: tempStateDir ? readSpawnLineage(tempStateDir) : undefined,
+    };
   }
 
   stateDir(record: RoleRecord): string | undefined {

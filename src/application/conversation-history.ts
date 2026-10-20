@@ -1,5 +1,5 @@
 import {createReadStream} from 'node:fs';
-import {open,readFile,readdir} from 'node:fs/promises';
+import {open,readFile,readdir,stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
 import type {ConversationEventV1,ConversationObservationState} from '../session/conversation-types.js';
@@ -36,10 +36,21 @@ async function readLinesBackward(path:string,visit:(line:string)=>boolean,signal
   } finally {await file.close();}
 }
 
+// Rotated segments never change, so their last cursor is reused until the file itself changes.
+const lastSeqs=new Map<string,{key:string;seq:number|undefined}>();
+
 /** The last event cursor in a segment, read from its tail; undefined when none is readable. */
 async function lastSeq(path:string):Promise<number|undefined> {
+  const info=await stat(path).catch(()=>undefined);
+  const key=info&&`${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`;
+  const known=key?lastSeqs.get(path):undefined;
+  if(key&&known?.key===key)return known.seq;
   let seq:number|undefined;
   await readLinesBackward(path,line=>{try{const value=Number(JSON.parse(line).seq);if(Number.isSafeInteger(value)){seq=value;return false;}}catch{}return true;});
+  if(key){
+    lastSeqs.delete(path);lastSeqs.set(path,{key,seq});
+    if(lastSeqs.size>4096)lastSeqs.delete(lastSeqs.keys().next().value!);
+  }
   return seq;
 }
 
