@@ -11,12 +11,12 @@ import { defaultConfigPath } from '../src/paths.js';
 
 const cleanup: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
-function fixture(project: (descriptor: any) => Promise<unknown>, configPath?: string) {
+function fixture(project: (descriptor: any) => Promise<unknown>, configPath?: string, activityIntervalMs = 20) {
   const root = mkdtempSync(join(tmpdir(), 'configuration-fairness-'));
   cleanup.push(() => rmSync(root, {recursive:true, force:true}));
   const response = Object.assign(new EventEmitter(), {write:vi.fn(() => true), end:vi.fn()});
   const resources = new FleetResourceViews({paths:[root], roots:[root], configPath,
-    watch:() => Object.assign(new EventEmitter(), {close(){}})}, project);
+    watch:() => Object.assign(new EventEmitter(), {close(){}})}, project, () => [], activityIntervalMs);
   const connection = resources.open(response as any, 'owner', () => true);
   cleanup.push(() => resources.close());
   const register = (epoch = 1, resource = 'configuration') => resources.register('owner', connection.connectionId, 'view', epoch, {viewId:'view', resource});
@@ -70,7 +70,7 @@ it('serves a real HTTP request before a sustained synchronous projection chain c
     while (performance.now() < until) { /* bounded synchronous canonical projection work */ }
     if (captures < total) publishFleetResourceCommit(join(f.root, 'Agent', '.conversation', 'events-000001.jsonl'));
     return {captures};
-  });
+  }, undefined, 0); // Serialization fairness itself, without activity coalescing.
   await f.bound(f.register(1, 'directory'));
   await requested;
   await expect.poll(() => captures).toBe(total);

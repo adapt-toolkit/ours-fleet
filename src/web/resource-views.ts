@@ -45,6 +45,8 @@ export const RESOURCE_FRAME_BYTES = 512 * 1024;
 export const RESOURCE_PENDING_BYTES = 8 * 1024 * 1024;
 export const RESOURCE_ASSEMBLY_BYTES = 16 * 1024 * 1024;
 const CHUNK_BYTES = 256 * 1024;
+/** Minimum spacing of activity-only follow-up captures of one view. */
+export const ACTIVITY_CAPTURE_INTERVAL_MS = 1000;
 
 /** Lazily yield byte chunks so backpressure never queues an entire large record.
  * Base64 prevents splitting a Unicode scalar from corrupting JSON/SSE parsing. */
@@ -203,6 +205,8 @@ interface View {
   payload?: unknown; covered?: FleetResourceState; qualifiedAt?: number;
   source: ReturnType<ReturnType<typeof observeFleetResources>['cursor']>; scheduledPosition: number;
   captureSource: ReturnType<ReturnType<typeof observeFleetResources>['cursor']>;
+  /** Start time and structural position of the latest capture; a deferred activity follow-up. */
+  capturedAt?: number; capturedStructure?: number; activityTimer?: ReturnType<typeof setTimeout>;
 }
 interface BoundProjection {
   payload: unknown; source: FleetResourceState; producerGeneration: string; revision: number; baselineId: string; descriptor: ResourceDescriptor;
@@ -221,7 +225,8 @@ export class FleetResourceViews {
   readonly producerGeneration = randomUUID();
   private connections = new Map<string, Connection>();
   constructor(private scope: FleetResourceScope, private project: (descriptor: ResourceDescriptor, signal: AbortSignal, owner: string) => Promise<unknown>,
-    private configurationInputs: () => readonly string[] = () => []) {}
+    private configurationInputs: () => readonly string[] = () => [],
+    private activityCaptureIntervalMs = ACTIVITY_CAPTURE_INTERVAL_MS) {}
   open(response: ServerResponse, owner: string, authorized: () => boolean) {
     const id = randomUUID(), controller = new AbortController();
     let connection: Connection | undefined;
@@ -311,7 +316,7 @@ export class FleetResourceViews {
     if(!connection || connection.owner!==owner)throw new ResourceBindingError(409,'unknown resource connection');return connection;
   }
   private current(connection:Connection,view:View) {return !connection.controller.signal.aborted && !view.controller.signal.aborted && connection.views.get(view.descriptor.viewId)===view;}
-  private retire(view:View) {view.controller.abort();view.rejectInitial(new ResourceBindingError(409,'resource binding retired'));}
+  private retire(view:View) {clearTimeout(view.activityTimer);view.activityTimer=undefined;view.controller.abort();view.rejectInitial(new ResourceBindingError(409,'resource binding retired'));}
   private emit(connection:Connection,view:View,kind:ResourceEnvelope['kind'],payload:unknown,source?:FleetResourceState) {
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,kind,payload,...(source?{source}:{})} as ResourceEnvelope,()=>{view.sequence++;if(source||kind==='ready')view.qualifiedAt=Date.now();});
   }
@@ -357,10 +362,10 @@ export class FleetResourceViews {
     if (descriptor.resource === 'previews' && /^task-[A-Za-z0-9_-]+(?:\.op\.json|\.json|\.brief\.md)$/.test(relative(resolve(stateRoot(), 'layouts'), path))) return false;
     // Only classify known activity writes under the configured role roots.
     // Parent/unknown events and every other file retain full invalidation.
-    // The canonical web producer atomically replaces hashed checkpoint files.
-    // These delivery acknowledgements are not role/task/config membership;
-    // retain full wakes without requiring an outbox-quiet capture window.
-    if (structural && /^[a-f0-9]{64}\.json$/.test(relative(resolve(stateRoot(), 'web', 'notification-outboxes'), path))) return false;
+    // The canonical web producer atomically replaces hashed checkpoint files,
+    // once per ledger advance of any role. No projection reads these delivery
+    // acknowledgements, so they neither fence a capture nor wake a follow-up.
+    if (/^[a-f0-9]{64}\.json$/.test(relative(resolve(stateRoot(), 'web', 'notification-outboxes'), path))) return false;
     for (const root of roots) {
       const parts = relative(resolve(root), path).split(sep);
       if (parts[0] === '..') continue;
@@ -384,8 +389,25 @@ export class FleetResourceViews {
     }
     return true;
   }
-  private schedule(connection:Connection,view:View) {
+  private schedule(connection:Connection,view:View,due=false) {
     if(!this.current(connection,view)||view.failed)return;
+    // Agent activity (ledger appends, status files) changes previews and status
+    // continuously while an agent works. Without a structural change since the
+    // latest capture began, coalesce those wakes into one trailing capture per
+    // interval instead of re-projecting every role after every append.
+    const wait=!due && view.captureSource!==view.source && view.capturedAt!==undefined
+      && view.captureSource.snapshot().position===view.capturedStructure
+      ? this.activityCaptureIntervalMs-(Date.now()-view.capturedAt) : 0;
+    if(wait>0) {
+      view.scheduledPosition=view.source.snapshot().position;view.dirty=true;
+      if(!view.running && !view.activityTimer) {
+        // The trailing capture runs when its timer fires, whatever the clock reads.
+        view.activityTimer=setTimeout(()=>{view.activityTimer=undefined;this.schedule(connection,view,true);},Math.min(wait,this.activityCaptureIntervalMs));
+        view.activityTimer.unref?.();
+      }
+      return;
+    }
+    clearTimeout(view.activityTimer);view.activityTimer=undefined;
     view.scheduledPosition=view.source.snapshot().position;
     view.dirty=true;if(view.running)return;view.running=true;
     const task=connection.tail.then(async()=>{
@@ -400,7 +422,7 @@ export class FleetResourceViews {
   private async refresh(connection:Connection,view:View) {
     try {
       if(!view.dirty||!this.current(connection,view))return;
-      view.dirty=false;
+      view.dirty=false;view.capturedAt=Date.now();view.capturedStructure=view.captureSource.snapshot().position;
       let payload:unknown,source:FleetResourceState|undefined;
       for(let attempt=0;attempt<3;attempt++) {
         view.controller.signal.throwIfAborted();

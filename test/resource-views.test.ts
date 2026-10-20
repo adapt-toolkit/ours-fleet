@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,13 +7,15 @@ import { FleetResourceViews, canonicalResourceDescriptor, resourceFrames } from 
 import { publishFleetResourceCommit } from '../src/application/resource-observer.js';
 import { conversationPreview } from '../src/application/conversation-history.js';
 import { stateRoot } from '../src/paths.js';
+import { open } from 'node:fs/promises';
 const clean:Array<()=>void>=[];
 afterEach(()=>{for(const fn of clean.splice(0).reverse())fn();});
-function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true,configPath?:string|((root:string)=>string)){
+// Churn tests keep activity coalescing active with a short interval; its production bound has its own test.
+function fixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,authorized=()=>true,configPath?:string|((root:string)=>string),activityIntervalMs=20){
   const root=mkdtempSync(join(tmpdir(),'resource-views-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));
   const response=new EventEmitter() as any;response.write=vi.fn(()=>true);response.end=vi.fn();
   const handles:any[]=[];
-  const resources=new FleetResourceViews({paths:[root],roots:[root],...(configPath?{configPath:typeof configPath==='function'?configPath(root):configPath}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project);
+  const resources=new FleetResourceViews({paths:[root],roots:[root],...(configPath?{configPath:typeof configPath==='function'?configPath(root):configPath}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();handles.push(h);return h;}},project,()=>[],activityIntervalMs);
   const connection=resources.open(response,'owner',authorized);clean.push(()=>resources.close());
   const frames=()=>response.write.mock.calls.map(([s]:[string])=>String(s)).filter((s:string)=>s.startsWith('event: resource\n')).map((s:string)=>JSON.parse(s.split('data: ')[1]));
   const register=(epoch=1,resource='directory',extra={})=>resources.register('owner',connection.connectionId,'view',epoch,{viewId:'view',resource,...extra});
@@ -76,6 +78,22 @@ it('projects durable text/nontext chunks with the existing preview grouping, tim
   expect(await conversationPreview(root,new AbortController().signal)).toEqual({text:'hi [image] there',at:'4'});
   writeFileSync(path,'{"partial":');expect(await conversationPreview(root,new AbortController().signal)).toEqual({text:'No recent agent output',at:''});
   writeFileSync(join(root,'.conversation','events-000002.jsonl'),'');await expect(conversationPreview(root,new AbortController().signal)).rejects.toThrow('partial record');
+});
+it('reads a preview backwards only until its newest two hundred events',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'preview-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));mkdirSync(join(root,'.conversation'));
+  const event=(seq:number,extra:object)=>JSON.stringify({schemaVersion:1,seq,at:String(seq),...extra});
+  // About 3 MiB of older tool output, then 250 small events ending in one assistant message.
+  const lines=[...Array.from({length:30},(_,i)=>event(i+1,{kind:'tool.upsert',pad:'x'.repeat(100*1024)})),
+    ...Array.from({length:250},(_,i)=>i%2?event(i+31,{kind:'message.chunk',messageId:'m',payload:{role:'assistant',content:{type:'text',text:`w${i} `}}}):event(i+31,{kind:'thought.chunk'}))];
+  writeFileSync(join(root,'.conversation','events-000001.jsonl'),lines.join('\n')+'\n');
+  const probe=await open(join(root,'.conversation','events-000001.jsonl'),'r'),proto=Object.getPrototypeOf(probe);await probe.close();
+  let bytes=0;const read=proto.read;
+  const spy=vi.spyOn(proto,'read').mockImplementation(async function(this:unknown,...args:unknown[]){const result=await read.apply(this,args);bytes+=result.bytesRead;return result;});
+  try {
+    const preview=await conversationPreview(root,new AbortController().signal);
+    expect(preview.at).toBe('280');expect(preview.text.startsWith('w51 w53 ')).toBe(true);
+    expect(bytes).toBeLessThanOrEqual(64*1024);
+  } finally {spy.mockRestore();}
 });
 it('serves one authenticated canonical capture over SSE and bound HTTP, reuses redacted config serialization and retires on revocation',async()=>{
   const {buildWebServer}=await import('../src/web/server.js');
@@ -244,7 +262,7 @@ it('readies committed selected previews during sustained appends and drains thei
       publishFleetResourceCommit(join(dir, 'manifest.json'));
     }
     return {previews:{selected:preview}};
-  });
+  }, undefined, undefined, 0); // Every follow-up in order; coalescing has its own tests.
   const dir=join(f.root,'selected','.conversation');mkdirSync(dir,{recursive:true});
   const file=join(dir,'events-000001.jsonl');writeFileSync(file,event(0));
   f.response.write.mockImplementation((text:string)=>{if(text.includes('"kind":"ready"'))readyAt=commits;return true;});
@@ -382,7 +400,7 @@ for (const resource of ['directory', 'roles']) it.each(['.conversation/events-00
       publishFleetResourceCommit(path);
     }
     return resource === 'directory' ? {roles:rows,tasks:[],lists:[]} : {roles:rows};
-  });
+  }, undefined, undefined, 0); // Every follow-up in order; coalescing has its own tests.
   f.response.write.mockImplementation((text:string) => {
     if (text.includes('"kind":"ready"')) readyAt = commits;
     return true;
@@ -516,7 +534,7 @@ it('qualifies changed data with captured source and suppresses its immediate cov
 it('excludes pending, failed and replaced registrations while an unchanged sibling stays covered',async()=>{
   vi.useFakeTimers({toFake:['setInterval','clearInterval','Date']});clean.push(()=>vi.useRealTimers());
   let hold=false,release!:(payload:unknown)=>void;
-  const f=fixture(async d=>d.viewId==='pending'&&hold?new Promise(r=>release=r):({rows:[d.viewId]}));
+  const f=fixture(async d=>d.viewId==='pending'&&hold?new Promise(r=>release=r):({rows:[d.viewId]}),undefined,undefined,0);
   for(const viewId of ['quiet','pending']){
     const binding=f.resources.register('owner',f.connection.connectionId,viewId,1,{viewId,resource:'previews',ids:[viewId]});
     await f.resources.bound('owner',f.connection.connectionId,viewId,1,binding.baselineId);
@@ -558,4 +576,45 @@ it('retains two-second idle authorization enforcement independently of sparse wi
   expect(authorized).toHaveBeenCalledTimes(34); // 30 admission checks + four health-send checks.
   expect(f.response.write.mock.calls).toHaveLength(4);
   valid=false;await vi.advanceTimersByTimeAsync(2000);expect(f.response.end).toHaveBeenCalledTimes(1);
+});
+
+describe('activity follow-up coalescing', () => {
+  const activity = (root:string) => join(root, 'A', '.conversation', 'events-000001.jsonl');
+  const setup = async () => {
+    vi.useFakeTimers({toFake:['setTimeout','clearTimeout','Date']});clean.push(()=>vi.useRealTimers());
+    let state = 0;
+    const project = vi.fn(async () => ({roles:[{id:'A', state}]}));
+    const f = fixture(project, undefined, undefined, 1000);
+    const binding = f.register();
+    await f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId);
+    const commit = async (path:string) => {state++;publishFleetResourceCommit(path);for(let i=0;i<5;i++)await new Promise(setImmediate);};
+    const latest = () => f.frames().filter(frame => frame.kind === 'snapshot').at(-1)?.payload.roles[0].state;
+    const advance = async (ms:number) => {await vi.advanceTimersByTimeAsync(ms);for(let i=0;i<5;i++)await new Promise(setImmediate);};
+    return {f, project, commit, latest, advance};
+  };
+  it('re-projects sustained agent activity once per interval and always ends with a trailing capture', async () => {
+    const {f, project, commit, latest, advance} = await setup();
+    for (let n = 0; n < 10; n++) { await commit(activity(f.root)); await advance(50); }
+    expect(project).toHaveBeenCalledTimes(1); // Ten appends inside the first interval add no capture yet.
+    await advance(600);
+    expect(project).toHaveBeenCalledTimes(2);
+    expect(latest()).toBe(10); // The trailing capture observes every append.
+    await advance(5000);
+    expect(project).toHaveBeenCalledTimes(2); // Quiet afterwards.
+  });
+  it('captures a structural change immediately during the activity interval', async () => {
+    const {f, project, commit, latest} = await setup();
+    await commit(activity(f.root));
+    expect(project).toHaveBeenCalledTimes(1);
+    await commit(join(f.root, 'A', 'role.yaml'));
+    expect(project).toHaveBeenCalledTimes(2);
+    expect(latest()).toBe(2);
+  });
+  it('drops a pending activity capture when its view is retired', async () => {
+    const {f, project, commit, advance} = await setup();
+    await commit(activity(f.root));
+    f.resources.remove('owner', f.connection.connectionId, 'view', 1);
+    await advance(2000);
+    expect(project).toHaveBeenCalledTimes(1);
+  });
 });
