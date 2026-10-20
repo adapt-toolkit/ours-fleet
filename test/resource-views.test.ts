@@ -229,17 +229,40 @@ for (const resource of ['configuration', 'previews']) it(`keeps ${resource} read
   expect(batches[0].views[0].source).toEqual(captured);
   expect(reads).toBe(settled);
 });
-it('retains the three capture limit for continuously changing selected preview data', async () => {
-  let reads = 0;
-  const f = fixture(async () => {
+it('readies committed selected previews during sustained appends and drains their starting watermarks in order', async () => {
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout','setInterval','clearInterval','Date','performance']});
+  clean.push(()=>vi.useRealTimers());
+  let reads = 0, commits = 0, readyAt = -1;
+  const event = (seq:number) => JSON.stringify({schemaVersion:1,seq,at:String(seq),kind:'message.replace',messageId:'reply',payload:{role:'assistant',content:{type:'text',text:`reply ${seq}`}}})+'\n';
+  const f = fixture(async (_descriptor, signal) => {
     reads++;
-    publishFleetResourceCommit(join(f.root, 'selected', '.conversation', 'events-000001.jsonl'));
-    return {value:'unstable'};
+    const preview = await conversationPreview(join(f.root, 'selected'), signal);
+    if (commits < 8) {
+      commits++;
+      writeFileSync(file, event(commits));
+      publishFleetResourceCommit(file);
+      publishFleetResourceCommit(join(dir, 'manifest.json'));
+    }
+    return {previews:{selected:preview}};
   });
+  const dir=join(f.root,'selected','.conversation');mkdirSync(dir,{recursive:true});
+  const file=join(dir,'events-000001.jsonl');writeFileSync(file,event(0));
+  f.response.write.mockImplementation((text:string)=>{if(text.includes('"kind":"ready"'))readyAt=commits;return true;});
   const binding = f.register(1, 'previews', {ids:['selected']});
-  await expect(f.resources.bound('owner', f.connection.connectionId, 'view', 1, binding.baselineId)).rejects.toThrow('unstable');
-  expect(reads).toBe(3);
-  expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
+  const initial=await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  expect(initial.payload).toEqual({previews:{selected:{text:'reply 0',at:'0'}}});
+  expect(initial.source.position).toBe(0);
+  expect(readyAt).toBe(1); // Ready while seven more captures will overlap commits.
+  await expect.poll(()=>f.frames().filter(frame=>frame.kind==='snapshot').at(-1)?.payload.previews.selected.text).toBe('reply 8');
+  const snapshots=f.frames().filter(frame=>frame.kind==='snapshot');
+  expect(snapshots.map(frame=>frame.payload.previews.selected.at)).toEqual(Array.from({length:9},(_,i)=>String(i)));
+  expect(snapshots.map(frame=>frame.source.position)).toEqual(Array.from({length:9},(_,i)=>i*2));
+  expect(f.frames().some(frame=>frame.kind==='resync'||frame.kind==='health')).toBe(false);
+  // Discover the directories created after initial watch installation, then
+  // verify idle coverage does not reopen completed preview records.
+  await vi.advanceTimersByTimeAsync(100);await new Promise(setImmediate);
+  const settled=reads;await vi.advanceTimersByTimeAsync(60_000);
+  expect(reads).toBe(settled);
 });
 
 it('keeps selected previews live while independent task layout receipts commit during every capture', async () => {
@@ -263,6 +286,30 @@ it('keeps selected previews live while independent task layout receipts commit d
   await expect.poll(()=>f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'committed'});
   expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
   expect(reads).toBe(2);
+});
+
+it.each(['unknown.json','nested/events-000001.jsonl'])('retains selected preview capture fencing for unknown ledger path %s', async filename => {
+  let reads=0;
+  const f=fixture(async()=>{
+    reads++;publishFleetResourceCommit(join(f.root,'selected','.conversation',filename));
+    return {previews:{selected:{text:'unstable',at:''}}};
+  });
+  const binding=f.register(1,'previews',{ids:['selected']});
+  await expect(f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId)).rejects.toThrow('unstable');
+  expect(reads).toBe(3);
+  expect(f.frames().some(frame=>frame.kind==='snapshot'||frame.kind==='ready')).toBe(false);
+});
+
+it('retains preview authority for an explicit config named as a known ledger manifest', async()=>{
+  let reads=0;
+  const f=fixture(async()=>{
+    reads++;publishFleetResourceCommit(join(f.root,'selected','.conversation','manifest.json'));
+    return {previews:{selected:{text:'stale',at:''}}};
+  },()=>true,root=>join(root,'selected','.conversation','manifest.json'));
+  const binding=f.register(1,'previews',{ids:['selected']});
+  await expect(f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId)).rejects.toThrow('unstable');
+  expect(reads).toBe(3);
+  expect(f.frames().some(frame=>frame.kind==='snapshot'||frame.kind==='ready')).toBe(false);
 });
 
 for (const [resource, filename] of [['directory', 'task-observed.op.json'], ['previews', 'unknown.json']]) {
