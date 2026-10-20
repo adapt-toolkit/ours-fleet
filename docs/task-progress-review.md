@@ -30,13 +30,21 @@ The packaged default roles divide the work so milestones are not duplicated:
 | LocalCoordinator | Default writer: appends significant verified milestones during room turns it already takes. Its 15-minute continuity pass never writes Progress. | Makes sure members prepare the package before a Review handoff; hands it to the Fleet Coordinator. |
 | Developer, Engineer | Not by default. | Prepare and keep the package current before reporting completion or asking for Review. |
 | Critic | Not by default. | Check that the package matches what was verified; withhold sign-off while it is missing, stale or misleading. |
-| Coordinator (Fleet Coordinator) | Not by default. | Before `task review`, check that the package exists; if it is missing, ask the room to complete it instead of writing it. Finish only when the Owner accepts or asks. |
+| Coordinator (Fleet Coordinator) | Not by default. | Before `task review`, check that the package exists and attaches the original description; if not, ask the room to complete it instead of writing it. Then replace the description with only the PR links (or deliverable links when there are no PRs). Finish only when the Owner accepts or asks. |
 
 This is default instruction policy, not an access rule: any agent bound to the
 task, and the local operator, can use the surfaces below. Preparing a package
 grants no lifecycle authority. A role moves a task to Review only when its
 instructions grant that; otherwise it hands the complete package to its
 authorized coordinator. Nothing here merges, deploys or marks a task done.
+
+At Review, the task description and the To review package have separate jobs.
+The description is replaced with only the clickable Markdown PR links, one per
+line, with no status or evidence. A research or document task without PRs links
+its actual deliverables instead; it never invents a PR. The package holds everything the Owner needs
+to review, including the original task description as an attached file. Package
+authors save and attach that file before the handoff, the Critic checks it, and
+the Coordinator replaces the description only once the package has it.
 
 Fresh installations get these instructions with preset revision 12. An existing
 configuration keeps its installed copies until you run
