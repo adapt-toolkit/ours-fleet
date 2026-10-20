@@ -123,6 +123,36 @@ identity: Temp
     expect(JSON.stringify(roles)).not.toContain('never-return-this');
   });
 
+  it('builds one role by id without probing the other roles', async () => {
+    const root = fixture();
+    writeV2Fixture(join(root, 'fleet.yaml'), `
+roles:
+  ConfigOnly:
+    session: acp
+  Permanent:
+    session: acp
+`);
+    mkdirSync(join(root, '.ours-fleet', 'agents', 'Permanent'));
+    mkdirSync(join(root, '.ours-fleet', 'agents', 'Orphan'));
+    mkdirSync(join(root, '.ours-fleet', 'tmp', 'Temp'), { recursive: true });
+    writeFileSync(join(root, '.ours-fleet', 'tmp', 'Temp', 'role.yaml'), 'harness: codex\nsession: acp\n');
+    const probed: string[] = [];
+    const repo = new RoleRepository({
+      configPath: join(root, 'fleet.yaml'),
+      probeBackend: async (name, intended) => { probed.push(name); return { acp: intended === 'acp' }; },
+    });
+    const listed = await repo.list();
+    for (const id of ['ConfigOnly', 'Orphan', 'Permanent', 'Temp']) {
+      probed.length = 0;
+      expect(await repo.get(id)).toEqual(listed.find(role => role.id === id));
+      expect(probed).toEqual([id]);
+    }
+    probed.length = 0;
+    expect(await repo.get('Missing')).toBeUndefined();
+    expect(await repo.get('../Temp')).toBeUndefined();
+    expect(probed).toEqual([]);
+  });
+
   it('keeps timeout/control failures distinct from proof of offline', () => {
     expect(normalizeError(new SessionControlError('timeout', 'busy')).toJSON()).toMatchObject({
       code: 'timeout', provesOffline: false, retryable: true,
