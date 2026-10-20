@@ -18,6 +18,8 @@ import { RuntimeController } from './controller.js';
 import { atomicPrivateWrite, binderKey } from './state.js';
 import { AgentOursRuntime, type RoomAdmission } from './runtime.js';
 import { startMcpEndpoint } from './mcp-endpoint.js';
+import { readTempSupervisorForScan } from '../temp-lifecycle.js';
+import type { TaskToolBinding } from '../rooms-tasks/task-tools.js';
 
 export const privateRuntimeRoot = () => join(stateRoot(), 'private-ours');
 export interface ManagedAgentService {
@@ -63,6 +65,13 @@ export function currentChatFileHandler(options: {
       } finally { await source.close(); }
     }, role.permissions);
   };
+}
+/** Task membership comes from supervisor launch records, re-read per call so a restart cannot leave it stale. */
+export function taskToolBinding(role: ResolvedRole, stateDir: string, cid: string | undefined): TaskToolBinding | undefined {
+  const owned = readTempSupervisorForScan(stateDir)?.taskOwner?.taskId;
+  const taskId = owned ?? role.roomMemberStartup?.task_id;
+  if (!taskId) return undefined;
+  return { taskId, role: role.name, ...(cid ? { identityCid: cid } : {}), taskOwned: !!owned };
 }
 function roomSecretPath(role: ResolvedRole): string {
   const startup = role.roomMemberStartup!;
@@ -299,6 +308,7 @@ export async function prepareManagedAgent(
       identities,
       remoteDaemonFiles: true,
       reminders: () => reminders,
+      task: () => taskToolBinding(role, stateDir, runtime.snapshot.cid),
       currentChatFile: currentChatFileHandler({
         role, cwd, store: new ArtifactStore(stateDir), sender: () => fileSender,
         privateState: [privateRuntimeRoot(), join(stateRoot(), 'private-file-delivery'), profile.configPath, profile.credentialPath],

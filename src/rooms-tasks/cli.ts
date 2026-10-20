@@ -61,6 +61,12 @@ import {
 } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
 import {
+  appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress,
+  openTaskWorkspaceFile, publicProgressEntry, publicReview, setTaskReviewMarkdown,
+} from './task-review.js';
+import type { TaskContributionAuthor } from './types.js';
+import { verifiedFleetCaller } from '../fleet-command-audit.js';
+import {
   beginFleetAuditCollection, consumeFleetAuditCollection, recordFleetAuditFailure,
   recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
@@ -166,6 +172,18 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
       action: 'Run ours-fleet room list to find a live room ID.',
     };
   }
+}
+
+/** A supervisor-verified managed agent is attributed as itself; otherwise the local operator. */
+function cliContributionAuthor(taskId: string): TaskContributionAuthor {
+  const caller = verifiedFleetCaller();
+  if (!caller) return { kind: 'local_control', surface: 'cli' };
+  const member = getTask(taskId).member_roles.find(item => item.name === caller);
+  return { kind: 'agent', role: caller, ...(member ? { identity_cid: member.identity_cid } : {}), surface: 'cli' };
+}
+
+function contributionAuthorLabel(author: TaskContributionAuthor): string {
+  return author.kind === 'agent' ? `${author.role} (agent, ${author.surface})` : `local ${author.surface}`;
 }
 
 function die(e: unknown): never {
@@ -1012,6 +1030,61 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task ready for review', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('progress <id>')
+    .description('read the task Progress log, or append one significant milestone with --text')
+    .option('--text <text>', 'milestone text to append, kept exactly as written')
+    .option('--text-file <path>', 'milestone text to append, from a file')
+    .option('--request-key <key>', 'retry key: repeating the same key and text returns the original entry')
+    .option('--json', 'JSON output')
+    .action((id: string, opts: { text?: string; textFile?: string; requestKey?: string; json?: boolean }) => {
+      try {
+        if (opts.text !== undefined && opts.textFile !== undefined) throw new Error('use --text or --text-file, not both');
+        const text = opts.textFile !== undefined ? readFileSync(opts.textFile, 'utf8') : opts.text;
+        if (text === undefined) {
+          if (opts.requestKey !== undefined) throw new Error('--request-key applies only when appending');
+          const progress = listTaskProgress(id).map(publicProgressEntry);
+          if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, progress }, null, 2)); return; }
+          console.log(progress.length ? progress.map(entry => `- ${entry.at} — ${contributionAuthorLabel(entry.author)}\n\n${entry.text}\n`).join('\n')
+            : `Task ${id} has no progress entries.`);
+          return;
+        }
+        const result = appendTaskProgress(id, { text, requestKey: opts.requestKey, author: cliContributionAuthor(id) });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, entry: publicProgressEntry(result.entry), replayed: result.replayed }, null, 2)); return; }
+        console.log(result.replayed ? `Progress entry ${result.entry.id} was already recorded.` : `Progress entry ${result.entry.id} added to task ${id}.`);
+      } catch (e) { die(e); }
+    });
+
+  taskCmd.command('review-package <id>')
+    .description('show or prepare the task To review package (Markdown and retained files)')
+    .option('--markdown <text>', 'replace the review Markdown')
+    .option('--markdown-file <path>', 'replace the review Markdown from a file')
+    .option('--attach <path>', 'retain a file from the task workspace in the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--detach <artifact-id>', 'remove a file from the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--request-key <key>', 'retry key for a single --attach: repeating it with the same file returns the original artifact')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { markdown?: string; markdownFile?: string; attach: string[]; detach: string[]; requestKey?: string; json?: boolean }) => {
+      try {
+        if (opts.markdown !== undefined && opts.markdownFile !== undefined) throw new Error('use --markdown or --markdown-file, not both');
+        if (opts.requestKey !== undefined && opts.attach.length !== 1) throw new Error('--request-key needs exactly one --attach');
+        const markdown = opts.markdownFile !== undefined ? readFileSync(opts.markdownFile, 'utf8') : opts.markdown;
+        const author = markdown !== undefined || opts.attach.length || opts.detach.length ? cliContributionAuthor(id) : undefined;
+        const attached = [];
+        if (markdown !== undefined)
+          setTaskReviewMarkdown(id, { markdown, expectedMarkdown: getTaskReview(id)?.markdown ?? '', author: author! });
+        for (const artifactId of opts.detach) detachTaskReviewArtifact(id, artifactId);
+        for (const path of opts.attach) {
+          const source = await openTaskWorkspaceFile(getTask(id), path);
+          attached.push(await attachTaskReviewArtifact(id, { name: source.name, source, author: author!, requestKey: opts.requestKey }));
+        }
+        const review = getTaskReview(id);
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, review: review ? publicReview(review) : null }, null, 2)); return; }
+        if (!review) { console.log(`Task ${id} has no To review package yet.`); return; }
+        const files = review.artifacts.map(artifact => `- \`${artifact.id}\` ${artifact.name} (${artifact.mime}, ${artifact.size} bytes)`).join('\n');
+        console.log(`## To review — task ${id}\n\n${review.markdown || '_No review Markdown yet._'}\n\n### Files\n\n${files || '_No files._'}`
+          + (attached.some(item => item.replayed) ? '\n\n(The attached file was already recorded.)' : ''));
+      } catch (e) { die(e); }
     });
 
   cOpt(taskCmd.command('done <id>'))
