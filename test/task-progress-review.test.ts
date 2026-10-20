@@ -395,6 +395,48 @@ describe('task lock', () => {
     expect(existsSync(dir)).toBe(false);
   });
 
+  it('never reclaims a live claimer paused right after publishing its lock, and keeps both appends when it resumes', async () => {
+    const t = task(), lock = lockDir(t.task_id);
+    // A stops itself the moment its lock exists (after mkdir or link of the lock path),
+    // before anything else, as a descheduled claimer would.
+    const pauseAfterClaim = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      for (const name of ['mkdirSync', 'linkSync', 'renameSync']) {
+        const original = fs[name];
+        fs[name] = function (...args) {
+          const result = original.apply(this, args);
+          if (args[name === 'mkdirSync' ? 0 : 1] === ${JSON.stringify(lock)}) process.kill(process.pid, 'SIGSTOP');
+          return result;
+        };
+      }
+      syncBuiltinESMExports();
+    `;
+    const paused = spawn(process.execPath, [
+      '--import', `data:text/javascript,${encodeURIComponent(pauseAfterClaim)}`, '--input-type=module', '-e', `
+      const { appendTaskProgress } = await import(${JSON.stringify(module())});
+      appendTaskProgress(${JSON.stringify(t.task_id)}, { text: 'paused claimer', author: { kind: 'local_control', surface: 'cli' } });
+    `], { env: { ...process.env, OURS_FLEET_HOME: root }, stdio: ['ignore', 'ignore', 'inherit'] });
+    const pausedDone = new Promise<number>(resolveExit => paused.on('exit', code => resolveExit(code ?? -1)));
+    try {
+      for (let waited = 0; !existsSync(lock); waited += 20) {
+        if (waited > 10_000) throw new Error('paused claimer never took the lock');
+        await settle(20);
+      }
+      const blocked = writer(t.task_id, 'second writer');
+      let finished = false;
+      void blocked.done.then(() => { finished = true; });
+      await settle(7_000);
+      expect(finished).toBe(false);
+      paused.kill('SIGCONT');
+      expect(await pausedDone).toBe(0);
+      expect(await blocked.done).toBe(0);
+      expect(stored(t.task_id)).toEqual(['paused claimer', 'second writer']);
+    } finally {
+      paused.kill('SIGCONT');
+    }
+  }, 30_000);
+
   it('releases without ever exposing a half-removed lock, so heavy contention keeps every append', async () => {
     const t = task();
     const writers = Array.from({ length: 8 }, (_, index) => {
