@@ -135,7 +135,48 @@ export interface TaskNotificationEvent {
   eventId: string; title: string; body: string; target: { kind: 'task' | 'task-deleted'; taskId: string }; taskId: string;
 }
 
+/** Who wrote a progress entry or review change, as established by the Fleet surface. */
+export type TaskContributionAuthor =
+  | { kind: 'agent'; role: string; identity_cid?: string; surface: 'mcp' | 'cli' }
+  | { kind: 'local_control'; surface: 'cli' | 'web' };
+
+/** One append-only milestone; text is stored exactly as authored. */
+export interface TaskProgressEntry {
+  id: string;
+  at: string;
+  author: TaskContributionAuthor;
+  text: string;
+  /** Caller retry key, scoped to the author. */
+  request_key?: string;
+}
+
+/** Metadata of a retained review file; bytes live in Fleet's private task review store. */
+export interface TaskReviewArtifact {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  added_at: string;
+  added_by: TaskContributionAuthor;
+  request_key?: string;
+}
+
+/** Self-contained material the Owner reviews: Markdown plus retained files. */
+export interface TaskReview {
+  /** Increases with every change to the Markdown or the files; absent on packages written before it. */
+  revision?: number;
+  markdown: string;
+  updated_at: string;
+  updated_by: TaskContributionAuthor;
+  artifacts: TaskReviewArtifact[];
+}
+
 export interface TaskRecord {
+  /** Optional milestone log; absent on tasks that never recorded one. */
+  progress?: TaskProgressEntry[];
+  /** Optional To review package; absent until an agent prepares it. */
+  review?: TaskReview;
   /** Pending lifecycle events, committed atomically with their task change. */
   notification_events?: TaskNotificationEvent[];
   workspace?: import('./workspace.js').OwnedWorkspace;

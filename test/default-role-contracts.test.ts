@@ -132,6 +132,72 @@ describe('packaged default role contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('ships the self-contained To review handoff to every task role and Progress writing only to LocalCoordinator', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-review-contracts-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const cfg = loadConfig(config, { yamlMode: 'strict' });
+      const generated = generateSetup(answers).files;
+      for (const source of ['bootstrap', 'generated'] as const) {
+        // Compare prose, not the YAML line wrapping.
+        const persona = (name: string) => (source === 'bootstrap' ? String(cfg.rolePresets?.[name].persona) : String(generated.get(`roles/${name}.yaml`))).replace(/\s+/g, ' ');
+        for (const name of ['Developer', 'Engineer', 'Critic', 'LocalCoordinator']) {
+          const text = persona(name);
+          expect(text, `${source}:${name}`).toMatch(/To\s+review\s+package/);
+          expect(text, `${source}:${name}`).toMatch(/without (?:reading )?the room or the task description|review from it alone/);
+          expect(text, `${source}:${name}`).toMatch(/PR\s+(?:link|and\s+specification)/);
+          expect(text, `${source}:${name}`).toMatch(/limits/);
+          expect(text, `${source}:${name}`).toMatch(/Owner\s+decision/);
+          expect(text, `${source}:${name}`).toMatch(/grants no lifecycle authority|You do not move the task/);
+        }
+        for (const name of ['Developer', 'Engineer']) {
+          expect(persona(name), `${source}:${name}`).toMatch(/ours-fleet task review-package\s+<task-id> --attach <path>/);
+          expect(persona(name), `${source}:${name}`).toMatch(/need no PR|they need no PR/);
+          expect(persona(name), `${source}:${name}`).toMatch(/Never mark the task done or merge/);
+          // At Review the description keeps only PR links; the package keeps the original requirements.
+          expect(persona(name), `${source}:${name}`).toMatch(/task description is replaced with only the clickable PR links, one per line/);
+          expect(persona(name), `${source}:${name}`).toMatch(/save the current description \(the original requirements\) to a file in the task workspace and attach it to the package, keep fuller evidence in task files/);
+          expect(persona(name), `${source}:${name}`).toMatch(/never add status logs to the description/);
+          expect(persona(name), `${source}:${name}`).toMatch(/a research or document task without PRs links its actual deliverables instead; never invent a PR/);
+        }
+        expect(persona('Critic')).toMatch(/must also attach the original task description, which at Review is replaced with only the clickable PR links, one per line \(or the actual deliverable links when there are no PRs\)/);
+        expect(persona('LocalCoordinator')).toMatch(/the original task description as an attached file \(at Review the description keeps only the PR links, or the actual deliverable links when there are no PRs\)/);
+        expect(persona('Critic')).toMatch(/Withhold sign-off while it is missing, stale or misleading/);
+        expect(persona('LocalCoordinator')).toMatch(/default writer of this task's Progress log/);
+        expect(persona('LocalCoordinator')).toMatch(/never poll, schedule turns or mirror messages/);
+        expect(persona('LocalCoordinator')).toMatch(/Do not record agent starts,\s+status checks, normal handoffs, ordinary review findings/);
+        for (const name of ['Developer', 'Engineer', 'Critic', 'Coordinator'])
+          expect(persona(name), `${source}:${name}`).not.toMatch(/fleet_task_progress_append|task progress <task-id> --text/);
+        const coordinator = persona('Coordinator');
+        expect(coordinator).toMatch(/ours-fleet task review-package <task-id>/);
+        expect(coordinator).toMatch(/do not write or judge it yourself/);
+        expect(coordinator).toMatch(/and that it attaches the original task description/);
+        expect(coordinator).toMatch(/Then replace the task description with only the clickable Markdown PR links, one per line, with no status or evidence \(those stay in To review\); a task without PRs links its actual deliverables instead, never an invented PR. Then move the task to Review with `ours-fleet task review <task-id>`/);
+        expect(coordinator).toMatch(/Only when the Owner accepts\s+the result or explicitly asks, run `ours-fleet task finish/);
+        // The packaged continuity loop stays observation-only and never becomes a Progress pipeline;
+        // generated setup ships no loop at all.
+        if (source === 'bootstrap')
+          expect(String(cfg.agentTemplates?.LocalCoordinator.loops?.continuity?.prompt).replace(/\s+/g, ' '))
+            .toMatch(/This pass never appends task Progress entries/);
+        else expect(String(generated.get('agent_templates/LocalCoordinator.yaml'))).not.toMatch(/loops|Progress/);
+      }
+      // Each generated room member task carries its charter's handoff; only a LocalCoordinator writes Progress.
+      for (const template of listTemplates(cfg.roomTemplates ?? {})) {
+        const roster = template.members.map(member => ({ role_name: `${template.name}-${member.slot}-1`, cowork_role: member.role }));
+        for (const [index, member] of template.members.entries()) {
+          const task = buildRoomMemberTask({
+            roomId: `${template.name}-room`, roomIdentityCid: 'A'.repeat(64), ownerSeatCid: 'B'.repeat(64), contract: template.contract,
+            member: { ...roster[index], persona: String(cfg.rolePresets?.[member.role].persona) }, roster,
+          });
+          expect(task, `${template.name}:${member.role}`).toMatch(/To\s+review\s+package/);
+          if (member.role === 'LocalCoordinator') expect(task).toContain('fleet_task_progress_append');
+          else expect(task, `${template.name}:${member.role}`).not.toContain('fleet_task_progress_append');
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('packages fleet/after_tool on every standard room Agent Template', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-template-monitor-'));
     try {

@@ -26,7 +26,8 @@
     "docs/fleet-migration.md",
     "LICENSE",
     "docs/acp-files.md",
-    "docs/self-reminders.md"
+    "docs/self-reminders.md",
+    "docs/task-progress-review.md"
   ],
   "engines": {
     "node": ">=22.13.0"

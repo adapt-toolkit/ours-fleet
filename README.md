@@ -1836,6 +1836,7 @@ or message delivery. File tools resolve paths in the invoking CLI process or
 Fleet web server's filesystem context, with that process's access permissions.
 
 Task workspace ownership, retention, safe deletion and legacy migration are documented in [Task workspaces](docs/task-workspaces.md).
+Task Progress milestones and the self-contained To review package (agent tools, CLI, API, limits and file retention) are documented in [Task Progress and To review](docs/task-progress-review.md).
 
 ### Active task readiness after interruption
 

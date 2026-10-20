@@ -47,6 +47,11 @@ import type { RoomLayoutDefinitions } from '../application/room-layout-definitio
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
+import type { TaskRecord } from '../rooms-tasks/types.js';
+import {
+  appendTaskProgress, getTaskReview, listTaskProgress, publicProgressEntry, publicReview, readTaskReviewArtifact,
+  setTaskReviewMarkdown, taskContributionSummary, TaskReviewError,
+} from '../rooms-tasks/task-review.js';
 import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
 import type { OfferedModels } from '../subscriptions/cli.js';
 import type { SubscriptionService } from '../subscriptions/service.js';
@@ -262,7 +267,7 @@ export async function buildWebServer(
   app.get('/api/v1/meta', async request => {
     auth.authenticate(request);
     return {
-      version: VERSION, api: { major: 1, minor: 0 },
+      version: VERSION, api: { major: 1, minor: 1 },
       websocketProtocols: [
         'ours-fleet-events.v1', 'ours-fleet-conversation.v1',
       ],
@@ -383,6 +388,29 @@ export async function buildWebServer(
       throw error;
     }
   };
+  const reviewApi = async <T>(fn: () => T | Promise<T>): Promise<T> => taskApi(async () => {
+    try { return await fn(); }
+    catch (error) {
+      if (error instanceof TaskReviewError) {
+        const code = error.code === 'not_found' ? 'resource_not_found' : error.code === 'limit_exceeded' ? 'conflict' : error.code;
+        throw new FleetError(code, error.message);
+      }
+      if (error instanceof TaskStateError && error.message.startsWith('invalid task ID'))
+        throw new FleetError('resource_not_found', 'task not found');
+      throw error;
+    }
+  });
+  /** Browser task payloads carry Progress/To review counts; bodies have their own routes. */
+  const wireTask = <T extends TaskRecord>(task: T) => {
+    const { progress: _progress, review: _review, ...rest } = task;
+    return { ...rest, ...taskContributionSummary(task) };
+  };
+  const wireTaskResult = <T>(result: T): T => {
+    const value = result as Record<string, unknown> | undefined;
+    if (value && typeof value === 'object' && value.task && typeof value.task === 'object')
+      return { ...value, task: wireTask(value.task as TaskRecord) } as T;
+    return result;
+  };
   const requireTaskRooms = (): TaskRoomApplicationService => {
     if (!services.taskRooms) throw new FleetError('capability_unavailable', 'task operations are unavailable');
     return services.taskRooms;
@@ -401,8 +429,8 @@ export async function buildWebServer(
       ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
     const api = requireTaskRooms();
     return taskApi(() => query.groupByList === 'true'
-      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => api.withLayoutRooms(task)) })) }
-      : { tasks: api.listTasks(filter).map(task => api.withLayoutRooms(task)) });
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })) }
+      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))) });
   };
   const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
     signal.throwIfAborted(); services.invalidateResourceCaches?.();
@@ -568,13 +596,13 @@ export async function buildWebServer(
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
     }));
-    reply.code(201); return { task };
+    reply.code(201); return { task: wireTask(task) };
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);
     const taskId = (request.params as { id: string }).id;
     const list = String((request.body as { list?: unknown })?.list ?? '');
-    return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
+    return { task: wireTask(await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list }))) };
   });
 
   app.patch('/api/v1/tasks/:id/description', async request => {
@@ -582,15 +610,57 @@ export async function buildWebServer(
     const body = request.body as { brief?: unknown; expectedBrief?: unknown };
     if (typeof body?.brief !== 'string' || typeof body.expectedBrief !== 'string' || body.brief.length > 100_000)
       throw new FleetError('invalid_request', 'brief and expectedBrief must be strings; brief maximum is 100000 characters');
-    return { task: await taskApi(() => requireTaskRooms().editTaskDescription({
+    return { task: wireTask(await taskApi(() => requireTaskRooms().editTaskDescription({
       actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
       brief: body.brief as string, expectedBrief: body.expectedBrief as string,
-    })) };
+    }))) };
   });
 
   app.get('/api/v1/tasks/:id', async request => {
     auth.authenticate(request);
-    return taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id));
+    return wireTaskResult(await taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id)));
+  });
+  app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async request => {
+    auth.authenticate(request);
+    return { progress: (await reviewApi(() => listTaskProgress(request.params.id))).map(publicProgressEntry) };
+  });
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body = request.body as { text?: unknown; requestKey?: unknown };
+    const header = request.headers['idempotency-key'];
+    const requestKey = typeof body?.requestKey === 'string' ? body.requestKey : typeof header === 'string' ? header : undefined;
+    if (typeof body?.text !== 'string' || (body.requestKey !== undefined && typeof body.requestKey !== 'string'))
+      throw new FleetError('invalid_request', 'text must be a string; requestKey, when given, a string');
+    const result = await reviewApi(() => appendTaskProgress(request.params.id, {
+      text: body.text as string, requestKey, author: { kind: 'local_control', surface: 'web' },
+    }));
+    if (!result.replayed) reply.code(201);
+    return { entry: publicProgressEntry(result.entry), replayed: result.replayed };
+  });
+  app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
+    auth.authenticate(request);
+    const review = await reviewApi(() => getTaskReview(request.params.id));
+    return { review: review ? publicReview(review) : null };
+  });
+  app.put<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
+    auth.authenticate(request, true);
+    const body = request.body as { markdown?: unknown; expectedMarkdown?: unknown };
+    if (typeof body?.markdown !== 'string' || typeof body.expectedMarkdown !== 'string')
+      throw new FleetError('invalid_request', 'markdown and expectedMarkdown must be strings');
+    const review = await reviewApi(() => setTaskReviewMarkdown(request.params.id, {
+      markdown: body.markdown as string, expectedMarkdown: body.expectedMarkdown as string,
+      author: { kind: 'local_control', surface: 'web' },
+    }));
+    return { review: publicReview(review) };
+  });
+  app.get<{ Params: { id: string; artifactId: string } }>('/api/v1/tasks/:id/review/artifacts/:artifactId', async (request, reply) => {
+    auth.authenticate(request);
+    const { artifact, bytes } = await reviewApi(() => readTaskReviewArtifact(request.params.id, request.params.artifactId));
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(artifact.name).replace(/'/g, '%27')}`);
+    return reply.type('application/octet-stream').send(bytes);
   });
   app.post('/api/v1/tasks/:id/members', async (request, reply) => {
     auth.authenticate(request, true);
@@ -617,7 +687,7 @@ export async function buildWebServer(
     const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
       taskId: (request.params as { id: string }).id, layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
     await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
-    return { task: requireTaskRooms().withLayoutRooms(task) };
+    return { task: wireTask(requireTaskRooms().withLayoutRooms(task)) };
   });
   app.get('/api/v1/tasks/:id/layout', async request => {
     auth.authenticate(request);
@@ -683,7 +753,7 @@ export async function buildWebServer(
       const body = (request.body ?? {}) as { reason?: string; template?: string };
       const input = { actor: { kind: 'local_control' as const, surface: 'web' as const }, taskId };
       const api = requireTaskRooms();
-      return taskApi(async () => {
+      return wireTaskResult(await taskApi(async () => {
         switch (action) {
           case 'start': {
             // A task's layout can be chosen or changed but never removed, so this check cannot go stale.
@@ -708,7 +778,7 @@ export async function buildWebServer(
             return { task, pending };
           }
         }
-      });
+      }));
     });
   }
 

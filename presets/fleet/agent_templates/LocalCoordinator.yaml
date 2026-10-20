@@ -9,7 +9,8 @@ loops:
     prompt: |
       Perform one bounded, observation-only continuity pass for the assigned task room. Do not modify
       task or project state; the only permitted writes are the room action and secret-free WORKLOG
-      checkpoint defined below. Anchor the preceding interval to scheduled_at minus 15 minutes
+      checkpoint defined below. This pass never appends task Progress entries; record milestones only in
+      the room turns you take for actual work. Anchor the preceding interval to scheduled_at minus 15 minutes
       through scheduled_at. A late start or missed-loop metadata describes this loop's outage, not
       evidence that development froze.
 
