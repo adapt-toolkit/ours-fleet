@@ -654,6 +654,9 @@ ours-fleet task review-package TASK [--markdown-file FILE] [--attach PATH] [--de
 
 By default only the LocalCoordinator writes Progress, and every task role prepares
 the To review package before a Review handoff without gaining lifecycle authority.
+At Review the task description keeps only the clickable PR links, one per line (a task
+without PRs links its actual deliverables, never an invented PR); the package holds the
+rest, including the original description as an attached file.
 Full contract: \`docs/task-progress-review.md\` in the package.
 
 ## Permissions

@@ -155,7 +155,14 @@ describe('packaged default role contract', () => {
           expect(persona(name), `${source}:${name}`).toMatch(/ours-fleet task review-package\s+<task-id> --attach <path>/);
           expect(persona(name), `${source}:${name}`).toMatch(/need no PR|they need no PR/);
           expect(persona(name), `${source}:${name}`).toMatch(/Never mark the task done or merge/);
+          // At Review the description keeps only PR links; the package keeps the original requirements.
+          expect(persona(name), `${source}:${name}`).toMatch(/task description is replaced with only the clickable PR links, one per line/);
+          expect(persona(name), `${source}:${name}`).toMatch(/save the current description \(the original requirements\) to a file in the task workspace and attach it to the package, keep fuller evidence in task files/);
+          expect(persona(name), `${source}:${name}`).toMatch(/never add status logs to the description/);
+          expect(persona(name), `${source}:${name}`).toMatch(/a research or document task without PRs links its actual deliverables instead; never invent a PR/);
         }
+        expect(persona('Critic')).toMatch(/must also attach the original task description, which at Review is replaced with only the clickable PR links, one per line \(or the actual deliverable links when there are no PRs\)/);
+        expect(persona('LocalCoordinator')).toMatch(/the original task description as an attached file \(at Review the description keeps only the PR links, or the actual deliverable links when there are no PRs\)/);
         expect(persona('Critic')).toMatch(/Withhold sign-off while it is missing, stale or misleading/);
         expect(persona('LocalCoordinator')).toMatch(/default writer of this task's Progress log/);
         expect(persona('LocalCoordinator')).toMatch(/never poll, schedule turns or mirror messages/);
@@ -165,7 +172,8 @@ describe('packaged default role contract', () => {
         const coordinator = persona('Coordinator');
         expect(coordinator).toMatch(/ours-fleet task review-package <task-id>/);
         expect(coordinator).toMatch(/do not write or judge it yourself/);
-        expect(coordinator).toMatch(/Then move the task to Review with `ours-fleet task review <task-id>`/);
+        expect(coordinator).toMatch(/and that it attaches the original task description/);
+        expect(coordinator).toMatch(/Then replace the task description with only the clickable Markdown PR links, one per line, with no status or evidence \(those stay in To review\); a task without PRs links its actual deliverables instead, never an invented PR. Then move the task to Review with `ours-fleet task review <task-id>`/);
         expect(coordinator).toMatch(/Only when the Owner accepts\s+the result or explicitly asks, run `ours-fleet task finish/);
         // The packaged continuity loop stays observation-only and never becomes a Progress pipeline;
         // generated setup ships no loop at all.
