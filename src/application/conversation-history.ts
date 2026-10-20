@@ -1,5 +1,5 @@
 import {createReadStream} from 'node:fs';
-import {open,readFile,readdir} from 'node:fs/promises';
+import {open,readFile,readdir,stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createInterface} from 'node:readline';
 import type {ConversationEventV1,ConversationObservationState} from '../session/conversation-types.js';
@@ -168,21 +168,68 @@ export async function conversationHasAttachment(stateDir: string, attachment: im
   return found;
 }
 
+type Preview={text:string;at:string};
+/** Identity and change metadata of one segment, taken from the handle that was read. */
+type SegmentStamp={name:string;dev:number;ino:number;size:number;mtimeMs:number;ctimeMs:number};
+type PreviewCacheEntry={files:string[];segments:SegmentStamp[];preview:Preview};
+// Directory previews are re-projected on every append by any selected agent, so
+// most calls are for agents whose ledger has not changed. A cached preview is
+// reused only while the segment list is identical and every segment it actually
+// read still has the same file identity, size, mtime and ctime. File times are
+// coarse, so a rewrite in the same tick as the read can leave all of those
+// unchanged: like git's racy-clean rule, a preview is only cached when every
+// segment it read was last changed well before the read began. Failures are
+// never cached. Bounded; least recently used entries are evicted first.
+const PREVIEW_CACHE_LIMIT=512;
+const PREVIEW_RACY_MS=1000;
+const previewCache=new Map<string,PreviewCacheEntry>();
+const stamp=(name:string,stat:{dev:number;ino:number;size:number;mtimeMs:number;ctimeMs:number}):SegmentStamp=>
+  ({name,dev:stat.dev,ino:stat.ino,size:stat.size,mtimeMs:stat.mtimeMs,ctimeMs:stat.ctimeMs});
+const sameStamp=(a:SegmentStamp,b:SegmentStamp)=>a.name===b.name&&a.dev===b.dev&&a.ino===b.ino&&a.size===b.size&&a.mtimeMs===b.mtimeMs&&a.ctimeMs===b.ctimeMs;
+
+async function cachedPreview(dir:string,files:string[],signal:AbortSignal):Promise<Preview|undefined>{
+  const entry=previewCache.get(dir);
+  if(!entry||entry.files.length!==files.length||entry.files.some((name,i)=>name!==files[i]))return undefined;
+  for(const segment of entry.segments){
+    signal.throwIfAborted();
+    let current:SegmentStamp;
+    try{current=stamp(segment.name,await stat(join(dir,segment.name)));}catch{return undefined;}
+    if(!sameStamp(segment,current))return undefined;
+  }
+  previewCache.delete(dir);previewCache.set(dir,entry);
+  return entry.preview;
+}
+
 /** Passive, bounded last assistant text for directory previews. Never opens the
  * ledger writer/recovery path or acquires a session/controller. An incomplete
  * newest append is not committed yet; completed malformed records still fail. */
-export async function conversationPreview(stateDir: string, signal: AbortSignal): Promise<{text:string;at:string}> {
+export async function conversationPreview(stateDir: string, signal: AbortSignal): Promise<Preview> {
   signal.throwIfAborted();
   const dir=join(stateDir,'.conversation');
   let files:string[];
   try {files=(await readdir(dir)).filter(name=>/^events-\d{6}\.jsonl$/.test(name)).sort().reverse();}
-  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return {text:'No recent agent output',at:''};throw error;}
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){previewCache.delete(dir);return {text:'No recent agent output',at:''};}throw error;}
+  const cached=await cachedPreview(dir,files,signal);
+  if(cached)return cached;
+  const segments:SegmentStamp[]=[];
+  const readStartedAt=Date.now();
+  const preview=await readPreview(dir,files,segments,signal);
+  previewCache.delete(dir);
+  if(segments.every(segment=>Math.max(segment.mtimeMs,segment.ctimeMs)<readStartedAt-PREVIEW_RACY_MS)){
+    previewCache.set(dir,{files,segments,preview});
+    if(previewCache.size>PREVIEW_CACHE_LIMIT)previewCache.delete(previewCache.keys().next().value!);
+  }
+  return preview;
+}
+
+async function readPreview(dir:string,files:string[],segments:SegmentStamp[],signal:AbortSignal):Promise<Preview>{
   const events:ConversationEventV1[]=[];
   for(const name of files){
     signal.throwIfAborted();
     const file=await open(join(dir,name),'r');
     try {
-      const size=(await file.stat()).size,length=Math.min(size,2*1024*1024),buffer=Buffer.alloc(length);
+      const segment=stamp(name,await file.stat());segments.push(segment);
+      const size=segment.size,length=Math.min(size,2*1024*1024),buffer=Buffer.alloc(length);
       await file.read(buffer,0,length,size-length);
       const completeEnd = buffer.lastIndexOf(10) + 1;
       // Only the newest segment can have an in-flight append. If its tail
