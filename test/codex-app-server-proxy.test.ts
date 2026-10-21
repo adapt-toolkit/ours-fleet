@@ -355,3 +355,68 @@ describe('Codex app-server missing terminal recovery', () => {
     expect(logs.join('\n')).toContain('suppressed late turn/completed');
   });
 });
+
+
+describe('managed Codex MCP approval propagation', () => {
+  const policy = { send_message: { approval_mode: 'approve' } };
+  const ours = { command: '/node', args: ['/bridge.js'], env: { FLEET_OURS_BRIDGE_DESCRIPTOR: '/bound/descriptor' },
+    tool_timeout_sec: 45, disabled_tools: ['send_file'],
+    tools: { send_message: { approval_mode: 'prompt', output_token_limit: 123 },
+      send_file: { approval_mode: 'prompt' } } };
+  const input = (method: string, server: unknown = ours) => ({ id: 9, method,
+    params: { cwd: '/work', approvalPolicy: 'never', sandbox: 'workspace-write',
+      config: { model_reasoning_effort: 'high', mcp_servers: { ours: server, other: { command: '/other' } } } } });
+  const rewrite = (value: unknown, disabled = false) => JSON.parse(rewriteCodexAppServerRequest(
+    JSON.stringify(value), 'never', 'workspace-write', disabled, policy));
+
+  it.each(['thread/start', 'thread/resume'])('merges tool approval on %s, preserving transport and unrelated fields', method => {
+    const original = input(method);
+    const expected = structuredClone(original);
+    expected.params.config.mcp_servers.ours = { ...ours,
+      tools: { ...ours.tools, send_message: { approval_mode: 'approve', output_token_limit: 123 } } };
+    expect(rewrite(original)).toEqual(expected);
+    expect(ours.tools.send_message.approval_mode).toBe('prompt');
+  });
+
+  it.each(['thread/start', 'thread/resume'])('keeps inherited-MCP disable authoritative on %s', method => {
+    const original = input(method);
+    expect(rewrite(original, true)).toEqual({ ...original, params: { ...original.params,
+      config: { ...original.params.config, mcp_servers: {} } } });
+  });
+
+  it.each(['thread/start', 'thread/resume'])('leaves absent, disabled and malformed connectors untouched on %s', method => {
+    for (const server of [null, false, [], 'invalid', { ...ours, enabled: false }]) {
+      const original = input(method, server);
+      expect(rewrite(original)).toEqual(original);
+    }
+    for (const config of [{}, { mcp_servers: {} }, { mcp_servers: { other: { command: '/other' } } }]) {
+      const original = { method, params: { config } };
+      expect(rewrite(original)).toEqual(original);
+    }
+  });
+
+  it('handles batches and preserves unrelated methods, sandbox, and malformed protocol input', () => {
+    const other = input('config/read');
+    const turn = request({ type: 'workspaceWrite', writableRoots: ['/work'] }, 'on-request');
+    const batch = rewrite([input('thread/start'), other, turn]);
+    expect(batch[0].params.config.mcp_servers.ours.tools.send_message.output_token_limit).toBe(123);
+    expect(batch[1]).toEqual(other);
+    expect(batch[2]).toEqual({ ...turn, params: { ...turn.params, approvalPolicy: 'never' } });
+    expect(rewriteCodexAppServerRequest('not json', 'never', 'workspace-write', false, policy)).toBe('not json');
+  });
+});
+
+describe('managed proxy environment policy gate', () => {
+  it('uses policy only from a managed, enabled, complete config object', async () => {
+    const { managedCodexToolPolicy } = await import('../src/harness/codex-app-server-proxy.js');
+    const tools = { get_messages: { approval_mode: 'approve' } };
+    const CODEX_CONFIG = JSON.stringify({ mcp_servers: { ours: { command: '/bridge', tools } } });
+    expect(managedCodexToolPolicy({ FLEET_OURS_MANAGED: '1', CODEX_CONFIG })).toEqual(tools);
+    for (const FLEET_OURS_MANAGED of [undefined, '0', 'true'])
+      expect(managedCodexToolPolicy({ FLEET_OURS_MANAGED, CODEX_CONFIG })).toBeUndefined();
+    for (const bad of ['{', 'null', '[]', '{}', '{"mcp_servers":null}',
+      '{"mcp_servers":{"ours":null}}', '{"mcp_servers":{"ours":{"tools":[]}}}',
+      JSON.stringify({ mcp_servers: { ours: { enabled: false, tools } } })])
+      expect(managedCodexToolPolicy({ FLEET_OURS_MANAGED: '1', CODEX_CONFIG: bad })).toBeUndefined();
+  });
+});

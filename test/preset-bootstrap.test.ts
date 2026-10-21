@@ -15,17 +15,21 @@ let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ours-fleet-presets-')); });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+import { RoomLayoutDefinitions } from '../src/application/room-layout-definitions.js';
 describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(6);
-    expect(seeded.created).toHaveLength(67);
+    expect(seeded.revision).toBe(12);
+    expect(seeded.created).toHaveLength(102);
+    // The standard experiences are also seeded as editable, web-visible room layouts.
+    expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
+      .toEqual([['engineering', []], ['pair', []], ['single', []], ['team', []]]);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
-      .toEqual(['pair', 'single', 'team']);
+      .toEqual(['engineering', 'pair', 'single', 'team']);
     expect(cfg.sourceDocuments?.filter(source => source.kind === 'RoomTemplate'))
-      .toHaveLength(3);
+      .toHaveLength(4);
     const continuity = cfg.agentTemplates?.LocalCoordinator.loops?.continuity;
     expect(continuity).toMatchObject({ interval: '15m' });
     expect(continuity?.prompt).toMatch(/scheduled_at minus 15 minutes/);
@@ -34,6 +38,10 @@ describe('packaged preset bootstrap', () => {
     expect(continuity?.prompt).toMatch(/CONTINUITY CHECK/);
     expect(continuity?.prompt).toMatch(/CONTINUITY STALLED/);
     expect(continuity?.prompt).toMatch(/suppress a semantic duplicate/);
+    // The checkpoint is dedupe state the session already holds, not a per-pass reread.
+    expect(continuity?.prompt).toMatch(/Read the\s+checkpoint in WORKLOG\.md only when it is missing from your context/);
+    expect(continuity?.prompt).toMatch(/Append a secret-free WORKLOG checkpoint/);
+    expect(continuity?.prompt).not.toMatch(/Re-read/);
     expect(cfg.agentTemplates?.Developer.loops).toBeUndefined();
     expect(cfg.agentTemplates?.Critic.loops).toBeUndefined();
     for (const template of listTemplates(cfg.roomTemplates ?? {})) {
@@ -43,10 +51,10 @@ describe('packaged preset bootstrap', () => {
         expect(definition, `${template.name}:${member.agent_template}`).toBeDefined();
         expect(definition?.role).toEqual({ inline: expect.objectContaining({}) });
         expect(definition?.brain).toEqual({ inline: expect.objectContaining({ harness: 'claude-code' }) });
-        expect(definition?.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
+        expect(definition?.permissions).toMatchObject({ approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' });
       }
     }
-    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(55);
+    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(83);
     for (const [id, brain] of Object.entries(cfg.brainPresets ?? {}))
       expect(() => validateEffectiveAgentTemplate({ role: { inline: {} }, brain: { inline: brain } }, id))
         .not.toThrow();
@@ -62,7 +70,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
-    expect(second.preserved).toHaveLength(66);
+    expect(second.preserved).toHaveLength(101);
   });
 
   it('creates private files and refuses symlink targets', () => {

@@ -1,3 +1,4 @@
+import { preparePermanentAssignment, releaseManagedAgent } from '../agent-ours/service.js';
 import {
   closeSync, existsSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
@@ -12,9 +13,9 @@ import { generateNotifierBriefing, generateWatchdogBriefing, type WatchManifest 
 import { computeDigest, reconcileLedger, readLedger, writeLedger } from './alerts.js';
 import { applyRole } from '../ops.js';
 import {
-  daemonIdentityInventoryProvisioner, ensureIdentity, type IdentityProvisioner,
+  type IdentityProvisioner,
 } from '../creation.js';
-import { runOnce, START_STAGGER_FILE } from '../runner.js';
+import { runOnce, loadTempRole, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, tmpRoot } from '../paths.js';
 import {
   loadConfig, ROLE_NAME_RE,
@@ -71,6 +72,7 @@ async function killIfNeeded(
   if (reason === 'stable' || reason === 'timeout') {
     if (reason === 'stable') await sleep(HARVEST_GRACE_MS);
     child.kill();
+    await child.exited;
   }
 }
 
@@ -185,8 +187,7 @@ export async function executeWatchdogRun(
 
   let report: WatchdogReport;
   try {
-    const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
+    const guarantee = { state: 'unverified' as const }; // The child supervisor provisions before its harness starts.
 
     const cfg = deps.cfg ?? loadConfig();
     const discovered = wd.watchExplicit
@@ -325,8 +326,7 @@ export async function executeNotifierRun(
     // A crashed previous run can leave the temp dir behind; start clean.
     if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
 
-    const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
+    const guarantee = { state: 'unverified' as const }; // The child supervisor provisions before its harness starts.
 
     const cfg = deps.cfg ?? loadConfig();
     const role = buildWatchdogRole(wd, cfg);
@@ -365,5 +365,10 @@ export async function executeNotifierRun(
 
 /** What `_run-watchdog` calls: one supervised session, no cleanup — the parent harvests. */
 export async function runWatchdogAgent(name: string): Promise<void> {
-  await runOnce(name, { temp: true });
+  const role=loadTempRole(name);
+  await preparePermanentAssignment(role);
+  let stopping=false;const stop=()=>{stopping=true;};
+  process.on('SIGTERM',stop);process.on('SIGINT',stop);
+  try { await runOnce(name, { temp: true, identityLifetime: 'permanent' }, {shouldStop:()=>stopping}); }
+  finally { process.off('SIGTERM',stop);process.off('SIGINT',stop);await releaseManagedAgent(role); }
 }

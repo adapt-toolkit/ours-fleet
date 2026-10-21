@@ -78,6 +78,7 @@ describe('scheduled loops CLI', () => {
     expect(JSON.parse(listed.stdout).loops[0].prompt).toMatchObject({ bytes: 17 });
   });
 
+  // Four sequential cold CLI starts each need a bounded 5 s allowance under CPU contention.
   it('uses versioned private control for status, run-now, persistent disable, and enable', async () => {
     config();
     const calls: string[] = [];
@@ -96,7 +97,7 @@ describe('scheduled loops CLI', () => {
     expect((await run(['loops', 'disable', 'Coordinator', 'health'])).code).toBe(0);
     expect((await run(['loops', 'enable', 'Coordinator', 'health'])).code).toBe(0);
     expect(calls).toEqual(['run:health', 'disable:health', 'enable:health']);
-  });
+  }, 20_000);
 
   it('asks the live manager even when no checkpoint was ever written', async () => {
     config();

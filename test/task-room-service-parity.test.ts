@@ -1,15 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import {
-  activateTask, completeTask, createTask, getTask, updateTaskMembers, updateTaskRoom,
+  activateTask, beginTaskTerminalIntent, completeTask, createTask, getTask, updateTaskMembers, updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import {
   activateRoom, advanceSaga, closeRoom, createRoomRecord, getRoomRecord, setSagaError,
-  setOwnerSeat, updateMemberSeats, updateMemberStartup,
+  setOwnerSeat, updateMemberSeats, updateMemberStartup, roomsDir,
 } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
@@ -51,7 +51,15 @@ function cowork() {
     adapter: {
       createRoom,
       acceptInvite: vi.fn(), issueInvite: vi.fn(), revokeInvite: vi.fn(),
-      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(), listRooms: vi.fn(),
+      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(async (id: string) => {
+        const room = getRoomRecord(id);
+        return room && { ...room, identity_cid: room.room_identity_cid,
+          seats: [...room.member_seats.map(seat => ({ ...seat, display_name: seat.role_name,
+            role: seat.cowork_role })), ...(room.owner_seat_cid ? [{
+              identity_cid: room.owner_seat_cid, seat_state: 'active', role: 'Owner',
+            }] : [])],
+        };
+      }), listRooms: vi.fn(),
       closeRoom: vi.fn(), deleteRoom: vi.fn(), getSeats: vi.fn(), recoverRoom: vi.fn(),
       available: vi.fn(),
     } as unknown as CoworkAdapter,
@@ -81,6 +89,86 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 }
 
 describe('task create/start surface parity', () => {
+  it.each(['persist_intent', 'create_room'] as const)('recovers orphan room publication at %s without duplicate creation', async phase => {
+    const cfg = config();
+    const snapshot = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: 'Orphan publication', start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    createRoomRecord({ room_id: 'orphan', room_name: 'Orphan', room_identity_cid: 'room-cid',
+      task_id: task.task_id, template_snapshot: snapshot });
+    if (phase === 'create_room') advanceSaga('orphan', phase, 1);
+    const h = cowork();
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      if (taskId) activateTask(taskId);
+      return activateRoom(roomId);
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
+    await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    expect(getTask(task.task_id).room_id).toBe('orphan');
+    expect(getRoomRecord('orphan')?.saga.phase).toBe('create_members');
+    await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(h.createRoom).not.toHaveBeenCalled();
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
+  it('reuses a published room while the original creator is still attaching its owner', async () => {
+    const cfg = config();
+    cfg.rooms!.defaults!.attach_owner = true;
+    cfg.ownerInvite = 'test-invite';
+    const snapshot = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: 'Concurrent publication', start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    const h = cowork();
+    let attaching!: () => void, release!: () => void;
+    const started = new Promise<void>(r => { attaching = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    vi.mocked(h.adapter.acceptInvite).mockImplementation(async () => {
+      attaching(); await gate; return { seat_cid: 'owner-cid' } as never;
+    });
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      if (taskId) activateTask(taskId);
+      return activateRoom(roomId);
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
+    // The second publisher holds the stale task captured before local linkage.
+    const first = app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id });
+    try {
+      await started;
+      // Enter the publication boundary with that stale task, as an independent
+      // process waiting on the snapshot lock would after the creator releases it.
+      await app['provisionRoom'](cfg, task, snapshot, room => {
+        updateTaskRoom(task.task_id, room.room_id, room.room_identity_cid!);
+      });
+      expect(h.createRoom).toHaveBeenCalledOnce();
+      expect(h.adapter.acceptInvite).toHaveBeenCalledOnce();
+      expect(getRoomRecord('room-shared')?.saga.phase).toBe('attach_owner');
+    } finally { release(); }
+    await first;
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('seals planned role counts before any Owner attachment (owner=%s)', async (attachOwner) => {
+    const team: TemplateDefinition = { name: 'planned', version: 1, description: 'Plan', contract: 'Wait.',
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' },
+        { slot: 'extra', role: 'Developer', count: 1, agent_template: 'Dev' }] };
+    const cfg = { ...config(), ownerInvite: 'OWNER-INVITE', roomTemplates: { planned: team },
+      rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: attachOwner } } } as FleetConfig;
+    const h = cowork();
+    vi.mocked(h.adapter.acceptInvite).mockResolvedValue({seat_cid:'owner-cid',seat_state:'active'});
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(async ({roomId}) => getRoomRecord(roomId)!) });
+    await app.createTask({actor:{kind:'local_control',surface:'cli'},title:'Whole team',template:'planned',origin:{type:'cli'}});
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({activation_requirements:
+      [...(attachOwner ? [{role:'Owner',count:1}] : []),{role:'Developer',count:3}]}));
+    if (attachOwner) expect(h.createRoom.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(h.adapter.acceptInvite).mock.invocationCallOrder[0]);
+    else expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+  });
+
   it.each([['single', 1], ['pair', 2], ['team', 3]] as const)(
     'emits one canonical Task-ready lifecycle event for a %s launch',
     async (name, count) => {
@@ -333,16 +421,26 @@ describe('task create/start surface parity', () => {
       monitor: { mode: 'fleet' }, session: 'acp' }) } as unknown as FleetConfig;
     const h = cowork();
     const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      updateMemberSeats(roomId, [{ role_name: 'dev', identity_cid: 'dev-cid', invite_id: 'invite',
+        slot: 'dev', cowork_role: 'Developer', seat_state: 'active',
+        launch: { state: 'launched', attempt: 1, launch_id: 'launch', updated_at: new Date().toISOString() } }]);
       const room = activateRoom(roomId); if (taskId) activateTask(taskId); return room;
     });
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
-      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any,
+      liveReadiness: {
+        supervisor: () => ({ version: 1, role: 'dev', launchId: 'launch', phase: 'active', createdAt: '' }),
+        liveness: async () => 'running',
+        readiness: () => ({ room: 'room-shared', invite: 'invite', cid: 'dev-cid', generation: 1 }),
+        control: async () => ({ version: 1, id: 'probe', ok: true, result: { alive: true, readiness: 'idle' } }),
+      } });
     const members = { dev: { approval: 'allow' as const, loops: { progress: {
       interval: '1m', initial_delay: '0s', prompt: 'SEALED_IDEMPOTENT_LOOP',
     } } } };
     const active = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
       title: 'Active plan', template: 'member-team', members, origin: { type: 'cli' } });
     expect(active.state).toBe('active');
+    await expect(app.observeTaskReadiness(active.task_id)).resolves.toEqual({ state: 'ready' });
     const sealedHash = active.execution_plan!.snapshot.launch_snapshot_hash!;
     expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
@@ -366,6 +464,23 @@ describe('task create/start surface parity', () => {
         interval: '2m', prompt: 'DIFFERENT_LOOP',
       } } } } }))
       .rejects.toMatchObject({ code: 'template_mismatch' });
+    const remoteHealthy = await h.adapter.getRoom(active.room_id!);
+    vi.mocked(h.adapter.getRoom).mockResolvedValue({ ...remoteHealthy!, seats: [] });
+    const durableBefore = JSON.stringify([getTask(active.task_id), getRoomRecord(active.room_id!)]);
+    for (const request of [{}, { template: 'member-team' }, { members }]) {
+      await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+        taskId: active.task_id, ...request })).rejects.toMatchObject({ code: 'task_not_ready',
+        fields: { readiness: 'degraded', reason: 'member_seat_mismatch' } });
+    }
+    await expect(app.awaitTaskProvisioning({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id })).rejects.toMatchObject({ code: 'task_not_ready' });
+    await expect(app.observeTaskReadiness(active.task_id)).resolves.toMatchObject({ state: 'degraded', reason: 'member_seat_mismatch' });
+    expect(JSON.stringify([getTask(active.task_id), getRoomRecord(active.room_id!)])).toBe(durableBefore);
+    expect(provision).toHaveBeenCalledOnce();
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+    expect(h.adapter.issueInvite).not.toHaveBeenCalled();
+    expect(h.adapter.recoverRoom).not.toHaveBeenCalled();
+    vi.mocked(h.adapter.getRoom).mockResolvedValue(remoteHealthy);
     expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, template: 'empty-team' }))
@@ -425,6 +540,26 @@ describe('task create/start surface parity', () => {
     })).toMatchObject({ kind: 'no_op', room: { room_name: expected } });
     expect(h.createRoom).not.toHaveBeenCalled();
     expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
+  });
+
+  it('stops background provisioning when a terminal intent has been accepted', async () => {
+    const h = cowork();
+    const app = service(h.adapter);
+    const task = createTask({ title: 'Cancelled provisioning', origin: { type: 'cli' } });
+    updateTaskRoom(task.task_id, 'missing-room', 'room-cid');
+    beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'missing-room' });
+    expect(await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id })).toMatchObject({ kind: 'no_op' });
+    expect(app.taskProvisioningOutcome(task.task_id).next_action).toContain('cancel');
+    expect(h.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('reports a member launch failure as requiring explicit intervention, not an automatic invite retry', () => {
+    const app = service(cowork().adapter);
+    const task = createTask({ title: 'Failed member', origin: { type: 'cli' } });
+    createRoomRecord({ room_id: 'room-member-fail', room_name: 'Room', task_id: task.task_id });
+    updateTaskRoom(task.task_id, 'room-member-fail', 'room-cid');
+    setSagaError('room-member-fail', 'launch failure', 'Inspect then retry', 'member_failed');
+    expect(app.taskProvisioningOutcome(task.task_id).next_action).toContain('task start');
   });
 
   it('continues a pre-room title validation failure through the canonical provision boundary', async () => {
@@ -594,7 +729,8 @@ describe('task create/start surface parity', () => {
     const task = createTask({ title: _case, origin: { type: 'cli' }, start: true,
       room_id: `room-public-${String(withDetail)}`, template: { name: template.name,
         version: template.version, content_hash: template.content_hash } });
-    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title,
+    updateTaskRoom(task.task_id, task.room_id!, 'room-cid');
+    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title, room_identity_cid: 'room-cid',
       task_id: task.task_id, template_snapshot: template, room_policy: { anonymous: false } });
     advanceSaga(room.room_id, 'attach_owner', 2);
     if (withDetail)
@@ -883,6 +1019,10 @@ describe('task create/start surface parity', () => {
   it('loads configured templates and cleans legacy rooms before live room listing', async () => {
     const closed = createRoomRecord({ room_id: 'room-legacy', room_name: 'Legacy' });
     closeRoom(closed.room_id);
+    const legacyPath = join(roomsDir(), `${closed.room_id}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace; // fixture written by a pre-workspace Fleet
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     const deleteRoom = vi.fn(async () => undefined);
     const listRooms = vi.fn(async () => [{ room_id: 'room-live', identity_name: 'Live',
       identity_cid: 'cid-live', room_name: 'Live', state: 'active' as const, seats: [], role_briefings: {} }]);
@@ -899,6 +1039,10 @@ describe('task create/start surface parity', () => {
   it('cleans a stale legacy room record when Cowork already deleted the room', async () => {
     const closed = createRoomRecord({ room_id: 'room-stale', room_name: 'Stale' });
     closeRoom(closed.room_id);
+    const legacyPath = join(roomsDir(), `${closed.room_id}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace; // fixture written by a pre-workspace Fleet
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     const deleteRoom = vi.fn(async () => {
       throw new CoworkProtocolError('room.delete', 'room directory does not exist', 'not_found');
     });
@@ -976,7 +1120,7 @@ describe('task create/start surface parity', () => {
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: config,
       cowork: construct, binPath: () => '/fleet', provisionMembers: vi.fn() });
     await expect(app.requestRoomDeletion({ actor: { kind: 'local_control', surface: 'cli' },
-      roomId: 'missing-room' })).rejects.toMatchObject({ code: 'room_record_not_found' });
+      roomId: 'missing-room' })).resolves.toMatchObject({ settlementRequired: true });
     expect(construct).toHaveBeenCalledOnce();
 
     const room = createRoomRecord({ room_id: 'room-repeat-delete', room_name: 'Repeat delete' });
@@ -1014,4 +1158,19 @@ describe('task create/start surface parity', () => {
     expect(result.room_id).toBeUndefined();
     expect(h.createRoom).not.toHaveBeenCalled();
   });
+});
+
+it('task health rejects persisted records changed while probing and sanitizes unavailable config', async () => {
+  const task = createTask({ title: 'Observe', start: true, room_id: 'observe-room' });
+  const template = snapshotTemplate(definition, config().agentTemplates);
+  createRoomRecord({ room_id: 'observe-room', room_name: 'Observe', task_id: task.task_id,
+    room_identity_cid: 'room-cid', template_snapshot: template });
+  updateTaskRoom(task.task_id, 'observe-room', 'room-cid');
+  activateRoom('observe-room'); activateTask(task.task_id);
+  const h = cowork(); const read = h.adapter.getRoom;
+  h.adapter.getRoom = async id => { const value = await read(id); reviewTaskForProbe(); return value; };
+  function reviewTaskForProbe() { beginTaskTerminalIntent(task.task_id, { kind: 'cancelled', roomId: 'observe-room' }); }
+  await expect(service(h.adapter).observeTaskReadiness(task.task_id)).resolves.toMatchObject({ reason: 'records_changed' });
+  const unavailable = new TaskRoomApplicationService(undefined, { loadConfiguration: () => { throw Error('private detail'); } });
+  await expect(unavailable.observeTaskReadiness(task.task_id)).resolves.toEqual({ state: 'unknown', reason: 'readiness_unavailable' });
 });

@@ -11,6 +11,7 @@ export interface RoomTaskMember {
 
 /** Build the complete task text Fleet places directly in a temporary member's briefing. */
 export function buildRoomMemberTask(input: {
+  workspace?: string;
   taskId?: string;
   roomId: string;
   roomIdentityCid: string;
@@ -27,6 +28,15 @@ export function buildRoomMemberTask(input: {
     `Fleet Task ${input.taskId ?? '(standalone)'} — ${member.cowork_role} in room ${input.roomId}`,
     '',
   ];
+  if (input.workspace) lines.push(
+    `Task-owned workspace: ${input.workspace}`,
+    'Start and keep all execution artifacts, dependency checkouts, and Git worktrees inside this workspace.',
+    'Clone repositories inside this workspace before adding worktrees; never attach to an external Git common directory.',
+    'Use distinct per-agent branches/directories for concurrent edits. Configured cwd is source context, not artifact ownership.',
+    'Completion, cancellation and room retirement retain artifacts. Only explicit owner deletion removes them.',
+    'Do not delete the workspace or its ownership marker yourself.',
+    '',
+  );
   if (input.goal) lines.push(`Goal: ${input.goal}`);
   if (input.brief) lines.push(`Brief: ${input.brief}`);
   lines.push('', 'Collaboration contract:');

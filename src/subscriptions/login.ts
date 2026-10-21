@@ -1,0 +1,231 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { FleetError } from '../application/errors.js';
+import { CodexAppServer, profileEnv, type SubscriptionBinaries } from './cli.js';
+import type { SubscriptionProvider } from './store.js';
+
+/**
+ * A short-lived, browser-owned login. The URL comes from the official CLI and
+ * is shown only if its origin is on the provider's allowlist; the user's code
+ * goes to the CLI's stdin exactly once and is never stored.
+ */
+export type LoginState = 'starting' | 'awaiting_user' | 'verifying' | 'succeeded' | 'failed' | 'cancelled' | 'expired';
+
+export interface LoginView {
+  loginId: string;
+  provider: SubscriptionProvider;
+  kind: 'paste_code' | 'device_code';
+  state: LoginState;
+  url?: string;
+  /** Device code to type at `url`; only exposed while the user still needs it. */
+  userCode?: string;
+  expiresAt: string;
+  error?: string;
+}
+
+export const LOGIN_TTL_MS = 10 * 60_000;
+
+export const LOGIN_URL_ALLOWLIST: Record<SubscriptionProvider, string[]> = {
+  claude: ['claude.com', 'claude.ai', 'platform.claude.com', 'console.anthropic.com'],
+  codex: ['auth.openai.com'],
+};
+
+export function allowedLoginUrl(provider: SubscriptionProvider, raw: string): string | undefined {
+  let url: URL;
+  try { url = new URL(raw); } catch { return undefined; }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return undefined;
+  return LOGIN_URL_ALLOWLIST[provider].includes(url.hostname) ? url.toString() : undefined;
+}
+
+/** Claude paste codes are opaque `code#state` strings; refuse anything else. */
+const PASTE_CODE_RE = /^[A-Za-z0-9._~#-]{8,512}$/;
+const URL_RE = /https:\/\/[^\s\x07\x1b"'<>\\]+/;
+
+export interface LoginHandle {
+  view(): LoginView;
+  /** Browser session that started the login; only it may act on it. */
+  readonly owner: string;
+  submitCode(code: string): void;
+  cancel(): void;
+  /** Resolves when the CLI has finished (success or not). */
+  readonly done: Promise<boolean>;
+}
+
+abstract class BaseLogin implements LoginHandle {
+  readonly loginId = randomBytes(16).toString('hex');
+  readonly expiresAt: number;
+  state: LoginState = 'starting';
+  url?: string;
+  userCode?: string;
+  error?: string;
+  done!: Promise<boolean>;
+  protected finish!: (ok: boolean) => void;
+  private readonly timer: NodeJS.Timeout;
+
+  constructor(
+    readonly provider: SubscriptionProvider, readonly owner: string,
+    readonly kind: LoginView['kind'], now = Date.now(), protected readonly changed: () => void = () => {},
+  ) {
+    this.expiresAt = now + LOGIN_TTL_MS;
+    this.done = new Promise(resolve => { this.finish = resolve; });
+    this.timer = setTimeout(() => this.end('expired', 'login timed out'), LOGIN_TTL_MS);
+    this.timer.unref?.();
+  }
+
+  view(): LoginView {
+    const live = this.state === 'starting' || this.state === 'awaiting_user';
+    return {
+      loginId: this.loginId, provider: this.provider, kind: this.kind, state: this.state,
+      url: live ? this.url : undefined,
+      userCode: this.state === 'awaiting_user' ? this.userCode : undefined,
+      expiresAt: new Date(this.expiresAt).toISOString(),
+      error: this.error,
+    };
+  }
+
+  abstract submitCode(code: string): void;
+  protected abstract stop(): void;
+
+  cancel(): void { this.end('cancelled'); }
+
+  protected end(state: LoginState, error?: string): void {
+    if (['succeeded', 'failed', 'cancelled', 'expired'].includes(this.state)) return;
+    this.state = state;
+    this.error = error?.slice(0, 200);
+    this.userCode = undefined;
+    clearTimeout(this.timer);
+    this.stop();
+    this.finish(state === 'succeeded');
+    this.changed();
+  }
+
+  /** Called by the service after verifying the new home. */
+  complete(ok: boolean, error?: string): void { this.end(ok ? 'succeeded' : 'failed', error); }
+}
+
+/** `claude auth login` inside script(1): prints an authorize URL, then reads a paste code. */
+export class ClaudeLogin extends BaseLogin {
+  private child?: ChildProcessWithoutNullStreams;
+  private output = '';
+  private submitted = false;
+  private continued = false;
+  /** Resolves with the CLI exit status once it exits. */
+  exited: Promise<number | null>;
+
+  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string, changed?: () => void) {
+    super('claude', owner, 'paste_code', Date.now(), changed);
+    const darwin = process.platform === 'darwin';
+    const args = darwin
+      ? ['-q', '/dev/null', bins.claude, 'auth', 'login']
+      : ['-qefc', `${shellQuote(bins.claude)} auth login`, '/dev/null'];
+    // BSD script accepts a real pipe, but rejects Node's socket-backed stdin.
+    // Own the pipeline as one process group so cancellation also stops cat.
+    const child = spawn(darwin ? '/bin/sh' : bins.script, darwin
+      ? ['-c', '/bin/cat 3>&- | { "$@" 3>&-; result=$?; printf "%s\\n" "$result" >&3; exit "$result"; }', 'fleet-claude-login', bins.script, ...args] : args, {
+      detached: darwin,
+      env: profileEnv('CLAUDE_CONFIG_DIR', profileId, home),
+      stdio: darwin ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+    }) as ChildProcessWithoutNullStreams;
+    // The terminal has exited; release cat's input so the shell can finish.
+    // Only the shell owns fd 3. Final close remains the authoritative status.
+    if (darwin) child.stdio[3]?.once('data', () => child.stdin.end());
+    this.child = child;
+    child.stdin.on('error', () => { /* CLI exited; handled by 'close' */ });
+    const onData = (chunk: Buffer) => {
+      if (this.output.length < 64 * 1024) this.output += chunk.toString('utf8');
+      if (!this.url) {
+        const match = URL_RE.exec(this.output);
+        if (match) {
+          const url = allowedLoginUrl('claude', match[0]);
+          if (!url) { this.end('failed', 'the CLI returned an unexpected sign-in address'); return; }
+          this.url = url;
+          this.state = 'awaiting_user';
+        this.changed();
+        }
+      }
+      // Claude asks for Enter after success; the answer carries no secret.
+      if (this.submitted && !this.continued && /press enter/i.test(this.output)) {
+        this.continued = true;
+        child.stdin.write('\r');
+      }
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    this.exited = new Promise(resolve => {
+      child.once('error', () => { this.end('failed', 'could not start the sign-in'); resolve(null); });
+      child.once('close', code => { this.child = undefined; resolve(code); });
+    });
+  }
+
+  submitCode(code: string): void {
+    if (this.state !== 'awaiting_user' || this.submitted)
+      throw new FleetError('conflict', 'this login is not waiting for a code');
+    if (!PASTE_CODE_RE.test(code)) throw new FleetError('invalid_request', 'that does not look like a sign-in code');
+    this.submitted = true;
+    this.state = 'verifying';
+    this.changed();
+    this.output = '';
+    this.child?.stdin.write(`${code}\r`);
+  }
+
+  protected stop(): void {
+    if (process.platform === 'darwin' && this.child?.pid) {
+      try { process.kill(-this.child.pid, 'SIGTERM'); } catch { /* already exited */ }
+    } else this.child?.kill('SIGTERM');
+  }
+}
+
+/** Codex device-code login through the app-server's supported account API. */
+export class CodexDeviceLogin extends BaseLogin {
+  private server?: CodexAppServer;
+  private codexLoginId?: string;
+  /** Resolves true when the app-server reports a successful login. */
+  completed: Promise<boolean>;
+
+  constructor(owner: string, bins: SubscriptionBinaries, home: string, profileId: string, changed?: () => void) {
+    super('codex', owner, 'device_code', Date.now(), changed);
+    this.completed = (async () => {
+      try {
+        this.server = await CodexAppServer.start(bins.codex, profileEnv('CODEX_HOME', profileId, home));
+        if (this.state !== 'starting') { this.server.close(); return false; }
+        const completion = new Promise<boolean>(resolve => {
+          this.server!.onNotification((method, params) => {
+            const p = params as { loginId?: string | null; success?: boolean; error?: string | null };
+            if (method === 'account/login/completed' && (!p.loginId || p.loginId === this.codexLoginId)) {
+              if (!p.success) this.error = 'sign-in was not completed';
+              resolve(Boolean(p.success));
+            }
+          });
+        });
+        const started = await this.server.call<{ type: string; loginId?: string; verificationUrl?: string; userCode?: string }>(
+          'account/login/start', { type: 'chatgptDeviceCode' });
+        if (this.state !== 'starting') { this.server.close(); return false; }
+        const url = started.verificationUrl && allowedLoginUrl('codex', started.verificationUrl);
+        if (!url || !started.userCode) { this.end('failed', 'the CLI returned an unexpected sign-in address'); return false; }
+        this.codexLoginId = started.loginId;
+        this.url = url;
+        this.userCode = String(started.userCode).slice(0, 32);
+        this.state = 'awaiting_user';
+        this.changed();
+        const ok = await Promise.race([completion, this.done.then(() => false)]);
+        if (this.state === 'awaiting_user') { this.state = 'verifying'; this.changed(); }
+        return ok;
+      } catch {
+        this.end('failed', 'could not start the sign-in');
+        return false;
+      }
+    })();
+  }
+
+  submitCode(): void { throw new FleetError('invalid_request', 'device-code logins need no code from Fleet'); }
+
+  protected stop(): void {
+    if (this.server && this.codexLoginId && this.state === 'cancelled')
+      void this.server.call('account/login/cancel', { loginId: this.codexLoginId }, 3_000).catch(() => {});
+    setTimeout(() => this.server?.close(), 500).unref?.();
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}

@@ -172,34 +172,29 @@ rollback; inspect host integration and private init stage/recovery evidence.
 Attachment also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`,
 and \`/detach\`.
 
-## Local web console
+## Local HTTP service
 
-The npm package includes the web console; installed users do not clone the repo
-or run \`npm run build\`:
+Fleet runs an HTTP service for the App. It serves no pages and opens no
+browser; every screen is in the App.
 
 \`\`\`sh
 npm i -g @ours.network/fleet
-ours-fleet init
-ours-fleet doctor
-ours-fleet web                         # install/update service, start, pair browser
+ours-fleet setup-tunnel --file /private/setup.txt # connect host; prints QR and connection code
+ours-fleet link-device                 # connect another browser or device
 \`\`\`
 
-The normal command uses stable \`http://127.0.0.1:49271/\`, installs an
-owner-level systemd user service (Linux) or LaunchAgent (macOS), and opens a
-five-minute one-use pairing link in the local browser. After pairing, bookmark
-the plain URL or install the PWA. To pair a new, signed-out, or revoked browser,
-run \`ours-fleet web open\`.
+The service listens on \`http://127.0.0.1:49271/\` and is installed as an
+owner-level systemd user service (Linux) or LaunchAgent (macOS).
 
 \`\`\`sh
 ours-fleet web status
 ours-fleet web start|stop|restart
-ours-fleet web open
-ours-fleet web revoke-all              # revoke every browser and active session
+ours-fleet web revoke-all              # revoke every device and active session
 ours-fleet web uninstall
-ours-fleet web serve --port 0 --no-open # isolated foreground/testing mode
+ours-fleet web serve --port 0          # isolated foreground/testing mode
 \`\`\`
 
-The console is IPv4-loopback-only by default. Both \`localhost\` and
+The service is IPv4-loopback-only by default. Both \`localhost\` and
 \`127.0.0.1\` are accepted locally. For an nginx/TLS reverse proxy, keep the
 default bind and declare the exact browser origin:
 
@@ -253,20 +248,15 @@ records receive a bounded grace so a not-yet-registered transient unit cannot be
 mistaken for a stopped one. Stale recorded supervisors are reclaimed in bounded
 batches by moving their state to the same recovery archive, never by blind deletion.
 
-Every temporary role creates a new session-owned identity by calling ours MCP
-\`create_temporary_identity\` with its exact assigned name. It never binds a
-pre-existing identity and never falls back to permanent \`create_identity\`.
-Fleet does not inspect, preserve, or provision an ours identity for temporary
-spawn; creation belongs exclusively to the launched temporary agent session.
-Collisions, missing tool support, and creation errors stop safely without
-force-adopting or deleting identity state. Permanent roles
-are provisioned by fleet before launch and never delegate normal identity
-creation to the harness.
+The Fleet supervisor creates and binds the assigned identity before the harness
+starts. Temporary identities survive harness reconnects and are released only when
+the logical run ends. Permanent identities remain available after the supervisor
+releases ownership. Agents receive ready tools; no model-owned identity bootstrap
+or onboarding skill is required.
 
-The temporary supervisor treats its first positive identity observation as the
-lifecycle readiness gate: a cold harness may take as long as needed to read its
-briefing and bind, without a fixed first-bind retirement timer. After readiness,
-only sustained authoritative absence closes the role. Unreachable, malformed, or
+The temporary supervisor provisions identity and verifies room readiness before
+starting the harness. After readiness, only sustained authoritative absence
+closes the role. Unreachable, malformed, or
 valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
 than becoming cleanup authority.
 
@@ -275,6 +265,88 @@ supervisor attribution boundary before Commander parsing. The original CLI remai
 the executor inside the role's existing OS sandbox, and ordinary CLI validation is
 the source of truth. Hidden worker entry points remain internal; public lifecycle and
 operator commands are not restricted by the proxy.
+
+### Fleet commands from a command sandbox (\`managed_cli\`)
+
+That supervisor connection is a Unix socket. A harness command sandbox (Codex
+\`workspace-write\`, Claude's OS sandbox) can refuse it with \`connect EPERM\`
+before any command, even \`--help\`, is parsed. Fleet prepares the native
+harness policy for one declared workflow; you never write Codex rules or Claude
+sandbox settings by hand.
+
+Opt an Agent (or Agent Template) in explicitly. It is never inferred from a
+role's name or persona and is not inherited by agents it spawns:
+
+\`\`\`yaml
+# fleet/agents/FleetCoordinator.yaml
+role: { ref: Coordinator }
+brain: { ref: codex-gpt-5-4-medium }
+permissions: { approval: auto, filesystem: workspace, unattended: deny }
+managed_cli: [task-workflow]
+\`\`\`
+
+\`ours-fleet managed-cli setup --enable FleetCoordinator\` adds that one key to
+an existing Agent file and changes nothing else, permissions included.
+\`ours-fleet managed-cli setup\` generates the policy for every declaring agent
+and \`ours-fleet managed-cli status\` compares without writing. Neither starts a
+session or a model. The same preparation runs at every agent start, so spawned
+and task-room agents need no separate step.
+
+\`task-workflow\` prepares: \`task create|start|finish|block|unblock|review\`,
+\`task list|show\`, \`room show|members\`, \`template list|show|validate\`,
+\`config\`, \`docs\` and \`--help\`. \`task start\` and \`task finish\`
+provision and retire rooms and agents: this is real authority. Not prepared, and
+still sandboxed: \`spawn\`, \`ours tools|call\`, \`status|peek|send\`, room
+create/delete/close, task cancel/delete and service administration.
+
+The agent invokes a prepared command through the pinned entry form shown in its
+briefing:
+
+\`\`\`sh
+/abs/node /abs/fleet/dist/cli.js --managed-configuration /abs/fleet.yaml task create --title "..." --backlog --no-room
+\`\`\`
+
+What the native policy does and does not do:
+
+- A rule fixes the Node executable, this Fleet CLI, the configuration and the
+  command. It matches an argv prefix and admits every trailing option and
+  argument. It is not argument validation, target authorization or per-agent
+  isolation.
+- A later \`-c\`/\`--configuration\` naming another file is refused by the
+  Fleet CLI itself, after the process has started outside the sandbox. That is
+  Fleet validation, not a native policy denial.
+- The supervisor audit and ordinary CLI validation are unchanged. The pinned
+  form is refused outside a managed session, where no supervisor would audit it.
+- Compound, piped, redirected, \`$(...)\` and \`VAR=value\`-prefixed command
+  lines do not match and stay sandboxed.
+- Codex: a Fleet-owned \`.codex/rules/ours-fleet-<id>.rules\` in the agent's
+  workspace. It applies to every trusted Codex session in that workspace, and
+  Codex must trust the workspace; Fleet does not change trust. Other files in
+  that directory are never touched.
+- Claude: entries in the agent's own Fleet settings overlay
+  (\`permissions.allow\` and \`sandbox.excludedCommands\`). Your Claude settings
+  are not modified and Fleet never enables or disables Claude's OS sandbox.
+- A Fleet CLI or configuration path containing spaces is spelled in single
+  quotes (Codex >= 0.160.0). The Node executable itself must be at a path that
+  needs no quoting: neither harness matches a quoted executable against a rule.
+  A path containing anything but letters, digits, spaces and \`_@%+=:,./-\`
+  (quotes, backslashes, \`*\` and other pattern characters), or located inside
+  the agent's workspace or a \`harness_options.add_dirs\` directory (also through
+  a symlink), is reported as unsupported; so is a Codex role with
+  \`harness_options.config\` or \`profile\`, whose sandbox Fleet does not inspect.
+- Prepared for: Codex native app-server and bundled ACP, Claude bundled ACP, on
+  Linux and macOS. The generated setup was qualified end to end on Linux
+  (Codex 0.160.0, Claude Code 2.1.289); the macOS run of that matrix is
+  outstanding and \`managed-cli status\` says so there. Custom session
+  commands, other harnesses, roles declaring \`isolation:\` and other
+  platforms are reported as unsupported and left exactly as sandboxed as before.
+
+\`ours-fleet doctor\` reports three separate facts per declaring agent: the
+generated setup (static), whether the last launch loaded the current policy, and
+what the supervisor audit ledger recorded since. A prepared setup is not
+evidence of supervisor access, and a successful \`--help\` proves only its own
+audited path, not the task lifecycle. See
+\`docs/validation/managed-cli-permissions.md\`.
 
 Command invocation, raw argv, read-only work, validation failures, and generic
 outcomes are never forwarded to the Owner-visible channel. Fleet announces only
@@ -454,10 +526,10 @@ tasks:
 \`\`\`
 
 Fleet launches each template member with a dedicated one-time Cowork invite.
-The generated temporary-agent briefing contains the exact identity name, invite,
-Cowork role, and task. The agent creates that identity itself with ours MCP
-\`create_temporary_identity\`, accepts the invite with \`add_contact\`, and starts
-work immediately. A room is ready only after the Cowork room (and its task, when
+The supervisor accepts the startup invite and verifies the provisioned identity CID
+in the authenticated room seat before starting the model. The generated briefing
+contains the assigned identity, room, role and task, without invite material.
+A room is ready only after the Cowork room (and its task, when
 task-bound) is durably active, every configured member seat is authenticated and active with its matching
 live Fleet launch, and the configured Owner seat is active when owner attachment is
 enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
@@ -480,8 +552,8 @@ Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
 \`task create\`, \`task start\`, \`task work\`, or \`room create\`, to create an
 anonymous Cowork room. \`--no-anonymous\` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
-the same choice. Temporary members of an anonymous room are instructed to call
-\`create_temporary_identity\` with \`expose_local=false\`. Their generated briefings
+the same choice. The supervisor creates anonymous room members with local contact-book exposure
+disabled. Their generated briefings
 do not disclose or compare an Owner participant CID. A participant-originated
 instruction has Owner authority only when the authenticated Cowork room envelope
 attributes that participant seat the exact \`Owner\` role. Literal text, display
@@ -496,6 +568,17 @@ steps. Untrusted prose is context-escaped and control characters are neutralized
 Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
 bytes with structural omission notices. \`--json\` bypasses this presentation layer
 and retains the versioned machine schema and serialization order.
+
+Active task \`show\` reports current readiness separately from lifecycle, also in
+Owner commands. Start/work preserve the fail-closed \`task_not_ready\` behavior.
+Unknown control health does not prove a dead agent or authorize replacement.
+Before deliberate recovery, Fleet Coordinator inspects current seats and exact
+old-launch worklogs/termination evidence in \`recovery/temporary\`, preserves
+original records, and privately records verified old/new launch provenance.
+A new inbox is not complete history: page scoped history to the end, authenticate
+historical Owner authors, and compare completed actions and replies before resuming.
+Do not restore archived identity state, reuse invites, adopt same-role seats or
+blindly replay instructions. Ask the Owner if authority/completion is uncertain.
 
 Every task belongs to a named list. The built-in \`default\` list always exists,
 and legacy tasks or create calls without \`--list\` resolve to it. Use \`task lists\`,
@@ -555,6 +638,26 @@ idempotent no-op. The Owner-channel equivalent is \`/task delete <id> <id>\`; th
 management API equivalent is \`DELETE /api/v1/tasks/<id>?confirm=<id>\` (200 when
 settled, 202 while pending; \`GET /api/v1/tasks?includeDeleting=true\` exposes
 deletion-pending tasks to operators).
+
+### Task Progress and To review
+
+A task can carry an append-only **Progress** milestone log and a self-contained
+**To review** package (Markdown plus retained files). Agents launched for a task
+use \`fleet_task_progress_list\`, \`fleet_task_progress_append\`,
+\`fleet_task_review_show\`, \`fleet_task_review_set\` and
+\`fleet_task_review_detach\`; files are attached from the task workspace with the CLI:
+
+\`\`\`sh
+ours-fleet task progress TASK [--text TEXT | --text-file FILE] [--request-key KEY] [--json]
+ours-fleet task review-package TASK [--markdown-file FILE] [--attach PATH] [--detach ID] [--json]
+\`\`\`
+
+By default only the LocalCoordinator writes Progress, and every task role prepares
+the To review package before a Review handoff without gaining lifecycle authority.
+At Review the task description keeps only the clickable PR links, one per line (a task
+without PRs links its actual deliverables, never an invented PR); the package holds the
+rest, including the original description as an attached file.
+Full contract: \`docs/task-progress-review.md\` in the package.
 
 ## Permissions
 
@@ -743,6 +846,32 @@ Override an adapter only when necessary with \`session_options.acp.command\`
 ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 \`claude-agent-acp\`. \`ours-fleet doctor -c FILE\` verifies the resolved adapter.
 
+## Boot-time daemon readiness
+
+Linux permanent-agent services wait for their configured daemon before launching
+Fleet's runner. This uses the role's saved manifest path and environment, including
+host profiles, gateway endpoints and expected daemon identity; no Docker container
+names or default ports are assumed. The read-only probe requires verified startup
+readiness and an available identity index. Unavailable or unauthorized daemons leave
+the service waiting, with a diagnostic code in the journal. Each wait is bounded
+and systemd retries it until the daemon is ready; stopping the service cancels it.
+This does not consume the agent crash budget or discard its session context.
+Once the runner starts, its normal crash circuit breaker still applies.
+After upgrading Fleet, run \`ours-fleet service refresh\` (\`ours-install\` does it for
+you). Service definitions start the exact release tree that wrote them, so an
+unrefreshed one starts the previous release after the next reboot.
+\`ours-fleet service check\` reports each supervisor, web and watchdog definition,
+and whether its running process uses another release, without changing anything.
+\`refresh\` only re-points the release paths in definitions Fleet generated, runs
+\`daemon-reload\`, and never creates, starts, stops or restarts a service. A running
+supervisor keeps its code until it is restarted.
+Temporary agents and macOS services retain their existing lifecycle behavior.
+
+After a supervisor restart or reboot, prompts a role had admitted but never
+started are dispatched only once its control socket is listening, so recovered
+work cannot reach the previous run's socket (\`connect ECONNREFUSED\`). Turns that
+had already started are closed as \`unknown_after_restart\` and never replayed.
+
 ## Reliable mail wake
 
 \`monitor.mode\` selects exactly one wake owner:
@@ -754,10 +883,12 @@ ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 - \`native\`: ours-fleet starts no supervisor monitor; the generated briefing
   instructs Claude Code or Codex to arm its harness-native wake mechanism.
 
-Set \`monitor.interrupt: true\` in fleet mode to cancel active work before every
-configured wake. Set it to \`after_tool\` to preserve an active ACP tool (and any
-pending permission), then steer the wake at the first tool-terminal boundary
-without cancellation. A hung boundary is bounded at 120 seconds and falls back
+\`monitor.interrupt\` defaults to \`after_tool\` for every harness except Hermes,
+which defaults to \`false\`; an explicit value always wins, and temporary snapshots
+written without one keep \`false\`. Set \`monitor.interrupt: true\` in fleet mode to
+cancel active work before every configured wake. \`after_tool\` preserves an active
+ACP tool (and any pending permission), then steers the wake at the first
+tool-terminal boundary without cancellation. A hung boundary is bounded at 120 seconds and falls back
 to non-cancelling steering/queueing; adapters without authenticated tool events
 use the same conservative fallback. Explicit human/control interrupts remain
 immediate. The policy is content-blind because the supervisor cannot inspect
@@ -777,6 +908,78 @@ Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
 selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
+
+## Self-reminders
+
+Every managed agent (\`session: acp\` or \`codex-app-server\`, Claude or Codex,
+persistent, temporary or task-owned) can schedule one-time wakes for ITSELF.
+The tools are on the agent's own fixed-identity ours MCP server, so there is no
+agent, identity or recipient argument and no setup, worker, service, chat or key:
+
+- \`fleet_reminder_create\` — \`request_key\` (stable per decision; a repeat with
+  the same input returns the same reminder, different input is refused),
+  \`title\`, optional \`note\`, \`local_time\` (date and time WITHOUT an offset, e.g.
+  \`2027-01-20T16:00\`), \`time_zone\` (IANA, e.g. \`Europe/London\`, \`UTC\`), optional
+  \`fold\` (0/1, required only for a time that occurs twice when clocks go back;
+  times skipped by a spring-forward gap are refused), \`late_window_seconds\`
+  (60..604800, default 3600) and \`interrupt\` (default false; see below).
+- \`fleet_reminder_list\` — \`state\` \`open\` (default) | \`closed\` | \`all\`, \`limit\`, \`after\`.
+- \`fleet_reminder_update\` / \`fleet_reminder_cancel\` — \`id\` + \`expected_revision\`;
+  every change bumps the revision and voids any wake issued for the old one.
+- \`fleet_reminder_inspect\` — \`event_id\` from a wake: the note, whether the
+  wake is still current and eligible, and for an urgent one \`interrupt.state\`.
+- \`fleet_reminder_ack\` — \`event_id\` + \`expected_revision\`: records that the
+  wake was handled. Idempotent; sends nothing and claims no external action.
+
+When a reminder is due the supervisor starts one turn beginning \`[fleet-reminder]\`
+with the event id. It is the agent's own stored reminder, not an owner
+instruction or ours mail, and grants no authority. Fleet never sends anything
+on the agent's behalf; whether to message anyone is the agent's own decision
+under its existing tools and authorization.
+
+Delivery: the supervisor process that runs the agent owns the timer — an idle
+agent with no open reminders costs nothing, and only a due reminder creates a
+model turn. By default a wake never interrupts or queues behind work: it is
+admitted at the next idle turn boundary after its due time and after the agent's
+startup turn.
+
+Urgent (\`interrupt: true\`), only for a return genuinely bound to a time: when
+due and the agent is busy with an interruptible turn (mail wake, scheduled loop,
+local console), the supervisor durably records the request, asks that exact turn
+to stop once per revision, keeps the session and context, and releases the wake
+through the same fence. It never stops owner-channel or owner-console work,
+startup, stall recovery, another reminder, a pending permission, queued work or a
+turn it cannot identify; then it waits like an ordinary reminder and \`inspect\`
+shows \`interrupt_deferred\`. Due, interruption requested, its terminal
+(\`cancelled\` only when correlated; else \`ended\`/\`forced\`/\`failed\`/\`unknown\`),
+release, ack and any external action are separate facts. A forced or failed stop
+never queues the wake. It is not a hard real-time alarm and does nothing while
+the host or agent is down.
+If the host, Fleet or the agent is down, paused or busy, a reminder is still
+delivered when it comes back within its late window, and otherwise expires
+without a turn. Reminders survive supervisor, Fleet and host restarts and
+ordinary stop/start. They do not survive the agent: removing or retiring an
+agent or its task cancels them and deletes their state, and a replaced identity
+or same-named successor never inherits them.
+
+Guarantees are at most once per reminder revision. Queue acceptance, release to
+the model, the agent's ack, and any external action are distinct facts. A wake
+is marked dispatched durably at the moment it is handed to the model; if the
+supervisor stops before that, the same event is retried. If it stops after, the
+event is held \`uncertain\` (shown by \`list\`/\`inspect\`, never re-sent): check your
+own records, then ack it or schedule something new.
+
+Waiting on a peer (Developer/Critic/Engineer): before waiting on a specific
+review, answer or artifact, schedule ONE idle-only reminder about 20 minutes out
+naming the task/room and the expectation; cancel or reschedule it (with its
+revision) when the state changes; on the wake re-check, ack if resolved, else one
+follow-up in the same room and at most one more reminder, then report the
+nonresponse once. No polling, recurring chains, repeated follow-ups or automatic
+done.
+
+Operators can read an agent's reminders with
+\`ours-fleet ours call Name fleet_reminder_list\`. Full guide, examples and the
+migration from the standalone \`self-reminders\` worker skill: \`docs/self-reminders.md\`.
 
 ## Trusted owner channel
 
@@ -1038,8 +1241,8 @@ reconcile explicitly; no chain preserves detection-only behavior.
  * \`forbidden\` is the more important half. The old skills prescribed
  * \`--approval ask --filesystem workspace --unattended deny\` as a blanket
  * default while also telling the agent to stop at a failed doctor check — and
- * that combination is exactly what \`doctor\` FAILS, because \`ask\` grants an
- * unattended role nothing but \`read-state\` and \`deny\` makes the shortfall
+ * that combination is exactly what \`doctor\` FAILS, because \`ask\` cannot
+ * guarantee unattended capabilities and \`deny\` makes the shortfall
  * fatal. Following the skill produced a role the CLI then refused.
  */
 export const SPAWN_SKILL_CONTRACT = {
@@ -1068,7 +1271,7 @@ export const SPAWN_SKILL_CONTRACT = {
    */
   forbidden: [
     // The contradictory blanket default both variants used to prescribe.
-    // `ask` grants an unattended role only `read-state`, and `deny` makes the
+    // `ask` cannot guarantee unattended capabilities, and `deny` makes the
     // shortfall a doctor FAILURE — so the skill told you to build a role the
     // CLI then refused, in the same breath as telling you to trust doctor.
     '--approval ask --filesystem workspace --unattended deny',

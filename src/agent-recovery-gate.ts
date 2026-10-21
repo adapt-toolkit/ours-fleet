@@ -150,7 +150,7 @@ export async function recoverAgentIdentity(
   const unsubscribe = session.subscribeConversation(event => events.push(event));
   try {
     const queued = await session.queuePrompt([
-      '[fleet-recovery] The shared ours daemon restarted.',
+      '[fleet-recovery] The shared ours-daemon restarted.',
       `Call ours choose_identity with name ${JSON.stringify(identity)} and force false.`,
       'Then call current_identity, then get_messages. Complete all three in that order.',
       'Do not create/delete identities, force-bind, interrupt, or restart any service/session.',

@@ -1,3 +1,4 @@
+import type {TaskCreatedNotice,TaskNoticeBinding} from './task-notice.js';
 import type { SessionBackendId } from '../config.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
@@ -23,7 +24,9 @@ export type SessionReadiness =
 
 export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
 export type TurnCancellationSource =
-  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown' | 'stall-watchdog';
+  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown' | 'stall-watchdog'
+  /** An urgent self-reminder of the same agent asked its current turn to stop. */
+  | 'self-reminder';
 export type PromptOrigin =
   | { kind: 'startup' }
   | { kind: 'stall-watchdog' }
@@ -31,6 +34,8 @@ export type PromptOrigin =
   | { kind: 'owner'; requestId: string; displayText?: string }
   | { kind: 'fleet-monitor' }
   | { kind: 'scheduled-loop'; loop: string; runId: string }
+  /** A due self-reminder wake; the agent's own stored reminder, never owner input. */
+  | { kind: 'self-reminder'; eventId: string; reminderId: string; revision: number }
   | { kind: 'owner-admin-console'; commandId: string };
 
 export interface RuntimeSelectorMetadata {
@@ -233,12 +238,20 @@ export interface SubmitPromptOptions {
   steer?: boolean;
   /** Audit-grade actor detail persisted with the conversation admission record. */
   actor?: { browserSession?: string };
+  /**
+   * Checked synchronously at the turn boundary, immediately before the prompt
+   * would be handed to a live model. False drops the prompt unsent. Only
+   * honoured for internal prompts, which always run alone.
+   */
+  releaseGuard?: () => boolean;
 }
 
 export interface SessionSnapshot {
   backend: SessionBackendId;
   alive: boolean;
   readiness: SessionReadiness;
+  /** Typed source of the active prompt; excludes prompt bodies and command IDs. */
+  activePromptSource?: PromptOrigin['kind'];
   sessionId?: string;
   lastError?: string;
   pendingPermissionId?: string;
@@ -377,15 +390,30 @@ export interface ConversationHandlePage {
  * on any concrete transport which implements it.
  */
 export interface AgentSession {
+  sendFileToChat?: (input: import('../file-delivery/types.js').FileDeliveryInput, signal: AbortSignal, copy: import('../file-delivery/types.js').CopyChatFile, policy: import('../config.js').CommonPermissions) => Promise<import('../file-delivery/types.js').DeliveredFile>;
   readonly backend: SessionBackendId;
   readonly pid: number;
   /** Live capabilities; optional only for source compatibility with external adapters. */
   readonly capabilities?: AgentSessionCapabilities;
+  /**
+   * Start never-started prompts recovered from a prior generation. Sessions
+   * started with deferRecoveredPrompts hold them until the supervisor's
+   * control plane is listening, so recovered work cannot reach a stale socket.
+   */
+  activateRecoveredPrompts?(): void;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  taskNoticeBinding?():TaskNoticeBinding|undefined;
+  recordTaskCreated?(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void;
   // ── durable conversation ledger ────────────────────────────────────────────
   conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
   conversationSnapshot?(): ConversationSnapshot;
+  /** Side-effect-free current-generation durability eligibility; does not certify a historical range. */
+  conversationReplayAvailable?(expectedGeneration: string): boolean;
+  replayConversation?(request: import('./conversation-replay.js').ConversationReplayRequest): AsyncIterable<import('./conversation-replay.js').ConversationReplayPage>;
+  /** Passive: registering never attaches a controller or acknowledges activity. */
+  observeConversation?(listener: (state: import('./conversation-types.js').ConversationObservationState) => void): import('./conversation-types.js').ConversationObservation;
+  subscribeConversationFailure?(listener: (generation: string) => void): () => void;
   subscribeConversation?(listener: (event: ConversationEventV1) => void): () => void;
   /** Durably admit an idempotent browser prompt; resolves on admission. */
   submitPromptBrowser?(command: SubmitPromptCommand): Promise<PromptReceipt>;
@@ -393,6 +421,11 @@ export interface AgentSession {
    * Hand the session a prompt and return as soon as it has accepted
    * responsibility for it. Throws `SessionControlError` if it cannot.
    */
+  /**
+   * The turn that carries an admitted prompt when one adapter turn delivered
+   * several; absent means the prompt's own id is its turn id.
+   */
+  sharedTurnId?(promptId: string): string | undefined;
   queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
@@ -408,6 +441,9 @@ export interface AgentSession {
    * keep compiling. Read it through `interruptOutcome`, never directly.
    */
   interrupt(source?: TurnCancellationSource): Promise<InterruptResult>;
+  /** Atomically bind cancellation to one voice-owned turn. */
+  readonly liveVoiceSupported?: boolean;
+  interruptPrompt?(generation: string, promptId: string): Promise<InterruptResult>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(

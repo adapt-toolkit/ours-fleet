@@ -1,9 +1,13 @@
+import type { LayoutControlRequest } from '../rooms-tasks/layout-control.js';
+import type { SupervisorCorrespondence, AgentHistoryQuery } from '../agent-ours/correspondence.js';
+import { socketPath as privateSocketPath } from '../socket-path.js';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
 import { SessionControlError } from './types.js';
+import { MAX_CONVERSATION_RECORD_BYTES, startConversationReplay, type PassiveConversationFollowRequest } from './conversation-replay.js';
 import type { AgentSession, ControlFailureKind, SessionEvent, SessionSnapshot } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
@@ -27,9 +31,14 @@ export interface ControlRequest {
   token: string;
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
-    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
-    | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
+    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'submit_voice_prompt' | 'interrupt_v2' | 'interrupt_voice_v2'
+    | 'layout_control' | 'agent_contacts' | 'agent_history' | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
+  layout?: LayoutControlRequest;
+  agentHistory?: AgentHistoryQuery;
   text?: string;
+  expectedSessionGeneration?: string;
+  requireIdle?: boolean;
+  promptId?: string;
   permissionId?: string;
   optionId?: string;
   since?: number;
@@ -39,7 +48,8 @@ export interface ControlRequest {
   loop?: string;
   // ── conversation v3 fields ──────────────────────────────────────────────────
   /** Conversation cursor: replay strictly after this durable seq. */
-  after?: string;
+  after?: string | number;
+  expectedGeneration?: string;
   limit?: number;
   /** Idempotency key for v3 mutations. */
   commandId?: string;
@@ -65,7 +75,7 @@ export interface ControlRequest {
 
 /** Commands that require protocol version 3. */
 const V3_COMMANDS = new Set<ControlRequest['command']>([
-  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'interrupt_v2',
+  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'submit_voice_prompt', 'interrupt_v2', 'interrupt_voice_v2',
   'respond_permission_v2',
 ]);
 
@@ -205,7 +215,7 @@ export function oversightTaxonomyLines(name = '<Name>'): string[] {
   return oversightTaxonomy(name).map(r => `- **${r.result}** — ${r.meaning} → ${r.action}`);
 }
 
-export const controlSocketPath = (stateDir: string) => join(stateDir, '.control.sock');
+export const controlSocketPath = (stateDir: string) => privateSocketPath(join(stateDir, '.control.sock'));
 export const controlTokenPath = (stateDir: string) => join(stateDir, '.control-token');
 
 function sameToken(actual: string, supplied: string): boolean {
@@ -222,9 +232,13 @@ export class RoleControlServer {
   private readonly sockets = new Set<Socket>();
   /** Interrupt idempotency: same command id returns the first receipt. */
   private readonly interruptCommands = new Map<string, unknown>();
+  private correspondence?: SupervisorCorrespondence;
+  setCorrespondence(value: SupervisorCorrespondence):void { this.correspondence=value; }
   private ownerChannel?: OwnerChannelHandle;
   private loopManager?: ScheduledLoopManagerHandle;
   private reloadConfig?: () => Promise<unknown>;
+  private layoutControl?: (request: LayoutControlRequest) => Promise<unknown>;
+  setLayoutControl(handler: (request: LayoutControlRequest) => Promise<unknown>): void { this.layoutControl = handler; }
   private fleetSpawner?: (options: SpawnOpts) => Promise<ManagedFleetSpawnResult>;
   private fleetAuditor?: {
     begin(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
@@ -310,6 +324,7 @@ export class RoleControlServer {
         if (!line.trim()) continue;
         void this.handle(line, socket).then(follow => {
           if (follow) {
+            if (socket.destroyed) { follow.stop(); if (follow.controller) this.session.setControllerAttached(false); return; }
             if (unsubscribe) {
               unsubscribe();
               if (controllerAttached) this.session.setControllerAttached(false);
@@ -355,7 +370,11 @@ export class RoleControlServer {
               protocolVersion: this.session.conversationPage ? 3 : 2,
               features: [
                 'events_since', 'observer_follow', 'retained_range',
+                ...(this.correspondence ? ['agent_correspondence'] : []),
                 ...(this.session.conversationPage ? ['conversation_v3'] : []),
+                ...this.observationFeatures(),
+                ...(this.session.submitPromptBrowser ? ['generation_bound_prompts'] : []),
+                ...(this.session.liveVoiceSupported ? ['idle_bound_prompts', 'targeted_voice_interrupt'] : []),
                 ...(this.session.capabilities?.steering ? ['steering'] : []),
                 ...(this.session.capabilities?.permissions ? ['permissions'] : []),
                 ...(this.session.capabilities?.messagePhases ? ['message_phases'] : []),
@@ -429,6 +448,13 @@ export class RoleControlServer {
           });
           return;
         }
+        case 'layout_control': {
+          if (request.version !== 2 || !request.layout || !this.layoutControl)
+            throw new SessionControlError('rejected', 'layout control unavailable');
+          const result = await this.layoutControl(request.layout);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
         case 'fleet_spawn': {
           if (request.version !== 2 || !request.spawn || typeof request.spawn.name !== 'string')
             throw new SessionControlError('rejected', 'version 2 and typed spawn options are required');
@@ -468,6 +494,17 @@ export class RoleControlServer {
           this.write(socket, { version: 1, id: request.id, ok: true, result: { delivered: true } });
           return;
         }
+        case 'agent_contacts':
+        case 'agent_history': {
+          if(!this.correspondence) throw new SessionControlError('rejected','Supervisor correspondence API is unavailable; this session needs an updated supervisor.');
+          const query=request.agentHistory;
+          if(request.command==='agent_history' && (!query || !/^[a-f0-9]{64}$/i.test(query.peer_cid) || (query.limit!==undefined && (!Number.isInteger(query.limit)||query.limit<1||query.limit>200)) || (query.before_seq!==undefined && (!Number.isSafeInteger(query.before_seq)||query.before_seq<1))))
+            throw new SessionControlError('rejected','Valid peer_cid, limit (1–200) and before_seq are required.');
+          let result:unknown;
+          try { result=request.command==='agent_contacts' ? await this.correspondence.contacts() : await this.correspondence.history(query!); }
+          catch { throw new SessionControlError('rejected','Supervisor correspondence read failed; identity or transport is unavailable.'); }
+          this.write(socket,{version:1,id:request.id,ok:true,result});return;
+        }
         case 'owner_channel_manage': {
           if (!request.ownerChannel || typeof request.ownerChannel.action !== 'string')
             throw new SessionControlError('rejected', 'owner-channel management action is required');
@@ -499,20 +536,89 @@ export class RoleControlServer {
         }
         case 'conversation_page': {
           this.requireConversation(request);
-          this.write(socket, {
-            version: 1, id: request.id, ok: true,
-            result: this.session.conversationPage!({
-              after: request.after, limit: request.limit,
-            }),
+          const page = this.session.conversationPage!({
+            after: request.after === undefined ? undefined : String(request.after), limit: request.limit,
           });
+          if (this.session.observeConversation) {
+            try {
+              const observation = this.session.observeConversation(() => {});
+              try {
+                if (observation.snapshot.observationFailure) {
+                  page.snapshot = { ...page.snapshot, historyDegraded: true, observationFailure: 'capture_failed' };
+                } else page.snapshot = observation.snapshot;
+              } finally { observation.unsubscribe(); }
+            } catch {
+              // Canonical REST recovery remains usable without a live observation.
+              // Never substitute a frozen capture/barrier for the current store page.
+              page.snapshot = { ...page.snapshot, historyDegraded: true, observationFailure: 'capture_failed' };
+            }
+          }
+          this.write(socket, { version: 1, id: request.id, ok: true, result: page });
           return;
         }
         case 'conversation_follow': {
           this.requireConversation(request);
+          if (request.controller === false && request.expectedGeneration !== undefined) {
+            let stopped = false;
+            let heartbeat: ReturnType<typeof setInterval> | undefined;
+            let writing: Promise<void> = Promise.resolve();
+            let lastQualifyingOutputAt = Date.now();
+            const send = (message: Record<string, unknown>): Promise<void> => {
+              const result = writing.then(async () => {
+                if (message.controlHeartbeat === true && Date.now() - lastQualifyingOutputAt < 15_000) return;
+                await writeMessage(message);
+                lastQualifyingOutputAt = Date.now();
+              });
+              writing = result.catch(() => {});
+              return result;
+            };
+            const writeMessage = async (message: Record<string, unknown>) => {
+              // Stream one replay record progressively; don't queue a valid 16 MiB record
+              // into the 8 MiB pending-output budget. Framing is owned by the transport.
+              const bytes = Buffer.from(JSON.stringify({ version: 1, ...message }) + '\n');
+              for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+                if (stopped || socket.destroyed) throw new Error('conversation socket closed');
+                if (!socket.write(bytes.subarray(offset, offset + 64 * 1024))) {
+                  await new Promise<void>((resolve, reject) => {
+                    const cleanup = () => { socket.off('drain', drained); socket.off('close', ended); socket.off('error', failed); };
+                    const drained = () => { cleanup(); resolve(); };
+                    const ended = () => { cleanup(); reject(new Error('conversation socket closed')); };
+                    const failed = (error: Error) => { cleanup(); reject(error); };
+                    socket.once('drain', drained); socket.once('close', ended); socket.once('error', failed);
+                  });
+                }
+              }
+            };
+            const follow = startConversationReplay(this.session, {
+              expectedGeneration: request.expectedGeneration, after: request.after === undefined ? 0 : Number(request.after), controller: false,
+            }, {
+              replay: page => send({ conversationReplay: page }),
+              ready: ready => send({ conversationReady: ready }),
+              event: event => send({ conversationEvent: event }),
+              state: state => send({ conversationState: state }),
+              close: reason => {
+                stopped = true; if (heartbeat) clearInterval(heartbeat);
+                if (reason && !socket.destroyed) socket.end(JSON.stringify({ version: 1, id: request.id, ok: false, error: reason }) + '\n');
+              },
+            });
+            const stop = () => { stopped = true; if (heartbeat) clearInterval(heartbeat); follow.close(); };
+            let heartbeatPending = false;
+            if (!stopped) {
+              heartbeat = setInterval(() => {
+                if (heartbeatPending || stopped) return;
+                heartbeatPending = true;
+                void send({ controlHeartbeat: true }).catch(() => { stop(); socket.destroy(); })
+                  .finally(() => { heartbeatPending = false; });
+              }, 15_000);
+              heartbeat.unref();
+            }
+            socket.once('close', stop);
+            return { controller: false, stop: () => { socket.off('close', stop); stop(); } };
+          }
           this.write(socket, {
             version: 1, id: request.id, ok: true,
             result: this.session.conversationPage!({
-              after: request.after, limit: request.limit,
+              after: request.after === undefined ? undefined : String(request.after), limit: request.limit,
             }),
           });
           // A live conversation view is an attached controller: permission
@@ -524,7 +630,10 @@ export class RoleControlServer {
               socket.write(JSON.stringify({ version: 1, conversationEvent: event }) + '\n');
           }) };
         }
+        case 'submit_voice_prompt':
         case 'submit_prompt_v2': {
+          if (request.command === 'submit_voice_prompt' && !request.expectedSessionGeneration?.trim())
+            throw new SessionControlError('rejected', 'expectedSessionGeneration is required');
           this.requireConversation(request);
           if (!request.commandId?.trim() || !request.text?.trim() || !request.actor?.trim()
               || request.source !== 'owner_admin_console')
@@ -536,6 +645,7 @@ export class RoleControlServer {
             const receipt = await this.session.submitPromptBrowser({
               commandId: request.commandId, text: request.text,
               source: 'owner_admin_console', actorBrowserSession: request.actor,
+              expectedSessionGeneration: request.expectedSessionGeneration, requireIdle: request.requireIdle === true,
             });
             this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           } catch (error) {
@@ -544,6 +654,25 @@ export class RoleControlServer {
                 'idempotency_conflict: this command id was used with a different prompt body');
             throw error;
           }
+          return;
+        }
+        case 'interrupt_voice_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim() || !request.expectedSessionGeneration?.trim() || !request.promptId?.trim())
+            throw new SessionControlError('rejected', 'commandId, expectedSessionGeneration and promptId are required');
+          if (!this.session.interruptPrompt) throw new SessionControlError('rejected', 'targeted voice interrupt unavailable');
+          const key = 'voice:' + request.commandId;
+          const signature = JSON.stringify([request.expectedSessionGeneration, request.promptId]);
+          const existing = this.interruptCommands.get(key) as { signature: string; receipt: unknown } | undefined;
+          if (existing) {
+            if (existing.signature !== signature) throw new SessionControlError('rejected', 'idempotency_conflict: interrupt target changed');
+            this.write(socket, { version: 1, id: request.id, ok: true, result: existing.receipt }); return;
+          }
+          const outcome = await this.session.interruptPrompt(request.expectedSessionGeneration, request.promptId);
+          const receipt = { accepted: true, commandId: request.commandId, ...outcome };
+          this.interruptCommands.set(key, { signature, receipt });
+          if (this.interruptCommands.size > 200) this.interruptCommands.delete(this.interruptCommands.keys().next().value!);
+          this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           return;
         }
         case 'interrupt_v2': {
@@ -611,6 +740,16 @@ export class RoleControlServer {
       throw new SessionControlError('rejected', 'this role has no conversation ledger');
   }
 
+  private observationFeatures(): string[] {
+    if (!this.session.observeConversation || !this.session.replayConversation || !this.session.subscribeConversation || !this.session.subscribeConversationFailure) return [];
+    try {
+      const observation = this.session.observeConversation(() => {});
+      try { return observation.snapshot.observationFailure || !this.session.conversationReplayAvailable?.(observation.snapshot.sessionGeneration)
+        ? [] : ['conversation_observation', 'control_heartbeat']; }
+      finally { observation.unsubscribe(); }
+    } catch { return []; }
+  }
+
   private write(socket: Socket, response: ControlResponse): void {
     if (!socket.destroyed) socket.write(JSON.stringify(response) + '\n');
   }
@@ -646,9 +785,15 @@ export async function controlRequest(
     socket.once('error', error => {
       clearTimeout(timer);
       const code = (error as NodeJS.ErrnoException).code;
+      const permissionHint = code === 'EPERM' || code === 'EACCES'
+        ? `; the operating system denied access before '${request.command}' reached the supervisor. `
+          + 'Check socket permissions and the command execution sandbox. '
+          + 'An existing socket does not prove this process can connect; do not bypass Fleet audit. '
+          + 'For managed workspace sessions, see docs/validation/managed-cli-permissions.md.'
+        : '';
       reject(new SessionControlError(
         code === 'ENOENT' || code === 'ECONNREFUSED' ? 'control-unavailable' : 'backend',
-        `role control socket: ${error.message}`));
+        `role control socket: ${error.message}${permissionHint}`));
     });
     socket.on('data', chunk => {
       buffer += chunk;
@@ -706,31 +851,49 @@ export async function followControl(
  */
 export async function followConversation(
   stateDir: string,
-  after: string | undefined,
+  after: string | undefined | PassiveConversationFollowRequest,
   onMessage: (message: Record<string, unknown>) => void,
 ): Promise<{ socket: Socket; close(): void }> {
+  const options = typeof after === 'object' ? after : undefined;
+  options?.signal?.throwIfAborted();
   const token = readFileSync(controlTokenPath(stateDir), 'utf8').trim();
   const socket = createConnection(controlSocketPath(stateDir));
   socket.setEncoding('utf8');
-  let buffer = '';
+  // Admit one maximum-size logical record plus its actual private wrapper.
+  // coveredThrough is a safe integer. JSON brackets/envelope are outside the record budget.
+  const privateEnvelopeBytes = Math.max(
+    Buffer.byteLength(JSON.stringify({version:1,conversationReplay:{events:[],coveredThrough:Number.MAX_SAFE_INTEGER}})),
+    Buffer.byteLength(JSON.stringify({version:1,conversationReady:{snapshot:null,coveredThrough:Number.MAX_SAFE_INTEGER}})) - 4,
+    Buffer.byteLength(JSON.stringify({version:1,conversationState:null})) - 4,
+    Buffer.byteLength(JSON.stringify({version:1,conversationEvent:null})) - 4,
+  );
+  const limit = MAX_CONVERSATION_RECORD_BYTES + privateEnvelopeBytes;
+  let parts: string[] = [], bytes = 0;
   socket.on('data', chunk => {
-    buffer += chunk;
-    for (;;) {
-      const newline = buffer.indexOf('\n');
-      if (newline < 0) break;
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      if (!line.trim()) continue;
-      try { onMessage(JSON.parse(line) as Record<string, unknown>); }
-      catch { /* a torn frame ends this stream; the client resyncs over HTTP */ }
+    for (const [index, part] of String(chunk).split('\n').entries()) {
+      if (index) {
+        const line=parts.join(''); parts=[]; bytes=0;
+        if (line.trim()) {
+          try { onMessage(JSON.parse(line) as Record<string, unknown>); }
+          catch { if (options) { socket.destroy(new Error('invalid conversation private frame')); return; } }
+        }
+      }
+      bytes+=Buffer.byteLength(part);
+      if (options && bytes>limit) { socket.destroy(new Error('conversation private frame exceeds assembly limit')); return; }
+      parts.push(part);
     }
   });
   await new Promise<void>((resolve, reject) => {
+    const onAbort = () => { socket.destroy(); reject(new Error('conversation follow aborted')); };
+    options?.signal?.addEventListener('abort', onAbort, { once: true });
+    socket.once('close', () => options?.signal?.removeEventListener('abort', onAbort));
     socket.once('connect', resolve);
     socket.once('error', reject);
+    if (options?.signal?.aborted) onAbort();
   });
   socket.write(JSON.stringify({
-    version: 3, id: randomUUID(), token, command: 'conversation_follow', after,
+    version: 3, id: randomUUID(), token, command: 'conversation_follow',
+    ...(options ? {expectedGeneration:options.expectedGeneration,after:options.after ?? 0,controller:false} : {after}),
   }) + '\n');
   return { socket, close: () => socket.destroy() };
 }

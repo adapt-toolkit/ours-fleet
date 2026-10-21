@@ -8,13 +8,16 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  askInitQuestions, decodeKey, executeInitWizard, formatSetupSummary, generateSetup,
+  askInitQuestions, brainPresetId, decodeKey, executeInitAnswers, executeInitWizard, formatSetupSummary, generateSetup,
   isInteractiveTerminal, preflightInitPaths, publishSetup,
-  TerminalPrompter, updateMultiSelect, validateCatalog,
+  readInitSettings, TerminalPrompter, updateMultiSelect, validateCatalog,
   type CatalogModel, type Choice, type InitAnswers, type InitPrompter, type ReasoningPreference,
   type Subscription, type WorkKind,
 } from '../src/init-wizard.js';
+import { migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
+import { validateRoomLayout } from '../src/rooms-tasks/layout-config.js';
+import { parse as parseYaml } from 'yaml';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
@@ -49,6 +52,15 @@ function model(harness: CatalogModel['harness'], name: string): CatalogModel {
   return { harness, session: 'acp', model: name, efforts };
 }
 
+/** The packaged Brain preset a prepared agent of each kind of work references, and that preset's file. */
+const BRAIN_HOLDER: Record<WorkKind, string> = {
+  development: 'agent_templates/Developer.yaml', review: 'agent_templates/Critic.yaml', coordination: 'agents/FleetCoordinator.yaml',
+};
+const brainRef = (generated: ReturnType<typeof generateSetup>, work: WorkKind): string =>
+  generated.files.get(BRAIN_HOLDER[work])!.match(/^brain: \{ ref: (\S+) \}$/m)![1];
+const brainOf = (generated: ReturnType<typeof generateSetup>, work: WorkKind): string =>
+  generated.files.get(`brains/${brainRef(generated, work)}.yaml`)!;
+
 function answers(
   subscriptions: Subscription[] = ['codex'],
   reasoning: ReasoningPreference = 'balanced',
@@ -77,6 +89,40 @@ function treeSnapshot(path: string): Record<string, string> {
 }
 
 describe('interactive questionnaire', () => {
+  it('reads a complete strict settings document and rejects malformed, incomplete, extra, and unsupported input', () => {
+    const path = join(root, 'settings.json');
+    writeFileSync(path, JSON.stringify(answers()));
+    expect(readInitSettings(path)).toEqual(answers());
+
+    for (const value of [
+      '{',
+      JSON.stringify({ subscriptions: ['codex'] }),
+      JSON.stringify({ ...answers(), extra: true }),
+      JSON.stringify({ ...answers(), subscriptions: ['codex', 'invented'] }),
+      JSON.stringify({ ...answers(), models: { ...answers().models,
+        review: model('codex', 'invented-model') } }),
+    ]) {
+      writeFileSync(path, value);
+      expect(() => readInitSettings(path)).toThrow();
+    }
+  });
+
+  it('validates supplied answers before host setup or publication and shares the mutation path', async () => {
+    let hostCalls = 0; let publishCalls = 0;
+    const config = join(root, 'fleet.yaml');
+    await expect(executeInitAnswers({ ...answers(), reasoning: 'invented' as ReasoningPreference }, config, {
+      async hostSetup() { hostCalls++; },
+      async publish() { publishCalls++; throw new Error('must not publish'); },
+    })).rejects.toThrow(/unsupported reasoning/);
+    expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
+
+    const result = await executeInitAnswers(answers(), config, {
+      async hostSetup() { hostCalls++; }, publish: publishSetup,
+    });
+    expect(result.configPath).toBe(config);
+    expect(hostCalls).toBe(1);
+  });
+
   it('begins with the preservation contract and names the complete seed scope', async () => {
     const config = join(root, 'custom.yaml');
     const prompt = new ScriptedPrompter([false]);
@@ -89,9 +135,9 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 8 },
-    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 3 },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 11 },
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 11 },
+    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 5 },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 16 },
   ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
     const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
@@ -109,10 +155,11 @@ describe('interactive questionnaire', () => {
     if (selected.includes(0)) {
       expect(selects[1].labels).toEqual(expect.arrayContaining([
         expect.stringContaining('GPT-6 Astra (Codex) — gpt-6-astra;'),
+        expect.stringContaining('GPT-6.1 Sol (Codex) — gpt-6.1-sol;'),
       ]));
       const generated = generateSetup(result!);
-      for (const work of ['development', 'review', 'coordination'])
-        expect(generated.files.get(`brains/${work}.yaml`)).toContain('model: gpt-6-astra');
+      for (const work of ['development', 'review', 'coordination'] as WorkKind[])
+        expect(brainOf(generated, work)).toContain('model: gpt-6-astra');
     }
     expect(selects[1].labels?.every(label => /— (gpt-|claude-)/.test(label))).toBe(true);
     expect(prompt.calls.filter(call => call.kind === 'note').at(0)?.message).toMatch(/not recommendations.*entitlement/s);
@@ -369,7 +416,23 @@ describe('deterministic default mapping', () => {
   ] as const)('maps %s reasoning to %s for every outcome', (preference, effort) => {
     const generated = generateSetup(answers(['codex'], preference));
     for (const work of ['development', 'review', 'coordination'] as WorkKind[])
-      expect(generated.files.get(`brains/${work}.yaml`)).toContain(`effort: ${effort}`);
+      expect(brainOf(generated, work)).toContain(`effort: ${effort}`);
+  });
+
+  it('references packaged Brain presets and defines no Brain named after a kind of work', () => {
+    const generated = generateSetup(answers(['codex'], 'thorough'));
+    for (const work of ['development', 'review', 'coordination'] as WorkKind[]) {
+      expect(brainRef(generated, work)).toBe('codex-gpt-5-6-sol-high');
+      expect(generated.files.has(`brains/${work}.yaml`)).toBe(false);
+    }
+    expect(brainPresetId(model('claude-code', 'claude-opus-5'), 'medium')).toBe('claude-opus-5-medium');
+    expect(brainPresetId(model('codex', 'gpt-6.1-sol'), 'low')).toBe('codex-gpt-6-1-sol-low');
+    // Every packaged preset is installed unchanged, so any of them can be chosen later.
+    const packaged = readdirSync(new URL('../presets/fleet/brains', import.meta.url)).filter(name => name.endsWith('.yaml'));
+    expect(packaged.length).toBeGreaterThan(3);
+    for (const name of packaged)
+      expect(generated.files.get(`brains/${name}`)).toBe(readFileSync(new URL(`../presets/fleet/brains/${name}`, import.meta.url), 'utf8'));
+    expect([...generated.files.keys()].filter(name => name.startsWith('brains/')).sort()).toEqual(packaged.map(name => `brains/${name}`).sort());
   });
 
   it('maps default single/pair/team and coordinator roles to chosen outcomes', () => {
@@ -381,18 +444,29 @@ describe('deterministic default mapping', () => {
         coordination: model('codex', 'gpt-5.6-terra'),
       },
     });
-    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
-    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: review }');
-    expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: coordination }');
+    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
+    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: claude-opus-5-medium }');
+    expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: codex-gpt-5-6-terra-medium }');
     for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
       expect(generated.files.get(`agent_templates/${role}.yaml`))
         .toContain('monitor: { mode: fleet, interrupt: after_tool }');
-    expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
+    expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: codex-gpt-5-6-terra-medium }');
     expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Critic');
     for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
       expect(generated.files.get('room_templates/team.yaml')).toContain(`agent_template: ${role}`);
+    // The same experiences ship as ordinary, editable room layouts: one room each, sessions per participant.
+    const layout = (name: string) => validateRoomLayout(parseYaml(generated.files.get(`room_layouts/${name}.yaml`)!), name);
+    const members = (name: string) => Object.values(layout(name).rooms).map(room => room.members);
+    expect(members('single')).toEqual([['developer']]);
+    expect(members('pair')).toEqual([['developer', 'critic']]);
+    expect(members('team')).toEqual([['local_coordinator', 'developer', 'critic']]);
+    expect(members('engineering')).toEqual([['developer', 'critic']]);
+    for (const name of ['single', 'pair', 'team', 'engineering'])
+      for (const participant of Object.values(layout(name).participants))
+        expect(generated.files.has(`agent_templates/${participant.agent_template}.yaml`)).toBe(true);
+    expect(layout('pair').rooms.task.contract).toContain('Completion requires Developer evidence and Critic sign-off.');
     for (const obsolete of ['Agent', 'Architect', 'Secretary', 'Tester']) {
       expect(generated.files.has(`roles/${obsolete}.yaml`)).toBe(false);
       expect(generated.files.has(`agent_templates/${obsolete}.yaml`)).toBe(false);
@@ -402,7 +476,7 @@ describe('deterministic default mapping', () => {
   it('generates a catalog-valid Claude setup without claiming or inventing entitlement fallback', () => {
     const generated = generateSetup(answers(['claude'], 'thorough'));
     for (const work of ['development', 'review', 'coordination'] as WorkKind[]) {
-      const brain = generated.files.get(`brains/${work}.yaml`)!;
+      const brain = brainOf(generated, work);
       expect(brain).toContain('harness: claude-code');
       expect(brain).toContain('model: claude-opus-5');
       expect(brain).toContain('effort: high');
@@ -433,7 +507,7 @@ describe('deterministic default mapping', () => {
     expect(() => generateSetup({ ...answers(), assignmentStrategy: 'impossible' as InitAnswers['assignmentStrategy'] }))
       .toThrow(/unsupported model assignment strategy/);
     for (const work of ['development', 'review', 'coordination'] as WorkKind[])
-      expect(generateSetup(answers()).files.get(`brains/${work}.yaml`)?.match(/^model:/gm)).toHaveLength(1);
+      expect(brainOf(generateSetup(answers()), work).match(/^model:/gm)).toHaveLength(1);
   });
 
   it('blocks an inconsistent one-model answer and allows the same explicit per-job mix', () => {
@@ -609,7 +683,7 @@ describe('locked replacement transaction', () => {
     const split = splitRootFor(config);
     writeFileSync(join(split, 'roles/Developer.yaml'), 'mission: custom developer\npersona: custom\nbio: custom\n');
     writeFileSync(join(split, 'agent_templates/Developer.yaml'),
-      'role: { ref: Developer }\nbrain: { ref: development }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
+      'role: { ref: Developer }\nbrain: { ref: codex-gpt-5-6-sol-low }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
     const single = join(split, 'room_templates/single.yaml');
     writeFileSync(single, readFileSync(single, 'utf8')
       .replace('Solo task: one Developer owns implementation and verification',
@@ -705,10 +779,46 @@ describe('locked replacement transaction', () => {
     const result = spawnSync(process.execPath, [child], { encoding: 'utf8' });
     expect(result.signal).toBe('SIGKILL');
     expect(existsSync(config)).toBe(false);
-    expect(readFileSync(join(splitRootFor(config), 'brains/development.yaml'), 'utf8'))
-      .toContain('model: gpt-5.6-sol');
+    expect(readFileSync(join(splitRootFor(config), 'agent_templates/Developer.yaml'), 'utf8'))
+      .toContain('brain: { ref: codex-gpt-5-6-sol-low }');
     const created = readdirSync(root).filter(name => !before.has(name) && name !== 'hard-kill.mjs');
     expect(created.some(name => name.includes('init-recovery'))).toBe(true);
     expect(created.some(name => name.includes('init-stage'))).toBe(true);
   });
+});
+
+it('adds engineering to an existing wizard install with the selected development brain', async () => {
+  const config = join(root, 'fleet.yaml');
+  await publishSetup(config, generateSetup(answers()));
+  const split = splitRootFor(config);
+  for (const relative of ['roles/Engineer.yaml', 'agent_templates/Engineer.yaml', 'room_templates/engineering.yaml'])
+    rmSync(join(split, relative));
+  const before = treeSnapshot(split);
+  const result = migratePackagedRoleDefaults(config, { write: true });
+  expect(result.removals).toEqual([]);
+  expect(result.replacements).toEqual([]);
+  const cfg = loadConfig(config, { yamlMode: 'strict' });
+  expect(cfg.agentTemplates?.Engineer.brain).toEqual(cfg.agentTemplates?.Developer.brain);
+  expect(cfg.agentTemplates?.Engineer.permissions).toMatchObject({ approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' });
+  const after = treeSnapshot(split);
+  for (const [path, bytes] of Object.entries(before)) expect(after[path], path).toBe(bytes);
+  expect(migratePackagedRoleDefaults(config, { write: true }).additions).toEqual([]);
+});
+
+it('preserves literal inline brain data and existing custom Engineer files on migration', async () => {
+  const config = join(root, 'fleet.yaml');
+  await publishSetup(config, generateSetup(answers()));
+  const split = splitRootFor(config);
+  const developer = join(split, 'agent_templates/Developer.yaml');
+  const brain = { inline: { harness: 'codex', session: 'acp', model: "custom-$&-$`-$'-model" } };
+  writeFileSync(developer, readFileSync(developer, 'utf8').replace('brain: { ref: codex-gpt-5-6-sol-medium }',
+    () => `brain: ${JSON.stringify(brain)}`));
+  const engineer = join(split, 'agent_templates/Engineer.yaml');
+  rmSync(engineer);
+  migratePackagedRoleDefaults(config, { write: true });
+  expect(loadConfig(config).agentTemplates?.Engineer.brain).toEqual(loadConfig(config).agentTemplates?.Developer.brain);
+  const custom = readFileSync(engineer, 'utf8') + '# owner customization\n';
+  writeFileSync(engineer, custom);
+  expect(migratePackagedRoleDefaults(config, { write: true }).preserved).toContain(engineer);
+  expect(readFileSync(engineer, 'utf8')).toBe(custom);
 });

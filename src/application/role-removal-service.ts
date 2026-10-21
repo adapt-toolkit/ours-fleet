@@ -1,9 +1,11 @@
+import { retireNotificationTarget } from '../notifications/target-cleanup.js';
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { loadConfig, ROLE_NAME_RE } from '../config.js';
 import { agentDir, stateRoot } from '../paths.js';
-import { rmRole, type OpsDeps } from '../ops.js';
+import { assertStandaloneRoleRemoval, rmRole, type OpsDeps } from '../ops.js';
 import { FleetError } from './errors.js';
+import { removeReminderState } from '../reminders/store.js';
 import { provesGeneratedAgentSource } from '../generated-agent-source.js';
 
 export interface RoleRemovalPreview {
@@ -28,6 +30,8 @@ export class RoleRemovalService {
   previewWeb(requested: string): RoleRemovalPreview {
     if (!ROLE_NAME_RE.test(requested)) throw new FleetError('invalid_request', 'invalid role name');
     const cfg = loadConfig(this.options.configPath);
+    try { assertStandaloneRoleRemoval(cfg, requested); }
+    catch (error) { throw new FleetError('conflict', error instanceof Error ? error.message : String(error)); }
     const names = new Set(cfg.roles.map(role => role.name));
     for (const root of [dirname(agentDir('_')), dirname(agentDir('_', true))]) {
       try { for (const entry of readdirSync(root, { withFileTypes: true })) if (entry.isDirectory()) names.add(entry.name); }
@@ -81,7 +85,11 @@ export class RoleRemovalService {
     const stamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
     const recoveryPath = join(stateRoot(), 'recovery', 'removed', `${stamp}-${preview.role}`);
     mkdirSync(recoveryPath, { recursive: true, mode: 0o700 });
-    if (existsSync(sourceState)) cpSync(sourceState, join(recoveryPath, 'state'), { recursive: true });
+    if (existsSync(sourceState)) {
+      cpSync(sourceState, join(recoveryPath, 'state'), { recursive: true });
+      // Recovery evidence is not a schedule: a removed agent's reminders end here.
+      removeReminderState(join(recoveryPath, 'state'));
+    }
     if (role && provesGeneratedAgentSource(agentDir(preview.role), cfg.files[0], role.sourceFile)
         && existsSync(role.sourceFile))
       cpSync(role.sourceFile, join(recoveryPath, basename(role.sourceFile)));
@@ -89,7 +97,11 @@ export class RoleRemovalService {
       await rmRole(cfg, preview.role, this.options.ops);
     else {
       await this.options.ops.backend.uninstall(preview.role);
-      if (existsSync(sourceState)) renameSync(sourceState, join(recoveryPath, 'orphan-state'));
+      if (existsSync(sourceState)) {
+        renameSync(sourceState, join(recoveryPath, 'orphan-state'));
+        removeReminderState(join(recoveryPath, 'orphan-state'));
+      }
+      await retireNotificationTarget({kind: 'agent', agentId: preview.role}).catch(()=>{});
       this.options.ops.log(`removed orphaned backend/state '${preview.role}'`);
     }
     return { ...preview, removed: true, recoveryPath };

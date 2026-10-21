@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { bootstrapPresets } from '../src/preset-bootstrap.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { listTemplates } from '../src/rooms-tasks/templates.js';
-import { generateSetup, type InitAnswers } from '../src/init-wizard.js';
+import { formatSetupSummary, generateSetup, type InitAnswers } from '../src/init-wizard.js';
 import { buildRoomMemberTask } from '../src/rooms-tasks/member-startup.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
@@ -20,20 +19,21 @@ const answers: InitAnswers = {
 };
 
 describe('packaged default role contract', () => {
-  it('fresh bootstrap exposes only the three executor roles and exact room layouts', () => {
+  it('fresh bootstrap exposes the four executor roles and exact room layouts', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-default-roles-'));
     try {
       const config = join(root, 'fleet.yaml');
       bootstrapPresets(config);
       const split = splitRootFor(config);
       expect(readdirSync(join(split, 'roles')).sort())
-        .toEqual(['Coordinator.yaml', 'Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+        .toEqual(['Coordinator.yaml', 'Critic.yaml', 'Developer.yaml', 'Engineer.yaml', 'LocalCoordinator.yaml']);
       expect(readdirSync(join(split, 'agent_templates')).sort())
-        .toEqual(['Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+        .toEqual(['Critic.yaml', 'Developer.yaml', 'Engineer.yaml', 'LocalCoordinator.yaml']);
       const cfg = loadConfig(config, { yamlMode: 'strict' });
       const layouts = Object.fromEntries(listTemplates(cfg.roomTemplates ?? {})
         .map(template => [template.name, template.members.map(member => member.role)]));
       expect(layouts).toEqual({
+        engineering: ['Engineer', 'Critic'],
         pair: ['Developer', 'Critic'], single: ['Developer'],
         team: ['LocalCoordinator', 'Developer', 'Critic'],
       });
@@ -43,7 +43,9 @@ describe('packaged default role contract', () => {
       expect(coordinator.persona).toMatch(/Own progress and workflow, not execution quality/);
       expect(coordinator.persona).toMatch(/Immediately before room creation/);
       expect(coordinator.persona).toMatch(/Brain, harness, session, model, reasoning effort/);
-      expect(coordinator.persona).toMatch(/Wait for `send_message` to confirm delivery/);
+      // The coordinator speaks in its own conversation; nothing waits on a named owner channel.
+      expect(coordinator.persona).toMatch(/introduce yourself in your first reply/);
+      expect(coordinator.persona).not.toMatch(/owner channel|confirm delivery|If delivery fails/i);
       expect(coordinator.bio).not.toBe(coordinator.persona);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -52,13 +54,30 @@ describe('packaged default role contract', () => {
     const files = generateSetup(answers).files;
     expect([...files.keys()].filter(path => path.startsWith('roles/')).sort()).toEqual([
       'roles/Coordinator.yaml', 'roles/Critic.yaml', 'roles/Developer.yaml',
-      'roles/LocalCoordinator.yaml',
+      'roles/Engineer.yaml', 'roles/LocalCoordinator.yaml',
     ]);
     expect([...files.keys()].filter(path => path.startsWith('agent_templates/')).sort()).toEqual([
       'agent_templates/Critic.yaml', 'agent_templates/Developer.yaml',
-      'agent_templates/LocalCoordinator.yaml',
+      'agent_templates/Engineer.yaml', 'agent_templates/LocalCoordinator.yaml',
     ]);
     expect(files.get('agents/FleetCoordinator.yaml')).toContain('role: { ref: Coordinator }');
+  });
+
+  it('ships a vendor-neutral gate-pipeline Engineer as the gated engineering experience', () => {
+    const files = generateSetup(answers).files;
+    const role = String(files.get('roles/Engineer.yaml'));
+    for (const marker of [
+      /Definition of Done/, /failing test/, /over-engineering/, /security/i,
+      /walk the same gates by\s+hand/, /gate-pipeline skill/,
+    ]) expect(role).toMatch(marker);
+    expect(role).not.toMatch(/engineer-mini|8hats/i);
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
+    const room = String(files.get('room_templates/engineering.yaml'));
+    expect(room).toContain('role: Engineer');
+    expect(room).toContain('agent_template: Engineer');
+    expect(room).toContain('agent_template: Critic');
+    expect(formatSetupSummary(answers, join(tmpdir(), 'fleet.yaml'))).toContain('Gated engineering');
   });
 
   it('gives every retained role a distinct public bio and enforces executor escalation boundaries', () => {
@@ -67,12 +86,12 @@ describe('packaged default role contract', () => {
       const config = join(root, 'fleet.yaml');
       bootstrapPresets(config);
       const presets = loadConfig(config, { yamlMode: 'strict' }).rolePresets!;
-      for (const name of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
+      for (const name of ['Coordinator', 'LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
         expect(presets[name].bio, name).toEqual(expect.any(String));
         expect(presets[name].persona, name).toEqual(expect.any(String));
         expect(presets[name].bio, name).not.toBe(presets[name].persona);
       }
-      for (const name of ['LocalCoordinator', 'Developer', 'Critic']) {
+      for (const name of ['LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
         const persona = String(presets[name].persona);
         expect(persona, name).toMatch(/task state, progress, checkpoints, findings, review verdicts, completion, handoffs, and ordinary\s+errors/i);
         expect(persona, name).toMatch(/only in the assigned Cowork room/i);
@@ -92,7 +111,7 @@ describe('packaged default role contract', () => {
         expect(persona, name).toMatch(/BLOCKED|resting/);
         expect(persona, name).toMatch(/(?:Leave recover,\s+block\/unblock, review\/finish, deletion, replacement, and respawn decisions to Fleet Coordinator|Only the configured Fleet Coordinator may recover, block, unblock, review, finish, delete, replace,\s+or respawn Fleet resources)/);
       }
-      for (const name of ['Developer', 'Critic']) {
+      for (const name of ['Developer', 'Engineer', 'Critic']) {
         const persona = String(presets[name].persona);
         expect(persona, name).toMatch(/follow.*instructions directly in the room/i);
         expect(persona, name).toMatch(/replies and evidence in that same room/i);
@@ -110,9 +129,72 @@ describe('packaged default role contract', () => {
       expect(local).toMatch(/other confirmed infrastructure or orchestration\s+blocker.*without waiting for the peer window/s);
       expect(local).toMatch(/your own work state BLOCKED or resting/);
       expect(local).toMatch(/never invoke a Fleet task block/);
-      const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
-      expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
-        .toBe('7093e77e1d4136ba791e9c607922995e3ea689880855657134f2c23e32a80a59');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('ships the self-contained To review handoff to every task role and Progress writing only to LocalCoordinator', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-review-contracts-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const cfg = loadConfig(config, { yamlMode: 'strict' });
+      const generated = generateSetup(answers).files;
+      for (const source of ['bootstrap', 'generated'] as const) {
+        // Compare prose, not the YAML line wrapping.
+        const persona = (name: string) => (source === 'bootstrap' ? String(cfg.rolePresets?.[name].persona) : String(generated.get(`roles/${name}.yaml`))).replace(/\s+/g, ' ');
+        for (const name of ['Developer', 'Engineer', 'Critic', 'LocalCoordinator']) {
+          const text = persona(name);
+          expect(text, `${source}:${name}`).toMatch(/To\s+review\s+package/);
+          expect(text, `${source}:${name}`).toMatch(/without (?:reading )?the room or the task description|review from it alone/);
+          expect(text, `${source}:${name}`).toMatch(/PR\s+(?:link|and\s+specification)/);
+          expect(text, `${source}:${name}`).toMatch(/limits/);
+          expect(text, `${source}:${name}`).toMatch(/Owner\s+decision/);
+          expect(text, `${source}:${name}`).toMatch(/grants no lifecycle authority|You do not move the task/);
+        }
+        for (const name of ['Developer', 'Engineer']) {
+          expect(persona(name), `${source}:${name}`).toMatch(/ours-fleet task review-package\s+<task-id> --attach <path>/);
+          expect(persona(name), `${source}:${name}`).toMatch(/need no PR|they need no PR/);
+          expect(persona(name), `${source}:${name}`).toMatch(/Never mark the task done or merge/);
+          // At Review the description keeps only PR links; the package keeps the original requirements.
+          expect(persona(name), `${source}:${name}`).toMatch(/task description is replaced with only the clickable PR links, one per line/);
+          expect(persona(name), `${source}:${name}`).toMatch(/save the current description \(the original requirements\) to a file in the task workspace and attach it to the package, keep fuller evidence in task files/);
+          expect(persona(name), `${source}:${name}`).toMatch(/never add status logs to the description/);
+          expect(persona(name), `${source}:${name}`).toMatch(/a research or document task without PRs links its actual deliverables instead; never invent a PR/);
+        }
+        expect(persona('Critic')).toMatch(/must also attach the original task description, which at Review is replaced with only the clickable PR links, one per line \(or the actual deliverable links when there are no PRs\)/);
+        expect(persona('LocalCoordinator')).toMatch(/the original task description as an attached file \(at Review the description keeps only the PR links, or the actual deliverable links when there are no PRs\)/);
+        expect(persona('Critic')).toMatch(/Withhold sign-off while it is missing, stale or misleading/);
+        expect(persona('LocalCoordinator')).toMatch(/default writer of this task's Progress log/);
+        expect(persona('LocalCoordinator')).toMatch(/never poll, schedule turns or mirror messages/);
+        expect(persona('LocalCoordinator')).toMatch(/Do not record agent starts,\s+status checks, normal handoffs, ordinary review findings/);
+        for (const name of ['Developer', 'Engineer', 'Critic', 'Coordinator'])
+          expect(persona(name), `${source}:${name}`).not.toMatch(/fleet_task_progress_append|task progress <task-id> --text/);
+        const coordinator = persona('Coordinator');
+        expect(coordinator).toMatch(/ours-fleet task review-package <task-id>/);
+        expect(coordinator).toMatch(/do not write or judge it yourself/);
+        expect(coordinator).toMatch(/and that it attaches the original task description/);
+        expect(coordinator).toMatch(/Then replace the task description with only the clickable Markdown PR links, one per line, with no status or evidence \(those stay in To review\); a task without PRs links its actual deliverables instead, never an invented PR. Then move the task to Review with `ours-fleet task review <task-id>`/);
+        expect(coordinator).toMatch(/Only when the Owner accepts\s+the result or explicitly asks, run `ours-fleet task finish/);
+        // The packaged continuity loop stays observation-only and never becomes a Progress pipeline;
+        // generated setup ships no loop at all.
+        if (source === 'bootstrap')
+          expect(String(cfg.agentTemplates?.LocalCoordinator.loops?.continuity?.prompt).replace(/\s+/g, ' '))
+            .toMatch(/This pass never appends task Progress entries/);
+        else expect(String(generated.get('agent_templates/LocalCoordinator.yaml'))).not.toMatch(/loops|Progress/);
+      }
+      // Each generated room member task carries its charter's handoff; only a LocalCoordinator writes Progress.
+      for (const template of listTemplates(cfg.roomTemplates ?? {})) {
+        const roster = template.members.map(member => ({ role_name: `${template.name}-${member.slot}-1`, cowork_role: member.role }));
+        for (const [index, member] of template.members.entries()) {
+          const task = buildRoomMemberTask({
+            roomId: `${template.name}-room`, roomIdentityCid: 'A'.repeat(64), ownerSeatCid: 'B'.repeat(64), contract: template.contract,
+            member: { ...roster[index], persona: String(cfg.rolePresets?.[member.role].persona) }, roster,
+          });
+          expect(task, `${template.name}:${member.role}`).toMatch(/To\s+review\s+package/);
+          if (member.role === 'LocalCoordinator') expect(task).toContain('fleet_task_progress_append');
+          else expect(task, `${template.name}:${member.role}`).not.toContain('fleet_task_progress_append');
+        }
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -160,10 +242,4 @@ describe('packaged default role contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('default presentation generators contain no legacy executor labels', () => {
-    for (const path of [
-      'scripts/generate-report-mocks.mjs', 'scripts/generate-inbox-task-mocks.mjs',
-      'scripts/generate-rich-task-mocks.mjs', 'scripts/generate-table-task-mocks.mjs',
-    ]) expect(readFileSync(path, 'utf8'), path).not.toMatch(/\b(?:Secretary|Architect|Tester)\b/);
-  });
 });

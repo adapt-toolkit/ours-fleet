@@ -1,8 +1,23 @@
 #!/usr/bin/env node
+import { beginWorkspaceReplacement, abandonWorkspaceReplacement, discardRetiredWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
+import { completeTunnelSetup } from './tunnel-setup-completion.js';
+import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup, inspectTunnelSetup, verifyTunnelSetupTarget } from './tunnel-setup-input.js';
+import { ensureMinimalSetup } from './minimal-setup.js';
+import { confirmWorkspaceTarget, checkWorkspaceConnector } from './workspace-enrollment.js';
+import { clearPendingTunnelSetup, readPendingTunnelSetup, requiredPortAfterExpiry, savePendingTunnelSetup, setupTunnelPreflight, type PendingTunnelSetup } from './setup-tunnel-preflight.js';
+import { availableWebPort } from './web/available-port.js';
+import QRCode from 'qrcode';
+import { readWorkspacePayload,enrollWorkspace,checkWorkspaceConfiguration } from './workspace-enrollment.js';
+import { waitForRoleDaemon } from './startup-readiness.js';
+import { SupervisorOursTools } from './application/supervisor-ours-tools.js';
+import { runTempSupervisor, TEMP_RECYCLE_EXIT } from './temp-supervisor-recovery.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
+import {
+  describeRegistration, refreshServiceRegistrations, registrationDrift, type RegistrationReport,
+} from './supervisor/registration-refresh.js';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
@@ -10,19 +25,20 @@ import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
 import {
-  executeInitWizard, isInteractiveTerminal, publishSetup, TerminalPrompter,
+  executeInitAnswers, executeInitWizard, isInteractiveTerminal, publishSetup, readInitSettings,
+  TerminalPrompter,
 } from './init-wizard.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath, stateRoot } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { redactSensitive, resolvedPlan, resolvedRolePlan } from './resolved-plan.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
-import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { readRestartLedger, runSupervised, runTemp, SupervisorRecycleRequiredError } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
 import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
 import { partitionRestartNames } from './watchdog/config.js';
@@ -54,7 +70,7 @@ import type {
   OwnerChannelManagementRequest, OwnerChannelManagementResult,
 } from './owner-channel/channel.js';
 import { startWebConsole } from './web/runtime.js';
-import { requestWebControl } from './web/control.js';
+import { requestWebControl, webControlPath } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/access.js';
 import {
@@ -62,12 +78,18 @@ import {
 } from './fleet-proxy.js';
 import {
   beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
-  setFleetAuditLifecycleCheckpoint,
+  setFleetAuditLifecycleCheckpoint, setVerifiedFleetCaller,
   type FleetAuditAttempt, type FleetCommandOutcomeClass,
 } from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import './harness/hermes.js';
+import { registerLayoutCommands } from './rooms-tasks/layout-cli.js';
+import {
+  MANAGED_CONFIGURATION_FLAG, assertPinnedConfiguration, enableManagedCli, managedCliReport,
+  parseManagedEntry, type ManagedCliReport,
+} from './managed-cli.js';
+import { MANAGED_CLI_WORKFLOW_IDS, type ManagedCliWorkflowId } from './config.js';
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 import { RoleCreationService } from './application/role-creation-service.js';
 import { RoleRemovalService } from './application/role-removal-service.js';
@@ -116,6 +138,20 @@ const program = new Command()
   .version(VERSION);
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'manifest (default: ~/fleet.yaml; documents under ~/fleet/)');
+
+/**
+ * Set only for the pinned managed entry form (see src/managed-cli.ts). Checked
+ * against the PARSED option, so every spelling of a later `-c` is covered.
+ */
+let pinnedConfiguration: string | undefined;
+program.hook('preAction', (_program, action) => {
+  if (pinnedConfiguration === undefined) return;
+  try { assertPinnedConfiguration(pinnedConfiguration, (action.opts() as { configuration?: unknown }).configuration); }
+  catch (error) {
+    console.error(`error: ${(error as Error).message}`);
+    throw new FleetCliExit(1, 'validation', 'not_started');
+  }
+});
 
 const collect = (value: string, previous: string[]) => [...previous, value];
 
@@ -475,6 +511,30 @@ program.command('peek <name> [lines]').description('pane snapshot without attach
     catch (e) { die(controlFailure(name, 'peek', e)); }
   });
 
+const oursToolsCommand = program.command('ours').description('invoke tools through a named agent supervisor and its fixed identity');
+oursToolsCommand.command('tools <agent>').description('list the same tools and schemas exposed to the agent MCP')
+  .action(async (agent: string) => {
+    try { console.log(JSON.stringify(await new SupervisorOursTools().list(agent), null, 2)); }
+    catch (error) { die(error); }
+  });
+oursToolsCommand.command('call <agent> <tool>').description('call a supervisor MCP tool without prompting the agent')
+  .option('--args-file <path>', 'JSON object arguments from a private file; omitted means {}')
+  .action(async (agent: string, tool: string, options: { argsFile?: string }) => {
+    try {
+      let args: Record<string, unknown> = {};
+      if (options.argsFile) {
+        try { args = JSON.parse(readFileSync(options.argsFile, 'utf8')); }
+        catch { throw new Error('cannot read tool arguments: expected a readable JSON object file'); }
+      }
+      const response = await new SupervisorOursTools().call(agent, { tool, arguments: args });
+      console.log(JSON.stringify(response, null, 2));
+      if ('isError' in response.result && response.result.isError) throw new FleetCliExit(1, 'runtime', 'unknown');
+    } catch (error) {
+      if (error instanceof FleetCliExit) throw error;
+      die(error);
+    }
+  });
+
 program.command('send <name> [text...]').description("type into the agent's console")
   .action(async (name, text, opts) => {
     const stateDir = acpStateDir(name);
@@ -530,7 +590,7 @@ cOpt(program.command('status <name>').description('declared persistent Agent uni
         + `${ledger.lastTermination.runStartedAt ?? 'unknown'}) died without an orderly exit; `
         + `observed ${ledger.lastTermination.observedAt}`
         + `\n  abrupt terminations recorded: ${ledger.abruptTerminations ?? 1}`
-        + `\n  cause (signal / OOM-kill): journalctl --user -u ours-fleet-agent@${name}.service`);
+        + `\n  inspect member output: ours-fleet logs ${name}`);
     const modelStatus = joinPath(agentDir(name), '.model-status');
     if (existsSync(modelStatus)) {
       try {
@@ -1161,6 +1221,67 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
     } catch (e) { die(e); }
   });
 
+function renderManagedCliReport(report: ManagedCliReport): string {
+  const lines = [
+    `Managed CLI setup for ${report.configuration}`,
+    `  node ${report.node}`, `  cli  ${report.cli}`,
+    `  platform ${report.platform.os}${report.platform.declared ? '' : ' (not a declared platform)'}`,
+  ];
+  for (const role of report.roles) {
+    if (role.setup.state === 'not-declared') continue;
+    lines.push('', `${role.role} (${role.harness}/${role.session}) — ${role.workflows.join(', ')}`);
+    lines.push(`  setup (static): ${role.setup.state}${role.setup.action ? ` [${role.setup.action}]` : ''} — ${role.setup.detail}`);
+    if (role.setup.artifact) lines.push(`    ${role.setup.artifact}`);
+    lines.push(`  running session: ${role.session_policy}`);
+    lines.push(`  observed (audit ledger): ${role.observed.summary}`);
+    if (role.commandPrefix) lines.push(`  invoke as: ${role.commandPrefix} <command>`);
+    for (const line of role.scope) lines.push(`  scope: ${line}`);
+    for (const line of role.warnings) lines.push(`  note: ${line}`);
+  }
+  if (!report.roles.some(role => role.setup.state !== 'not-declared'))
+    lines.push('', 'No agent declares managed_cli. Nothing was generated and no permission changed.',
+      'Enable it for one agent with: ours-fleet managed-cli setup --enable <Agent>');
+  for (const item of report.removed) lines.push('', `${item.action}: ${item.path} — ${item.detail ?? ''}`);
+  lines.push('', ...report.disclosure.map(line => `* ${line}`));
+  return lines.join('\n');
+}
+
+const managedCliCommand = program.command('managed-cli')
+  .description('prepare and inspect native harness policy for Fleet commands run from a command sandbox');
+for (const [name, write, description] of [
+  ['setup', true, 'generate the policy for agents declaring managed_cli; starts no session and no model'],
+  ['status', false, 'compare generated policy and observed supervisor access without changing anything'],
+] as const) {
+  const command = cOpt(managedCliCommand.command(name).description(description)).option('--json', 'JSON output');
+  if (write) command.option('--enable <agent>',
+    'first add managed_cli: [task-workflow] to this Agent file (repeatable); its permissions are not changed',
+    (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--workflow <id>', `workflow --enable adds (${MANAGED_CLI_WORKFLOW_IDS.join(', ')})`, 'task-workflow');
+  command.action((opts: { configuration?: string; json?: boolean; enable?: string[]; workflow?: string }) => {
+    try {
+      const enabled = [];
+      if (opts.enable?.length) {
+        if (!(MANAGED_CLI_WORKFLOW_IDS as readonly string[]).includes(opts.workflow ?? ''))
+          throw new Error(`unknown workflow '${opts.workflow}'; supported: ${MANAGED_CLI_WORKFLOW_IDS.join(', ')}`);
+        // Validate every name before the first file is touched.
+        const cfg = loadConfig(opts.configuration);
+        for (const agent of opts.enable) findRole(cfg, agent);
+        for (const agent of opts.enable)
+          enabled.push({ agent, ...enableManagedCli(opts.configuration, agent, opts.workflow as ManagedCliWorkflowId) });
+      }
+      const report = managedCliReport(loadConfig(opts.configuration), opts.configuration, { write });
+      if (opts.json) { console.log(JSON.stringify({ ...report, enabled }, null, 2)); }
+      else {
+        for (const item of enabled)
+          console.log(`${item.changed ? 'Enabled' : 'Already enabled'} ${opts.workflow} for ${item.agent} in ${item.file}`);
+        console.log(renderManagedCliReport(report));
+      }
+      const failing = report.roles.filter(role => ['unsupported', 'conflict', 'stale', 'missing'].includes(role.setup.state));
+      if (failing.length) throw new FleetCliExit(1);
+    } catch (error) { if (error instanceof FleetCliExit) throw error; die(error); }
+  });
+}
+
 cOpt(program.command('doctor').description('prerequisite report'))
   .option('--harness <id>', 'check one harness explicitly')
   .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
@@ -1171,29 +1292,59 @@ cOpt(program.command('doctor').description('prerequisite report'))
       harness: opts.harness,
       configPath: opts.configuration,
       yamlMode: opts.yamlMode as YamlMode,
+      serviceRegistration: { binPath },
     });
     for (const c of rep.checks) console.log(`${c.ok ? 'ok  ' : 'MISS'} ${c.name.padEnd(22)} ${c.detail}`);
     if (!rep.ok) throw new FleetCliExit(1);
   });
 
-cOpt(program.command('init').description('interactively add missing Fleet defaults while preserving existing configuration'))
-  .action(async (opts: { configuration?: string }) => {
+const serviceCommand = program.command('service')
+  .description('installed Fleet service definitions (supervisor, web, watchdogs)');
+const printRegistrations = (reports: RegistrationReport[], json?: boolean) => {
+  if (json) console.log(JSON.stringify({ binPath, services: reports }, null, 2));
+  else for (const report of reports) console.log(describeRegistration(report));
+};
+serviceCommand.command('check')
+  .description('report whether installed definitions and running services use this release; changes nothing')
+  .option('--json', 'machine-readable report')
+  .action(async (opts: { json?: boolean }) => {
+    const reports = await refreshServiceRegistrations({ binPath, write: false });
+    printRegistrations(reports, opts.json);
+    if (registrationDrift(reports).length) throw new FleetCliExit(1);
+  });
+serviceCommand.command('refresh')
+  .description('point installed definitions at this release; never creates, enables, starts, stops or restarts a service')
+  .option('--json', 'machine-readable report')
+  .action(async (opts: { json?: boolean }) => {
+    const reports = await refreshServiceRegistrations({ binPath, write: true });
+    printRegistrations(reports, opts.json);
+    if (!opts.json && reports.some(report => report.running === 'stale'))
+      console.log('A running service still uses another release. Restart it when convenient, '
+        + 'e.g. systemctl --user restart ours-fleet.service; agents resume through their supervisor.');
+  });
+
+cOpt(program.command('init').description('add missing Fleet defaults while preserving existing configuration')
+  .option('--settings <file>', 'validated InitAnswers JSON; runs without interactive questions'))
+  .action(async (opts: { configuration?: string; settings?: string }) => {
     const configuration = opts.configuration ?? defaultConfigPath();
-    if (!isInteractiveTerminal(process.stdin, process.stdout))
+    if (!opts.settings && !isInteractiveTerminal(process.stdin, process.stdout))
       die('ours-fleet init requires an interactive terminal; no host setup ran and no configuration changed');
     try {
-      const result = await executeInitWizard(
-        new TerminalPrompter(process.stdin, process.stdout), configuration, {
-          async hostSetup() {
-            for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
-            for (const message of await pickBackend().init(binPath)) console.log(message);
-          },
-          publish: publishSetup,
+      const initDeps = {
+        async hostSetup() {
+          for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
+          for (const message of await pickBackend().init(binPath)) console.log(message);
         },
-      );
+        publish: publishSetup,
+      };
+      const result = opts.settings
+        ? await executeInitAnswers(readInitSettings(opts.settings), configuration, initDeps)
+        : await executeInitWizard(
+          new TerminalPrompter(process.stdin, process.stdout), configuration, initDeps,
+        );
       if (!result) {
         console.log('Fleet setup cancelled. No host setup ran and no configuration changed.');
-        return;
+        throw new FleetCliExit(1);
       }
       const prior = result.manifestExisted && result.rootExisted ? 'manifest and split configuration'
         : result.manifestExisted ? 'manifest only'
@@ -1202,7 +1353,10 @@ cOpt(program.command('init').description('interactively add missing Fleet defaul
       console.log(`Previous targets: ${prior}.`);
       console.log(`Private recovery record: ${result.recoveryPath}`);
       console.log(INIT_COMPLETION_GUIDANCE);
-    } catch (error) { die(error); }
+    } catch (error) {
+      if (error instanceof FleetCliExit) throw error;
+      die(error);
+    }
   });
 
 cOpt(program.command('migrate-agent-templates')
@@ -1237,14 +1391,14 @@ cOpt(program.command('migrate-role-defaults')
     } catch (error) { die(error); }
   });
 
-const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
+const webCommand = cOpt(program.command('web').description('start the Fleet HTTP service used by the App'))
   .enablePositionalOptions()
   .option('--port <port>', 'loopback service port (default: 49271)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid port');
     return port;
   })
-  .option('--no-open', 'do not open a browser automatically')
+  .option('--no-open', 'accepted for existing service units; Fleet opens no browser')
   .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
   .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
   .option('--password-file <path>', 'configure password protection from an owner-readable file')
@@ -1260,10 +1414,7 @@ const webCommand = cOpt(program.command('web').description('start or open the se
         process.stdout.write(line + '\n');
       if (accessNotice) process.stdout.write(accessNotice + '\n');
       await manager.start();
-      if (opts.open !== false) {
-        await requestWebControlWhenReady('open');
-        process.stdout.write('Control-panel authentication opened in the browser.\n');
-      } else process.stdout.write('Web service started; run `ours-fleet web open` to pair a browser.\n');
+      process.stdout.write('Fleet service started.\n');
     } catch (e) { die(e); }
   });
 
@@ -1274,7 +1425,7 @@ const webPort = (command: Command) => cOpt(command)
     return port;
   });
 
-const webServe = cOpt(webCommand.command('serve').description('run the web console in the foreground'))
+const webServe = cOpt(webCommand.command('serve').description('run the Fleet HTTP service in the foreground'))
   .option('--port <port>', 'loopback port (default: 49271; 0 chooses a free port)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('invalid port');
@@ -1282,7 +1433,7 @@ const webServe = cOpt(webCommand.command('serve').description('run the web conso
   });
 
 webServe
-  .option('--no-open', 'do not open a browser automatically')
+  .option('--no-open', 'accepted for existing service units; Fleet opens no browser')
   .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
   .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
   .option('--password-file <path>', 'configure password protection from an owner-readable file')
@@ -1293,14 +1444,11 @@ webServe
       const accessNotice = configureWebAccess(opts);
       const consoleServer = await startWebConsole({
         configPath: opts.configuration, port: opts.port,
-        open: opts.open !== false, binPath, bind: opts.bind, publicOrigin: opts.publicOrigin,
+        binPath, bind: opts.bind, publicOrigin: opts.publicOrigin,
         log: line => process.stderr.write(line + '\n'),
       });
       if (accessNotice) process.stdout.write(accessNotice + '\n');
       process.stdout.write(`ours-fleet web listening on ${consoleServer.address}\n`);
-      process.stdout.write(opts.open !== false
-        ? 'Control-panel authentication opened in the browser.\n'
-        : 'Run `ours-fleet web open` to authenticate a browser.\n');
       const shutdown = async () => { await consoleServer.close(); process.exit(0); };
       process.once('SIGINT', () => { void shutdown(); });
       process.once('SIGTERM', () => { void shutdown(); });
@@ -1347,12 +1495,144 @@ webCommand.command('uninstall').description('stop and uninstall the owner web se
     catch (e) { die(e); }
   });
 
-webCommand.command('open').description('securely open or re-pair a browser with the running console')
+async function workspaceEnrollmentCommand(opts: { file?: string; configuration?: string; preserveProfile?: boolean; migrateAppOrigin?: boolean; check?: boolean; resume?: boolean; stdin?: boolean; replaceRegistration?: boolean; abandonReplacement?:boolean;discardRetiredReplacement?:boolean }, setupTunnel = false, argument?: string): Promise<void> { try {
+    if(opts.discardRetiredReplacement){
+      if(!setupTunnel || argument!==undefined || opts.file || opts.stdin || opts.check || opts.resume || opts.migrateAppOrigin || opts.replaceRegistration || opts.configuration || opts.abandonReplacement)throw Error('--discard-retired-replacement takes no payload or other setup options');
+      discardRetiredWorkspaceReplacement();process.stdout.write('Retired replacement recovery discarded. This host has no working registration: the old service was stopped and linked devices revoked. After removing the failed successor in the App, use a fresh command to complete a new registration. Installation data and the old local binding are preserved.\n');return;
+    }
+    if(opts.abandonReplacement){
+      if(!setupTunnel || argument!==undefined || opts.file || opts.stdin || opts.check || opts.resume || opts.migrateAppOrigin || opts.replaceRegistration || opts.configuration)throw Error('--abandon-replacement takes no payload or other setup options');
+      await abandonWorkspaceReplacement();process.stdout.write('Unsent or rejected replacement abandoned; existing local setup preserved. Obtain a fresh App command for another setup.\n');return;
+    }
+    if (setupTunnel && opts.check && opts.resume) throw Error('Use either --check or --resume');
+    if (setupTunnel && (opts.check || opts.resume) && (argument !== undefined || opts.file || opts.stdin || opts.migrateAppOrigin || opts.replaceRegistration)) throw Error('--check and --resume take no payload or migration flag');
+    if (setupTunnel && opts.check) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); process.stdout.write('Tunnel setup prerequisites are available.\n'); return; }
+    let pending: PendingTunnelSetup;
+    if (setupTunnel && opts.resume) {
+      const replacement=readWorkspaceReplacement();
+      if(replacement){
+        if(opts.configuration && resolvePath(opts.configuration)!==replacement.configuration)throw Error('Resume replacement with its original configuration');
+        await setupTunnelPreflight();
+        const result=await finishWorkspaceReplacement(replacement);
+        pending={appOrigin:replacement.payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:replacement.payload.challenge,configuration:replacement.configuration};
+        savePendingTunnelSetup(pending);clearWorkspaceReplacement();
+      }else{
+        pending=readPendingTunnelSetup();
+        if (opts.configuration && resolvePath(opts.configuration)!==pending.configuration) throw Error(`This setup started with configuration ${pending.configuration}; resume it without --configuration`);
+        await setupTunnelPreflight();
+      }
+    }
+    else {
+      if (argument === undefined && !opts.file && !opts.stdin) throw Error('setup-tunnel requires an App grant argument, --file <path>, or --stdin (or --resume to finish an interrupted setup)');
+      if (Number(argument !== undefined) + Number(!!opts.file) + Number(!!opts.stdin) > 1) throw Error('Use one payload argument, --file, or --stdin');
+      if (opts.stdin && process.stdin.isTTY) throw Error('--stdin requires a pipe; use an owned private --file instead');
+      const input=setupTunnel ? (argument !== undefined ? readTunnelSetupArgument(argument) : opts.stdin ? await readTunnelSetupStdin() : readTunnelSetupFile(opts.file!)) : undefined;
+      const previous=setupTunnel ? readWorkspaceBinding() : undefined;
+      const replacement=setupTunnel ? readWorkspaceReplacement() : undefined;
+      if(replacement && !opts.replaceRegistration)throw Error('An unfinished replacement exists. Run setup-tunnel --resume, use a fresh command for the same target with --replace-registration, or --abandon-replacement when retirement was never sent or definitively rejected. If retirement and cleanup completed but the successor cannot be recovered, remove the successor in the App and use --discard-retired-replacement');
+      if(replacement && resolvePath(opts.configuration ?? defaultConfigPath())!==replacement.configuration)throw Error('Replacement requires its original configuration');
+      const target=previous && !replacement ? await inspectTunnelSetup(input!) : undefined;
+      const different=previous && !replacement && (!target || requiresWorkspaceReplacement(previous,target,opts.migrateAppOrigin));
+      if(different && !(await confirmWorkspaceReplacement(previous!,opts.replaceRegistration))){if(!process.stdin.isTTY)throw Error('Replacement confirmation required; existing setup and grant preserved');return;}
+      if (setupTunnel) { await setupTunnelPreflight(); await checkWorkspaceConfiguration(opts.configuration ?? defaultConfigPath()); }
+      let payload=setupTunnel ? await redeemTunnelSetup(input!) : readWorkspacePayload(opts.file!);
+      verifyTunnelSetupTarget(target,payload);
+      const replace=previous && !replacement && requiresWorkspaceReplacement(previous,{workspaceId:payload.challenge.workspaceId,serverCid:payload.serverCid,appOrigin:payload.appOrigin},opts.migrateAppOrigin);
+      if(replacement){refreshWorkspaceReplacement(replacement,payload,opts.configuration ?? defaultConfigPath());payload=replacement.payload;}
+      checkWorkspaceConnector(payload);
+      if (setupTunnel) await ensureMinimalSetup(opts.configuration ?? defaultConfigPath());
+      let result: {origin:string;hostWorkspaceId:string;rootCid:string};
+      if(replacement){
+        result=await finishWorkspaceReplacement(replacement);
+      }else if(replace){
+        const record=await beginWorkspaceReplacement(previous!,payload,opts.configuration ?? defaultConfigPath());
+        result=await finishWorkspaceReplacement(record);
+      }else result=await enrollWorkspace(payload,opts.configuration,{migrateAppOrigin:opts.migrateAppOrigin,preserveProfile:setupTunnel || opts.preserveProfile});
+      pending={appOrigin:payload.appOrigin,origin:result.origin,hostWorkspaceId:result.hostWorkspaceId,rootCid:result.rootCid,challenge:payload.challenge,configuration:resolvePath(opts.configuration ?? defaultConfigPath())};
+      // Keep both the replacement capability and the proof until the next recovery record is durable.
+      if (setupTunnel) { savePendingTunnelSetup(pending);clearWorkspaceReplacement(); }
+    }
+    try {
+      await finishWorkspaceService(pending,opts.resume ? pending.configuration : opts.configuration,setupTunnel);
+    } catch (error) {
+      if (!setupTunnel) throw error;
+      throw Error(`${error instanceof Error ? error.message : String(error)}\nThis host is already bound to the workspace; do not request a new command. Fix the problem above, then run: ours-fleet setup-tunnel --resume`);
+    }
+    if (setupTunnel) {
+      await completeTunnelSetup({link:()=>requestWebControl('link-device'),qr:code=>QRCode.toString(code,{type:'terminal',small:true}),write:text=>new Promise<void>((resolve,reject)=>{
+        const onError=(error:Error)=>reject(error);process.stdout.once('error',onError);
+        process.stdout.write(text,error=>{if(error)reject(error);else{process.stdout.removeListener('error',onError);resolve();}});
+      }),clear:clearPendingTunnelSetup});
+    } else {
+      const link=await requestWebControl('link-device');const code=Buffer.from(JSON.stringify(link)).toString('base64url');
+      process.stdout.write('Root proof submitted; account setup is ready only after tunnel health and binding verification.\nPrivate single-use device code:\n');
+      process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));process.stdout.write('\n'+code+'\n');
+      clearPendingTunnelSetup();
+    }
+
+  }catch(error){die(error);} }
+
+/** Everything after the root proof: supervised web service, its bound port, and the tunnel target. Safe to repeat. */
+async function finishWorkspaceService(pending: PendingTunnelSetup, configuration: string | undefined, record: boolean): Promise<void> {
+    if(!existsSync(new WebAccessStore().path))configureWebAccess({pairing:true});
+    // Once the challenge has expired the account can no longer retarget the tunnel. Decide before touching a running service.
+    const expired=pending.challenge.expiresAt<=Date.now();
+    const requiredPort=expired ? requiredPortAfterExpiry(pending) : undefined;
+    const manager=new WebServiceManager(),previous=manager.readMetadata();
+    if(previous)await manager.stop();
+    const selectedPort=await availableWebPort(requiredPort ?? previous?.port ?? 49271);
+    mkdirSync(joinPath(stateRoot(),'web'),{recursive:true,mode:0o700});
+    writeFileSync(joinPath(stateRoot(),'web','port-selection.json'),JSON.stringify({expiresAt:Date.now()+60000})+'\n',{mode:0o600});
+    const notes=await manager.install(binPath,selectedPort,configuration,{bind:'127.0.0.1',publicOrigin:pending.origin});await manager.restart();
+    // Without linger the user service, and with it the tunnel, stops at logout and does not start at boot.
+    for(const note of notes)if(note.startsWith('warning:'))process.stderr.write(`${note}\nUntil then the tunnel stops when you log out of this host.\n`);
+    const waitForControl=async()=>{
+      const controlDeadline=Date.now()+20000;
+      while(!existsSync(webControlPath())) {if(Date.now()>=controlDeadline)throw Error('Fleet backend did not become ready within 20 seconds. Run ours-fleet web status; on Linux inspect journalctl --user -u ours-fleet-web.service -n 25 --no-pager. Resolve the startup error before running ours-fleet link-device');await new Promise(resolve=>setTimeout(resolve,200));}
+    };
+    await waitForControl();
+    const bound=JSON.parse(readFileSync(joinPath(stateRoot(),'web','workspace-port.json'),'utf8')) as {port:number};
+    if(!Number.isInteger(bound.port) || bound.port<1 || bound.port>65535)throw Error('Invalid workspace listener port');
+    if(bound.port!==selectedPort){
+      await manager.retainBoundPort(binPath,bound.port,configuration,{bind:'127.0.0.1',publicOrigin:pending.origin});
+      await waitForControl();
+    }
+    if(requiredPort===undefined){
+      // Record the request first: if its answer is lost, a later resume must not assume the default target.
+      if(record){pending={...pending,confirmedPort:undefined,requestedPorts:[...(pending.requestedPorts ?? []),bound.port]};savePendingTunnelSetup(pending);}
+      await confirmWorkspaceTarget(pending,pending.hostWorkspaceId,pending.rootCid,bound.port,error=>{process.stderr.write(`The enrollment contact could not be removed from Messenger (${error instanceof Error ? error.message : String(error)}); it can be removed there by hand.\n`);});
+      if(record) savePendingTunnelSetup({...pending,confirmedPort:bound.port});
+    } else if(bound.port!==requiredPort)throw Error(`The setup window has expired and the tunnel points at port ${requiredPort}, but this host could only bind port ${bound.port}. Free port ${requiredPort} on this host`);
+    rmSync(joinPath(stateRoot(),'web','port-selection.json'),{force:true});
+}
+
+cOpt(program.command('workspace-enroll').description('enroll this host using a private account setup file'))
+  .requiredOption('--file <path>', 'owned private payload file')
+  .option('--preserve-profile', 'retain the existing human profile without creating or rewriting it')
+  .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
+  .action(async opts => workspaceEnrollmentCommand(opts));
+
+cOpt(program.command('setup-tunnel').argument('[payload]', 'minimal one-use v2 App grant (appears in shell history and process listings)')
+  .configureOutput({outputError: (_message, write) => write('Invalid setup-tunnel command; run ours-fleet setup-tunnel --help.\n')}).description('connect an installed host using scoped expiring App credentials; preserves identities and agent configuration'))
+  .option('--file <path>', 'owned private App grant or legacy payload file (chmod 600)')
+  .option('--stdin', 'read the private App grant or legacy payload from a pipe')
+  .option('--check', 'only verify host prerequisites; changes nothing and needs no payload')
+  .option('--resume', 'finish an interrupted replacement or setup; needs no new payload')
+  .option('--discard-retired-replacement', 'forget a failed successor after retirement and local cleanup; remove it in the App first')
+  .option('--abandon-replacement', 'discard an unsent or definitively rejected replacement after checking its private receipt')
+  .option('--replace-registration', 'confirm retirement of the existing account registration when the new one differs')
+  .option('--migrate-app-origin', 'explicitly migrate the same workspace to its new account origin after verified signed proof')
+  .action(async (payload, opts) => workspaceEnrollmentCommand(opts, true, payload));
+
+program.command('link-device').description('create a single-use workspace device connection code (expires in five minutes)')
   .action(async () => {
     try {
-      await requestWebControl('open');
-      process.stdout.write('Control-panel authentication opened in the browser.\n');
-    } catch (e) { die(e); }
+      const link=await requestWebControl('link-device');
+      process.stdout.write('Private connection code; share only with the intended device.\n');
+      const code=Buffer.from(JSON.stringify(link)).toString('base64url');
+      process.stdout.write(await QRCode.toString(code,{type:'terminal',small:true}));
+      process.stdout.write('\n'+code+'\n');
+    } catch(e) { die(e); }
   });
 
 webCommand.command('revoke-all').description('revoke all trusted browsers and active web sessions')
@@ -1362,15 +1642,6 @@ webCommand.command('revoke-all').description('revoke all trusted browsers and ac
       process.stdout.write('Revoked all trusted browsers and active web sessions.\n');
     } catch (e) { die(e); }
   });
-
-async function requestWebControlWhenReady(command: 'open' | 'revoke-all'): Promise<void> {
-  let last: unknown;
-  for (let attempt = 0; attempt < 40; attempt++) {
-    try { await requestWebControl(command, undefined, 500); return; }
-    catch (error) { last = error; await new Promise(resolve => setTimeout(resolve, 125)); }
-  }
-  throw last;
-}
 
 function configureWebAccess(opts: {
   passwordFile?: string; password?: boolean; pairing?: boolean; publicOrigin?: string;
@@ -1401,9 +1672,30 @@ function configureWebAccess(opts: {
 }
 
 // ── rooms & tasks ──────────────────────────────────────────────────────────
+registerLayoutCommands(program, cOpt);
 registerTemplateCommands(program, cOpt);
 registerTaskCommands(program, cOpt);
 registerRoomCommands(program, cOpt);
+
+program.command('_wait-daemon <name>', { hidden: true }).description('internal: service startup readiness')
+  .option('-c, --configuration <file>')
+  .action(async (name, opts) => {
+    try { await waitForRoleDaemon(name, opts.configuration); } catch (e) { die(e); }
+  });
+
+program.command('_wait-temp-daemon <name>', { hidden: true })
+  .action(async name => {
+    try { await waitForRoleDaemon(name, undefined, {}, true); } catch (error) { die(error); }
+  });
+
+program.command('_run-fleet', { hidden: true }).action(async () => {
+  try { const { runFleetManager } = await import('./supervisor/manager.js'); await runFleetManager(process.argv[1]); }
+  catch (error) { die(error); }
+});
+program.command('_run-managed <key> <generation>', { hidden: true }).action(async (key, generation) => {
+  try { const { runManagedMember } = await import('./supervisor/manager.js'); await runManagedMember(key, generation); }
+  catch (error) { die(error); }
+});
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
@@ -1415,7 +1707,14 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
 
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')
   .action(async name => {
-    try { await runTemp(name); } catch (e) { die(e); }
+    try { await runTempSupervisor(name, process.argv[1]); } catch (e) { die(e); }
+  });
+
+program.command('_run-temp-worker <name>', { hidden: true })
+  .option('--suspend-on-stop')
+  .action(async (name, options) => {
+    try {await runTemp(name, { suspendOnStop: options.suspendOnStop === true });}
+    catch(error){if(error instanceof SupervisorRecycleRequiredError)process.exitCode=TEMP_RECYCLE_EXIT;else die(error);}
   });
 
 program.command('_run-watchdog <name>', { hidden: true })
@@ -1446,6 +1745,7 @@ async function parseFleetCli(): Promise<void> {
   }
   try { await program.parseAsync(process.argv); }
   catch (error) {
+    if (error instanceof FleetCliExit) throw error;
     const commander = error as { code?: string; exitCode?: number };
     if (commander.exitCode === 0) return;
     if (typeof commander.exitCode === 'number') throw new FleetCliExit(
@@ -1457,7 +1757,17 @@ async function parseFleetCli(): Promise<void> {
 async function runFleetCli(): Promise<void> {
   const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
   const caller = process.env[FLEET_PROXY_CALLER_ENV];
-  if (!stateDir || !caller) { await parseFleetCli(); return; }
+  const entry = parseManagedEntry(process.argv.slice(2));
+  if (!stateDir || !caller) {
+    // The pinned form exists for managed sessions; outside one there is no
+    // supervisor to audit the call, so it is refused rather than run unaudited.
+    if (entry.kind !== 'none') {
+      console.error(`error: ${entry.kind === 'error' ? entry.message
+        : `${MANAGED_CONFIGURATION_FLAG} is only valid inside a Fleet-managed agent session, where the supervisor audits the call`}`);
+      throw new FleetCliExit(1, 'validation', 'not_started');
+    }
+    await parseFleetCli(); return;
+  }
   const requestId = randomUUID();
   let attempt: FleetAuditAttempt;
   const begun = await controlRequest(stateDir, {
@@ -1467,6 +1777,7 @@ async function runFleetCli(): Promise<void> {
   attempt = begun.result as FleetAuditAttempt;
   if (attempt.caller !== caller)
     throw new SessionControlError('rejected', `fleet audit caller mismatch: expected '${caller}', got '${attempt.caller}'`);
+  setVerifiedFleetCaller(attempt.caller, stateDir);
   let exitCode = 0;
   let outcomeClass: FleetCommandOutcomeClass = 'success';
   let effect: 'not_started' | 'completed' | 'unknown' = 'completed';
@@ -1484,7 +1795,18 @@ async function runFleetCli(): Promise<void> {
   } else {
     const originalExit = process.exit;
     process.exit = ((code?: number) => { throw new FleetCliExit(code ?? 0); }) as never;
-    try { await parseFleetCli(); }
+    try {
+      if (entry.kind === 'error') {
+        console.error(`error: ${entry.message}`);
+        throw new FleetCliExit(1, 'validation', 'not_started');
+      }
+      if (entry.kind === 'pinned') {
+        // The supervisor audited the argv as typed; Commander parses the ordinary form.
+        pinnedConfiguration = entry.configuration;
+        process.argv = [process.argv[0]!, process.argv[1]!, ...entry.argv];
+      }
+      await parseFleetCli();
+    }
     catch (error) {
       exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
       outcomeClass = error instanceof FleetCliExit ? error.outcomeClass : 'runtime';

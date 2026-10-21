@@ -22,6 +22,8 @@ export interface RoleRecord {
   id: string;
   lifetime: RoleLifetime;
   configured: boolean;
+  /** Read-only display ownership; never authorizes lifecycle operations. */
+  taskId?: string;
   config?: ResolvedRoleView;
   stateRef?: { lifetime: 'permanent' | 'temporary' };
   stateHealth: 'present' | 'missing' | 'corrupt';

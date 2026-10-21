@@ -63,6 +63,30 @@ export type UnattendedMode = 'deny' | 'wait';
 /** Monitor wake policy: preserve legacy booleans and add one explicit safe boundary. */
 export type MonitorInterrupt = boolean | 'after_tool';
 
+/**
+ * Workflows Fleet prepares native harness execution policy for. Declared per
+ * Agent; never inferred from a role's name or persona, and never inherited.
+ */
+export const MANAGED_CLI_WORKFLOW_IDS = ['task-workflow'] as const;
+export type ManagedCliWorkflowId = (typeof MANAGED_CLI_WORKFLOW_IDS)[number];
+
+/** Retired opt-in. Both keys are accepted so existing manifests load, and neither has any effect. */
+export interface FileDeliveryConfig { enabled?: boolean; directory?: string }
+
+/**
+ * Current-chat file delivery is on for every Agent and takes the path the Agent
+ * provides. A legacy block is shape-checked only: `enabled: false` does not turn
+ * delivery off and `directory` does not restrict or create anything.
+ */
+export function validateFileDelivery(value: unknown): FileDeliveryConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainObject(value) || Object.keys(value).some(k => !['enabled', 'directory'].includes(k))
+      || (value.enabled !== undefined && typeof value.enabled !== 'boolean')
+      || (value.directory !== undefined && typeof value.directory !== 'string'))
+    throw new ConfigError('file_delivery is retired and ignored; it accepts only the legacy enabled:boolean and directory:string keys');
+  return value as FileDeliveryConfig;
+}
+
 export interface CommonPermissions {
   approval: ApprovalMode;
   filesystem: FilesystemMode;
@@ -245,6 +269,10 @@ export interface RoleConfig {
   owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
+  /** Fleet-prepared CLI workflows this role may run outside its command sandbox. */
+  managed_cli?: ManagedCliWorkflowId[];
+  /** Retired and ignored; current-chat file delivery needs no Agent setting. */
+  file_delivery?: FileDeliveryConfig;
 }
 
 export type AgentSelection<T extends Record<string, unknown> = Record<string, unknown>> =
@@ -266,6 +294,10 @@ export interface AgentDefinition {
   owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
+  /** Fleet-prepared CLI workflows this Agent may run outside its command sandbox. */
+  managed_cli?: ManagedCliWorkflowId[];
+  /** Retired and ignored; current-chat file delivery needs no Agent setting. */
+  file_delivery?: FileDeliveryConfig;
   /** Scheduled turns scoped only to temporary launches; persistent Agents reject this field. */
   loops?: AgentLoopsConfig;
 }
@@ -281,6 +313,9 @@ export interface AgentTemplateInstance {
 
 /** Internal first-boot payload for a Fleet-provisioned Cowork room member. */
 export interface RoomMemberStartup {
+  /** Task ownership; absent for standalone rooms and legacy snapshots. */
+  task_id?: string;
+  workspace?: import('./rooms-tasks/workspace.js').OwnedWorkspace;
   room_id: string;
   room_identity_cid: string;
   identity_name: string;
@@ -415,7 +450,7 @@ export const ROLE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'effort', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'managed_cli', 'file_delivery',
 ];
 
 export const ROLE_PRESET_KEYS = ['mission', 'persona', 'bio', 'briefing_file'];
@@ -425,7 +460,7 @@ export const BRAIN_PRESET_KEYS = [
 ];
 export const AGENT_KEYS = [
   'role', 'brain', 'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops', 'managed_cli', 'file_delivery',
 ];
 const AGENT_INSTANCE_KEYS = ['template', 'overrides'];
 const TEMPLATE_FORBIDDEN_KEYS = ['identity'];
@@ -477,6 +512,7 @@ export function validateBrainValue(value: BarePreset, file: string, pointer: str
 export function validateEffectiveAgentTemplate(
   definition: AgentTemplateDefinition, id = 'room-member',
 ): AgentTemplateDefinition {
+  validateFileDelivery(definition.file_delivery);
   const value = structuredClone(definition) as unknown as Record<string, unknown>;
   const bad = Object.keys(value).filter(key => !AGENT_KEYS.includes(key));
   if (bad.length) throw new ConfigError(`member '${id}' has unknown Agent key(s) ${bad.join(', ')}`);
@@ -516,6 +552,13 @@ function validateAgentScalars(value: BarePreset, file: string, id: string): void
     const current = value[key];
     if (current !== undefined && (typeof current !== 'string' || !current.trim()))
       schemaError(file, `/agents/${id}/${key}`, 'must be a non-blank string');
+  }
+  if (value.managed_cli !== undefined) {
+    const ids = value.managed_cli;
+    if (!Array.isArray(ids) || ids.some(entry => !(MANAGED_CLI_WORKFLOW_IDS as readonly unknown[]).includes(entry))
+        || new Set(ids).size !== ids.length)
+      schemaError(file, `/agents/${id}/managed_cli`,
+        `must be a list of distinct workflow IDs; supported: ${MANAGED_CLI_WORKFLOW_IDS.join(', ')}`);
   }
   if (value.coordinator !== undefined
       && (typeof value.coordinator !== 'string' || !ROLE_NAME_RE.test(value.coordinator)))
@@ -875,10 +918,20 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
   return v;
 }
 
+/** Read only room connection/owner settings for an existing layout. */
+export function loadRoomsConfig(configPath = defaultConfigPath()): ReturnType<typeof validateRoomsConfig> {
+  assertTrustedPath(configPath, 'file');
+  const doc = parseFleetDocument(configPath, readFileSync(configPath, 'utf8')).value;
+  const vars = (doc.vars ?? {}) as Record<string, string>;
+  return validateRoomsConfig(deepSub(doc.rooms, vars), vars, configPath);
+}
+
 /** Load a v2 manifest and bare Agent/Role/Brain documents from its stem directory. */
 export function loadConfig(
   configPath?: string,
-  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean }; skipWatchdogs?: boolean } = {},
+  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean }; skipWatchdogs?: boolean;
+    /** The one Owner invitation file that tunnel setup writes itself and that may therefore still be absent. */
+    deferredOwnerInviteFile?: string } = {},
 ): FleetConfig {
   const base = configPath ?? defaultConfigPath();
   const files: string[] = [];
@@ -931,6 +984,7 @@ export function loadConfig(
       if (bad.length)
         throw new ConfigError(
           `${file}: role '${name}' has unknown key(s) ${bad.join(', ')}; allowed: ${ROLE_KEYS.join(', ')}`);
+      validateFileDelivery(r.file_delivery);
       const isolation = r.isolation ?? (defaults.isolation as IsolationConfig | undefined);
       const session = resolveSession(r.session ?? defaults.session, file, name);
       const sessionOptions = resolveSessionOptions(
@@ -953,12 +1007,12 @@ export function loadConfig(
         if (problems.length)
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
-      const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
+      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
+      const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name, harness });
       const ownerChannel = resolveOwnerChannelConfig(
         defaults.owner_channel, r.owner_channel, session, file, name);
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
-      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
       if (session === 'codex-app-server' && harness !== 'codex')
         throw new ConfigError(
           `${file}: role '${name}' session: codex-app-server requires harness: codex`);
@@ -1070,7 +1124,7 @@ export function loadConfig(
   for (const { file, doc } of docs) {
     if (doc.rooms !== undefined) {
       if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
-      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file);
+      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file, options.deferredOwnerInviteFile);
       ownerInviteFingerprint = validated._invite?.fingerprint;
       ownerInvite = validated._invite?.value;
       const { _invite: _, ...clean } = validated;
@@ -1487,9 +1541,27 @@ function resolveStartStaggerMs(raw: unknown, base: string): number {
  * malformed block so a typo fails loudly rather than silently disarming a monitor.
  * Exported so temp-spawn (which builds a ResolvedRole by hand) resolves identically.
  */
+/**
+ * A monitor without an explicit `interrupt` steers wakes at the next tool
+ * boundary. Hermes cannot, so its default stays non-interrupting; sessions
+ * without tool-boundary steering fall back to non-cancelling delivery.
+ */
+export function defaultMonitorInterrupt(harness: string | undefined): MonitorInterrupt {
+  return harness === 'hermes' ? false : 'after_tool';
+}
+
+/**
+ * Resolve a persisted temporary-role monitor. A snapshot written before
+ * monitor.interrupt existed keeps the non-interrupting delivery it ran with.
+ */
+export function resolveSnapshotMonitor(monitor: unknown): MonitorConfig {
+  if (!isPlainObject(monitor)) return resolveMonitorConfig(undefined, monitor as Partial<MonitorConfig>);
+  return resolveMonitorConfig(undefined, { interrupt: false, ...monitor } as Partial<MonitorConfig>);
+}
+
 export function resolveMonitorConfig(
   defMonitor: unknown, roleMonitor?: Partial<MonitorConfig>,
-  labels: { base?: string; file?: string; name?: string } = {},
+  labels: { base?: string; file?: string; name?: string; harness?: string } = {},
 ): MonitorConfig {
   const where = labels.file && labels.name ? `${labels.file}: role '${labels.name}' ` : '';
   if (defMonitor !== undefined && !isPlainObject(defMonitor))
@@ -1523,7 +1595,7 @@ export function resolveMonitorConfig(
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
-    interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? false,
+    interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? defaultMonitorInterrupt(labels.harness),
     ...(merged.stall_recovery !== undefined ? { stall_recovery: merged.stall_recovery as boolean } : {}),
     ...(merged.stall_timeout_ms !== undefined ? { stall_timeout_ms: merged.stall_timeout_ms as number } : {}),
     turn_fail_threshold:

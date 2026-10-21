@@ -61,6 +61,12 @@ import {
 } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
 import {
+  appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress,
+  openTaskWorkspaceFile, publicProgressEntry, publicReview, setTaskReviewMarkdown, TaskReviewError,
+} from './task-review.js';
+import type { TaskContributionAuthor } from './types.js';
+import { verifiedFleetCaller } from '../fleet-command-audit.js';
+import {
   beginFleetAuditCollection, consumeFleetAuditCollection, recordFleetAuditFailure,
   recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
@@ -70,7 +76,7 @@ import { stateRoot } from '../paths.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
-  | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable'
+  | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'task_not_ready'
   | 'template_not_found' | 'template_mismatch' | 'task_template_drift'
   | 'room_filter' | 'room_not_found' | 'room_record_not_found';
 
@@ -107,6 +113,11 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
 } {
   const f = error.fields;
   switch (error.code) {
+    case 'task_not_ready': return {
+      legacy: `task readiness ${f.readiness}: ${f.reason}`, kind: 'state',
+      detail: `Task ${f.task} readiness is ${f.readiness}: ${f.reason}${f.member ? ` (${f.member})` : ''}.`,
+      action: 'Ask Fleet Coordinator to inspect room and member status and choose supported recovery. Do not blindly relaunch agents or reuse invites.',
+    };
     case 'task_confirmation_mismatch': return {
       legacy: 'confirmation ID must match task ID', kind: 'usage',
       detail: 'The two task IDs must match.', action: 'Repeat the same task ID twice.',
@@ -161,6 +172,27 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
       action: 'Run ours-fleet room list to find a live room ID.',
     };
   }
+}
+
+/** A supervisor-verified managed agent is attributed as itself; otherwise the local operator. */
+function cliContributionAuthor(taskId: string): TaskContributionAuthor {
+  const verified = verifiedFleetCaller();
+  if (!verified) return { kind: 'local_control', surface: 'cli' };
+  // The same identity CID the agent's MCP tools use, so retries match across both surfaces.
+  const cid = getTask(taskId).member_roles.find(item => item.name === verified.caller)?.identity_cid ?? bridgeIdentityCid(verified.stateDir);
+  return { kind: 'agent', role: verified.caller, ...(cid ? { identity_cid: cid } : {}), surface: 'cli' };
+}
+
+/** The managed runtime CID its supervisor recorded for the agent's MCP bridge, when present. */
+function bridgeIdentityCid(stateDir: string): string | undefined {
+  try {
+    const cid = (JSON.parse(readFileSync(join(stateDir, '.ours-bridge', 'descriptor.json'), 'utf8')) as { cid?: unknown }).cid;
+    return typeof cid === 'string' && /^[A-Fa-f0-9]{64}$/.test(cid) ? cid : undefined;
+  } catch { return undefined; }
+}
+
+function contributionAuthorLabel(author: TaskContributionAuthor): string {
+  return author.kind === 'agent' ? `${author.role} (agent, ${author.surface})` : `local ${author.surface}`;
 }
 
 function die(e: unknown): never {
@@ -236,6 +268,19 @@ function dieTaskRoom(e: unknown): never {
     recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
     process.exit(1);
   }
+  if (e instanceof TaskReviewError) {
+    const output = renderMarkdownFailure({
+      kind: e.code === 'not_found' ? 'not_found' : e.code === 'conflict' || e.code === 'idempotency_conflict' ? 'state' : 'usage',
+      subject: 'ours-fleet task progress/review-package',
+      detail: e.message,
+      action: e.code === 'conflict' ? 'Show the current review package and retry against it.'
+        : e.code === 'idempotency_conflict' ? 'Use a new --request-key for different content.'
+          : 'Correct the request and retry.',
+    });
+    process.stderr.write(`${output}\n`);
+    recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
+    process.exit(1);
+  }
   if (e instanceof TaskListError) {
     const notFound = e.code === 'list_not_found';
     const conflict = ['duplicate_name', 'reserved_name', 'default_immutable',
@@ -285,6 +330,8 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
     records: tasks.map(t =>
       `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
       + ` — List ${markdownCode(t.list_name ?? 'default')}`
+      + (t.deletion?.status === 'pending' ? ' — Deletion pending'
+        + (t.deletion.error ? `: ${markdownProse(t.deletion.error)}` : '') : '')
       + (t.blocked ? ` — 🚧 Blocked: ${markdownProse(t.blocked.reason)}` : '')),
   });
 
@@ -578,10 +625,10 @@ function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
   return cfg.roomTemplates ?? {};
 }
 
-function coworkFor(cfg: FleetConfig) {
+function coworkFor(cfg: FleetConfig, options?: { timeoutMs: number }) {
   if (!cfg.rooms)
     throw new ConfigError('rooms: configuration is required before creating or querying rooms');
-  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config, ...options });
 }
 
 function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot | undefined {
@@ -768,15 +815,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--state <state>', 'filter by state (backlog|active|provisioning|review|done|cancelled|failed|all)')
     .option('--list <name>', 'filter by task list')
     .option('--group-by-list', 'group deterministic results by list (JSON)')
+    .option('--include-deleting', 'include tasks whose accepted deletion is still pending')
     .option('--json', 'JSON output')
-    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; includeDeleting?: boolean; json?: boolean }) => {
       try {
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
         const service = taskRoomService(opts.configuration);
-        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}) };
+        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}),
+          ...(opts.includeDeleting ? { includeDeleting: true } : {}) };
         const tasks = service.listTasks(filter);
         if (opts.json) {
           console.log(JSON.stringify(opts.groupByList
@@ -847,16 +896,19 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
-  taskCmd.command('show <id>')
+  cOpt(taskCmd.command('show <id>'))
     .description('show task details')
     .option('--json', 'JSON output')
-    .action(async (id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean; configuration?: string }) => {
       try {
-        const service = taskRoomService();
+        const service = taskRoomService(opts.configuration);
         const { task: t, orchestration: room } = service.getTask(id);
+        const readiness = t.state === 'active' && t.deletion?.status !== 'pending'
+          ? await service.observeTaskReadiness(id) : undefined;
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
+            ...(readiness ? { readiness } : {}),
           }, null, 2));
           return;
         }
@@ -866,6 +918,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(t.deletion?.status === 'pending' ? [
+              { label: 'Deletion', value: 'Pending — cleanup is not complete' },
+              ...(t.deletion.error ? [{ label: 'Cleanup error', value: t.deletion.error }] : []),
+              { label: 'Retry', value: `ours-fleet task delete ${t.task_id} ${t.task_id}`, kind: 'code' as const },
+            ] : []),
+            ...(readiness ? [{ label: 'Readiness', value: readiness.state },
+              ...('reason' in readiness ? [{ label: 'Reason', value: readiness.reason }] : [])] : []),
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
@@ -886,6 +945,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             ...(room ? roomStartupSections(room) : []),
           ],
         }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  cOpt(taskCmd.command('recover-members <id>'))
+    .description('resume proven stopped task members in-place; never create identities or replay invites')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const { recoverTaskMembers } = await import('./recovery.js');
+        const task = getTask(id), cfg = loadConfig(opts.configuration);
+        const members = await recoverTaskMembers({ taskId: id, binPath: getBinPath(),
+          cowork: task.layout ? undefined : createCoworkAdapter({ configPath: cfg.rooms?.cowork?.config }) });
+        if (opts.json) console.log(JSON.stringify({ schema_version: 1, task_id: id, members }, null, 2));
+        else for (const member of members) console.log(`${member.name}: ${member.status}`);
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
@@ -978,6 +1051,61 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         auditTask('review', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task ready for review', t));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('progress <id>')
+    .description('read the task Progress log, or append one significant milestone with --text')
+    .option('--text <text>', 'milestone text to append, kept exactly as written')
+    .option('--text-file <path>', 'milestone text to append, from a file')
+    .option('--request-key <key>', 'retry key: repeating the same key and text returns the original entry')
+    .option('--json', 'JSON output')
+    .action((id: string, opts: { text?: string; textFile?: string; requestKey?: string; json?: boolean }) => {
+      try {
+        if (opts.text !== undefined && opts.textFile !== undefined) throw new Error('use --text or --text-file, not both');
+        const text = opts.textFile !== undefined ? readFileSync(opts.textFile, 'utf8') : opts.text;
+        if (text === undefined) {
+          if (opts.requestKey !== undefined) throw new Error('--request-key applies only when appending');
+          const progress = listTaskProgress(id).map(publicProgressEntry);
+          if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, progress }, null, 2)); return; }
+          console.log(progress.length ? progress.map(entry => `- ${entry.at} — ${contributionAuthorLabel(entry.author)}\n\n${entry.text}\n`).join('\n')
+            : `Task ${id} has no progress entries.`);
+          return;
+        }
+        const result = appendTaskProgress(id, { text, requestKey: opts.requestKey, author: cliContributionAuthor(id) });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, entry: publicProgressEntry(result.entry), replayed: result.replayed }, null, 2)); return; }
+        console.log(result.replayed ? `Progress entry ${result.entry.id} was already recorded.` : `Progress entry ${result.entry.id} added to task ${id}.`);
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('review-package <id>')
+    .description('show or prepare the task To review package (Markdown and retained files)')
+    .option('--markdown <text>', 'replace the review Markdown')
+    .option('--markdown-file <path>', 'replace the review Markdown from a file')
+    .option('--attach <path>', 'retain a file from the task workspace in the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--detach <artifact-id>', 'remove a file from the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
+    .option('--request-key <key>', 'retry key for a single --attach: repeating it with the same file returns the original artifact')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { markdown?: string; markdownFile?: string; attach: string[]; detach: string[]; requestKey?: string; json?: boolean }) => {
+      try {
+        if (opts.markdown !== undefined && opts.markdownFile !== undefined) throw new Error('use --markdown or --markdown-file, not both');
+        if (opts.requestKey !== undefined && opts.attach.length !== 1) throw new Error('--request-key needs exactly one --attach');
+        const markdown = opts.markdownFile !== undefined ? readFileSync(opts.markdownFile, 'utf8') : opts.markdown;
+        const author = markdown !== undefined || opts.attach.length || opts.detach.length ? cliContributionAuthor(id) : undefined;
+        const attached = [];
+        if (markdown !== undefined)
+          setTaskReviewMarkdown(id, { markdown, expectedMarkdown: getTaskReview(id)?.markdown ?? '', author: author! });
+        for (const artifactId of opts.detach) detachTaskReviewArtifact(id, artifactId, { author: author! });
+        for (const path of opts.attach) {
+          const source = await openTaskWorkspaceFile(getTask(id), path);
+          attached.push(await attachTaskReviewArtifact(id, { name: source.name, source, author: author!, requestKey: opts.requestKey }));
+        }
+        const review = getTaskReview(id);
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task_id: id, review: review ? publicReview(review) : null }, null, 2)); return; }
+        if (!review) { console.log(`Task ${id} has no To review package yet.`); return; }
+        const files = review.artifacts.map(artifact => `- \`${artifact.id}\` ${artifact.name} (${artifact.mime}, ${artifact.size} bytes)`).join('\n');
+        console.log(`## To review — task ${id}\n\n${review.markdown || '_No review Markdown yet._'}\n\n### Files\n\n${files || '_No files._'}`
+          + (attached.some(item => item.replayed) ? '\n\n(The attached file was already recorded.)' : ''));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
@@ -1125,7 +1253,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           const app = taskRoomService(opts.configuration);
           for (;;) {
             const before = app.taskProvisioningOutcome(id);
-            if (before.kind !== 'in_progress') {
+            if (before.kind !== 'in_progress' || before.next_action) {
               await presentDetachedProvisioningOutcome(before);
               return;
             }
@@ -1141,6 +1269,21 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             await sleep(1_000);
           }
         }, {}, 10 * 60_000);
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  cOpt(taskCmd.command('_layout <id> <operation> [room]', { hidden: true }))
+    .description('internal: run an accepted layout room operation (open, close-room, close)')
+    .option('--json', 'JSON output')
+    .option('--operation-id <id>', 'accepted operation ID; status updates apply only while it is current')
+    .action(async (id: string, operation: string, room: string | undefined, opts: { configuration?: string; json?: boolean; operationId?: string }) => {
+      try {
+        if (!['open', 'close-room', 'close'].includes(operation)) throw new Error(`unknown layout operation: ${operation}`);
+        const view = await taskRoomService(opts.configuration).runTaskLayoutOperation({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+          operation: operation as 'open' | 'close-room' | 'close', room, operationId: opts.operationId,
+        });
+        console.log(JSON.stringify({ schema_version: 1, layout: view }, null, 2));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 

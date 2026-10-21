@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { fleetHostBackend } from '../../src/supervisor/fleet.js';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RoleRemovalService } from '../../src/application/role-removal-service.js';
-import { agentDir } from '../../src/paths.js';
+import { agentDir, stateRoot } from '../../src/paths.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../../src/temp-lifecycle.js';
 import { writeV2Fixture } from '../v2-fixture.js';
 import {
@@ -27,6 +28,23 @@ function fixture(roles: string): { root: string; calls: string[]; service: RoleR
 }
 
 describe('safe web role removal', () => {
+  it('refuses task-owned preview and removal before copying state or stopping the member, even without a task record', async () => {
+    const { root, calls, service } = fixture('  Stable: {}\n');
+    const state = agentDir('OwnedTask', true); mkdirSync(state, { recursive: true });
+    prepareTempSupervisor(state, 'OwnedTask', { taskId: 'missing-task', roomId: 'original-room',
+      roomIdentityCid: 'original-room-cid', creationActionId: 'original-action' });
+    writeFileSync(join(state, 'owner.json'), 'original owner proof');
+    const before = readFileSync(join(state, '.temp-supervisor.json'));
+    expect(() => service.previewWeb('OwnedTask')).toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    await expect(service.removeWeb({ role: 'OwnedTask', confirmed: true })).rejects.toMatchObject({ code: 'conflict' });
+    await expect(service.removeDirect({ actor: { kind: 'local_control', surface: 'cli' }, role: 'OwnedTask' }))
+      .rejects.toThrow('TASK_MEMBER_IS_TASK_OWNED');
+    expect(calls).toEqual([]);
+    expect(readFileSync(join(state, '.temp-supervisor.json'))).toEqual(before);
+    expect(readFileSync(join(state, 'owner.json'), 'utf8')).toBe('original owner proof');
+    expect(existsSync(join(state, '.temp-stop-request.json'))).toBe(false);
+    expect(existsSync(join(root, '.ours-fleet', 'recovery'))).toBe(false);
+  });
   it('preserves direct CLI removal policy without web preview, archive, or coordinator gates', async () => {
     const { root, calls, service } = fixture(
       '  Coordinator: {}\n  Worker: { coordinator: Coordinator }\n');
@@ -43,12 +61,15 @@ describe('safe web role removal', () => {
     const { root, calls, service } = fixture('  Worker: { harness: codex }\n');
     mkdirSync(agentDir('Worker'), { recursive: true });
     writeFileSync(join(agentDir('Worker'), 'WORKLOG.md'), 'recover me');
+    writeFileSync(join(agentDir('Worker'), '.self-reminders.json'), '{"private":"reminder"}', { mode: 0o600 });
     expect(() => service.previewWeb('worker')).toThrow(/case-sensitive.*Worker/);
     await expect(service.removeWeb({ role: 'Worker', confirmation: 'worker' })).rejects.toMatchObject({ code: 'invalid_request' });
     const result = await service.removeWeb({ role: 'Worker', confirmation: 'Worker' });
     expect(calls).toEqual(['Worker']);
     expect(result.recoveryPath).toContain('-Worker');
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
+    // A removed agent's reminders end with it: not kept in recovery evidence.
+    expect(existsSync(join(result.recoveryPath, 'state', '.self-reminders.json'))).toBe(false);
     expect(existsSync(join(root, 'fleet.yaml'))).toBe(true);
   });
 
@@ -67,15 +88,18 @@ describe('safe web role removal', () => {
   });
 
   it('fails closed on case-fold collisions and cleans orphaned failed-start state', async () => {
-    const collision = fixture('  Coordinator: {}\n  coordinator: {}\n');
+    const collision = fixture('  Coordinator: {}\n');
+    mkdirSync(agentDir('coordinator'), { recursive: true });
     expect(() => collision.service.previewWeb('coordinator')).toThrow(/case-fold collision/);
     const orphan = fixture('  Stable: {}\n');
     mkdirSync(agentDir('dangling'), { recursive: true });
     writeFileSync(join(agentDir('dangling'), 'briefing.md'), 'minimal');
+    writeFileSync(join(agentDir('dangling'), '.self-reminders.json'), '{}', { mode: 0o600 });
     const result = await orphan.service.removeWeb({ role: 'dangling', confirmation: 'dangling' });
     expect(orphan.calls).toEqual(['dangling']);
     expect(existsSync(agentDir('dangling'))).toBe(false);
     expect(existsSync(join(result.recoveryPath, 'orphan-state', 'briefing.md'))).toBe(true);
+    expect(existsSync(join(result.recoveryPath, 'orphan-state', '.self-reminders.json'))).toBe(false);
   });
 
   it('protects the current control role and requires coordinator impact acknowledgement', async () => {
@@ -94,9 +118,10 @@ describe('safe web role removal', () => {
     writeFileSync(join(state, 'role.yaml'), 'name: Temp\nharness: codex\nsession: acp\n');
     writeFileSync(join(state, 'WORKLOG.md'), 'temporary evidence');
     prepareTempSupervisor(state, 'Temp');
+    await fleetHostBackend(async () => ({ stdout: '', stderr: '', code: 0 }), 'linux').init('/fixture/fleet');
     await makeTempSupervisorLauncher({
       platform: 'linux', supervisor: 'systemd',
-      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+      exec: async () => ({ stdout: 'active', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], state);
     (service as any).options.ops.exec = async (_command: string, args: string[]) => ({
       stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,
@@ -110,4 +135,21 @@ describe('safe web role removal', () => {
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
     expect(existsSync(join(root, '.ours-fleet', 'recovery', 'temporary'))).toBe(true);
   });
+});
+
+it.each(['direct','web'])('queues canonical notification retirement only after authorized %s removal',async(surface)=>{
+ const oldOrigin=process.env.OURS_NOTIFICATIONS_ORIGIN,oldToken=process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;
+ process.env.OURS_NOTIFICATIONS_ORIGIN='http://127.0.0.1:1';process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN='t'.repeat(40);
+ try{
+  const {root,service}=fixture(surface==='direct'?'  Worker: {}\n':'  Stable: {}\n');mkdirSync(agentDir('Worker'),{recursive:true});
+  if(surface==='direct')recordGeneratedAgentSource(agentDir('Worker'),join(root,'fleet.yaml'),join(root,'fleet','agents','Worker.yaml'));
+  if(surface==='direct')await service.removeDirect({actor:{kind:'local_control',surface:'cli'},role:'Worker'});
+  else await service.removeWeb({role:'Worker',confirmation:'Worker'});
+  const dir=join(stateRoot(),'notifications','removed-targets');
+  expect(readdirSync(dir)).toHaveLength(1);
+  expect(JSON.parse(readFileSync(join(dir,readdirSync(dir)[0]),'utf8'))).toEqual({target:{kind:'agent',agentId:'Worker'}});
+ }finally{
+  if(oldOrigin===undefined)delete process.env.OURS_NOTIFICATIONS_ORIGIN;else process.env.OURS_NOTIFICATIONS_ORIGIN=oldOrigin;
+  if(oldToken===undefined)delete process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN;else process.env.OURS_NOTIFICATIONS_PRODUCER_TOKEN=oldToken;
+ }
 });

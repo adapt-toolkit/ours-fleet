@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
-import { accessSync, constants, existsSync, realpathSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { accessSync, constants, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join, isAbsolute, resolve, delimiter } from 'node:path';
 import { realExec, type Exec } from '../exec.js';
 import type { AcpAgentResolution } from './acp-agent.js';
@@ -42,8 +43,34 @@ export function codexExecutable(entry: string): string {
   throw new Error(`Codex platform binary missing under ${vendor}; reinstall Fleet with optional dependencies`);
 }
 
+const versionOf = (text: string): string | undefined => text.match(/\b(\d+\.\d+\.\d+)\b/)?.[1];
+function installedCodexVersion(path: string, env: NodeJS.ProcessEnv): string | undefined {
+  const result = spawnSync(path, ['--version'], { env, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] });
+  return result.status === 0 ? versionOf(result.stdout ?? '') : undefined;
+}
+
+/**
+ * The host's own Codex, when ACP sessions should run it instead of the copy bundled with the adapter.
+ * The person signs in to, updates and checks the host Codex, and a newer Codex knows models the bundled
+ * one does not. It is used only when it is at least as new as the bundled copy; an explicit CODEX_PATH
+ * (including an empty one, which selects the bundled copy) always decides instead.
+ */
+export function hostCodex(
+  adapterManifest: string | undefined, env: NodeJS.ProcessEnv, cwd = process.cwd(),
+  version: (path: string, env: NodeJS.ProcessEnv) => string | undefined = installedCodexVersion,
+): { path: string; version: string } | undefined {
+  if (env.CODEX_PATH !== undefined || !adapterManifest) return undefined;
+  let path: string, bundled: string;
+  try {
+    path = executableOnPath('codex', env, cwd);
+    bundled = JSON.parse(readFileSync(createRequire(adapterManifest).resolve('@openai/codex/package.json'), 'utf8')).version;
+  } catch { return undefined; }
+  const found = version(path, env);
+  return found && typeof bundled === 'string' && codexVersionAtLeast(found, bundled) ? { path, version: found } : undefined;
+}
+
 export interface CodexRuntime {
-  source: 'CODEX_PATH' | 'bundled';
+  source: 'CODEX_PATH' | 'host' | 'bundled';
   entry: string;
   executable: string;
   version: string;
@@ -52,7 +79,8 @@ export interface CodexRuntime {
 export async function probeCodexRuntime(
   adapter: AcpAgentResolution, env: NodeJS.ProcessEnv, exec: Exec = realExec, cwd = process.cwd(),
 ): Promise<CodexRuntime> {
-  const configured = env.CODEX_PATH;
+  const host = hostCodex(adapter.manifestPath, env, cwd);
+  const configured = env.CODEX_PATH || host?.path;
   if (!configured && !adapter.manifestPath)
     throw new Error('ACP runtime is unknown for a PATH/custom adapter; set CODEX_PATH to an absolute executable or use the bundled adapter');
   const entry = configured ? executableOnPath(configured, env, cwd)
@@ -60,10 +88,10 @@ export async function probeCodexRuntime(
   const executable = codexExecutable(entry);
   const result = await exec(!configured ? process.execPath : entry,
     !configured ? [entry, '--version'] : ['--version'], { env, timeout: 5_000 });
-  const version = result.stdout.match(/\b(\d+\.\d+\.\d+)\b/)?.[1];
+  const version = versionOf(result.stdout);
   if (result.code !== 0 || !version)
     throw new Error(`Cannot read Codex version from ${entry}; check CODEX_PATH and executable permissions`);
-  return { source: configured ? 'CODEX_PATH' : 'bundled', entry, executable, version };
+  return { source: host ? 'host' : configured ? 'CODEX_PATH' : 'bundled', entry, executable, version };
 }
 
 export function codexVersionAtLeast(version: string, minimum: string): boolean {

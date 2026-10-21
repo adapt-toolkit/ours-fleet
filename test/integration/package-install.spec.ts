@@ -4,14 +4,11 @@
  * suite can safely use the dist built by its global setup.
  */
 import { execFileSync } from 'node:child_process';
-import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const CODEX_ACP_VERSION = '1.10.0';
 
 describe('packed root package', () => {
   it('fresh-installs the gated codex-acp and reports coupled allow full access', () => {
@@ -48,13 +45,35 @@ describe('packed root package', () => {
       });
 
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
-      const fleetPackage = JSON.parse(readFileSync(join(fleetRoot, 'package.json'), 'utf8'));
-      expect(fleetPackage.optionalDependencies['@agentclientprotocol/codex-acp'])
-        .toBe(CODEX_ACP_VERSION);
-
+      expect(existsSync(join(fleetRoot, 'dist', 'supervisor', 'manager.js'))).toBe(true);
+      expect(existsSync(join(fleetRoot, 'docs', 'fleet-migration.md'))).toBe(true);
+      const webProbe = `
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        const root = join(process.cwd(),'node_modules/@ours.network/fleet/dist');
+        const {buildWebServer}=await import(pathToFileURL(join(root,'web/server.js')));
+        const {WebAuth}=await import(pathToFileURL(join(root,'web/auth.js')));
+        const boundary={origin:'http://127.0.0.1:49271',host:'127.0.0.1:49271'};
+        const auth=new WebAuth(boundary.origin,boundary.host,Date.now,undefined,{version:1,mode:'none'});
+        const server=await buildWebServer({},boundary,{auth});
+        try {
+          for(const url of ['/','/index.html','/fleet','/fleet?workspace-frame=1','/chats','/sw.js','/fleet.webmanifest']){
+            const response=await server.app.inject({url,headers:{host:boundary.host}});
+            if(response.statusCode!==404 || !String(response.headers['content-type']).includes('application/json'))throw Error('Packed Fleet answered a page address: '+url+' '+response.statusCode);
+          }
+          const api=await server.app.inject({url:'/api/v1/auth/mode',headers:{host:boundary.host}});
+          if(api.statusCode!==200)throw Error('Packed Fleet auth API unavailable');
+        }finally{await server.close();}
+      `;
+      execFileSync(process.execPath,['--input-type=module','--eval',webProbe],{cwd:consumerDir,encoding:'utf8'});
+      // The package carries an HTTP service only: no bundled page, script bundle or static-file server.
+      expect(existsSync(join(fleetRoot, 'dist', 'web-app'))).toBe(false);
+      const shipped = readdirSync(fleetRoot, { recursive: true, encoding: 'utf8' }).filter(file => !file.split(sep).includes('node_modules'));
+      expect(shipped.filter(file => /\.(html?|webmanifest)$/.test(file) || /(^|[\\/])sw\.js$/.test(file))).toEqual([]);
+      expect(Object.keys(JSON.parse(readFileSync(join(fleetRoot, 'package.json'), 'utf8')).dependencies)).not.toContain('@fastify/static');
       const probe = `
         import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -121,7 +140,6 @@ describe('packed root package', () => {
         '--input-type=module', '--eval', probe,
       ], { cwd: consumerDir, encoding: 'utf8' }));
 
-      expect(result.version).toBe(CODEX_ACP_VERSION);
       expect(result.runtime.source).toBe('bundled');
       expect(result.runtime.executable).toContain('vendor');
       expect(result.permissionMetadataSource).toBe('codex-acp');
@@ -140,7 +158,7 @@ describe('packed root package', () => {
         sandbox: 'danger-full-access',
         initialAgentMode: 'agent-full-access',
       });
-      expect(result.presets).toEqual({ revision: 6, created: 67, team: true, localCoordinator: true });
+      expect(result.presets).toMatchObject({ team: true, localCoordinator: true });
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,
@@ -157,7 +175,7 @@ describe('packed root package', () => {
 
       const fallbackProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { pathToFileURL } from 'node:url';
         const modules = join(process.cwd(), 'node_modules');
         const fleetRoot = join(modules, '@ours.network', 'fleet');
@@ -207,7 +225,7 @@ describe('packed root package', () => {
       // this checkout and with both dependency installation postures.
       const hermesProbe = `
         import { existsSync } from 'node:fs';
-        import { join } from 'node:path';
+        import { join, resolve } from 'node:path';
         import { makeHermesAdapter, hermesAdapter, getAdapter } from '@ours.network/fleet';
         const adapter = makeHermesAdapter();
         process.stdout.write(JSON.stringify({

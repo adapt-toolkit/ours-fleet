@@ -1,3 +1,4 @@
+import { stateRoot } from '../paths.js';
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import {
@@ -63,7 +64,7 @@ const SYSTEM_RO = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc'];
 /** Ephemeral scratch mounts. */
 const scratchTmpfs = (home: string) => ['/tmp', join(home, '.cache')];
 /** Home-relative sensitive paths never exposed (the blocklist's teeth). */
-const SENSITIVE_HOME = ['.ssh', '.aws', '.docker', '.gnupg', '.ours', 'fleet.yaml', 'fleet.d'];
+const SENSITIVE_HOME = ['.ssh', '.aws', '.docker', '.gnupg', '.ours', '.ours-fleet/private-ours', '.ours-fleet/private-file-delivery', 'fleet.yaml', 'fleet.d'];
 
 const ISOLATION_KEYS = ['backend', 'on_unavailable', 'fs', 'network', 'allow_hosts', 'resources', 'secrets'];
 const FS_KEYS = ['read', 'write'];
@@ -182,6 +183,7 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
     addRw(join(home, '.claude.json'));
   }
   for (const dir of ctx.additionalWriteDirs ?? []) addRw(dir);
+  if (ctx.subscriptionHome) addRw(ctx.subscriptionHome);
 
   // The selected harness/session command may live outside the system allowlist
   // (for example Node and a bundled ACP adapter under ~/.local). The runner
@@ -200,6 +202,8 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   const agentsRoot = dirname(stateDir);
   const blocklist = [
     ...SENSITIVE_HOME.map(p => join(home, p)),
+    join(stateRoot(), 'private-ours'),
+    join(stateRoot(), 'private-file-delivery'),
     agentsRoot, // sibling agents' state dirs (this agent's own is explicitly mounted)
   ];
 

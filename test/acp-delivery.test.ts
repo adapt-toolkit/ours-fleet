@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
+import { ConversationObservation } from '../src/session/conversation-observation.js';
+import type { ConversationObservationState } from '../src/session/conversation-types.js';
 
 interface FakeAgent {
   request(method: string, params: unknown): Promise<unknown>;
@@ -17,6 +19,10 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     readiness: 'running',
     lastError: undefined,
     promptTail: Promise.resolve(),
+    pendingPrompts: [],
+    sharedTurns: new Map(),
+    advertisedCommands: new Set(),
+    presentedCommands: [],
     queueDepth: 0,
     steeringSupported: true,
     closing: false,
@@ -36,6 +42,8 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     },
     ...overrides,
   });
+  const owner = session as unknown as { captureObservation(): Omit<ConversationObservationState, 'stateRevision'> };
+  Object.assign(session, { observation: new ConversationObservation(() => owner.captureObservation()) });
   return session;
 }
 

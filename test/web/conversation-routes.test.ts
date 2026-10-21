@@ -80,7 +80,7 @@ async function authenticated(control: unknown = conversationControl()) {
       async list() { return []; },
       async detail() { return { role, status: {}, capabilities: {} }; },
     },
-    repository: { async get() { return role; } },
+    repository: { async get() { return role; }, stateDir: () => dir },
     async session() { return control; },
     logs: { source: () => ({ tail: async () => ({ records: [], truncated: false }) }) },
     commands: { async execute() { return {}; }, get() { return undefined; } },
@@ -106,6 +106,103 @@ async function authenticated(control: unknown = conversationControl()) {
 }
 
 describe('conversation web routes', () => {
+  it('cancels a pending backward history read when the browser disconnects', async () => {
+    let entered!: () => void, cancelled!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const aborted = new Promise<void>(resolve => { cancelled = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), async conversationTail(request: { signal: AbortSignal }) {
+      request.signal.addEventListener('abort', cancelled, { once: true });
+      entered();
+      await gate;
+      request.signal.throwIfAborted();
+      throw Error('A retired read must not publish');
+    } };
+    const { server, cookie } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const owner = new AbortController();
+    const response = fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/conversation?latest=1&limit=200`,
+      { headers: headers(cookie), signal: owner.signal }).catch(error => error);
+    try {
+      await started;
+      owner.abort();
+      await aborted;
+      expect((await response).name).toBe('AbortError');
+    } finally { release(); owner.abort(); await server.close(); }
+  });
+  it('requires authentication, CSRF and generation before Live controller attachment', async () => {
+    let attached = 0;
+    const control = { ...conversationControl(), followConversation: async () => { attached++; return { close() {} }; } };
+    const { server, cookie, csrf } = await authenticated(control);
+    const url = '/api/v1/roles/Alpha/live-presence';
+    const denied = await server.app.inject({ method: 'POST', url, headers: { host: boundary.host, origin: boundary.origin }, payload: { expectedSessionGeneration: 'gen' } });
+    expect(denied.statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie), payload: { expectedSessionGeneration: 'gen' } })).statusCode).toBe(403);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: {} })).statusCode).toBe(400);
+    expect((await server.app.inject({ method: 'POST', url, headers: headers(cookie, csrf), payload: { expectedSessionGeneration: 'old' } })).statusCode).toBe(409);
+    expect(attached).toBe(0);
+    await server.close();
+  });
+
+  it.each(['logout', 'revoke', 'abort-before-follow-return', 'revoke-before-follow-return', 'changed-during-attach'] as const)('detaches Live presence on %s', async mode => {
+    let attached = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), followConversation: async (request: any) => {
+      attached++;
+      request.onPage({ snapshot: { sessionGeneration: mode === 'changed-during-attach' ? 'replacement' : 'gen' } });
+      if (['abort-before-follow-return','revoke-before-follow-return'].includes(mode)) await gate;
+      let closed = false;
+      return { close() { if (!closed) { closed = true; attached--; request.onClose(); } } };
+    } };
+    const { server, cookie, csrf } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const abort = new AbortController();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/live-presence`, { method: 'POST', headers: headers(cookie, csrf), body: JSON.stringify({ expectedSessionGeneration: 'gen' }), signal: abort.signal });
+      expect(response.status).toBe(200); reader = response.body!.getReader();
+      const first = new TextDecoder().decode((await reader.read()).value);
+      if (mode === 'changed-during-attach') {
+        expect(first).toContain('Agent session changed');
+      } else {
+        expect(first).toContain('"ready":true'); expect(attached).toBe(1);
+        if (mode === 'logout') expect((await server.app.inject({ method: 'POST', url: '/api/v1/auth/logout', headers: headers(cookie, csrf), payload: {} })).statusCode).toBe(200);
+        if (mode === 'revoke') server.auth.clearSessions();
+        if (mode === 'revoke-before-follow-return') { server.auth.clearSessions(); release(); }
+        if (mode === 'abort-before-follow-return') { abort.abort(); await new Promise(r => setTimeout(r, 50)); release(); }
+      }
+      await expect.poll(() => attached, { timeout: 1000 }).toBe(0);
+      if (mode !== 'abort-before-follow-return') expect((await reader.read()).done).toBe(true);
+    } finally { release(); abort.abort(); await reader?.cancel().catch(() => {}); await server.close(); }
+  });
+
+  it.each(['revoked', 'aborted'] as const)('does not attach after discovery is %s', async mode => {
+    let attached = 0;
+    let entered!: () => void, release!: () => void;
+    const seen = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const control = { ...conversationControl(), conversationPage: async () => { entered(); await gate; return { snapshot: { sessionGeneration: 'gen' } }; }, followConversation: async () => { attached++; return { close() { attached--; } }; } };
+    const { server, cookie, csrf } = await authenticated(control);
+    await server.app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (server.app.server.address() as { port: number }).port;
+    server.auth.setBoundary(boundary.origin, boundary.host, { hosts: [`127.0.0.1:${port}`] });
+    const abort = new AbortController();
+    try {
+      const pending = fetch(`http://127.0.0.1:${port}/api/v1/roles/Alpha/live-presence`, { method: 'POST', headers: headers(cookie, csrf), body: JSON.stringify({ expectedSessionGeneration: 'gen' }), signal: abort.signal }).catch(() => undefined);
+      await seen;
+      if (mode === 'revoked') server.auth.clearSessions();
+      else { abort.abort(); await new Promise(r => setTimeout(r, 50)); }
+      release(); const response = await pending;
+      if (mode === 'revoked') expect(response?.status).toBe(401);
+      await new Promise(r => setTimeout(r, 50)); expect(attached).toBe(0);
+    } finally { release(); abort.abort(); await server.close(); }
+  });
+
   it('serves conversation history to an authenticated browser only', async () => {
     const { server, cookie } = await authenticated();
     const denied = await server.app.inject({
@@ -123,6 +220,38 @@ describe('conversation web routes', () => {
     await server.close();
   });
 
+  it('pages backwards with latest/before and keeps after for forward paging', async () => {
+    const calls: unknown[] = [];
+    const control = conversationControl() as Record<string, unknown>;
+    control.conversationTail = async (request: unknown) => {
+      calls.push(request);
+      return {
+        events: [{ schemaVersion: 1, roleId: 'Alpha', eventId: 'e9', seq: 9, at: new Date().toISOString(), sessionGeneration: 'gen', kind: 'prompt.admitted', payload: {} }],
+        context: [], hasOlder: true, olderCursor: '9', nextCursor: '12', hasMore: false,
+        snapshot: { sessionGeneration: 'gen', readiness: 'idle', queueDepth: 0, pendingPermissionIds: [] },
+      };
+    };
+    const { server, cookie } = await authenticated(control);
+    const latest = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1&limit=100', headers: headers(cookie) });
+    expect(latest.statusCode).toBe(200);
+    expect(latest.json()).toMatchObject({ hasOlder: true, olderCursor: '9', nextCursor: '12', context: [] });
+    const older = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?before=9&limit=100', headers: headers(cookie) });
+    expect(older.statusCode).toBe(200);
+    expect(calls).toEqual([
+      { before: undefined, limit: 100, signal: expect.any(AbortSignal) },
+      { before: '9', limit: 100, signal: expect.any(AbortSignal) },
+    ]);
+    const mixed = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1&after=3', headers: headers(cookie) });
+    expect(mixed.statusCode).toBe(400);
+    const forward = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?after=3', headers: headers(cookie) });
+    expect(forward.statusCode).toBe(200);
+    expect(calls).toHaveLength(2);
+    delete control.conversationTail;
+    const unsupported = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/conversation?latest=1', headers: headers(cookie) });
+    expect(unsupported.json().error.code).toBe('capability_unavailable');
+    await server.close();
+  });
+
   it('reports capability_unavailable when the role has no ledger', async () => {
     const control = conversationControl() as Record<string, unknown>;
     delete control.conversationPage;
@@ -136,6 +265,18 @@ describe('conversation web routes', () => {
     await server.close();
   });
 
+
+  it('validates and forwards the optional voice session binding', async () => {
+    const submitted:any[]=[];
+    const {server,cookie,csrf}=await authenticated(conversationControl(request=>submitted.push(request)));
+    try {
+      const send=(generation:unknown)=>server.app.inject({method:'POST',url:'/api/v1/roles/Alpha/input',headers:headers(cookie,csrf),payload:{text:'Voice message: fixture',commandId:'voice',expectedSessionGeneration:generation}});
+      for(const bad of ['',null,23])expect((await send(bad)).statusCode).toBe(400);
+      expect(submitted).toHaveLength(0);
+      expect((await send('recorded-generation')).statusCode).toBe(202);
+      expect(submitted[0].expectedSessionGeneration).toBe('recorded-generation');
+    } finally {await server.close();}
+  });
   it('admits prompts idempotently with 202 receipts and CSRF protection', async () => {
     const submitted: any[] = [];
     const { server, cookie, csrf } = await authenticated(conversationControl(request => submitted.push(request)));

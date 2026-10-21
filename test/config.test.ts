@@ -2,9 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, findRole, validateMonitorConfig, ConfigError } from '../src/config.js';
+import { loadConfig, findRole, validateFileDelivery, validateMonitorConfig, resolveSnapshotMonitor, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
 import { writeV2Fixture } from './v2-fixture.js';
+import '../src/harness/hermes.js';
 
 let dir: string;
 beforeEach(() => {
@@ -553,7 +554,35 @@ describe('loadConfig monitor', () => {
     ]);
     expect(a.monitor.batch_ms).toBe(2000);
     expect(a.monitor.inject).toBe('notification');
-    expect(a.monitor.interrupt).toBe(false);
+    expect(a.monitor.interrupt).toBe('after_tool');
+  });
+
+  it('defaults every supporting harness to after_tool and Hermes to no interrupt', () => {
+    base(
+      'defaults:\n  harness: codex\nroles:\n  A: {}\n  B:\n    harness: claude-code\n'
+      + '  H:\n    harness: hermes\n    model: fixture-model\n  N:\n    monitor:\n      mode: native\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'N').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'H').monitor.interrupt).toBe(false);
+  });
+
+  it('resolves a temporary snapshot without interrupt to the delivery it ran with', () => {
+    expect(resolveSnapshotMonitor({ mode: 'fleet' }).interrupt).toBe(false);
+    expect(resolveSnapshotMonitor({ mode: 'fleet', interrupt: 'after_tool' }).interrupt).toBe('after_tool');
+    expect(resolveSnapshotMonitor({ enabled: true, interrupt: true }).interrupt).toBe(true);
+  });
+
+  it('keeps an explicit interrupt over the harness default', () => {
+    base(
+      'defaults:\n  monitor:\n    interrupt: false\nroles:\n  A: {}\n'
+      + '  B:\n    monitor:\n      interrupt: true\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe(false);
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe(true);
   });
 
   it('inherits defaults.monitor.enabled and lets a role override it', () => {
@@ -725,8 +754,6 @@ describe('rooms-tasks split-config backward compat', () => {
       '  owner:',
       `    expected_cid: ${cid}`,
       '    public_invite: test-invite-string',
-      '  cowork:',
-      '    config: /tmp/cowork.toml',
       '',
     ].join('\n'));
     const cfg = loadConfig();
@@ -811,4 +838,11 @@ describe('rooms-tasks split-config backward compat', () => {
     ].join('\n'));
     expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
+});
+
+it('file delivery needs no Agent setting; a legacy file_delivery block still loads and gates nothing',()=>{
+ base('roles:\n  A: {session: acp, file_delivery: {enabled: true, directory: deliverables}}\n  B: {session: acp}\n  C: {session: acp, file_delivery: {enabled: false, directory: /absolute/../.hidden}}\n  D: {session: acp, file_delivery: {}}\n');
+ const config=loadConfig();for(const name of ['A','B','C','D'])expect(findRole(config,name).session).toBe('acp');
+ for(const value of [undefined,{},{enabled:false},{directory:'../anything/.hidden'},{enabled:true,directory:'deliverables'}])expect(()=>validateFileDelivery(value)).not.toThrow();
+ for(const value of [null,[],'on',{enabled:'true'},{directory:1},{enabled:true,directory:'a',retry:true}])expect(()=>validateFileDelivery(value)).toThrow('retired and ignored');
 });

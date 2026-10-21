@@ -1,12 +1,13 @@
+import { socketPath as privateSocketPath } from '../socket-path.js';
 import { chmodSync, mkdirSync, rmSync } from 'node:fs';
 import { createConnection, createServer, type Server } from 'node:net';
 import { join } from 'node:path';
 import { FleetError, safeLine } from '../application/errors.js';
 import { stateRoot } from '../paths.js';
 
-export type WebControlCommand = 'open' | 'revoke-all';
+export type WebControlCommand = 'revoke-all' | 'link-device';
 
-export const webControlPath = (dir = join(stateRoot(), 'web')) => join(dir, 'control.sock');
+export const webControlPath = (dir = join(stateRoot(), 'web')) => privateSocketPath(join(dir, 'control.sock'));
 
 export interface WebControlServer {
   path: string;
@@ -15,7 +16,7 @@ export interface WebControlServer {
 
 export async function startWebControlServer(options: {
   dir?: string;
-  onOpen(): void | Promise<void>;
+  onLinkDevice?(): Record<string, unknown> | Promise<Record<string, unknown>>;
   onRevokeAll(): void | Promise<void>;
   now?: () => number;
   rateLimit?: number;
@@ -43,10 +44,11 @@ export async function startWebControlServer(options: {
           used++;
           if (used > rateLimit) throw new FleetError('rate_limited', 'local web control rate limit exceeded');
           const parsed = JSON.parse(body.slice(0, body.indexOf('\n'))) as { command?: unknown };
-          if (parsed.command === 'open') await options.onOpen();
+          let result: Record<string,unknown> | undefined;
+          if (parsed.command === 'link-device' && options.onLinkDevice) result = await options.onLinkDevice();
           else if (parsed.command === 'revoke-all') await options.onRevokeAll();
           else throw new FleetError('invalid_request', 'unknown local web control command');
-          socket.end(JSON.stringify({ ok: true }) + '\n');
+          socket.end(JSON.stringify({ ok: true, result }) + '\n');
         } catch (error) {
           const code = error instanceof FleetError ? error.code : 'internal';
           const message = safeLine(error instanceof Error ? error.message : String(error));
@@ -73,8 +75,8 @@ export async function requestWebControl(
   command: WebControlCommand,
   path = webControlPath(),
   timeoutMs = 5_000,
-): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+): Promise<Record<string,unknown> | void> {
+  return await new Promise<Record<string,unknown> | void>((resolve, reject) => {
     const socket = createConnection(path);
     let response = '';
     let settled = false;
@@ -82,11 +84,11 @@ export async function requestWebControl(
       socket.destroy();
       reject(new FleetError('timeout', 'local web control request timed out'));
     }, timeoutMs);
-    const finish = (error?: Error) => {
+    const finish = (error?: Error, result?: Record<string,unknown>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (error) reject(error); else resolve();
+      if (error) reject(error); else resolve(result);
     };
     socket.once('connect', () => socket.write(JSON.stringify({ command }) + '\n'));
     socket.on('data', chunk => { response += chunk.toString('utf8'); });
@@ -95,12 +97,12 @@ export async function requestWebControl(
     )));
     socket.once('end', () => {
       try {
-        const parsed = JSON.parse(response) as { ok?: boolean; error?: { code?: string; message?: string } };
+        const parsed = JSON.parse(response) as { ok?: boolean; result?: Record<string,unknown>; error?: { code?: string; message?: string } };
         if (!parsed.ok) throw new FleetError(
           parsed.error?.code === 'rate_limited' ? 'rate_limited' : 'rejected',
           parsed.error?.message ?? 'local web control request was rejected',
         );
-        finish();
+        finish(undefined, parsed.result);
       } catch (error) { finish(error as Error); }
     });
   });

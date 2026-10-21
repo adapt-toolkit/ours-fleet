@@ -1,12 +1,16 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
+import type { ArchivedMemberAbsence } from './types.js';
+import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { replaceFileAtomically } from '../atomic-file.js';
+import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
+import { incarnationEnded, processIncarnation, type ProcessIncarnation } from '../process-incarnation.js';
 import { stateRoot } from '../paths.js';
+import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
-  TaskDeletionActor, TaskDeletionMemberPhase,
+  TaskDeletionActor, TaskDeletionMemberPhase, TaskNotificationEvent,
 } from './types.js';
 import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
@@ -17,38 +21,94 @@ function taskPath(id: string): string { return join(tasksDir(), `${id}.json`); }
 function taskLockPath(id: string): string { return join(tasksDir(), '.locks', id); }
 const localTaskLocks = new Set<string>();
 
+/**
+ * Remove a lock atomically: rename it to a unique name first, so no other
+ * process ever observes a half-removed lock.
+ */
+function retireLock(path: string): void {
+  const retired = `${path}.retired.${process.pid}.${randomUUID()}`;
+  try { renameSync(path, retired); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  rmSync(retired, { recursive: true, force: true });
+}
+
+/** A legacy lock directory without an owner file younger than this may still be releasing. */
+const LEGACY_OWNERLESS_LOCK_GRACE_MS = 5_000;
+
+/**
+ * Hold a task's cross-process lock while `fn` runs.
+ *
+ * The lock is a file holding its owner record, published complete by hard-linking
+ * a written temporary file: link never replaces an existing lock, and there is no
+ * moment at which a live claimer has an ownerless lock that could look abandoned.
+ * A lock is reclaimed only when its owner process has provably ended; reclaimers
+ * take turns and remove only the lock they observed. Directory locks are left by
+ * earlier versions; they are honored, and an ownerless one is reclaimed once it is
+ * old enough, since this version never creates one.
+ */
 function withTaskLock<T>(id: string, fn: () => T): T {
   if (localTaskLocks.has(id)) return fn();
-  const path = taskLockPath(id); const ownerPath = join(path, 'owner.json');
+  const path = taskLockPath(id);
   const token = randomUUID(); mkdirSync(join(tasksDir(), '.locks'), { recursive: true });
-  for (;;) {
-    const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
-    try {
-      mkdirSync(claimPath);
-      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
-      renameSync(claimPath, path); break;
-    } catch (error) {
-      rmSync(claimPath, { recursive: true, force: true });
-      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+  type Owner = { token?: string; pid?: number } & ProcessIncarnation;
+  const readOwner = (): Owner | undefined => {
+    try { return JSON.parse(readFileSync(path, 'utf8')) as Owner; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EISDIR') return undefined;
+      try { return JSON.parse(readFileSync(join(path, 'owner.json'), 'utf8')) as Owner; }
+      catch { return undefined; }
+    }
+  };
+  /** Who holds the lock now, and whether it can be proved abandoned. */
+  const holder = () => {
+    let stat;
+    try { stat = lstatSync(path); } catch { return undefined; }
+    const owner = readOwner();
+    if (owner && typeof owner.pid === 'number') {
       let alive = false;
-      try {
-        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
-        if (typeof owner.pid === 'number') {
-          try { process.kill(owner.pid, 0); alive = true; } catch { /* dead */ }
+      try { process.kill(owner.pid, 0); alive = true; }
+      catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+      return { token: owner.token, stale: !alive || incarnationEnded(owner.pid, owner) };
+    }
+    return {
+      token: undefined,
+      stale: stat.isDirectory() && Date.now() - stat.mtimeMs > LEGACY_OWNERLESS_LOCK_GRACE_MS,
+    };
+  };
+  const claimPath = `${path}.claim.${process.pid}.${randomUUID()}`;
+  writeFileSync(claimPath, JSON.stringify({ token, pid: process.pid, ...processIncarnation(process.pid) }));
+  try {
+    for (;;) {
+      try { linkSync(claimPath, path); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const observed = holder();
+      if (observed?.stale) {
+        try {
+          withSynchronousFileLock(`${path}.reclaim`, () => {
+            const current = holder();
+            if (current?.stale && current.token === observed.token) retireLock(path);
+          });
+        } catch (error) {
+          // A contender stalled inside the reclaim section: keep waiting like any other poll.
+          if (!(error instanceof Error) || !/^Timed out acquiring synchronous/.test(error.message)) throw error;
         }
-      } catch { /* corrupt legacy lock */ }
-      if (!alive) { rmSync(path, { recursive: true, force: true }); continue; }
+        continue;
+      }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
+  } finally {
+    rmSync(claimPath, { force: true });
   }
   localTaskLocks.add(id);
   try { return fn(); }
   finally {
     localTaskLocks.delete(id);
-    try {
-      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
-      if (owner.token === token) rmSync(path, { recursive: true, force: true });
-    } catch { /* ownership cannot be proved */ }
+    // Only this live owner removes its lock; reclaimers never take a live owner's lock.
+    if (readOwner()?.token === token) retireLock(path);
   }
 }
 
@@ -86,7 +146,78 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
   mkdirSync(tasksDir(), { recursive: true });
   const persisted = { ...record } as Record<string, unknown>;
   delete persisted.list_name;
+  const path = taskPath(record.task_id);
+  const previous = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord : undefined;
+  const status = (task: StoredTaskRecord) => task.deletion?.status === 'pending' ? 'deleting' : task.blocked ? `${task.state} (blocked)` : task.state;
+  // Read pending events under the same task lock as every mutation. Metadata edits
+  // and retries preserve the queue; acknowledgement cannot be resurrected by stale input.
+  const pending = [...(previous?.notification_events ?? [])];
+  if (!previous || status(previous) !== status(record)) {
+    const next = status(record), before = previous ? status(previous) : undefined;
+    pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
+      title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
+      body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
+      target: { kind: 'task', taskId: record.task_id } });
+  }
+  if (pending.length) persisted.notification_events = pending;
+  else delete persisted.notification_events;
   replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
+  publishFleetResourceCommit(taskPath(record.task_id));
+}
+
+const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
+
+function typedTaskNotification(value: TaskNotificationEvent, id: string): boolean {
+  if (!value || typeof value !== 'object' || Object.keys(value).some(key => !['eventId', 'title', 'body', 'target', 'taskId'].includes(key))) return false;
+  const target = value.target;
+  return typeof value.eventId === 'string' && value.eventId.startsWith(`task:${id}:`) && value.eventId.length <= 512
+    && value.taskId === id && !!target && typeof target === 'object' && !Array.isArray(target)
+    && Object.keys(target).every(key => ['kind', 'taskId'].includes(key)) && target.taskId === id
+    && (target.kind === 'task' || (target.kind === 'task-deleted' && value.eventId === `task:${id}:deleted`))
+    && typeof value.title === 'string' && !!value.title.trim() && value.title.length <= 160
+    && typeof value.body === 'string' && !!value.body.trim() && value.body.length <= 512;
+}
+
+/** Atomic snapshots contain the events, including intermediate states between polls. */
+export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[] }> {
+  const result: Array<{ taskId: string; events: TaskNotificationEvent[] }> = [];
+  for (const dir of [tasksDir(), retiredNotificationsDir()]) {
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir).filter(file => TASK_ID_PATTERN.test(file.slice(0, -5)) && file.endsWith('.json'))) {
+      try {
+        const path = join(dir, file), stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('invalid notification source');
+        const value = JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord;
+        const id = file.slice(0, -5);
+        // A prepared deletion copy has no authority while the original still exists.
+        if (dir === retiredNotificationsDir() && existsSync(taskPath(id))) continue;
+        if (value.notification_events === undefined) continue;
+        if (!Array.isArray(value.notification_events)) throw new Error('invalid notification events');
+        // Only typed task events are delivered. Unsupported entries are never sent or converted,
+        // and they do not block later lifecycle events.
+        const events = value.notification_events.filter(event => typedTaskNotification(event, id));
+        if (events.length) result.push({ taskId: id, events });
+      } catch (error) {
+        if (!isNotFoundError(error)) warn('Task notification record unavailable; other task deliveries continue');
+      }
+    }
+  }
+  return result;
+}
+
+/** Service event-id dedupe covers acceptance followed by a crash before this acknowledgement. */
+export function acknowledgeTaskNotification(id: string, eventId: string): void {
+  assertCanonicalTaskId(id);
+  withTaskLock(id, () => {
+    for (const path of [taskPath(id), join(retiredNotificationsDir(), `${id}.json`)]) {
+      if (!existsSync(path)) continue;
+      const value = JSON.parse(readFileSync(path, 'utf8')) as StoredTaskRecord;
+      if (!value.notification_events?.some(event => typedTaskNotification(event, id) && event.eventId === eventId)) continue;
+      value.notification_events = value.notification_events.filter(event => !typedTaskNotification(event, id) || event.eventId !== eventId);
+      replaceFileAtomically(path, JSON.stringify(value, null, 2) + '\n');
+      if (path.startsWith(retiredNotificationsDir() + '/') && !value.notification_events.length) unlinkSync(path);
+    }
+  });
 }
 
 function presentTask(record: StoredTaskRecord): TaskRecord {
@@ -145,26 +276,38 @@ export interface CreateTaskInput {
   idempotency_key?: string;
   start?: boolean;
   no_room?: boolean;
+  layout?: { name: string; definition_hash: string };
   room_id?: string;
   listId?: string;
 }
 
+function creationPlan(plan: TaskRecord['execution_plan'], layout?: { name: string; definition_hash: string }): string {
+  return JSON.stringify([plan?.plan_hash ?? null, storedRoomLaunchPolicy(plan?.room_policy) ?? null,
+    layout ? `${layout.name}@${layout.definition_hash}` : null]);
+}
+
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
-  const existing = findByIdempotencyKey(key);
+  const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
+  const requestedPlan = creationPlan(input.execution_plan, input.layout);
   if (existing) {
-    const existingPlan = existing.execution_plan?.plan_hash;
-    const requestedPlan = input.execution_plan?.plan_hash;
-    const existingPolicy = storedRoomLaunchPolicy(existing.execution_plan?.room_policy);
-    const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
-    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy))
+    // After a Backlog plan edit the current plan differs from the one created; retries compare the original request.
+    if ((existing.creation_plan ?? creationPlan(existing.execution_plan, existing.layout)) !== requestedPlan)
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
-    return existing;
+    return withTaskLock(existing.task_id, () => {
+      const fresh = readTask(existing.task_id);
+      assertNoPendingDeletion(fresh);
+      if (fresh.workspace) ensureWorkspace(fresh.workspace);
+      return fresh;
+    });
   }
 
+  if (input.layout && (input.execution_plan || input.no_room || input.room_id))
+    throw new TaskStateError('a layout task cannot also use a room template, no-room mode or a room');
   const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
+  const taskId = generateTaskId();
   const record: StoredTaskRecord = {
-    task_id: generateTaskId(),
+    task_id: taskId,
     list_id: input.listId ?? DEFAULT_TASK_LIST_ID,
     title: input.title,
     brief: input.brief,
@@ -173,14 +316,18 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     template: input.template,
     execution_plan: input.execution_plan,
     no_room: input.no_room || undefined,
+    ...(input.layout ? { layout: { name: input.layout.name, run_id: `task-${taskId}`, definition_hash: input.layout.definition_hash } } : {}),
     room_id: input.room_id,
     member_roles: [],
     origin: input.origin,
     idempotency_key: key,
+    creation_plan: requestedPlan,
     created_at: new Date().toISOString(),
     started_at: state === 'provisioning' ? new Date().toISOString() : undefined,
   };
+  record.workspace = planWorkspace('task', record.task_id);
   writeTask(record);
+  ensureWorkspace(record.workspace);
   return readTask(record.task_id);
 }
 
@@ -209,7 +356,7 @@ export function updateTaskExecutionPlan(
 }
 
 export function listTasks(filter?: {
-  state?: TaskState | TaskState[]; listId?: string; includeDeleting?: boolean;
+  state?: TaskState | TaskState[]; listId?: string; includeDeleting?: boolean; strict?: boolean;
 }): TaskRecord[] {
   const dir = tasksDir();
   if (!existsSync(dir)) return [];
@@ -223,7 +370,7 @@ export function listTasks(filter?: {
       const t = withTaskLock(id, () => presentTask(JSON.parse(readFileSync(join(dir, f), 'utf8')) as StoredTaskRecord));
       if (t.deletion?.status === 'pending' && !filter?.includeDeleting) continue;
       if ((!states || states.includes(t.state)) && (!filter?.listId || t.list_id === filter.listId)) tasks.push(t);
-    } catch { /* corrupt file, skip */ }
+    } catch (error) { if(filter?.strict)throw error; /* legacy CLI inventory tolerates corrupt files */ }
   }
   const order = new Map(readTaskLists().map((item, index) => [item.list_id, index]));
   return tasks.sort((a, b) => (order.get(a.list_id!)! - order.get(b.list_id!)!)
@@ -527,9 +674,8 @@ export function taskDeletionState(id: string): 'none' | 'pending' | 'absent' {
 
 /**
  * Durable, surface-independent audit evidence for a permanent deletion. The
- * receipt outlives the task record: written with the acceptance intent, and
- * completed before settlement is reported. Metadata only — never brief or
- * room content.
+ * receipt supports in-flight recovery only: written with acceptance intent,
+ * then erased before settlement is reported. It may contain a bounded title.
  */
 export interface TaskDeletionReceipt {
   schema_version: 1;
@@ -540,6 +686,7 @@ export interface TaskDeletionReceipt {
   original_state: TaskState;
   room_id?: string;
   member_count: number;
+  archived_absences?: ArchivedMemberAbsence[];
   settled_at?: string;
   result?: 'deleted';
 }
@@ -570,7 +717,8 @@ function writeDeletionReceiptForIntent(stored: StoredTaskRecord): void {
     actor: deletion.actor,
     original_state: stored.state,
     room_id: deletion.room_id,
-    member_count: deletion.members.length,
+    member_count: deletion.members.length + (deletion.archived_absences?.length ?? 0),
+    ...(deletion.archived_absences?.length ? { archived_absences: deletion.archived_absences } : {}),
   };
   replaceFileAtomically(deletionReceiptPath(stored.task_id), JSON.stringify(receipt, null, 2) + '\n');
 }
@@ -591,13 +739,10 @@ export function ensureTaskDeletionReceipt(id: string): void {
   });
 }
 
-/** Record settlement on the receipt; idempotent, tolerant of legacy absence. */
+/** Erase the in-flight receipt; also heals a crash after task unlink. */
 export function completeTaskDeletionReceipt(id: string): void {
-  const receipt = readTaskDeletionReceipt(id);
-  if (!receipt || receipt.settled_at) return;
-  receipt.settled_at = new Date().toISOString();
-  receipt.result = 'deleted';
-  replaceFileAtomically(deletionReceiptPath(id), JSON.stringify(receipt, null, 2) + '\n');
+  assertCanonicalTaskId(id);
+  rmSync(deletionReceiptPath(id), { force: true });
 }
 
 export type TaskDeletionAcceptance =
@@ -620,7 +765,10 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
   try {
     stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
   } catch (error) {
-    if (isNotFoundError(error)) return { status: 'already_absent' };
+    if (isNotFoundError(error)) {
+      completeTaskDeletionReceipt(id);
+      return { status: 'already_absent' };
+    }
     throw error;
   }
   if (stored.deletion?.status === 'pending') {
@@ -733,7 +881,8 @@ export function advanceTaskDeletionMember(
 interface SeatEvidence {
   role_name: string;
   identity_cid?: string;
-  retirement?: { phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
+  launch?: { launch_id?: string; action_id?: string; task_supervised?: boolean };
+  retirement?: { absence_verified?: boolean; phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
 }
 
 function findCursorForSeat(
@@ -745,6 +894,8 @@ function findCursorForSeat(
     throw new TaskStateError(
       `task ${id} deletion member '${seat.role_name}' identity CID mismatch between cursor and room seat`,
     );
+  if (cursor?.action_id && seat.launch?.action_id && cursor.action_id !== seat.launch.action_id)
+    throw new TaskStateError(`task ${id} deletion member '${seat.role_name}' creation ownership proof changed`);
   return cursor;
 }
 
@@ -767,10 +918,16 @@ export function upsertTaskDeletionMembersFromSeats(
   const now = new Date().toISOString();
   for (const seat of seats) {
     if (!seat.identity_cid) continue;
-    if (!findCursorForSeat(id, stored, seat)) {
+    const cursor = findCursorForSeat(id, stored, seat);
+    if (!cursor) {
       stored.deletion.members.push({
         name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now,
+        ...(seat.launch?.action_id ? { action_id: seat.launch.action_id } : {}),
+        ...(seat.launch?.task_supervised ? { task_supervised: true } : {}),
       });
+    } else {
+      if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
+      if (seat.launch?.task_supervised) cursor.task_supervised = true;
     }
   }
   writeTask(stored);
@@ -787,11 +944,11 @@ export function upsertTaskDeletionMembersFromSeats(
  *
  * The room saga is trusted for phase jumps, but partial or corrupt retained
  * records must not become false success: every seat must be identity_absent;
- * a real launch requires archive evidence; an identity-less seat is accepted
- * only via the never-launched proof.
+ * a real launch requires archive evidence; an identity-less seat requires
+ * never-launched proof or a freshly verified archived-absence checkpoint.
  */
 export function importTaskDeletionRetirementEvidence(
-  id: string, seats: ReadonlyArray<SeatEvidence>,
+  id: string, seats: ReadonlyArray<SeatEvidence>, proofs: ReadonlyArray<ArchivedMemberAbsence> = [],
 ): TaskRecord {
   return withTaskLock(id, () => {
   assertCanonicalTaskId(id);
@@ -805,13 +962,29 @@ export function importTaskDeletionRetirementEvidence(
       throw new TaskStateError(
         `task ${id} deletion cannot checkpoint member '${seat.role_name}' before completed retirement`,
       );
-    const neverLaunched = evidence.launch_id === DELETION_MEMBER_NEVER_LAUNCHED;
+    const neverLaunched = evidence.launch_id === DELETION_MEMBER_NEVER_LAUNCHED
+      || evidence.launch_id === DELETION_MEMBER_ABSENT_VERIFIED || evidence.absence_verified === true;
     if (!neverLaunched && evidence.archive_path === undefined)
       throw new TaskStateError(
         `task ${id} deletion member '${seat.role_name}' retirement evidence lacks its archive`,
       );
     if (!seat.identity_cid) {
-      if (neverLaunched) continue; // provably never held a managed identity
+      if (neverLaunched) {
+        stored.deletion.absent_members ??= [];
+        if (!stored.deletion.absent_members.includes(seat.role_name)) stored.deletion.absent_members.push(seat.role_name);
+        continue;
+      }
+      const proof = proofs.find(value => value.name === seat.role_name);
+      if (proof && proof.launch_id === evidence.launch_id && proof.archive_path === evidence.archive_path
+          && proof.launch_id === seat.launch?.launch_id && proof.action_id === seat.launch?.action_id) {
+        const existing = stored.deletion.archived_absences?.find(value => value.name === proof.name);
+        if (existing && (existing.launch_id !== proof.launch_id || existing.action_id !== proof.action_id
+            || existing.archive_path !== proof.archive_path))
+          throw new TaskStateError('Archived absence checkpoint ownership is immutable');
+        stored.deletion.archived_absences ??= [];
+        if (!existing) stored.deletion.archived_absences.push({ ...proof });
+        continue;
+      }
       throw new TaskStateError(
         `task ${id} deletion member '${seat.role_name}' has retirement evidence but no identity CID`,
       );
@@ -821,6 +994,8 @@ export function importTaskDeletionRetirementEvidence(
       cursor = { name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now };
       stored.deletion.members.push(cursor);
     }
+    if (seat.launch?.action_id) cursor.action_id ??= seat.launch.action_id;
+    if (seat.launch?.task_supervised) cursor.task_supervised = true;
     if (DELETION_MEMBER_PHASE_ORDER[evidence.phase] < DELETION_MEMBER_PHASE_ORDER[cursor.phase]) continue;
     if (cursor.launch_id !== undefined && cursor.launch_id !== evidence.launch_id)
       throw new TaskStateError(
@@ -837,7 +1012,22 @@ export function importTaskDeletionRetirementEvidence(
     cursor.updated_at = now;
   }
   writeTask(stored);
+  writeDeletionReceiptForIntent(stored);
   return presentTaskLenient(stored);
+  });
+}
+
+/** Settlement-only checkpoint, under the task-operation lock after fresh archive verification.
+ * From here retries still verify live absence, but owned archives may be consumed.
+ */
+export function beginTaskWorkspaceCleanup(id: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending'
+        || stored.deletion.members.some(member => member.phase !== 'identity_absent'))
+      throw new TaskStateError('Task is not ready for workspace cleanup');
+    stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
+    writeTask(stored);
   });
 }
 
@@ -858,6 +1048,13 @@ export function unlinkDeletedTask(id: string): boolean {
   }
   if (stored.deletion?.status !== 'pending')
     throw new TaskStateError(`task ${id} has no pending deletion`);
+  // Preserve committed deliveries outside the record before deletion. A crash
+  // before unlink may replay two copies; both carry identical service dedupe IDs.
+  const removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
+    title: `Task deleted: ${stored.title}`.slice(0, 160), body: `Task ${id}: deleting → deleted.`,
+    target: { kind: 'task-deleted', taskId: id } };
+  replaceFileAtomically(join(retiredNotificationsDir(), `${id}.json`),
+    JSON.stringify({ notification_events: [...(stored.notification_events ?? []), removed] }) + '\n');
   try {
     unlinkSync(taskPath(id));
   } catch (error) {
@@ -865,5 +1062,103 @@ export function unlinkDeletedTask(id: string): boolean {
     throw error;
   }
   return true;
+  });
+}
+
+/** Called only after current temp and exact identity absence have been checked. */
+export function settleAbsentTaskDeletionMember(id: string, name: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
+    const member = stored.deletion.members.find(value => value.name === name);
+    if (!member) throw new TaskStateError('Unknown deletion member');
+    member.phase = 'identity_absent';
+    member.launch_id ??= DELETION_MEMBER_ABSENT_VERIFIED;
+    member.updated_at = new Date().toISOString();
+    writeTask(stored);
+  });
+}
+
+/** Room-only erasure keeps the parent Task but removes its dead room/member links. */
+export function detachDeletedRoom(taskId: string, roomId: string): void {
+  withTaskLock(taskId, () => {
+    if (!existsSync(taskPath(taskId))) return;
+    const stored = JSON.parse(readFileSync(taskPath(taskId), 'utf8')) as StoredTaskRecord;
+    if (stored.room_id !== roomId || stored.deletion?.status === 'pending') return;
+    delete stored.room_id;
+    delete stored.room_identity_cid;
+    stored.member_roles = [];
+    writeTask(stored);
+  });
+}
+
+/** A completed room may consume its archives while other task members still retire. */
+export function beginTaskArchiveCleanup(id: string): void {
+  withTaskLock(id, () => {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    if (stored.deletion?.status !== 'pending') throw new TaskStateError('Task is not deleting');
+    stored.deletion.workspace_cleanup_started_at ??= new Date().toISOString();
+    writeTask(stored);
+  });
+}
+
+/** Metadata-only edit; compare under the task lock to prevent lost updates. */
+/**
+ * Choose, change or clear a Backlog task's Room Layout before it starts.
+ * `expected` is the layout name the caller saw (null = none); a different
+ * current choice is a stale edit. Choosing a layout drops the sealed room
+ * template plan; the caller releases the returned launch snapshot hash.
+ */
+export function updateTaskLayout(
+  id: string, expected: string | null, next: { name: string; definition_hash: string } | null,
+): { task: TaskRecord; releasedSnapshot?: string } {
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if (task.state !== 'backlog' || task.room_id)
+      throw new TaskStateError(`task ${id} has started; its room layout is fixed (state '${task.state}')`);
+    const current = task.layout?.name ?? null;
+    // A replay of the same choice is idempotent (and refreshes the pinned source hash).
+    if (current !== expected && current !== (next?.name ?? null))
+      throw new TaskStateError(`task ${id} room layout changed to '${current ?? 'one room'}'; reload before changing it`);
+    const releasedSnapshot = next ? task.execution_plan?.snapshot.launch_snapshot_hash : undefined;
+    if (next) {
+      task.layout = { name: next.name, run_id: `task-${task.task_id}`, definition_hash: next.definition_hash };
+      delete task.execution_plan; delete task.template; delete task.no_room;
+    } else delete task.layout;
+    task.room_plan_changed_at = new Date().toISOString();
+    writeTask(task);
+    return { task: readTask(id), ...(releasedSnapshot ? { releasedSnapshot } : {}) };
+  });
+}
+
+/**
+ * Progress and To review edits: one read-modify-write under the task lock, so
+ * concurrent writers never lose each other's changes. Lifecycle state is untouched.
+ */
+export function updateTaskContribution<T>(id: string, change: (task: TaskRecord) => { value: T; changed: boolean }): T {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    const { value, changed } = change(task);
+    if (changed) writeTask(task);
+    return value;
+  });
+}
+
+export function updateTaskBrief(id: string, brief: string, expectedBrief: string): TaskRecord {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    assertNoPendingTerminalIntent(task);
+    if ((task.brief ?? '') !== expectedBrief && task.brief !== brief)
+      throw new TaskStateError('Description changed elsewhere. Reload the task before saving.');
+    task.brief = brief;
+    writeTask(task);
+    return task;
   });
 }

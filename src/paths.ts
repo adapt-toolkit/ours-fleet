@@ -26,6 +26,11 @@ export function deriveXdgRuntimeDir(
   return env.XDG_RUNTIME_DIR;
 }
 export const stateRoot = () => join(home(), '.ours-fleet');
+/** The Owner invitation file that tunnel setup writes itself after enrollment. */
+export const workspaceOwnerInvite = () => join(stateRoot(), 'workspace', 'owner.invite');
+/** Serializes writers of the workspace binding and of its unfinished replacement record. */
+export const workspaceBindingLock = () => join(stateRoot(), 'workspace', '.binding.lock');
+export const workspaceReplacementFile = () => join(stateRoot(), 'workspace', 'replacement.json');
 export const agentsRoot = () => join(stateRoot(), 'agents');
 export const tmpRoot = () => join(stateRoot(), 'tmp');
 export const logsRoot = () => join(stateRoot(), 'logs');

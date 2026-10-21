@@ -83,6 +83,8 @@ export type TaskDeletionMemberPhase =
 export interface TaskDeletionMemberCursor {
   name: string;
   identity_cid: string;
+  action_id?: string;
+  task_supervised?: boolean;
   phase: TaskDeletionMemberPhase;
   launch_id?: string;
   archive_path?: string;
@@ -95,6 +97,14 @@ export interface TaskDeletionMemberCursor {
  * evidence. While pending, the task is hidden from normal operation and every
  * lifecycle mutation or room publication is rejected.
  */
+export interface ArchivedMemberAbsence {
+  name: string;
+  launch_id: string;
+  action_id: string;
+  archive_path: string;
+  checked_at: string;
+}
+
 export interface TaskDeletionIntent {
   status: 'pending';
   accepted_at: string;
@@ -102,6 +112,10 @@ export interface TaskDeletionIntent {
   room_id?: string;
   /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
   members: TaskDeletionMemberCursor[];
+  archived_absences?: ArchivedMemberAbsence[];
+  absent_members?: string[];
+  /** Archive proofs were verified before owned workspace cleanup may consume them. */
+  workspace_cleanup_started_at?: string;
   error?: string;
   error_at?: string;
   recovery_hint?: string;
@@ -109,7 +123,63 @@ export interface TaskDeletionIntent {
   first_recovery_hint?: string;
 }
 
+export interface TaskLayoutLink {
+  name: string;
+  /** Deterministic `task-<task_id>` Room Layout run ID. */
+  run_id: string;
+  /** sha256 of the canonical source layout definition the run must snapshot. */
+  definition_hash: string;
+}
+
+export interface TaskNotificationEvent {
+  eventId: string; title: string; body: string; target: { kind: 'task' | 'task-deleted'; taskId: string }; taskId: string;
+}
+
+/** Who wrote a progress entry or review change, as established by the Fleet surface. */
+export type TaskContributionAuthor =
+  | { kind: 'agent'; role: string; identity_cid?: string; surface: 'mcp' | 'cli' }
+  | { kind: 'local_control'; surface: 'cli' | 'web' };
+
+/** One append-only milestone; text is stored exactly as authored. */
+export interface TaskProgressEntry {
+  id: string;
+  at: string;
+  author: TaskContributionAuthor;
+  text: string;
+  /** Caller retry key, scoped to the author. */
+  request_key?: string;
+}
+
+/** Metadata of a retained review file; bytes live in Fleet's private task review store. */
+export interface TaskReviewArtifact {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  added_at: string;
+  added_by: TaskContributionAuthor;
+  request_key?: string;
+}
+
+/** Self-contained material the Owner reviews: Markdown plus retained files. */
+export interface TaskReview {
+  /** Increases with every change to the Markdown or the files; absent on packages written before it. */
+  revision?: number;
+  markdown: string;
+  updated_at: string;
+  updated_by: TaskContributionAuthor;
+  artifacts: TaskReviewArtifact[];
+}
+
 export interface TaskRecord {
+  /** Optional milestone log; absent on tasks that never recorded one. */
+  progress?: TaskProgressEntry[];
+  /** Optional To review package; absent until an agent prepares it. */
+  review?: TaskReview;
+  /** Pending lifecycle events, committed atomically with their task change. */
+  notification_events?: TaskNotificationEvent[];
+  workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
   list_id: string;
@@ -130,6 +200,12 @@ export interface TaskRecord {
     plan_hash: string;
   };
   no_room?: boolean;
+  /** Multi-room task: rooms and participants come from a Room Layout run. */
+  layout?: TaskLayoutLink;
+  /** Set when the room plan (layout or one-room template) was changed after creation, before start. */
+  room_plan_changed_at?: string;
+  /** Fingerprint of the room plan requested at creation; idempotent retries compare against it after later plan edits. */
+  creation_plan?: string;
   room_id?: string;
   room_identity_cid?: string;
   member_roles: TaskMemberRole[];
@@ -194,6 +270,7 @@ export interface RoomRoleBriefingDefinition {
 }
 
 export interface RoomMemberLaunchState {
+  task_supervised?: boolean;
   state: 'pending' | 'intent' | 'launched' | 'stopped' | 'failed';
   attempt: number;
   action_id?: string;
@@ -240,6 +317,7 @@ export type MemberRetirementPhase =
   | 'identity_absent';
 
 export interface MemberRetirement {
+  absence_verified?: boolean;
   phase: MemberRetirementPhase;
   launch_id: string;
   updated_at: string;
@@ -270,12 +348,14 @@ export interface RoomMemberSeat {
 }
 
 export interface RoomOrchestrationRecord {
+  workspace?: import('./workspace.js').OwnedWorkspace;
   room_id: string;
   room_identity_cid?: string;
   room_name: string;
   goal?: string;
   task_id?: string;
   template_snapshot?: TemplateSnapshot;
+  additional_member_templates?: TemplateSnapshot[];
   /** Resolved once at launch; legacy absence means non-anonymous. */
   room_policy?: RoomLaunchPolicy;
   saga: SagaCursor;

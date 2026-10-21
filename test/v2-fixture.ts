@@ -17,7 +17,7 @@ function buildAgentDocument(raw: RoleConfig): Record<string, unknown> {
     .map(key => [key, raw[key as keyof RoleConfig]]));
   const operational = Object.fromEntries([
     'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee', 'isolation',
-    'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+    'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'file_delivery',
   ].filter(key => raw[key as keyof RoleConfig] !== undefined)
     .map(key => [key, raw[key as keyof RoleConfig]]));
   return { role: { inline: role }, brain: { inline: brain }, ...operational };

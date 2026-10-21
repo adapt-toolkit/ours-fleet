@@ -1,8 +1,12 @@
-import { readFileSync, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 
-import { resolveEndpoint, type FetchLike } from './monitor.js';
+import { classifyIdentityPresence, type FetchLike, type IdentityPresence } from './monitor.js';
+import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { replaceFileAtomically } from './atomic-file.js';
 
 export const DAEMON_RECOVERY_MAX_ATTEMPTS = 6;
@@ -43,8 +47,12 @@ interface StartupProgress {
 }
 
 interface GenerationProbeDeps {
+  requestSignal?: AbortSignal;
   readText?(path: string): string;
   canonicalize?(path: string): string;
+  attachClient?(
+    options: AttachOursClientOptions,
+  ): Pick<OursClient, 'version' | 'identities' | 'close'> | Promise<Pick<OursClient, 'version' | 'identities' | 'close'>>;
 }
 
 function positiveInteger(value: unknown): value is number {
@@ -71,105 +79,164 @@ function startupProgress(value: unknown): StartupProgress | undefined {
   return row as unknown as StartupProgress;
 }
 
-function canonical(path: string, deps: GenerationProbeDeps): string {
-  const absolute = resolve(path);
-  return deps.canonicalize?.(absolute) ?? realpathSync.native(absolute);
-}
-
-/**
- * Corroborate the loopback daemon's unauthenticated `/info`, its credentialed
- * identity-index readiness route, and its local boot-generation record. The
- * index enforces auth when the daemon visibility requires it; open visibility
- * deliberately does not. No source is sufficient
- * alone: `/info` has no boot id, the identity index has no generation, and a
- * stale `ready` file can outlive the process that wrote it.
- */
+/** Read generation and readiness through the selected gateway. Server paths are opaque. */
 export async function probeDaemonGeneration(
   fetch: FetchLike,
   env: NodeJS.ProcessEnv,
   deps: GenerationProbeDeps = {},
 ): Promise<DaemonGenerationProbe> {
-  const endpoint = resolveEndpoint(env);
-  let response;
   try {
-    response = await fetch(`${endpoint.origin}/info`, { headers: endpoint.headers });
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_INFO_UNREACHABLE' };
+    const { identities: _identities, ...generation } = await probeSelectedDaemon(deps, readClientProfile(env));
+    return generation;
   }
-  if (!response.ok) return {
-    state: 'unavailable',
-    reason: response.status === 401 ? 'DAEMON_INFO_UNAUTHORIZED' : 'DAEMON_INFO_HTTP_ERROR',
-  };
-  let info: Record<string, unknown>;
-  try {
-    const value = await response.json();
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('shape');
-    info = value as Record<string, unknown>;
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_INFO_INVALID' };
-  }
-  if (info.name !== 'ours' || !positiveInteger(info.pid)
-      || typeof info.stateDir !== 'string' || info.stateDir.length === 0)
-    return { state: 'unavailable', reason: 'DAEMON_INFO_INVALID' };
+  catch { return { state: 'unavailable', reason: 'CLIENT_GATEWAY_PROFILE_INVALID' }; }
+}
 
-  let reportedStateDir: string;
-  let expectedStateDir: string;
+/** Container selection uses public SDK reads; daemon paths/PIDs remain opaque metadata. */
+async function probeSelectedDaemon(
+  deps: GenerationProbeDeps,
+  profile: ExplicitClientProfile,
+): Promise<DaemonGenerationProbe & { identities?: unknown[] }> {
+  // Defer credential-file access to SDK selection, which checks the configured
+  // daemon identity/capability before it reads or sends the credential.
+  let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
   try {
-    reportedStateDir = canonical(info.stateDir, deps);
-    expectedStateDir = canonical(endpoint.stateDir, deps);
+    const options: AttachOursClientOptions = {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: randomUUID(), env: {}, requestSignal: deps.requestSignal,
+    };
+    client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+    const info = await client.version({startup:true});
+    if (info.name !== 'ours' || !positiveInteger(info.pid)
+        || typeof info.stateDir !== 'string' || !info.stateDir)
+      return {state:'unavailable', reason:'DAEMON_INFO_INVALID'};
+    const progress = startupProgress(info.startup);
+    if (!progress) return {state:'unavailable', reason:'DAEMON_PROGRESS_INVALID'};
+    if (progress.phase !== 'ready') return {state:'unavailable', reason:'DAEMON_PROGRESS_NOT_READY'};
+    if (progress.pid !== info.pid) return {state:'unavailable', reason:'DAEMON_GENERATION_MISMATCH'};
+    const identities = await client.identities();
+    if (!Array.isArray(identities)) return {state:'unavailable', reason:'DAEMON_IDENTITIES_INVALID'};
+    if (!identities.length) return {state:'unavailable', reason:'DAEMON_IDENTITIES_NOT_READY'};
+    return {state:'ready', identities, generation:{
+      bootId:progress.bootId, pid:progress.pid, startedAt:progress.startedAt, stateDir:info.stateDir,
+    }};
   } catch {
-    return { state: 'unavailable', reason: 'DAEMON_STATE_DIR_UNAVAILABLE' };
-  }
-  if (reportedStateDir !== expectedStateDir)
-    return { state: 'unavailable', reason: 'DAEMON_STATE_DIR_MISMATCH' };
+    // Failed selection, auth or transport is unavailable, never owner death.
+    return {state:'unavailable', reason:'DAEMON_SELECTED_PROBE_UNAVAILABLE'};
+  } finally { await client?.close().catch(() => undefined); }
+}
 
-  // `/identities` is the daemon's credential-capable readiness route. A
-  // valid-but-empty index is a documented intermediate startup state, never
-  // proof of readiness.
-  let identitiesResponse;
-  try {
-    identitiesResponse = await fetch(`${endpoint.origin}/identities`, { headers: endpoint.headers });
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_UNREACHABLE' };
-  }
-  if (!identitiesResponse.ok) return {
-    state: 'unavailable',
-    reason: identitiesResponse.status === 401
-      ? 'DAEMON_IDENTITIES_UNAUTHORIZED' : 'DAEMON_IDENTITIES_HTTP_ERROR',
-  };
-  try {
-    const body = await identitiesResponse.json();
-    if (!body || typeof body !== 'object' || Array.isArray(body)
-        || !Array.isArray((body as { identities?: unknown }).identities))
-      return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_INVALID' };
-    if ((body as { identities: unknown[] }).identities.length === 0)
-      return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_NOT_READY' };
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_IDENTITIES_INVALID' };
-  }
+export interface SelectedDaemonHealthSnapshot {
+  generation: DaemonGenerationProbe;
+  identities?: unknown[];
+}
 
-  let progress: StartupProgress | undefined;
-  try {
-    const text = deps.readText?.(join(reportedStateDir, 'startup-progress.json'))
-      ?? readFileSync(join(reportedStateDir, 'startup-progress.json'), 'utf8');
-    progress = startupProgress(JSON.parse(text));
-  } catch {
-    return { state: 'unavailable', reason: 'DAEMON_PROGRESS_UNAVAILABLE' };
+export interface SelectedDaemonHealthLease {
+  sample(): Promise<SelectedDaemonHealthSnapshot>;
+  presence(name: string, snapshot: SelectedDaemonHealthSnapshot): IdentityPresence;
+  release(): void;
+}
+
+interface SelectedHealthOwner {
+  consumers: number;
+  sample(): Promise<SelectedDaemonHealthSnapshot>;
+  stop(): void;
+}
+const selectedHealthOwners = new Map<string, SelectedHealthOwner>();
+const unavailableHealth = (reason: string): SelectedDaemonHealthSnapshot => ({
+  generation: { state: 'unavailable', reason },
+});
+
+/** Retained runtime health, independent of browser delivery and stream readiness. */
+export function acquireSelectedDaemonHealth(
+  env: NodeJS.ProcessEnv, deps: GenerationProbeDeps = {},
+): SelectedDaemonHealthLease {
+  let profile: ExplicitClientProfile;
+  try { profile = readClientProfile(env); }
+  catch {
+    return {
+      sample: async () => unavailableHealth('CLIENT_GATEWAY_PROFILE_INVALID'),
+      presence: () => ({ state: 'unknown', detail: 'selected daemon unavailable' }),
+      release: () => {},
+    };
   }
-  if (!progress) return { state: 'unavailable', reason: 'DAEMON_PROGRESS_INVALID' };
-  if (progress.phase !== 'ready')
-    return { state: 'unavailable', reason: 'DAEMON_PROGRESS_NOT_READY' };
-  if (progress.pid !== info.pid)
-    return { state: 'unavailable', reason: 'DAEMON_GENERATION_MISMATCH' };
+  // Credentials are part of the selection boundary, not merely endpoint identity.
+  const key = JSON.stringify([profile.endpoint, profile.expectedInstanceId, profile.credentialPath]);
+  let owner = selectedHealthOwners.get(key);
+  if (!owner) {
+    let stopped = false;
+    let timer: NodeJS.Timeout | undefined;
+    let current: SelectedDaemonHealthSnapshot | undefined;
+    let nextProbeAt = 0;
+    let pending: Promise<SelectedDaemonHealthSnapshot> | undefined;
+    let cancelProbe: (() => void) | undefined;
+    const run = (): Promise<SelectedDaemonHealthSnapshot> => {
+      let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
+      let closed = false;
+      let cancelled = false;
+      const request = new AbortController();
+      const close = async () => {
+        if (client && !closed) { closed = true; await client.close().catch(() => undefined); }
+      };
+      let deadline: NodeJS.Timeout | undefined;
+      const interrupted = new Promise<SelectedDaemonHealthSnapshot>(resolve => {
+        cancelProbe = () => {
+          cancelled = true;
+          request.abort();
+          void close();
+          resolve(unavailableHealth('DAEMON_SELECTED_PROBE_UNAVAILABLE'));
+        };
+        deadline = setTimeout(cancelProbe, 10_000);
+        deadline.unref?.();
+      });
+      const probe = probeSelectedDaemon({ ...deps, requestSignal: request.signal, attachClient: async options => {
+        client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+        if (cancelled) { void close(); throw new Error('health probe cancelled'); }
+        return { version: (...args) => client!.version(...args),
+          identities: () => client!.identities(), close };
+      } }, profile).then(({ identities, ...generation }) => ({ generation, identities }));
+      pending = Promise.race([probe, interrupted]).then(snapshot => {
+        if (!stopped) current = snapshot;
+        return snapshot;
+      }).finally(() => {
+        if (deadline) clearTimeout(deadline);
+        cancelProbe = undefined;
+        pending = undefined;
+        if (!stopped) {
+          nextProbeAt = Date.now() + 2_000;
+          timer = setTimeout(() => { void run(); }, 2_000);
+          timer.unref?.();
+        }
+      });
+      return pending;
+    };
+    owner = {
+      consumers: 0,
+      sample: () => {
+        if (pending) return pending;
+        if (current && Date.now() < nextProbeAt) return Promise.resolve(current);
+        // A delayed timer after process suspension cannot certify old absence.
+        if (timer) clearTimeout(timer);
+        return run();
+      },
+      stop: () => { stopped = true; if (timer) clearTimeout(timer); cancelProbe?.(); },
+    };
+    selectedHealthOwners.set(key, owner);
+    void run();
+  }
+  const retained = owner;
+  retained.consumers++;
+  let released = false;
   return {
-    state: 'ready',
-    generation: {
-      // Keep bootId opaque. Its current writer uses `${pid}-${startedAt}`, but
-      // equality—not its formatting—is the generation contract Fleet needs.
-      bootId: progress.bootId,
-      pid: progress.pid,
-      startedAt: progress.startedAt,
-      stateDir: reportedStateDir,
+    sample: () => released ? Promise.resolve(unavailableHealth('HEALTH_OWNER_RELEASED')) : retained.sample(),
+    presence: (name, snapshot) => snapshot.generation.state === 'ready'
+      ? classifyIdentityPresence(name, snapshot.identities)
+      : { state: 'unknown', detail: 'selected daemon unavailable' },
+    release: () => {
+      if (released) return;
+      released = true;
+      if (--retained.consumers === 0) { retained.stop(); selectedHealthOwners.delete(key); }
     },
   };
 }

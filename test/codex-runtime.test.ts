@@ -1,10 +1,13 @@
+import { fleetHostBackend } from '../src/supervisor/fleet.js';
+import { readMember, managedMemberEnvironment } from '../src/supervisor/catalog.js';
+import { agentDir } from '../src/paths.js';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { probeCodexRuntime, codexVersionAtLeast } from '../src/harness/codex-runtime.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { probeCodexRuntime, codexVersionAtLeast, hostCodex } from '../src/harness/codex-runtime.js';
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { makeCodexAdapter, codexAcpLaunchForResolution } from '../src/harness/codex.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
@@ -13,6 +16,8 @@ import type { ResolvedRole } from '../src/config.js';
 
 const roots: string[] = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'fleet-codex-runtime-')); roots.push(dir); return dir; };
+// Runtime-selection fixtures own their environment; individual override tests opt in below.
+beforeEach(() => { vi.stubEnv('CODEX_PATH', undefined); });
 afterEach(() => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const adapter = () => resolveBundledAcpAgent('@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
 function binary(version: string): string {
@@ -23,6 +28,38 @@ function binary(version: string): string {
 }
 const role = (env: Record<string, string> = {}): ResolvedRole => ({
   name: 'Runtime', identity: 'Runtime', harness: 'codex', session: 'acp', sourceFile: 'fixture', env,
+});
+
+/** A PATH holding only a `codex` that reports `version`. */
+function hostPath(version: string): string {
+  const dir = temp();
+  writeFileSync(join(dir, 'codex'), `#!/bin/sh\nprintf 'codex-cli ${version}\\n'\n`);
+  chmodSync(join(dir, 'codex'), 0o700);
+  return dir;
+}
+
+describe('host Codex selection', () => {
+  it('runs a host Codex that is newer than the bundled one, for the check and for the session alike', async () => {
+    const dir = hostPath('99.0.0');
+    const runtime = await probeCodexRuntime(adapter(), { PATH: dir });
+    expect(runtime).toEqual({ source: 'host', entry: join(dir, 'codex'), executable: join(dir, 'codex'), version: '99.0.0' });
+    vi.stubEnv('PATH', `${dir}:${process.env.PATH}`);
+    const state = temp();
+    const prep = await makeCodexAdapter().prepareSession(role(), { stateDir: state, runCwd: state });
+    expect(prep.env.OURS_FLEET_REAL_CODEX_PATH).toBe(join(dir, 'codex'));
+  });
+  it('keeps the bundled Codex when the host one is older, missing or unreadable', async () => {
+    expect((await probeCodexRuntime(adapter(), { PATH: hostPath('0.1.0') })).source).toBe('bundled');
+    expect((await probeCodexRuntime(adapter(), { PATH: temp() })).source).toBe('bundled');
+    const broken = temp(); writeFileSync(join(broken, 'codex'), '#!/bin/sh\nexit 3\n'); chmodSync(join(broken, 'codex'), 0o700);
+    expect((await probeCodexRuntime(adapter(), { PATH: broken })).source).toBe('bundled');
+  });
+  it('lets an explicit CODEX_PATH decide, including an empty one that selects the bundled Codex', async () => {
+    const dir = hostPath('99.0.0'), chosen = binary('0.153.4');
+    expect(hostCodex(adapter().manifestPath, { PATH: dir, CODEX_PATH: '' })).toBeUndefined();
+    expect((await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: '' })).source).toBe('bundled');
+    expect(await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: chosen })).toMatchObject({ source: 'CODEX_PATH', entry: chosen });
+  });
 });
 
 describe('Codex runtime provenance', () => {
@@ -82,21 +119,20 @@ describe('Codex runtime provenance', () => {
       const persistent = await makeCodexAdapter().prepareSession(role(env),
         { stateDir: persistentDir, runCwd: persistentDir });
       const expected = harnessChildEnv(role(env), persistent.env, persistentDir).OURS_FLEET_REAL_CODEX_PATH;
-      const dir = temp();
+      vi.stubEnv('OURS_FLEET_HOME', temp());
+      const dir = agentDir('Runtime', true); mkdirSync(dir, { recursive: true });
       prepareTempSupervisor(dir, 'Runtime');
-      let serviceArgs: string[] = [];
+      await fleetHostBackend(async () => ({ code: 0, stdout: '', stderr: '' }), platform).init('/installed/fleet');
       await makeTempSupervisorLauncher({
         platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd',
         exec: async (_command, args) => {
-          serviceArgs = args;
-          return { code: 0, stdout: '', stderr: '' };
+          return { code: 0, stdout: _command === 'launchctl' ? 'state = running' : 'active', stderr: '' };
         },
       })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
-      const prefix = platform === 'linux' ? '--setenv=CODEX_PATH=' : 'CODEX_PATH=';
-      const entry = serviceArgs.find(arg => arg.startsWith(prefix));
-      expect(entry).toBe(prefix + inherited);
-      // Simulate only the environment explicitly passed to the temporary service.
-      vi.stubEnv('CODEX_PATH', entry?.slice(prefix.length));
+      const member = readMember('temporary-Runtime')!;
+      const selectedEnv = managedMemberEnvironment(member, { CODEX_PATH: '/other-parent/codex' });
+      expect(selectedEnv.CODEX_PATH).toBe(inherited);
+      vi.stubEnv('CODEX_PATH', selectedEnv.CODEX_PATH);
       const prep = await makeCodexAdapter().prepareSession(role(env), { stateDir: dir, runCwd: dir });
       const child = harnessChildEnv(role(env), prep.env, dir);
       expect(child.OURS_FLEET_REAL_CODEX_PATH).toBe(expected);

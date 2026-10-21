@@ -106,6 +106,7 @@ export function resolvedRolePlan(role: ResolvedRole, manifestDir = dirname(role.
     isolation: role.isolation ?? null,
     worklog: role.worklog ?? null,
     authProxy: role.auth_proxy ?? null,
+    managedCli: role.managed_cli ?? [],
     oversee: role.oversee ?? [],
     harnessOptions: redactSensitive(role.harness_options ?? null),
     env: {

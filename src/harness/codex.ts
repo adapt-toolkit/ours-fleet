@@ -13,10 +13,11 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
-import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast } from './codex-runtime.js';
+import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast, hostCodex } from './codex-runtime.js';
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
+import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from './codex-reasoning.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -49,11 +50,12 @@ const CODEX_PROXY_MANIFEST_ENV = 'OURS_FLEET_CODEX_ACP_MANIFEST';
 
 /**
  * What an unattended role can actually do under Codex's native settings.
- * `on-request` and `untrusted` stop to ask, and with no console attached that
- * request is refused rather than answered — so the role can only read.
+ * `on-request` and `untrusted` can ask even for startup file reads (for example,
+ * shell reads or files outside the sandbox). Without a controller the request
+ * waits or is denied according to policy. Neither guarantees `read-state`.
  */
 export function codexCapabilities(approval: string, sandbox: string): UnattendedCapability[] {
-  if (approval !== 'never') return ['read-state'];
+  if (approval !== 'never') return [];
   const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
   if (sandbox !== 'read-only') caps.push('write-state', 'workspace-edit');
   return caps;
@@ -155,6 +157,13 @@ function isNativeConfigKeyAllowed(key: string): boolean {
   return NATIVE_CONFIG_ALLOWLIST.has(key);
 }
 
+/** Brain wins; a validated native effort also needs delivery through ACP's selection API. */
+function reasoningEffort(role: ResolvedRole): string | undefined {
+  if (typeof role.effort === 'string') return role.effort;
+  const value = (role.harness_options as CodexOptions | undefined)?.config?.model_reasoning_effort;
+  return isCodexReasoningEffort(value) ? value : undefined;
+}
+
 /** Defense in depth for callers which launch a role after validation was bypassed. */
 export function nativeCodexConfig(role: ResolvedRole): Record<string, unknown> | undefined {
   const options = role.harness_options as CodexOptions | undefined;
@@ -183,6 +192,10 @@ function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
       ...(options?.search ? ['--search'] : []),
       'app-server',
     ];
+    // Fleet delivers wakes through the native session itself. The ours-codex
+    // launcher owns a remote TUI and cannot serve this stdio transport.
+    if (launcher === 'auto' && role.monitor?.mode === 'fleet')
+      return { argv: ['codex', ...flags], env: prep.env };
     // Preserve the established `auto` launcher contract without resolving PATH
     // during synchronous launch preparation. The static shell fragment passes
     // every dynamic value as an argv element and `exec`s the selected process.
@@ -279,7 +292,9 @@ function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string,
     [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
     [CODEX_PROXY_SANDBOX_ENV]: acpRuntimeSandbox(role),
     [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
-    [CODEX_PROXY_REAL_PATH_ENV]: role.env?.CODEX_PATH ?? process.env.CODEX_PATH ?? '',
+    // Same choice as probeCodexRuntime: an explicit CODEX_PATH, else a host Codex at least as new as the bundled one.
+    [CODEX_PROXY_REAL_PATH_ENV]: role.env?.CODEX_PATH ?? process.env.CODEX_PATH
+      ?? hostCodex(resolution.manifestPath, { ...process.env, ...role.env }, dirs.runCwd)?.path ?? '',
   };
 }
 
@@ -332,10 +347,8 @@ export function makeCodexAdapter(
     id: 'codex',
     agentSession: new CodexAgentSessionAdapter({
       resolveBrain(brain) {
-        const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-        if (brain.effort != null
-            && (typeof brain.effort !== 'string' || !levels.includes(brain.effort)))
-          throw new Error(`Codex Brain effort must be one of: ${levels.join(', ')}`);
+        if (brain.effort != null && !isCodexReasoningEffort(brain.effort))
+          throw new Error(`Codex Brain effort must be one of: ${CODEX_REASONING_EFFORTS.join(', ')}`);
         const harnessOptions = { ...(brain.harnessOptions ?? {}) };
         if (brain.effort) harnessOptions.config = {
           ...((harnessOptions.config ?? {}) as Record<string, unknown>),
@@ -356,8 +369,8 @@ export function makeCodexAdapter(
       sessionConfigSelections: role => [
         ...(typeof role.model === 'string'
           ? [{ configId: 'model', value: role.model }] : []),
-        ...(typeof role.effort === 'string'
-          ? [{ configId: 'reasoning_effort', value: role.effort }] : []),
+        ...(reasoningEffort(role)
+          ? [{ configId: 'reasoning_effort', value: reasoningEffort(role)! }] : []),
       ],
       permissionModeId: role => acpAgentMode(role),
       mcpServers: () => undefined,
@@ -628,12 +641,16 @@ export function makeCodexAdapter(
         'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
         '`[fleet-monitor]` lines — do NOT arm arm_monitor or foreground_monitor. When such a line ' +
         'appears, call **get_messages**, handle the mail, and reply with send_message.',
-      launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
+      launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Announce console readiness before task details.`,
       restartPrompt: (id, worklog, configuredRole) => {
         if (configuredRole?.monitor?.mode === 'fleet')
-          return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true); ` +
-            'your mail wakes are delivered by the fleet supervisor as `[fleet-monitor]` console lines, so do ' +
-            `NOT arm arm_monitor/foreground_monitor. Continue from ${worklog}. Do not re-run whatever crashed you.`;
+          return `Session restarted. The supervisor has verified assigned identity "${id}"; ` +
+            'accept that readiness and continue without rebinding or profile reconciliation. ' +
+            'Mail wakes arrive as `[fleet-monitor]` lines; do NOT arm arm_monitor/foreground_monitor. ' +
+            'Announce console readiness first without tools, then end that readiness turn. ' +
+            `For a separate continuation task, read ${worklog} once for continuity if it records previous work; ` +
+            'do not read it again later in this session. ' +
+            'Do not re-run whatever crashed you.';
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
           (consented

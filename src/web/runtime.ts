@@ -1,5 +1,17 @@
-import { spawn } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
+import { ConversationRoleObserver, type ConversationRoleState } from '../application/conversation-role-observer.js';
+import { replaceFileAtomically } from '../atomic-file.js';
+import {validateAccountOrigin} from '../account-origin.js';
+import { startWorkspaceTunnel } from './workspace-tunnel.js';
+import {createPrefixGateway,type ServiceTarget} from './prefix-gateway.js';
+import {readClientProfile} from '../client-profile.js';
+import {readPrivateFile} from '@ours.network/sdk/connector';
+import { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
+import { RoomLayoutService } from '../rooms-tasks/layout-service.js';
+import { FleetNotificationProducer } from '../notifications/fleet-producer.js';
+import { producerConfig } from '../notifications/outbox.js';
+import { SubscriptionService } from '../subscriptions/service.js';
+import { createCodexModelDiscovery } from '../application/codex-models.js';
+import { existsSync, mkdirSync, realpathSync,readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
@@ -13,7 +25,8 @@ import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
-import { home, stateRoot } from '../paths.js';
+import { home, stateRoot, agentsRoot, tmpRoot, logsRoot } from '../paths.js';
+import { executeInitAnswers, publishSetup } from '../init-wizard.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
@@ -21,8 +34,11 @@ import { FleetConfigService } from './fleet-config-service.js';
 import { mergeTopology } from './topology-model.js';
 import { TopologyDraftStore } from './topology-draft-store.js';
 import { TopologyPromoteService } from './topology-promote.js';
+import { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
+import { PresetProvenance } from '../application/preset-provenance.js';
 import { doctor } from '../doctor.js';
 import { acquireWebServerLock } from './lock.js';
+import { WorkspaceDeviceStore } from './workspace-devices.js';
 import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
 import { startWebControlServer, type WebControlServer } from './control.js';
@@ -39,19 +55,22 @@ const CONFIG_CACHE_TTL_MS = 5_000;
  * short TTL rather than re-parsing per request. Runtime-only concern (not the
  * scheduler's), so a plain Date.now() clock is fine.
  */
-function cachedConfigProvider(configPath: string | undefined): () => FleetConfig {
+function cachedConfigProvider(configPath: string | undefined) {
   let cached: { at: number; cfg: FleetConfig } | undefined;
-  return () => {
+  const read = () => {
     const now = Date.now();
     if (!cached || now - cached.at >= CONFIG_CACHE_TTL_MS) cached = { at: now, cfg: loadConfig(configPath) };
     return cached.cfg;
   };
+  return Object.assign(read,{invalidate:()=>{cached=undefined;}});
 }
 
 export interface StartWebOptions {
   configPath?: string;
+  /** Separate console state for an independently launched gateway. */
+  webStateDir?: string;
+  control?: boolean;
   port?: number;
-  open?: boolean;
   binPath: string;
   log?(line: string): void;
   bind?: string;
@@ -64,23 +83,28 @@ export interface RunningWebConsole extends WebServer {
 }
 
 export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
-  const requestedPort = options.port ?? 49_271;
+  const notificationConfig = producerConfig(process.env, undefined, options.log);
+  let requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
-  const lock = acquireWebServerLock();
-  const webDir = resolve(stateRoot(), 'web');
+  const webDir = options.webStateDir ?? resolve(stateRoot(), 'web');
+  const lock = acquireWebServerLock(webDir);
   const bind = options.bind ?? '127.0.0.1';
   const publicOrigin = options.publicOrigin ? validatePublicOrigin(options.publicOrigin) : undefined;
+  const workspaceGateway=Boolean(publicOrigin && existsSync(resolve(stateRoot(),'workspace','binding.json')));
   if (!isLoopback(bind) && !publicOrigin) {
     lock.release();
     throw new FleetError('forbidden', 'a non-loopback bind requires an explicit --public-origin');
   }
   const access = options.access ?? new WebAccessStore(webDir).read();
+  const bindingFile=resolve(stateRoot(),'workspace','binding.json');
+  let appOrigin:string|undefined;
+  try {if(existsSync(bindingFile))appOrigin=validateAccountOrigin(JSON.parse(readFileSync(bindingFile,'utf8')).appOrigin);}catch(error){lock.release();throw error;}
   const auth = new WebAuth(
     publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
     publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,
     Date.now, new TrustedDeviceStore(webDir),
-    access,
+    access, new WorkspaceDeviceStore(webDir),appOrigin,
   );
   const backend = pickBackend();
   const repository = new RoleRepository({
@@ -103,6 +127,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
   });
   const events = new FleetEventBus();
+  const roleMutations = new Set<() => void>();
+  const signalRoleMutation = () => { for (const listener of roleMutations) listener(); };
+  const observeRole = (roleId: string, listener: (state: ConversationRoleState) => void) => new ConversationRoleObserver({
+    roleId, configPath: options.configPath,
+    subscribeMutations: changed => { roleMutations.add(changed); return () => { roleMutations.delete(changed); }; },
+  }, listener);
   const audit = new AuditSink();
   const watchdogConfigProvider = cachedConfigProvider(options.configPath);
   const log = options.log ?? (() => {});
@@ -141,6 +171,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         ? 'ready' : detail?.status.overall === 'attention' ? 'attention' : 'unknown';
     },
     onProgress: action => {
+      signalRoleMutation();
       events.publish('creation.changed', action, action.roleId);
       void audit.record({
         roleId: action.roleId, action: `creation.${action.state}`,
@@ -156,6 +187,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     repository, ops, configPath: options.configPath,
     status: async roleId => (await query.detail(roleId)).status,
     onProgress: receipt => {
+      signalRoleMutation();
       events.publish('action.changed', receipt, receipt.roleId);
       void audit.record({
         roleId: receipt.roleId, action: `lifecycle.${receipt.action}`,
@@ -178,9 +210,31 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
-    taskRooms: new TaskRoomApplicationService(options.configPath),
+    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration, observeRole,
+    resourceScope:{configPath:configuration.path,subscribeMutations:listener=>events.subscribeResources(listener)},
+    invalidateResourceCaches:()=>{watchdogConfigProvider.invalidate();watchdogFindings.invalidate();},
+    taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
+    roomLayouts: new RoomLayoutDefinitions(options.configPath),
+    layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),
+    presetProvenance: new PresetProvenance(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
+    // Same boundary as `ours-fleet init --settings`: existing files are preserved, missing defaults are added.
+    onboardingSetup: async answers => {
+      await executeInitAnswers(answers, configuration.path, {
+        async hostSetup() {
+          for (const directory of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(directory, { recursive: true });
+          await pickBackend().init(options.binPath);
+        },
+        publish: publishSetup,
+      });
+    },
+    codexModels: createCodexModelDiscovery(),
+    subscriptions: new SubscriptionService({
+      agents: async () => (await query.list(true)).map(({ role, status }) => ({
+        roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',
+      })),
+      onChange: () => events.publish('subscription.changed', {}),
+    }),
     async session(roleId) {
       const role = await repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
@@ -188,7 +242,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
           || role.configuredBackend === 'codex-app-server') {
         const dir = repository.stateDir(role);
         if (!dir) throw new FleetError('control_unavailable', 'role state directory is unavailable');
-        return new RoleSessionControlAdapter(dir);
+        return new RoleSessionControlAdapter(dir, undefined, undefined, listener => observeRole(roleId, listener));
       }
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
@@ -198,42 +252,65 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw error;
   }
   let address: string;
-  try { address = await server.app.listen({ host: bind, port: requestedPort }); }
+  try { address = await server.app.listen({ host: workspaceGateway?'127.0.0.1':bind, port: workspaceGateway?0:requestedPort }); }
   catch (error) { await server.close(); lock.release(); throw error; }
   const actual = new URL(address);
   const localHost = `127.0.0.1:${actual.port}`;
   const browserOrigin = publicOrigin?.origin ?? `http://${localHost}`;
   const browserHost = publicOrigin?.host ?? localHost;
+  let gateway:ReturnType<typeof createPrefixGateway>|undefined;
+  if(workspaceGateway)try{
+    const profile=readClientProfile(),provider=new URL(profile.serverUrl),credential=readPrivateFile(profile.credentialPath,4096).toString('utf8').trim();
+    const basePath=provider.pathname.replace(/\/$/,'');
+    const services:ServiceTarget[]=['daemon','cowork','messenger','notifications'].map(name=>({prefix:'/'+name,origin:provider.origin,upstreamPrefix:basePath+'/'+name,stripBrowserContext:true,headers:{'X-Ours-Api-Token':credential,...(name==='messenger'?{Origin:provider.origin,'X-Ours-Messenger-CSRF':'1'}:name==='cowork'?{Origin:provider.origin}:{})},
+      // The App reports a visible page to the notification service, so an open app is not sent a push.
+      ...(name==='notifications'?{deviceSocketPaths:['/api/v1/presence']}:{})}));
+    gateway=createPrefixGateway({auth:server.auth,fleetOrigin:address,services,audit});
+    const listen = (port:number) => new Promise<void>((resolve,reject)=>{gateway!.server.once('error',reject);gateway!.server.listen(port,bind,()=>{gateway!.server.off('error',reject);resolve();});});
+    try { await listen(requestedPort); }
+    catch(error) {
+      const selection=resolve(webDir,'port-selection.json');
+      if((error as NodeJS.ErrnoException).code!=='EADDRINUSE' || !existsSync(selection) || JSON.parse(readPrivateFile(selection,4096).toString()).expiresAt<=Date.now())throw error;
+      await listen(0);
+    }
+    const bound=gateway.server.address();if(!bound || typeof bound==='string')throw Error('Workspace listener did not bind');
+    requestedPort=bound.port;
+    replaceFileAtomically(resolve(webDir,'workspace-port.json'),JSON.stringify({port:requestedPort})+'\n',0o600);
+  }catch(error){await gateway?.close().catch(()=>{});await server.close();lock.release();throw error;}
   server.auth.setBoundary(browserOrigin, browserHost, publicOrigin ? {
     // nginx's safe default uses the loopback upstream as Host. The declared
     // browser Origin remains mandatory for auth/mutations and WebSocket hello,
     // so operators do not need a fragile Host-rewrite incantation.
-    hosts: [localHost, `localhost:${actual.port}`],
+    hosts: [localHost, `localhost:${actual.port}`,...(workspaceGateway?[`127.0.0.1:${requestedPort}`,`localhost:${requestedPort}`]:[])],
   } : {
     hosts: [`localhost:${actual.port}`], origins: [`http://localhost:${actual.port}`],
   });
-  let control: WebControlServer;
+  let control: WebControlServer | undefined;
   try {
-    control = await startWebControlServer({
+    if (options.control !== false) control = await startWebControlServer({
       dir: webDir,
-      onOpen() {
-        const url = access.mode === 'pairing'
-          ? `${browserOrigin}/#bootstrap=${server.auth.mintBootstrap()}` : `${browserOrigin}/`;
-        openBrowser(url);
-      },
+      onLinkDevice() { return {version:1,origin:browserOrigin,...server.auth.workspaceEnrollment()}; },
       onRevokeAll() { server.auth.revokeAllTrustedDevices(); },
     });
   } catch (error) {
+    await gateway?.close();
     await server.close();
     lock.release();
     throw error;
   }
-  if (options.open !== false) openBrowser(access.mode === 'pairing'
-    ? `${browserOrigin}/#bootstrap=${server.auth.bootstrapSecret}` : `${browserOrigin}/`);
+  let stopTunnel:()=>Promise<void>;
+  try { stopTunnel=startWorkspaceTunnel(browserOrigin); }
+  catch(error) {
+    try { await control?.close(); await gateway?.close(); await server.close(); }
+    finally { lock.release(); }
+    throw error;
+  }
+  const notifications = notificationConfig ? new FleetNotificationProducer(
+    [agentsRoot(), tmpRoot()], resolve(webDir, 'notification-outboxes'), notificationConfig, options.log) : undefined;
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await control.close(); await server.close(); }
+      try { await stopTunnel(); await notifications?.close(); await control?.close(); await gateway?.close(); await server.close(); }
       finally { lock.release(); }
     },
   };
@@ -241,13 +318,4 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
 
 function isLoopback(host: string): boolean {
   return ['127.0.0.1', 'localhost', '::1'].includes(host);
-}
-
-function openBrowser(url: string): void {
-  const command = process.platform === 'darwin' ? 'open'
-    : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
-  const child = spawn(command, args, { stdio: 'ignore', detached: true, shell: false });
-  child.on('error', () => undefined);
-  child.unref();
 }

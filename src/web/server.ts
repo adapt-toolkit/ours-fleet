@@ -1,8 +1,23 @@
-import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { FleetResourceViews, ResourceBindingError, canonicalResourceDescriptor, type ResourceDescriptor } from './resource-views.js';
+import { publishFleetResourceCommit } from '../application/resource-observer.js';
+import { stateRoot, defaultConfigPath } from '../paths.js';
+import type { FleetResourceScope } from '../application/resource-observer.js';
+import { conversationPreview } from '../application/conversation-history.js';
+import { registerConversationStream } from './conversation-stream.js';
+import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
+import { conversationHasAttachment } from '../application/conversation-history.js';
+import { readDeliveredFile } from '../file-delivery/store.js';
+import { WorkspaceDeviceAuthError } from './workspace-devices.js';
+import { readFileSync } from 'node:fs';
+import { packagedPresetRoot } from '../preset-bootstrap.js';
+import { validateCatalog, type CatalogModel, type InitAnswers, type Subscription, type WorkKind } from '../init-wizard.js';
+import { getAdapter } from '../harness/registry.js';
+import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
+import { readChatIdle } from '../temp-idle.js';
+import { agentDir } from '../paths.js';
+import { SupervisorOursTools, type SupervisorToolRequest } from '../application/supervisor-ours-tools.js';
+import { join } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
-import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import type { WebSocket } from 'ws';
 import { createHmac, randomBytes } from 'node:crypto';
@@ -28,10 +43,28 @@ import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
+import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
+import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
+import type { TaskRecord } from '../rooms-tasks/types.js';
+import {
+  appendTaskProgress, getTaskReview, listTaskProgress, publicProgressEntry, publicReview, readTaskReviewArtifact,
+  setTaskReviewMarkdown, taskContributionSummary, TaskReviewError,
+} from '../rooms-tasks/task-review.js';
+import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
+import type { OfferedModels } from '../subscriptions/cli.js';
+import type { SubscriptionService } from '../subscriptions/service.js';
+
+import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
+
+const ONBOARDING_WORK = ['coordination', 'development', 'review'] as const;
 
 export interface WebServices {
+  resourceScope?: FleetResourceScope;
+  invalidateResourceCaches?(): void;
+  observeRole?(roleId: string, listener: (state: ConversationRoleState) => void): ConversationRoleObservation;
+  layoutBindings?: Pick<LayoutBindingGrants, 'control'>;
   query: FleetQueryService;
   repository: RoleRepository;
   session(roleId: string): Promise<RoleSessionControl>;
@@ -47,6 +80,14 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
+  roomLayouts?: RoomLayoutDefinitions;
+  presetProvenance?: PresetProvenance;
+  oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
+  subscriptions?: SubscriptionService;
+  /** First-time setup from the packaged presets; the account App supplies only the model choices. */
+  onboardingSetup?(answers: InitAnswers): Promise<void>;
+  /** The Codex models the runtime that sessions will use offers the active account. Absent: this server cannot tell, and filters nothing. */
+  codexModels?(): Promise<OfferedModels>;
 }
 
 export interface WebServer {
@@ -84,29 +125,57 @@ export async function buildWebServer(
   app.addHook('onRequest', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
-    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-    reply.header('X-Frame-Options', 'DENY');
-    reply.header('Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ` +
-      `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
-      `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
+    reply.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=(), payment=()');
+    // Fleet serves an API only: nothing it returns may run, load or be framed as a page.
+    reply.header('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
-    try { auth.validateBoundary(request, false); }
-    catch (error) {
-      if (request.url.startsWith('/api/')) throw error;
-      const message = normalizeError(error).message;
-      return reply.code(421).type('text/html').send(`<!doctype html><html><head><title>Fleet console address</title></head><body><main><h1>This fleet-console address is not configured</h1><p>${escapeHtml(message)}</p><p>For nginx or VPS access, configure an explicit public origin. The console does not guess proxy hosts.</p></main></body></html>`);
+    if (auth.appOrigin && request.headers.origin === auth.appOrigin && request.url.startsWith('/api/')) {
+      reply.header('Access-Control-Allow-Origin',auth.appOrigin).header('Vary','Origin');
+      reply.header('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      // The App binds resource reads by these headers; it must be able to send and read them cross-origin.
+      reply.header('Access-Control-Expose-Headers','X-Ours-Workspace-Auth, X-Ours-Request-Id, X-Resource-Producer, X-Resource-Revision, X-Resource-Source-Generation, X-Resource-Source-Position, X-Resource-Connection, X-Resource-View, X-Resource-Epoch, X-Resource-Baseline');
+      reply.header('Access-Control-Allow-Headers','Authorization,Content-Type,X-CSRF-Token,Idempotency-Key,X-Ours-Messenger-CSRF,X-Resource-Connection,X-Resource-View,X-Resource-Epoch,X-Resource-Baseline');
+      if (request.method === 'OPTIONS') {auth.validateBoundary(request,false);return reply.code(204).send();}
+    }
+    auth.validateBoundary(request, false);
+  });
+
+  app.addHook('onResponse',async(request,reply)=>{
+    if(reply.statusCode<400 && ['POST','PUT','PATCH','DELETE'].includes(request.method) && !request.url.includes('/resource-subscriptions')) {
+      publishFleetResourceCommit(services.configuration?.path??defaultConfigPath());
+      publishFleetResourceCommit(stateRoot());
     }
   });
 
+  app.post<{ Params: { id: string } }>('/api/v1/layout-bindings/:id/control', async request => {
+    // Initial support is direct same-host Fleet-to-Fleet transport.
+    const forwarded = Object.keys(request.headers).some(name =>
+      name === 'forwarded' || name.startsWith('x-forwarded-') || name === 'x-real-ip' || name === 'via');
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.ip) || forwarded)
+      throw new FleetError('forbidden', 'layout bindings require direct loopback access');
+    // Machine credentials cannot authenticate browser or lifecycle routes.
+    if (request.headers.origin) auth.validateBoundary(request, true);
+    if (!services.layoutBindings) throw new FleetError('capability_unavailable', 'layout bindings unavailable');
+    return services.layoutBindings.control(request.params.id, request.headers.authorization, request.body);
+  });
+
   app.setErrorHandler(async (error, request, reply) => {
-    const fleetError = normalizeError(error, request.id);
+    if(error instanceof ResourceBindingError)return reply.code(error.status).send({error:{code:'resource_binding',message:error.message}});
+    const privateToolParseError = ['/api/v1/roles/:id/ours/call', '/api/v1/layout-bindings/:id/control'].includes(request.routeOptions.url ?? '')
+      && error instanceof Error && 'code' in error
+      && typeof error.code === 'string' && error.code.startsWith('FST_ERR_CTP_');
+    const fleetError = normalizeError(privateToolParseError
+      ? new FleetError('invalid_request', 'expected a valid JSON tool request') : error, request.id);
     await audit.record({
       requestId: request.id, action: `${request.method} ${request.routeOptions.url ?? request.url}`,
       result: 'rejected', errorCode: fleetError.code,
     });
+    if (error instanceof WorkspaceDeviceAuthError) reply.header('X-Ours-Workspace-Auth', 'rejected');
+    if (fleetError.code === 'unauthorized') reply.header('X-Ours-Request-Id', request.id);
     reply.code(statusFor(fleetError.code)).send({ error: fleetError.toJSON() });
   });
+
+  registerConversationStream(app, services, auth);
 
   app.post('/api/v1/auth/exchange', async (request, reply) => {
     const { session, device } = auth.exchange(request);
@@ -153,15 +222,121 @@ export async function buildWebServer(
     return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
   });
 
+  app.get('/api/v1/workspace/identity',async () => auth.workspaceIdentity());
+  app.post('/api/v1/devices/enroll',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    const input=request.body as { enrollment: string; workspaceId: string; label: string; credential?: unknown };
+    if (!input) throw new FleetError('invalid_request','device enrollment body required');
+    return auth.enrollWorkspace(request,input);
+  });
+  // Refresh credentials travel between the account server and this host; these routes refuse browsers.
+  const refreshInput=(request: { body: unknown }, name: 'refreshToken' | 'refreshHash') => {
+    const value=(request.body as Record<string, unknown> | null)?.[name];
+    if (typeof value!=='string') throw new FleetError('invalid_request',`${name} is required`);
+    return value;
+  };
+  app.post('/api/v1/devices/refresh',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.refreshWorkspace(request,refreshInput(request,'refreshToken'));
+  });
+  app.post('/api/v1/devices/exchange',async (request,reply) => {
+    reply.header('Cache-Control','no-store');
+    return auth.exchangeWorkspace(request);
+  });
+  app.post('/api/v1/devices/revoke',async request => ({revoked:auth.revokeWorkspaceRefresh(request,refreshInput(request,'refreshHash'))}));
+  app.post('/api/v1/devices/link',async (request,reply) => {
+    const proof=(request.body as Record<string, unknown> | null)?.refreshToken;
+    if (proof!==undefined) {
+      reply.header('Cache-Control','no-store');
+      const {enrollment,enrollmentExpiresAt,...credentials}=auth.linkWorkspaceDevice(request,refreshInput(request,'refreshToken'));
+      return {...credentials,code:{version:1,origin:auth.origin,enrollment,workspaceId:credentials.workspaceId,expiresAt:enrollmentExpiresAt}};
+    }
+    const session=auth.authenticate(request,true);
+    // A short-lived access credential must not be able to create a lasting one.
+    if (session.rotating) throw new FleetError('forbidden','linking another device requires this link\'s refresh credential');
+    return {version:1,origin:auth.origin,...auth.workspaceEnrollment(session.id)};
+  });
+  app.get('/api/v1/devices/current',async request => {
+    const session=auth.authenticate(request);
+    if (!session.id.startsWith('workspace:')) throw new FleetError('resource_not_found','no workspace device');
+    return {deviceId:session.id.slice(10),authorizedUntil:session.absoluteExpiresAt};
+  });
+  app.get('/api/v1/devices',async request => {auth.authenticate(request);return {devices:auth.listWorkspaceDevices()};});
+  app.delete<{Params:{id:string}}>('/api/v1/devices/:id',async request => {auth.authenticate(request,true);auth.revokeWorkspaceDevice(request.params.id);return {revoked:true};});
+
   app.get('/api/v1/meta', async request => {
     auth.authenticate(request);
     return {
-      version: VERSION, api: { major: 1, minor: 0 },
+      version: VERSION, api: { major: 1, minor: 1 },
       websocketProtocols: [
         'ours-fleet-events.v1', 'ours-fleet-conversation.v1',
       ],
       auditDegraded: audit.degraded,
     };
+  });
+
+  let onboardingObserved: { owner: string; revision: unknown; payload: Record<string, unknown> } | undefined;
+  app.get<{ Querystring: { view?: string } }>('/api/v1/onboarding',async request=>{
+    const browser=auth.authenticate(request);
+    const revision=services.configuration?.read().revision;
+    // Opening an existing workspace needs configuration state, not CLI/account discovery.
+    // Keep the full report for the setup screens and older App clients.
+    if(request.query.view==='state')return {configured:onboardingConfigured()};
+    const harnesses=await Promise.all((['codex','claude-code'] as const).map(async harness=>{
+      try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
+    }));
+    const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
+    // Codex models are offered only when the runtime itself listed them for the active account.
+    // When it could not be asked, none is offered and the reason is reported.
+    const codexModels=services.codexModels ? await services.codexModels() : undefined;
+    const offered=(model:CatalogModel)=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model));
+    const payload = {harnesses,catalog:catalog.models.filter(offered),...(codexModels?{codexModels:codexModels.state==='known'?{state:'known'}:codexModels}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    if(revision===services.configuration?.read().revision) { onboardingObserved={owner:browser.id,revision,payload}; events.publish('onboarding.changed',{}); }
+    return payload;
+  });
+
+  // First-time setup is what creates the persistent coordinator. A configuration that loads and
+  // has it is set up, whatever its brains are called; its models are then changed by editing it.
+  const onboardingConfigured=():boolean=>{
+    if(!services.configuration)return false;
+    try{return Boolean(services.configuration.read(false).model.agents.FleetCoordinator);}catch{return false;}
+  };
+  let onboardingSetupQueue:Promise<unknown>=Promise.resolve();
+
+  app.post('/api/v1/onboarding/setup',async request=>{
+    auth.authenticate(request,true);
+    if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
+    const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown}>}|undefined)?.models;
+    const codexModels=services.codexModels ? await services.codexModels() : undefined;
+    const supported=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8'))).models
+      .filter(model=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model)));
+    const models={} as Record<WorkKind,CatalogModel>;
+    for(const work of ONBOARDING_WORK){
+      const matches=supported.filter(model=>model.harness===requested?.[work]?.harness && model.model===requested?.[work]?.model);
+      if(matches.length!==1)throw new FleetError('invalid_request',`choose a supported model for ${work}`);
+      models[work]=matches[0];
+    }
+    const chosen=Object.values(models);
+    const subscriptions=[...new Set(chosen.map(model=>model.harness==='codex'?'codex':'claude'))] as Subscription[];
+    const oneModel=new Set(chosen.map(model=>`${model.harness}\0${model.model}`)).size===1;
+    const configuration=services.configuration,setup=services.onboardingSetup;
+    // One setup at a time: the first-time check and the publication it guards must not interleave.
+    const run=onboardingSetupQueue.then(async()=>{
+      if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});}
+      catch(error){throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);}
+      // Setup preserves files it finds, so confirm the published models are the ones this request chose.
+      // The prepared agents reference packaged Brain presets, so resolve what each of them now points at:
+      // a preserved file of a packaged name may hold another model, session or reasoning than its name says.
+      const published=configuration.read(true).model,brains=published.brains ?? {};
+      const brainOf=(holder:Record<string,unknown>|undefined)=>brains[String((holder?.brain as {ref?:unknown}|undefined)?.ref ?? '')];
+      const assigned:Record<WorkKind,Record<string,unknown>|undefined>={coordination:brainOf(published.agents.FleetCoordinator),development:brainOf(published.agent_templates?.Developer),review:brainOf(published.agent_templates?.Critic)};
+      for(const work of ONBOARDING_WORK)if(assigned[work]?.harness!==models[work].harness || assigned[work]?.model!==models[work].model || assigned[work]?.session!==models[work].session || assigned[work]?.effort!=='medium')
+        throw new FleetError('conflict','Fleet was set up with different models; review its configuration');
+      return {configured:true};
+    });
+    onboardingSetupQueue=run.catch(()=>{});
+    return run;
   });
 
   app.get('/api/v1/creation-capabilities', async request => {
@@ -190,7 +365,11 @@ export async function buildWebServer(
 
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
-    return { roles: await services.query.list() };
+    const query = request.query as { includeTemporary?: string };
+    // Unbound REST retains the existing problem-bearing inventory. Bound reads
+    // are handled by the strict resource preHandler before this route.
+    services.invalidateResourceCaches?.();
+    return { roles: await services.query.list(query.includeTemporary === 'true') };
   });
 
   const taskApi = async <T>(fn: () => T | Promise<T>): Promise<T> => {
@@ -202,20 +381,155 @@ export async function buildWebServer(
             ? 'conflict' : 'invalid_request';
         throw new FleetError(code, error.message);
       }
+      if (error instanceof TaskStateError && 'accepted' in error && error.accepted === false) return Promise.reject(Object.assign(new FleetError('invalid_request',error.message),{memberNotAccepted:true}));
       if (error instanceof TaskStateError) {
         throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'conflict', error.message);
       }
       throw error;
     }
   };
+  const reviewApi = async <T>(fn: () => T | Promise<T>): Promise<T> => taskApi(async () => {
+    try { return await fn(); }
+    catch (error) {
+      if (error instanceof TaskReviewError) {
+        const code = error.code === 'not_found' ? 'resource_not_found' : error.code === 'limit_exceeded' ? 'conflict' : error.code;
+        throw new FleetError(code, error.message);
+      }
+      if (error instanceof TaskStateError && error.message.startsWith('invalid task ID'))
+        throw new FleetError('resource_not_found', 'task not found');
+      throw error;
+    }
+  });
+  /** Browser task payloads carry Progress/To review counts; bodies have their own routes. */
+  const wireTask = <T extends TaskRecord>(task: T) => {
+    const { progress: _progress, review: _review, ...rest } = task;
+    return { ...rest, ...taskContributionSummary(task) };
+  };
+  const wireTaskResult = <T>(result: T): T => {
+    const value = result as Record<string, unknown> | undefined;
+    if (value && typeof value === 'object' && value.task && typeof value.task === 'object')
+      return { ...value, task: wireTask(value.task as TaskRecord) } as T;
+    return result;
+  };
   const requireTaskRooms = (): TaskRoomApplicationService => {
     if (!services.taskRooms) throw new FleetError('capability_unavailable', 'task operations are unavailable');
     return services.taskRooms;
   };
 
+  const projectTasks = async (query: Record<string,string|undefined>, strict = true) => {
+    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
+    if (query.state && query.state !== 'all' && !states.includes(query.state))
+      throw new FleetError('invalid_request', 'invalid task state filter');
+    if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
+      throw new FleetError('invalid_request', 'groupByList must be true or false');
+    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
+      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
+    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
+    const filter = { strict, ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
+      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
+    const api = requireTaskRooms();
+    return taskApi(() => query.groupByList === 'true'
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })) }
+      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))) });
+  };
+  const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
+    signal.throwIfAborted(); services.invalidateResourceCaches?.();
+    switch(descriptor.resource) {
+      case 'task-layout':
+        try {return {layout:await taskApi(()=>requireTaskRooms().taskLayout(descriptor.entityId!))};}
+        catch(error) {if((error as any)?.code==='task_not_found' || (error as any)?.code==='resource_not_found')return {deleted:true,id:descriptor.entityId};throw error;}
+      case 'creation-action': return services.creation.get(descriptor.entityId!) ?? {deleted:true,id:descriptor.entityId};
+      case 'action': return services.commands.get(descriptor.entityId!) ?? {deleted:true,id:descriptor.entityId};
+      case 'member-addition':
+        try{return await taskApi(()=>requireTaskRooms().memberAddition(descriptor.entityId!,descriptor.receiptId!));}
+        catch(error){if(['task_not_found','resource_not_found'].includes((error as any)?.code) || (error as Error)?.message==='Member request not found')return {deleted:true,id:descriptor.receiptId};throw error;}
+      case 'login':
+        // A foreign login must never be delivered, including its URL/device code.
+        try{return subscriptions().login(descriptor.entityId!,owner).view();}
+        catch(error){if((error as any)?.code==='resource_not_found')return {deleted:true,id:descriptor.entityId};throw error;}
+      case 'subscriptions': return {providers:await subscriptions().list(true)};
+      case 'onboarding-health': {
+        const revision=services.configuration?.read().revision;
+        if(onboardingObserved && onboardingObserved.revision!==revision)onboardingObserved=undefined;
+        const observed=onboardingObserved?.owner===owner ? onboardingObserved : undefined;
+        return {...observed?.payload,observationCurrent:!!observed,configured:onboardingConfigured(),providers:services.subscriptions?await services.subscriptions.list(true):[]};
+      }
+
+      case 'roles': return {roles: await services.query.list(descriptor.includeTemporary ?? false, true)};
+      case 'tasks': return projectTasks({state:descriptor.state,list:descriptor.list,groupByList:String(descriptor.groupByList??false),includeDeleting:String(descriptor.includeDeleting??false)});
+      case 'task-lists': return {lists:requireTaskRooms().listTaskLists()};
+      case 'configuration':
+        if(!services.configuration)throw new FleetError('capability_unavailable','fleet configuration editing is unavailable');
+        return {...services.configuration.read(descriptor.includeDefinitions??false), provenance:services.presetProvenance?.read() ?? null};
+      case 'directory': {
+        const [roles,tasks]=await Promise.all([services.query.list(true,true),projectTasks({})]);
+        return {roles,tasks:(tasks as {tasks:unknown[]}).tasks,lists:requireTaskRooms().listTaskLists()};
+      }
+      case 'previews': {
+        const roles=await services.repository.list(true),selected=new Map(roles.map(role=>[role.id,role]));
+        const previews:Record<string,unknown>={};
+        for(const id of descriptor.ids??[]) {
+          signal.throwIfAborted(); const role=selected.get(id),dir=role && services.repository.stateDir(role);
+          if(!role)continue;
+          try {
+            previews[id]=dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
+          } catch {
+            signal.throwIfAborted();
+            // A damaged/unreadable ledger is unavailable, not empty or removed.
+            // Keep this selected row observable so a repair can refresh it,
+            // without retiring previews for the other selected roles.
+            previews[id]={text:'Preview unavailable',at:'',unavailable:true};
+          }
+        }
+        return {previews};
+      }
+    }
+  };
+  const resources=new FleetResourceViews(services.resourceScope??{},project,()=>services.configuration?.resourceValidationInputs?.()??[]);
+  app.addHook('preClose',async()=>resources.close());
+  app.get('/api/v1/resource-events', async (request,reply)=>{
+    const browser=auth.authenticate(request);
+    reply.hijack();
+    // A hijacked reply bypasses Fastify headers: keep the exact-origin CORS and security headers.
+    for (const [name, value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name, Array.isArray(value) ? value : String(value));
+    reply.raw.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform',Connection:'keep-alive','X-Accel-Buffering':'no'});reply.raw.flushHeaders();
+    const opened=resources.open(reply.raw,browser.id,()=>auth.sessionValid(browser));
+    const binding=auth.bindTransport(browser,opened.close);
+    reply.raw.once('close',()=>binding());
+  });
+  app.post('/api/v1/resource-subscriptions',async (request,reply)=>{
+    const browser=auth.authenticate(request,true),body=request.body as any;
+    const binding=resources.register(browser.id,String(body?.connectionId??''),String(body?.viewId??''),body?.subscriptionEpoch,body?.descriptor);
+    const retire=()=>{
+      if(reply.raw.writableFinished)return;
+      try {resources.remove(browser.id,String(body.connectionId),String(body.viewId),body.subscriptionEpoch);} catch { /* Connection may already be closed. */ }
+    };
+    reply.raw.once('close',retire);
+    reply.raw.once('finish',()=>reply.raw.off('close',retire));
+    if(reply.raw.destroyed)retire();
+    return binding;
+  });
+  app.delete('/api/v1/resource-subscriptions',async request=>{
+    const browser=auth.authenticate(request,true),body=request.body as any;
+    resources.remove(browser.id,String(body?.connectionId??''),String(body?.viewId??''),body?.subscriptionEpoch);return {removed:true};
+  });
+  // Bound reads return precisely the registered initial capture, never an unrelated GET.
+  app.addHook('preHandler',async(request,reply)=>{
+    if(request.method!=='GET' || !request.headers['x-resource-connection'])return;
+    const browser=auth.authenticate(request),headers=request.headers;
+    const baseline=await resources.bound(browser.id,String(headers['x-resource-connection']),String(headers['x-resource-view']),Number(headers['x-resource-epoch']),String(headers['x-resource-baseline']));
+    const expected='/api/v1/'+baseline.descriptor.resource;
+    if(request.url.split('?')[0]!==expected)throw new ResourceBindingError(409,'resource route mismatch');
+    for(const name of ['Connection','View','Epoch','Baseline'])reply.header('X-Resource-'+name,String(headers['x-resource-'+name.toLowerCase()]));
+    reply.header('X-Resource-Producer',baseline.producerGeneration).header('X-Resource-Revision',baseline.revision).header('X-Resource-Source-Generation',baseline.source.producerGeneration).header('X-Resource-Source-Position',baseline.source.position);
+    return reply.send(baseline.payload);
+  });
+  for(const resource of ['task-layout','creation-action','action','member-addition','login','onboarding-health'] as const) app.get('/api/v1/'+resource,async()=>{throw new ResourceBindingError(409,'resource binding required');});
+  app.get('/api/v1/directory',async request=>{auth.authenticate(request);return project({viewId:'read',resource:'directory'},new AbortController().signal);});
+  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const ids=String((request.query as any).ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids}),new AbortController().signal);});
   app.get('/api/v1/task-lists', async request => {
     auth.authenticate(request);
-    return { lists: requireTaskRooms().listTaskLists() };
+    return project({viewId:'read',resource:'task-lists'},new AbortController().signal);
   });
   app.post('/api/v1/task-lists', async (request, reply) => {
     auth.authenticate(request, true);
@@ -237,22 +551,7 @@ export async function buildWebServer(
   });
   app.get('/api/v1/tasks', async request => {
     auth.authenticate(request);
-    const query = request.query as {
-      state?: string; list?: string; groupByList?: string; includeDeleting?: string;
-    };
-    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
-    if (query.state && query.state !== 'all' && !states.includes(query.state))
-      throw new FleetError('invalid_request', 'invalid task state filter');
-    if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
-      throw new FleetError('invalid_request', 'groupByList must be true or false');
-    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
-      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
-    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
-    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
-      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
-    return taskApi(() => query.groupByList === 'true'
-      ? { groups: requireTaskRooms().groupedTasks(filter) }
-      : { tasks: requireTaskRooms().listTasks(filter) });
+    return projectTasks(request.query as Record<string,string>, false);
   });
   app.delete('/api/v1/tasks/:id', async (request, reply) => {
     auth.authenticate(request, true);
@@ -282,30 +581,217 @@ export async function buildWebServer(
     const body = request.body as Record<string, unknown>;
     if (typeof body?.title !== 'string' || !body.title)
       throw new FleetError('invalid_request', 'title is required');
+    // Every task runs a saved Room Layout; rooms are never defined inline or from room templates here.
+    if (typeof body.layout !== 'string' || !body.layout)
+      throw new FleetError('invalid_request', 'layout is required: choose a room layout from Settings › Room layouts');
+    if (body.template !== undefined || body.noRoom !== undefined)
+      throw new FleetError('invalid_request', 'tasks use room layouts; template and noRoom are not accepted');
     const task = await taskApi(() => requireTaskRooms().createTask({
       actor: { kind: 'local_control', surface: 'web' }, title: body.title as string,
       brief: typeof body.brief === 'string' ? body.brief : undefined,
-      template: typeof body.template === 'string' ? body.template : undefined,
-      backlog: body.backlog === true, noRoom: body.noRoom === true,
+      backlog: body.backlog === true,
       list: typeof body.list === 'string' ? body.list : undefined,
+      layout: body.layout as string,
       idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
     }));
-    reply.code(201); return { task };
+    reply.code(201); return { task: wireTask(task) };
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);
     const taskId = (request.params as { id: string }).id;
     const list = String((request.body as { list?: unknown })?.list ?? '');
-    return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
+    return { task: wireTask(await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list }))) };
   });
 
+  app.patch('/api/v1/tasks/:id/description', async request => {
+    auth.authenticate(request, true);
+    const body = request.body as { brief?: unknown; expectedBrief?: unknown };
+    if (typeof body?.brief !== 'string' || typeof body.expectedBrief !== 'string' || body.brief.length > 100_000)
+      throw new FleetError('invalid_request', 'brief and expectedBrief must be strings; brief maximum is 100000 characters');
+    return { task: wireTask(await taskApi(() => requireTaskRooms().editTaskDescription({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+      brief: body.brief as string, expectedBrief: body.expectedBrief as string,
+    }))) };
+  });
+
+  app.get('/api/v1/tasks/:id', async request => {
+    auth.authenticate(request);
+    return wireTaskResult(await taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id)));
+  });
+  app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async request => {
+    auth.authenticate(request);
+    return { progress: (await reviewApi(() => listTaskProgress(request.params.id))).map(publicProgressEntry) };
+  });
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body = request.body as { text?: unknown; requestKey?: unknown };
+    const header = request.headers['idempotency-key'];
+    const requestKey = typeof body?.requestKey === 'string' ? body.requestKey : typeof header === 'string' ? header : undefined;
+    if (typeof body?.text !== 'string' || (body.requestKey !== undefined && typeof body.requestKey !== 'string'))
+      throw new FleetError('invalid_request', 'text must be a string; requestKey, when given, a string');
+    const result = await reviewApi(() => appendTaskProgress(request.params.id, {
+      text: body.text as string, requestKey, author: { kind: 'local_control', surface: 'web' },
+    }));
+    if (!result.replayed) reply.code(201);
+    return { entry: publicProgressEntry(result.entry), replayed: result.replayed };
+  });
+  app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
+    auth.authenticate(request);
+    const review = await reviewApi(() => getTaskReview(request.params.id));
+    return { review: review ? publicReview(review) : null };
+  });
+  app.put<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
+    auth.authenticate(request, true);
+    const body = request.body as { markdown?: unknown; expectedMarkdown?: unknown };
+    if (typeof body?.markdown !== 'string' || typeof body.expectedMarkdown !== 'string')
+      throw new FleetError('invalid_request', 'markdown and expectedMarkdown must be strings');
+    const review = await reviewApi(() => setTaskReviewMarkdown(request.params.id, {
+      markdown: body.markdown as string, expectedMarkdown: body.expectedMarkdown as string,
+      author: { kind: 'local_control', surface: 'web' },
+    }));
+    return { review: publicReview(review) };
+  });
+  app.get<{ Params: { id: string; artifactId: string } }>('/api/v1/tasks/:id/review/artifacts/:artifactId', async (request, reply) => {
+    auth.authenticate(request);
+    const { artifact, bytes } = await reviewApi(() => readTaskReviewArtifact(request.params.id, request.params.artifactId));
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(artifact.name).replace(/'/g, '%27')}`);
+    return reply.type('application/octet-stream').send(bytes);
+  });
+  app.post('/api/v1/tasks/:id/members', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
+    try {
+      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+      reply.code(result.state==='running'?202:200);return result;
+    } catch(error) {
+      if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});
+      throw error;
+    }
+  });
+  app.get('/api/v1/tasks/:id/member-additions/:requestId', async request => {
+    auth.authenticate(request);
+    const {id,requestId}=request.params as {id:string;requestId:string};
+    return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
+  });
+  app.patch('/api/v1/tasks/:id/layout', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { layout?: unknown; expectedLayout?: unknown };
+    const name = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+    if (!name(body?.layout) || !(body.expectedLayout === null || name(body.expectedLayout)))
+      throw new FleetError('invalid_request', 'layout must be a layout name; expectedLayout a layout name or null');
+    const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
+      taskId: (request.params as { id: string }).id, layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
+    await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
+    return { task: wireTask(requireTaskRooms().withLayoutRooms(task)) };
+  });
+  app.get('/api/v1/tasks/:id/layout', async request => {
+    auth.authenticate(request);
+    return { layout: await taskApi(async () => requireTaskRooms().taskLayout((request.params as { id: string }).id)) };
+  });
+  for (const operation of ['open', 'close'] as const) {
+    app.post(`/api/v1/tasks/:id/layout/rooms/:room/${operation}`, async (request, reply) => {
+      const session = auth.authenticate(request, true);
+      const { id, room } = request.params as { id: string; room: string };
+      const accepted = await taskApi(() => requireTaskRooms().launchTaskLayoutOperation({
+        actor: { kind: 'local_control', surface: 'web' }, taskId: id, room,
+        operation: operation === 'open' ? 'open' : 'close-room',
+      }));
+      await audit.record({ requestId: request.id, browser: session.id, action: `task.layout.${operation}`, result: 'succeeded' });
+      reply.code(202); return { operation: accepted };
+    });
+  }
+  app.post('/api/v1/tasks/:id/layout/cleanup', async (request, reply) => {
+    auth.authenticate(request, true);
+    const accepted = await taskApi(() => requireTaskRooms().retryTaskLayoutCleanup({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+    }));
+    reply.code(202); return { operation: accepted };
+  });
+  app.get('/api/v1/task-templates', async request => {
+    auth.authenticate(request); return { templates: requireTaskRooms().listTemplates() };
+  });
+  const layouts = (): RoomLayoutDefinitions => {
+    if (!services.roomLayouts) throw new FleetError('capability_unavailable', 'room layout editing is unavailable');
+    return services.roomLayouts;
+  };
+  app.get('/api/v1/room-layouts', async request => {
+    auth.authenticate(request);
+    const list = layouts().list(), defaultLayout = layouts().defaultLayout(list);
+    return { layouts: list, ...(defaultLayout ? { default_layout: defaultLayout } : {}) };
+  });
+  app.post('/api/v1/room-layouts/validate', async request => {
+    auth.authenticate(request, true);
+    return layouts().validate((request.body as { definition?: unknown })?.definition);
+  });
+  app.put('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { revision?: unknown; definition?: unknown };
+    if (typeof body?.revision !== 'string') throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().save((request.params as { name: string }).name, body.revision, body.definition);
+    events.publish('room_layouts.changed', { name: result.name, revision: result.revision });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.save', result: 'succeeded' });
+    return result;
+  });
+  app.delete('/api/v1/room-layouts/:name', async request => {
+    const session = auth.authenticate(request, true);
+    const revision = (request.query as { revision?: string }).revision;
+    if (typeof revision !== 'string' || !revision) throw new FleetError('invalid_request', 'revision is required');
+    const result = await layouts().remove((request.params as { name: string }).name, revision);
+    events.publish('room_layouts.changed', { name: result.name });
+    await audit.record({ requestId: request.id, browser: session.id, action: 'room_layout.delete', result: 'succeeded' });
+    return result;
+  });
+  for (const action of ['start', 'block', 'unblock', 'review', 'finish', 'cancel'] as const) {
+    app.post(`/api/v1/tasks/:id/${action}`, async (request, reply) => {
+      auth.authenticate(request, true);
+      const taskId = (request.params as { id: string }).id;
+      const body = (request.body ?? {}) as { reason?: string; template?: string };
+      const input = { actor: { kind: 'local_control' as const, surface: 'web' as const }, taskId };
+      const api = requireTaskRooms();
+      return wireTaskResult(await taskApi(async () => {
+        switch (action) {
+          case 'start': {
+            // A task's layout can be chosen or changed but never removed, so this check cannot go stale.
+            if (!api.getTask(taskId).task.layout)
+              throw new FleetError('conflict', 'choose a room layout for this task before starting it');
+            const task = await api.startTask(input);
+            const provisioning = await api.launchTaskProvisioning(taskId);
+            if (provisioning.kind !== 'ready') reply.code(202);
+            return { task, provisioning };
+          }
+          case 'block':
+            if (typeof body.reason !== 'string' || !body.reason.trim()) throw new FleetError('invalid_request', 'reason is required');
+            return { task: api.blockTask({ ...input, reason: body.reason }) };
+          case 'unblock': return { task: api.unblockTask(input) };
+          case 'review': return { task: api.reviewTask(input) };
+          case 'finish':
+          case 'cancel': {
+            const plan = action === 'finish' ? await api.finishTask(input) : await api.cancelTask(input);
+            const task = plan.settlementRequired ? await api.launchTaskSettlement(taskId) : plan.task;
+            const pending = task.terminal_intent?.status === 'pending';
+            if (pending) reply.code(202);
+            return { task, pending };
+          }
+        }
+      }));
+    });
+  }
+
+  app.get('/api/v1/configuration/provenance', async request => {
+    auth.authenticate(request);
+    if (!services.presetProvenance) throw new FleetError('capability_unavailable', 'preset provenance is unavailable');
+    return { provenance: services.presetProvenance.read() };
+  });
   app.get('/api/v1/configuration', async request => {
     auth.authenticate(request);
     if (!services.configuration)
       throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
-    return services.configuration.read();
+    return project({viewId:'read',resource:'configuration',includeDefinitions:(request.query as {includeDefinitions?:string}).includeDefinitions==='true'},new AbortController().signal);
   });
 
   app.post('/api/v1/configuration/preview', async request => {
@@ -327,6 +813,93 @@ export async function buildWebServer(
       requestId: request.id, browser: session.id, action: 'configuration.save', result: 'succeeded',
     });
     return result;
+  });
+
+  // Claude Code / Codex subscription profiles. Responses carry account metadata
+  // only; token values never leave the CLI-owned credential files.
+  const subscriptions = () => {
+    if (!services.subscriptions)
+      throw new FleetError('capability_unavailable', 'subscription management is unavailable');
+    return services.subscriptions;
+  };
+  const provider = (raw: string): SubscriptionProvider => {
+    if (!isProvider(raw)) throw new FleetError('invalid_request', 'unknown subscription provider');
+    return raw;
+  };
+  const subscriptionsChanged = () => events.publish('subscription.changed', {});
+
+  app.get('/api/v1/subscriptions', async request => {
+    auth.authenticate(request);
+    return { providers: await subscriptions().list() };
+  });
+
+  app.post<{ Params: { provider: string } }>('/api/v1/subscriptions/:provider/logins', async (request, reply) => {
+    const session = auth.authenticate(request, true);
+    const login = await subscriptions().startLogin(provider(request.params.provider), session.id);
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.login.${request.params.provider}`, result: login.state });
+    reply.code(201);
+    return login;
+  });
+
+  app.get<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId', async request => {
+    const session = auth.authenticate(request);
+    return subscriptions().login(request.params.loginId, session.id).view();
+  });
+
+  app.post<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId/code', async request => {
+    const session = auth.authenticate(request, true);
+    const code = (request.body as { code?: unknown })?.code;
+    if (typeof code !== 'string') throw new FleetError('invalid_request', 'code is required');
+    const login = subscriptions().login(request.params.loginId, session.id);
+    login.submitCode(code.trim());
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.login.code.${request.params.provider}`, result: 'submitted' });
+    return login.view();
+  });
+
+  app.delete<{ Params: { provider: string; loginId: string } }>('/api/v1/subscriptions/:provider/logins/:loginId', async request => {
+    const session = auth.authenticate(request, true);
+    const login = subscriptions().login(request.params.loginId, session.id);
+    login.cancel();
+    return login.view();
+  });
+
+  app.post<{ Params: { provider: string } }>('/api/v1/subscriptions/:provider/active', async request => {
+    const session = auth.authenticate(request, true);
+    const profileId = (request.body as { profileId?: unknown })?.profileId;
+    if (typeof profileId !== 'string') throw new FleetError('invalid_request', 'profileId is required');
+    const view = await subscriptions().setActive(provider(request.params.provider), profileId);
+    subscriptionsChanged();
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.activate.${request.params.provider}`, result: 'succeeded' });
+    return view;
+  });
+
+  app.post<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId/check', async request => {
+    auth.authenticate(request, true);
+    return subscriptions().check(provider(request.params.provider), request.params.profileId);
+  });
+
+  app.post<{ Params: { profileId: string } }>('/api/v1/subscriptions/claude/profiles/:profileId/probe', async request => {
+    const session = auth.authenticate(request, true);
+    const usage = await subscriptions().probeClaudeUsage(request.params.profileId);
+    await audit.record({ requestId: request.id, browser: session.id, action: 'subscription.usage.probe.claude', result: usage.source });
+    return { usage };
+  });
+
+  app.patch<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId', async request => {
+    auth.authenticate(request, true);
+    const label = (request.body as { label?: unknown })?.label;
+    if (typeof label !== 'string') throw new FleetError('invalid_request', 'label is required');
+    await subscriptions().rename(provider(request.params.provider), request.params.profileId, label);
+    subscriptionsChanged();
+    return { ok: true };
+  });
+
+  app.delete<{ Params: { provider: string; profileId: string } }>('/api/v1/subscriptions/:provider/profiles/:profileId', async request => {
+    const session = auth.authenticate(request, true);
+    await subscriptions().remove(provider(request.params.provider), request.params.profileId);
+    subscriptionsChanged();
+    await audit.record({ requestId: request.id, browser: session.id, action: `subscription.remove.${request.params.provider}`, result: 'succeeded' });
+    return { ok: true };
   });
 
   app.get('/api/v1/topology', async request => {
@@ -382,9 +955,40 @@ export async function buildWebServer(
     return result;
   });
 
+  const oursTools = services.oursTools ?? new SupervisorOursTools();
+  app.get<{Params:{id:string}}>('/api/v1/roles/:id/contacts',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentContacts)throw new FleetError('capability_unavailable','Supervisor contacts API is unavailable');
+    return control.agentContacts();
+  });
+  app.get<{Params:{id:string};Querystring:{peer_cid:string;limit?:string;before_seq?:string}}>('/api/v1/roles/:id/messages',async request=>{
+    auth.authenticate(request);const control=await services.session(request.params.id);
+    if(!control.agentHistory)throw new FleetError('capability_unavailable','Supervisor history API is unavailable');
+    return control.agentHistory({peer_cid:request.query.peer_cid,...(request.query.limit!==undefined?{limit:Number(request.query.limit)}:{}),...(request.query.before_seq!==undefined?{before_seq:Number(request.query.before_seq)}:{})});
+  });
+
+  app.get<{ Params: { id: string } }>('/api/v1/roles/:id/ours/tools', async request => {
+    auth.authenticate(request);
+    return oursTools.list(request.params.id);
+  });
+  app.post<{ Params: { id: string }; Body: SupervisorToolRequest }>('/api/v1/roles/:id/ours/call', async request => {
+    const session = auth.authenticate(request, true);
+    const result = await oursTools.call(request.params.id, request.body);
+    await audit.record({ requestId: request.id, browser: session.id,
+      action: 'ours.call', result: result.result.isError === true ? 'tool_error' : 'succeeded' });
+    return result;
+  });
+
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
     auth.authenticate(request);
-    return services.query.detail(request.params.id);
+    const detail=await services.query.detail(request.params.id);
+    return {...detail, chatIdle: detail.role.lifetime==='temporary' ? readChatIdle(agentDir(request.params.id,true)) ?? null : null};
+  });
+
+  app.get<{ Params: { id: string } }>('/api/v1/roles/:id/voice-capabilities', async request => {
+    auth.authenticate(request);
+    const descriptor = await (await services.session(request.params.id)).describe();
+    return { supported: ['generation_bound_prompts', 'idle_bound_prompts', 'targeted_voice_interrupt'].every(f => descriptor.features.includes(f)) };
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id/removal-preview', async request => {
@@ -415,22 +1019,110 @@ export async function buildWebServer(
       });
     });
 
-  app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>(
-    '/api/v1/roles/:id/conversation', async request => {
+  app.get<{ Params: { id: string }; Querystring: { after?: string; before?: string; latest?: string; limit?: string } }>(
+    '/api/v1/roles/:id/conversation', async (request, reply) => {
       auth.authenticate(request);
       const control = await services.session(request.params.id);
       if (!control.conversationPage)
         throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
-      return control.conversationPage({
-        after: request.query.after,
-        limit: request.query.limit ? Number(request.query.limit) : undefined,
-      });
+      const limit = request.query.limit ? Number(request.query.limit) : undefined;
+      // `latest` / `before` page backwards from the newest event; `after` pages forward for live updates.
+      const backward = request.query.latest === '1' || request.query.before !== undefined;
+      if (backward && request.query.after !== undefined)
+        throw new FleetError('invalid_request', 'after cannot be combined with latest or before');
+      if (backward && !control.conversationTail)
+        throw new FleetError('capability_unavailable', 'this role cannot page its conversation backwards');
+      const role = await services.repository.get(request.params.id);
+      const stateDir = role ? services.repository.stateDir(role) : undefined;
+      const present = (event: Parameters<typeof presentAttachmentEvent>[2]) => presentAttachmentEvent(stateDir, request.params.id, event);
+      if (backward) {
+        const owner = new AbortController();
+        const cancel = () => owner.abort();
+        request.raw.once('aborted', cancel);
+        reply.raw.once('close', cancel);
+        if (request.raw.aborted || reply.raw.destroyed) cancel();
+        try {
+          const page = await control.conversationTail!({ before: request.query.before, limit, signal: owner.signal });
+          owner.signal.throwIfAborted();
+          return { ...page, events: page.events.map(present), context: page.context.map(present) };
+        } finally {
+          request.raw.off('aborted', cancel);
+          reply.raw.off('close', cancel);
+        }
+      }
+      const page = await control.conversationPage({ after: request.query.after, limit });
+      return { ...page, events: page.events.map(present) };
     });
+
+  app.get<{ Params: { id: string; artifactId: string } }>('/api/v1/roles/:id/artifacts/:artifactId', async (request, reply) => {
+    auth.authenticate(request);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('resource_not_found', 'Agent file not found');
+    try {
+      const { record, bytes } = await readDeliveredFile(stateDir, request.params.artifactId);
+      if (!await conversationHasAttachment(stateDir, record)) throw Error('ARTIFACT_NOT_PUBLISHED');
+      reply.header('Cache-Control', 'private, no-store');
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+      reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(record.name).replace(/'/g, '%27')}`);
+      return reply.type('application/octet-stream').send(bytes);
+    } catch { throw new FleetError('resource_not_found', 'Agent file unavailable'); }
+  });
+
+  app.get<{ Params: { id: string; attachmentId: string } }>('/api/v1/roles/:id/attachments/:attachmentId', async (request, reply) => {
+    auth.authenticate(request);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const { record, bytes } = readAgentAttachment(stateDir, request.params.attachmentId);
+    const image = /^image\/(png|jpeg|gif|webp|avif)$/.test(record.mimeType);
+    reply.header('Cache-Control', 'private, no-store');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    reply.header('Content-Disposition', `${image ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(record.name).replace(/'/g, '%27')}`);
+    return reply.type(image ? record.mimeType : 'application/octet-stream').send(bytes);
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/attachments', { bodyLimit: MAX_ATTACHMENT_BODY }, async (request) => {
+    auth.authenticate(request, true);
+    const role = await services.repository.get(request.params.id);
+    if (!role) throw new FleetError('role_not_found', 'Agent not found');
+    const stateDir = services.repository.stateDir(role);
+    if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+    const body = request.body as { expectedSessionGeneration?: unknown };
+    if (typeof body?.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+      throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+    const control = await services.session(request.params.id);
+    if (!control.conversationPage || !control.submitPromptV2)
+      throw new FleetError('capability_unavailable', 'Session-bound attachments are unavailable');
+    const page = await control.conversationPage({ limit: 1 });
+    if (page.snapshot.sessionGeneration !== body.expectedSessionGeneration)
+      throw new FleetError('stale_state', 'Agent session changed. Select the files again.');
+    return storeAgentAttachment(stateDir, body.expectedSessionGeneration, request.body);
+  });
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { text?: unknown; commandId?: unknown };
-    const text = String(body?.text ?? '');
+    const body = request.body as { text?: unknown; commandId?: unknown; expectedSessionGeneration?: unknown; requireIdle?: unknown; attachments?: unknown };
+    if (body?.expectedSessionGeneration !== undefined && (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim()))
+      throw new FleetError('invalid_request', 'expectedSessionGeneration must be a nonempty string');
+    if (body?.requireIdle !== undefined && typeof body.requireIdle !== 'boolean') throw new FleetError('invalid_request', 'requireIdle must be boolean');
+    let text = String(body?.text ?? '');
+    if (body?.attachments !== undefined) {
+      if (typeof body.commandId !== 'string' || !body.commandId.trim()) throw new FleetError('invalid_request', 'commandId is required for attachments');
+      if (typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim())
+        throw new FleetError('invalid_request', 'expectedSessionGeneration is required for attachments');
+      const role = await services.repository.get(request.params.id);
+      if (!role) throw new FleetError('role_not_found', 'Agent not found');
+      const stateDir = services.repository.stateDir(role);
+      if (!stateDir) throw new FleetError('capability_unavailable', 'Agent file storage is unavailable');
+      const originalText = text;
+      text = attachmentPrompt(stateDir, body.expectedSessionGeneration, body.attachments, text);
+      prepareAttachmentPresentation(stateDir, body.expectedSessionGeneration, body.commandId, body.attachments as string[], originalText, text);
+    }
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
     const control = await services.session(request.params.id);
@@ -441,6 +1133,7 @@ export async function buildWebServer(
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
         commandId: admittedCommandId, text, source: 'owner_admin_console',
+        expectedSessionGeneration: body.expectedSessionGeneration as string | undefined, requireIdle: body.requireIdle === true,
         actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
       });
       await audit.record({
@@ -452,6 +1145,8 @@ export async function buildWebServer(
       reply.code(202);
       return receipt;
     }
+    if (body.expectedSessionGeneration !== undefined || body.requireIdle)
+      throw new FleetError('capability_unavailable', 'session-bound voice input is unavailable for this role');
     const receipt = await control.sendText(text);
     await audit.record({
       requestId: request.id, browser: session.id, roleId: request.params.id,
@@ -464,10 +1159,18 @@ export async function buildWebServer(
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/interrupt', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const body = request.body as { commandId?: unknown } | undefined;
+    const body = request.body as { commandId?: unknown; expectedSessionGeneration?: unknown; promptId?: unknown } | undefined;
     const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
       ? body.commandId : undefined;
     const control = await services.session(request.params.id);
+    if (body?.expectedSessionGeneration !== undefined || body?.promptId !== undefined) {
+      if (!commandId || typeof body.expectedSessionGeneration !== 'string' || !body.expectedSessionGeneration.trim() || typeof body.promptId !== 'string' || !body.promptId.trim())
+        throw new FleetError('invalid_request', 'Targeted interrupt requires commandId, expectedSessionGeneration and promptId');
+      if (!control.interruptPromptV2) throw new FleetError('capability_unavailable', 'Targeted voice interrupt is unavailable');
+      const receipt = await control.interruptPromptV2({ commandId, expectedSessionGeneration: body.expectedSessionGeneration, promptId: body.promptId });
+      await audit.record({ requestId: request.id, browser: session.id, roleId: request.params.id, action: 'session.interrupt_voice', result: 'accepted' });
+      reply.code(202); return receipt;
+    }
     if (commandId && control.interruptV2) {
       const receipt = await control.interruptV2(commandId);
       await audit.record({
@@ -525,10 +1228,21 @@ export async function buildWebServer(
     const body = request.body as { action?: LifecycleAction; actionId?: string; confirmation?: string };
     if (!body.action || !['start', 'stop', 'restart_resume', 'restart_fresh'].includes(body.action))
       throw new FleetError('invalid_request', 'invalid lifecycle action');
-    const receipt = await services.commands.execute({
-      roleId: request.params.id, action: body.action!,
-      actionId: body.actionId, confirmation: body.confirmation,
-    });
+    let receipt;
+    try {
+      receipt = await services.commands.execute({
+        roleId: request.params.id, action: body.action!,
+        actionId: body.actionId, confirmation: body.confirmation,
+      });
+    } catch (error) {
+      // An existing receipt always wins: a conflicting/repeated action is not a
+      // proof that the original operation was never admitted.
+      if (typeof body.actionId === 'string' && !services.commands.get(body.actionId)) {
+        const normalized = normalizeError(error);
+        return reply.code(409).send({error:{code:'action_not_accepted',message:normalized.message},accepted:false});
+      }
+      throw error;
+    }
     events.publish('action.changed', receipt, request.params.id);
     reply.code(202);
     return receipt;
@@ -547,6 +1261,47 @@ export async function buildWebServer(
     if (!action) throw new FleetError('role_not_found', 'creation action not found');
     return action;
   });
+
+  // A fetch stream works through the same authenticated workspace transport as
+  // ordinary requests, and owns one ACP controller until its browser disconnects.
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/live-presence', async (request, reply) => {
+    const browser = auth.authenticate(request, true);
+    const generation = (request.body as { expectedSessionGeneration?: unknown })?.expectedSessionGeneration;
+    if (typeof generation !== 'string' || !generation.trim()) throw new FleetError('invalid_request', 'expectedSessionGeneration is required');
+    const control = await services.session(request.params.id);
+    if (!control.followConversation || !control.conversationPage) throw new FleetError('capability_unavailable', 'Live voice requires a conversation controller');
+    const page = await control.conversationPage({ limit: 1 });
+    if (page.snapshot.sessionGeneration !== generation) throw new FleetError('stale_state', 'Agent session changed. Start live voice again.');
+    // Session/page discovery can await I/O; recheck revocation before attaching.
+    auth.authenticate(request, true);
+    if (reply.raw.destroyed) return;
+    reply.hijack();
+    for (const [name, value] of Object.entries(reply.getHeaders())) if (value !== undefined) reply.raw.setHeader(name, Array.isArray(value) ? value : String(value));
+    reply.raw.writeHead(200, { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+    let ended = false;
+    let follow: { close(): void } | undefined;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let unbind: (() => void) | undefined;
+    const close = () => { if (ended) return; ended = true; unbind?.(); if (heartbeat) clearInterval(heartbeat); follow?.close(); reply.raw.end(); };
+    const write = (value: unknown) => { if (!ended && !reply.raw.write(JSON.stringify(value) + '\n')) close(); };
+    reply.raw.once('close', close);
+    // A voice session outlives one access credential; its page renews this stream by name.
+    const renewal = browser.rotating ? randomBytes(32).toString('base64url') : undefined;
+    unbind = auth.bindTransport(browser, close, renewal);
+    try {
+      follow = await control.followConversation({
+        after: page.nextCursor,
+        onPage: current => { if (current.snapshot.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } else write({ ready: true, ...(renewal ? { renewal } : {}) }); },
+        onEvent: event => { if (event.sessionGeneration !== generation) { write({ error: 'Agent session changed. Start live voice again.' }); close(); } },
+        onClose: () => close(),
+      });
+      if (ended) follow.close();
+      // A renewable stream is ended by its own deadline and by revocation, not by the first credential's expiry.
+      else heartbeat = setInterval(() => { try { if (!renewal) auth.authenticate(request); write({ heartbeat: true }); } catch { close(); } }, 10_000);
+    } catch { write({ error: 'Agent controller connection failed.' }); close(); }
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/transports/:id/renew', async request => auth.renewTransport(request, request.params.id));
 
   app.post('/api/v1/ws-tickets', async request => {
     const body = request.body as {
@@ -589,7 +1344,7 @@ export async function buildWebServer(
     requireSubprotocol(request, 'ours-fleet-events.v1');
     authorizeSocket(socket, request, async hello => {
       const session = auth.consumeTicket(request, String(hello.ticket ?? ''), 'events');
-      auth.bindSocket(session.id, socket);
+      auth.bindSocket(session, socket);
       const detach = events.attach(socket, typeof hello.lastEventId === 'string' ? hello.lastEventId : undefined);
       socket.on('close', detach);
       socket.send(JSON.stringify({ kind: 'ready', at: new Date().toISOString() }));
@@ -602,7 +1357,7 @@ export async function buildWebServer(
       authorizeSocket(socket, request, async hello => {
         const session = auth.consumeTicket(
           request, String(hello.ticket ?? ''), 'conversation', request.params.id);
-        auth.bindSocket(session.id, socket);
+        auth.bindSocket(session, socket);
         const control = await services.session(request.params.id);
         if (!control.followConversation)
           throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
@@ -628,6 +1383,9 @@ export async function buildWebServer(
           socket.send(JSON.stringify(payload));
         };
 
+        const role = await services.repository.get(request.params.id);
+        const stateDir = role ? services.repository.stateDir(role) : undefined;
+        const present = (event: any) => presentAttachmentEvent(stateDir, request.params.id, event);
         const follow = await control.followConversation({
           after,
           onPage: page => {
@@ -637,10 +1395,10 @@ export async function buildWebServer(
               firstAvailableCursor: page.firstAvailableCursor,
               lastCursor: page.nextCursor ?? after,
             });
-            if (page.events.length) guardedSend({ type: 'events', events: page.events });
+            if (page.events.length) guardedSend({ type: 'events', events: page.events.map(present) });
             if (page.hasMore) guardedSend({ type: 'resync.required' });
           },
-          onEvent: event => guardedSend({ type: 'events', events: [event] }),
+          onEvent: event => guardedSend({ type: 'events', events: [present(event)] }),
           onClose: reason => {
             if (socket.readyState === socket.OPEN)
               socket.close(4409, (reason ?? 'conversation stream ended').slice(0, 120));
@@ -653,14 +1411,8 @@ export async function buildWebServer(
       });
     });
 
-  const staticRoot = join(dirname(fileURLToPath(import.meta.url)), '..', 'web-app');
-  if (existsSync(staticRoot)) {
-    await app.register(fastifyStatic, { root: staticRoot, prefix: '/' });
-    app.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith('/api/')) return reply.code(404).send({ error: 'not found' });
-      return reply.sendFile('index.html');
-    });
-  }
+  // Fleet has no pages of its own; every screen belongs to the App.
+  app.setNotFoundHandler((_request, reply) => reply.code(404).send({ error: 'not found' }));
 
   return {
     app, auth, audit, events,
@@ -675,19 +1427,19 @@ export async function buildWebServer(
 function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string, secure = false): void {
   const suffix = secure ? '; Secure' : '';
   reply.header('Set-Cookie', [
-    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${suffix}`,
-    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000${suffix}`,
+    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${suffix}`,
+    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000${suffix}`,
   ]);
 }
 
 function setSessionCookie(reply: { header(name: string, value: string | string[]): unknown }, session: string, secure = false): void {
-  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${secure ? '; Secure' : ''}`);
+  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure ? '; Secure' : ''}`);
 }
 
 function clearAuthCookies(reply: { header(name: string, value: string | string[]): unknown }): void {
   reply.header('Set-Cookie', [
-    'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
-    'ofs_device=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
+    'ofs_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+    'ofs_device=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
   ]);
 }
 
@@ -703,10 +1455,6 @@ function promoteRequest(body: unknown): { ids: string[]; configRevision: string;
 }
 
 function cryptoRandomId(): string { return randomBytes(12).toString('hex'); }
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]!));
-}
 
 function requireSubprotocol(request: FastifyRequest, expected: string): void {
   const protocols = String(request.headers['sec-websocket-protocol'] ?? '')

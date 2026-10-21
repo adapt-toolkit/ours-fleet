@@ -1,3 +1,7 @@
+import { taskSupervisorMayRun } from './task-supervision.js';
+import { randomUUID } from 'node:crypto';
+import { storeRoomSecret, storeTemporaryLaunch, preparePermanentAssignment } from './agent-ours/service.js';
+import { ensureWorkspace } from './rooms-tasks/workspace.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -33,7 +37,8 @@ import './harness/hermes.js';
 import { getAdapter } from './harness/registry.js';
 import {
   archiveTempState, makeTempSupervisorLauncher, prepareTempSupervisor, reclaimStaleTempState,
-  type SupervisorLauncher,
+  stopTempSupervisor, secureStoppedTempArchive, readTempSupervisor, requestedTempStopReason,
+  type SupervisorLauncher, type TaskSupervisorOwner,
 } from './temp-lifecycle.js';
 
 /**
@@ -45,6 +50,8 @@ export let lastProvenance: CreationProvenance | undefined;
 export interface SpawnOpts {
   name: string;
   temp?: boolean;
+  /** Internal exact task-layout ownership, never a standalone manifest entry. */
+  taskOwner?: TaskSupervisorOwner;
   brain?: AgentSelection;
   role?: AgentSelection;
   /** Trusted canonical definition used by room provisioning; never a second schema. */
@@ -314,26 +321,12 @@ export async function spawnPermanent(
     async tx => {
       assertNameFree(o);
       const cfg = loadConfig(o.configPath);
-      // Establish the identity BEFORE the service is enabled, and record
-      // what was actually guaranteed so the briefing can say something true.
+      // Pin an existing assignment without binding; the supervisor provisions
+      // a missing role identity before starting its harness.
       creation.onStage?.('checking_identity');
-      const guarantee = await ensureIdentity(
-        effectiveIdentity(o),
-        { bio: prepared.role.bio, persona: prepared.role.persona },
-        creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
-        deps.log);
-      creation.onStage?.('checking_identity', {
-        result: guarantee.evidence, guarantee: guarantee.state,
-      });
-      if (guarantee.state === 'created')
-        // We minted it; a failed creation must not leave an orphan identity
-        // behind. Only ever removes an identity THIS transaction created.
-        tx.record({
-          stage: `ours identity ${effectiveIdentity(o)}`,
-          undo: async () => {
-            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
-          },
-        });
+      const assignment = await preparePermanentAssignment(prepared.role);
+      const guarantee = { state: assignment, evidence: assignment === 'verified' ? 'verified' as const : 'missing' as const };
+      creation.onStage?.('checking_identity', { result: guarantee.evidence, guarantee: guarantee.state });
       const agentRoot = join(splitRootFor(o.configPath ?? defaultConfigPath()), 'agents');
       mkdirSync(agentRoot, { recursive: true });
       creation.onStage?.('writing_role');
@@ -417,6 +410,14 @@ export async function spawnTemp(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
+  if ((o.taskOwner || o.roomMemberStartup?.task_id) && !getAdapter(prepared.role.harness).supportsResume)
+    throw Error('TASK_HARNESS_RESUME_UNSUPPORTED: task agents require a resumable harness');
+  if (o.roomMemberStartup?.workspace) {
+    const workspace = o.roomMemberStartup.workspace;
+    if (prepared.role.cwd !== workspace.path)
+      throw new Error('room member cwd must equal its recorded owned workspace');
+    ensureWorkspace(workspace);
+  }
   // Retire only supervisors whose recorded owner is definitively stopped. This
   // bounded pass keeps the active roster clean without deleting old evidence.
   await reclaimStaleTempState();
@@ -450,8 +451,11 @@ async function spawnTempInner(
     temporaryLoopSource: o.loopSource ?? (temporaryLoops?.length ? 'agent-template' : 'omitted'),
     roomMemberStartup: o.roomMemberStartup,
   };
+  storeTemporaryLaunch(role, o.creationActionId ?? randomUUID());
+  storeRoomSecret(role);
+  if (role.roomMemberStartup) role.roomMemberStartup = { ...role.roomMemberStartup, invite: '' };
   onStage?.('writing_role');
-  const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
+  const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified', configPath: o.configPath });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
     settings: provenanceSettings(o, cfg.defaults, preparedRole.temporaryLoops),
@@ -461,7 +465,13 @@ async function spawnTempInner(
   lastProvenance = provenance;
   tx.record({
     stage: `temp state dir ${dir}`,
-    undo: () => {
+    undo: async () => {
+      if (o.taskOwner || role.roomMemberStartup?.task_id) {
+        await stopTempSupervisor(o.name);
+        const supervisor = readTempSupervisor(dir);
+        if (supervisor) await secureStoppedTempArchive(o.name, supervisor.launchId);
+        return;
+      }
       // A failed launch is still lifecycle evidence: briefing, provenance,
       // metadata and supervisor output explain what happened. Remove it from
       // the live roster by atomic archive, never recursive deletion.
@@ -477,11 +487,27 @@ async function spawnTempInner(
   // out; a lone temp spawn still waits zero (time-based gate).
   if (cfg.startStaggerMs > 0)
     writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
-  prepareTempSupervisor(dir, o.name);
+  prepareTempSupervisor(dir, o.name, o.taskOwner ?? (o.roomMemberStartup?.task_id ? {
+    taskId: o.roomMemberStartup.task_id,
+    roomId: o.roomMemberStartup.room_id,
+    roomIdentityCid: o.roomMemberStartup.room_identity_cid,
+    creationActionId: o.creationActionId!,
+  } : undefined));
+  if (o.taskOwner || o.roomMemberStartup?.task_id) taskSupervisorMayRun(o.name);
   // Run the supervisor independently. On a service-managed host the temp
   // runner gets its own transient unit/job, so stopping the coordinator's unit
   // cannot kill a live worker in the coordinator's cgroup.
   onStage?.('starting_temp');
   await launch(binPath, ['_run-temp', o.name], dir);
   return dir;
+}
+
+/** Resume the exact durable task launch; no creation, invite issuance or state rotation. */
+export async function resumeTaskSupervisor(name: string, binPath: string): Promise<void> {
+  if (!taskSupervisorMayRun(name)) throw Error('TASK_SUPERVISOR_RETIRED');
+  const dir = agentDir(name, true);
+  if (requestedTempStopReason(dir)) throw Error('TASK_SUPERVISOR_STOP_REQUESTED');
+  const launcher = readTempSupervisor(dir)?.kind === 'detached'
+    ? makeTempSupervisorLauncher({ spawnDetached, supervisor: 'none' }) : independentSupervisor;
+  await launcher(binPath, ['_run-temp', name], dir);
 }

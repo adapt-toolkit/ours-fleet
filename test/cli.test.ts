@@ -1,3 +1,5 @@
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
@@ -9,8 +11,6 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { realExec } from '../src/exec.js';
@@ -33,6 +33,13 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const run = (args: string[]) =>
   realExec('node', [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: dir } });
+
+const validInitSettings = () => {
+  const selected = { harness: 'codex', session: 'acp', model: 'gpt-5.6-sol',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] };
+  return { subscriptions: ['codex'], assignmentStrategy: 'one-model', reasoning: 'balanced',
+    models: { development: selected, review: selected, coordination: selected } };
+};
 
 const writeWatchdogReportFixture = () => {
   writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
@@ -82,6 +89,28 @@ describe('ours-fleet CLI', () => {
     expect(existsSync(config)).toBe(false);
     expect(existsSync(join(dir, 'custom'))).toBe(false);
     expect(existsSync(join(dir, '.ours-fleet'))).toBe(false);
+  });
+
+  it('accepts valid settings without a TTY and rejects invalid settings before setup effects', async () => {
+    const config = join(dir, 'prepared.yaml');
+    const settings = join(dir, 'settings.json');
+    writeFileSync(settings, JSON.stringify(validInitSettings()), { mode: 0o600 });
+    const valid = await realExec('node', [CLI, 'init', '--configuration', config, '--settings', settings], {
+      env: { ...process.env, OURS_FLEET_HOME: dir, OURS_FLEET_SUPERVISOR: 'none' },
+    });
+    expect(valid.code).toBe(0);
+    expect(valid.stdout).toContain(`Created Fleet setup: ${config}`);
+    expect(readFileSync(config, 'utf8')).toContain('api_version: ours.network/fleet/v2');
+
+    const invalidConfig = join(dir, 'invalid.yaml');
+    writeFileSync(settings, JSON.stringify({ ...validInitSettings(), unexpected: true }), { mode: 0o600 });
+    const invalid = await realExec('node', [CLI, 'init', '--configuration', invalidConfig, '--settings', settings], {
+      env: { ...process.env, OURS_FLEET_HOME: join(dir, 'invalid-home'), OURS_FLEET_SUPERVISOR: 'none' },
+    });
+    expect(invalid.code).toBe(1);
+    expect(invalid.stderr).toContain('must contain exactly');
+    expect(existsSync(invalidConfig)).toBe(false);
+    expect(existsSync(join(dir, 'invalid-home'))).toBe(false);
   });
 
   it('redacts nested harness secrets identically from human and JSON config output', async () => {
@@ -205,12 +234,15 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(c);
   });
 
-  it('web help exposes secure re-pair and revocation commands', async () => {
+  it('web help exposes the service and revocation commands and no browser command', async () => {
     const r = await run(['web', '--help']);
     expect(r.code).toBe(0);
     for (const command of [
-      'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'open', 'revoke-all',
+      'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'revoke-all',
     ]) expect(r.stdout).toContain(command);
+    expect(r.stdout).not.toMatch(/^\s+open\b/m);
+    // Installed service units still pass it.
+    expect(r.stdout).toContain('--no-open');
     for (const option of ['--bind', '--public-origin', '--password-file', '--no-password', '--pairing'])
       expect(r.stdout).toContain(option);
     expect(r.stdout).not.toContain('#bootstrap=');
@@ -288,8 +320,9 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');
       expect(r.stdout).toContain('monitor.mode');
-      expect(r.stdout).toContain('## Local web console');
-      expect(r.stdout).toContain('ours-fleet web open');
+      expect(r.stdout).toContain('## Local HTTP service');
+      expect(r.stdout).toContain('It serves no pages and opens no');
+      expect(r.stdout).not.toContain('ours-fleet web open');
       expect(r.stdout).toContain('ours-fleet web revoke-all');
       expect(r.stdout).toContain('IPv4-loopback-only by default');
       expect(r.stdout).toContain('--public-origin');
@@ -473,7 +506,8 @@ describe('ours-fleet CLI', () => {
     // the config chip clears too, once the watchdog is no longer held down
     const cfgAfter = await run(['config']);
     expect(cfgAfter.stdout).not.toContain('(held down)');
-  });
+  // Four CLI processes in a row: each takes over a second on a busy runner.
+  }, 30_000);
 
   it('spawn --help exposes only Brain/Role agent configuration', async () => {
     const r = await run(['spawn', '--help']);

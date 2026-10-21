@@ -1,3 +1,4 @@
+import { managedClaudeMeta } from '../agent-ours/harness.js';
 import type { ResolvedRole } from '../config.js';
 import { AcpSession } from '../session/acp.js';
 import type { AcpMcpServer, SessionPrep } from './types.js';
@@ -44,10 +45,11 @@ export class ClaudeCodeAgentSessionAdapter implements AgentSessionAdapter {
     return this.transport({
       name: role.name, harness: role.harness,
       argv: launch.argv, cwd: options.cwd, env: launch.env,
-      stateDir: options.stateDir, mode: options.mode, permissions: options.permissions,
+      stateDir: options.stateDir, mode: options.mode, requireResume: options.requireResume, deferRecoveredPrompts: options.deferRecoveredPrompts, permissions: options.permissions,
       modeId: this.strategy.permissionModeId(role),
-      mcpServers: this.strategy.mcpServers(role),
-      sessionMeta: this.strategy.sessionMeta(role, prep),
+      mcpServers: options.managedOurs ? [...(this.strategy.mcpServers(role) ?? []).filter(s => s.name !== 'ours'), options.managedOurs.server] : this.strategy.mcpServers(role),
+      inheritEnvironment: options.managedOurs ? false : undefined,
+      sessionMeta: options.managedOurs ? managedClaudeMeta(this.strategy.sessionMeta(role, prep)) : this.strategy.sessionMeta(role, prep),
       configSelections: this.strategy.sessionConfigSelections(role),
       permissionMode: options.permissionMode,
       permissionMetadataSource: acpAdapterState(launch.adapterState).permissionMetadataSource,

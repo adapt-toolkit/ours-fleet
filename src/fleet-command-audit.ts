@@ -1,5 +1,6 @@
+import { erasedArg, redactErasedContent, writePrivacyFilteredLedger } from './erased-resources.js';
 import { existsSync, readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { replaceFileAtomically } from './atomic-file.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
@@ -53,6 +54,11 @@ export function lifecycleEventDigestBasis(value: FleetAuditPresentation): string
   const resourceKind = value.kind === 'lifecycle_failure' ? value.resource : value.kind;
   return `${resourceKind}\0${value.id}\0${value.eventId}`;
 }
+
+let verifiedCaller: { caller: string; stateDir: string } | undefined;
+/** The managed agent the supervisor authenticated for this CLI process (fleet_audit_begin) and its state directory. */
+export function setVerifiedFleetCaller(caller: string, stateDir: string): void { verifiedCaller = { caller, stateDir }; }
+export function verifiedFleetCaller(): { caller: string; stateDir: string } | undefined { return verifiedCaller; }
 
 let collection: { resourceIds: Record<string, string>; presentations: FleetAuditPresentation[];
   failure?: { class: FleetCommandOutcomeClass; effect: 'not_started' | 'completed' | 'unknown' } } | undefined;
@@ -118,7 +124,7 @@ export function recordFleetAuditPresentation(value: FleetAuditPresentationInput)
         : value.kind === 'lifecycle_failure'
           ? { label: fleetPresentationLabel(value.label) }
           : {};
-    const presentation = structuredClone({ ...value, ...labels, eventId: basis }) as FleetAuditPresentation;
+    const presentation = redactErasedContent(structuredClone({ ...value, ...labels, eventId: basis })) as FleetAuditPresentation;
     const digest = lifecycleEventDigestBasis(presentation);
     if (!collection.presentations.some(existing => lifecycleEventDigestBasis(existing) === digest))
       collection.presentations.push(presentation);
@@ -148,6 +154,7 @@ export interface FleetCommandClassification {
 }
 
 export interface FleetAuditAttempt {
+  erased?: boolean;
   version: 1;
   correlationId: string;
   requestId: string;
@@ -170,9 +177,11 @@ export interface FleetAuditAttempt {
 const SAFE_READ = new Set(['docs', 'version', 'config', 'ls', 'peek', 'logs', 'status', 'doctor']);
 const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
+  ours: new Set(['tools', 'call']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
+    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish',
+    'progress', 'review-package']),
   room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
@@ -186,10 +195,11 @@ export const fleetProxyTopLevelInventory = Object.freeze({
     'up', 'down', 'restart', 'force-restart', 'attach', 'send', 'loops', 'owner-channel',
     'watchdog-run', 'watchdog-report', 'rm', 'init', 'web',
   ], denied: [...DENIED],
-  hidden: ['_run', '_run-temp', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
+  hidden: ['_run', '_run-temp', '_run-temp-worker', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
 });
 
-const globalValueOptions = new Set(['-c', '--configuration']);
+// `--managed-configuration <file>` is the pinned managed entry form (src/managed-cli.ts).
+const globalValueOptions = new Set(['-c', '--configuration', '--managed-configuration']);
 
 /** Classify before Commander parsing. Unknown and internal paths fail closed. */
 export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassification {
@@ -229,12 +239,20 @@ export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassifi
 }
 
 const marker = (value: string): string => value === '' ? '[REDACTED:empty]' : '[REDACTED:value]';
+/**
+ * The pinned configuration of a managed entry (src/managed-cli.ts) is recorded
+ * as a fingerprint, not as its path: diagnostics must tell which configuration a
+ * row ran under without the ledger holding the path itself.
+ */
+export const managedPinMarker = (configuration: string): string =>
+  `[PIN:${createHash('sha256').update(configuration).digest('hex').slice(0, 16)}]`;
 const sensitiveValueFlags = new Set([
   '--identity', '--invite', '--token', '--api-token', '--password', '--password-file',
   '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file', '--loops-file',
-  '--configuration', '-c', '--public-invite', '--public-invite-file', '--invite-file',
-  '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
+  '--configuration', '-c', '--managed-configuration', '--public-invite', '--public-invite-file', '--invite-file',
+  '--args-file', '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
   '--identity-cid', '--owner-cid', '--contact-cid', '--codex-config', '--add-dir',
+  '--text-file', '--markdown', '--markdown-file', '--attach',
 ]);
 
 function redactUrl(value: string): string {
@@ -276,6 +294,9 @@ export function redactFleetArgv(argv: readonly string[]): string[] {
     }
     const equal = /^(--[^=]+)=(.*)$/su.exec(arg);
     if (equal && sensitiveValueFlags.has(equal[1]!)) { result[index] = `${equal[1]}=${marker(equal[2]!)}`; continue; }
+    if (index === 0 && arg === '--managed-configuration' && result.length > 1) {
+      result[1] = managedPinMarker(result[1]!); index++; continue;
+    }
     if (sensitiveValueFlags.has(arg) && index + 1 < result.length) {
       result[index + 1] = marker(result[index + 1]!); index++; continue;
     }
@@ -314,11 +335,12 @@ export class FleetCommandAuditStore {
     }
     if (recovered) this.persist();
   }
-  list(): readonly FleetAuditAttempt[] { return this.attempts.map(item => structuredClone(item)); }
+  list(): readonly FleetAuditAttempt[] { return redactErasedContent(this.attempts).map(item => structuredClone(item)); }
   begin(requestId: string, caller: string, argv: readonly string[]): FleetAuditAttempt {
+    this.attempts = redactErasedContent(this.attempts);
     const existing = this.attempts.find(item => item.caller === caller && item.requestId === requestId);
     if (existing) {
-      if (JSON.stringify(existing.argv) !== JSON.stringify(redactFleetArgv(argv)))
+      if (JSON.stringify(existing.argv) !== JSON.stringify(existing.erased ? redactFleetArgv(argv).map(erasedArg) : redactFleetArgv(argv)))
         throw new Error('fleet command request ID was reused with different argv');
       return structuredClone(existing);
     }
@@ -335,6 +357,8 @@ export class FleetCommandAuditStore {
     return structuredClone(attempt);
   }
   finish(correlationId: string, caller: string, outcome: Omit<NonNullable<FleetAuditAttempt['outcome']>, 'completedAt' | 'delivery'>): FleetAuditAttempt {
+    this.attempts = redactErasedContent(this.attempts);
+    outcome = redactErasedContent({ outcome }).outcome;
     const attempt = this.owned(correlationId, caller);
     if (!attempt.outcome) attempt.outcome = { ...outcome, completedAt: this.deps.now().toISOString(), delivery: 'sending' };
     else {
@@ -360,7 +384,8 @@ export class FleetCommandAuditStore {
     return attempt;
   }
   private persist(): void {
-    replaceFileAtomically(this.path, `${JSON.stringify({ version: 1, attempts: this.attempts } satisfies AuditFile)}\n`, 0o600);
+    this.attempts = redactErasedContent(this.attempts);
+    writePrivacyFilteredLedger(this.path, { version: 1, attempts: this.attempts } satisfies AuditFile);
   }
 }
 

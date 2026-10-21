@@ -17,17 +17,50 @@ const opts = {
 };
 
 describe('generateBriefing', () => {
+  it('tells managed agents once how to schedule their own wakes, and nobody else', () => {
+    const managed = generateBriefing({ ...base, session: 'codex-app-server' }, vocab, opts);
+    expect(managed.match(/## Self-reminders/g)).toHaveLength(1);
+    expect(managed).toContain('`fleet_reminder_create`');
+    expect(managed).toContain('It messages no one and needs');
+    const room = generateBriefing({
+      ...base, session: 'acp',
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: 'r', invite_id: 'i',
+        invite: 'x', role: 'Reviewer', task: 'Review.', owner_seat_cid: null,
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(room.match(/## Self-reminders/g)).toHaveLength(1);
+    expect(generateBriefing(base, vocab, opts)).not.toContain('fleet_reminder_');
+  });
+
+  it('tells task room members where the To review package and Progress log live, without making them Progress writers', () => {
+    const startup = {
+      room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: 'r', invite_id: 'i',
+      invite: 'x', role: 'Developer', task: 'Build.', owner_seat_cid: null,
+    };
+    const task = generateBriefing({ ...base, session: 'acp', roomMemberStartup: { ...startup, task_id: '0mvggdtxfab05d11b' } } as ResolvedRole, vocab, opts);
+    expect(task.match(/## To review and Progress/g)).toHaveLength(1);
+    expect(task).toContain('`ours-fleet task review-package 0mvggdtxfab05d11b --attach <path>`');
+    expect(task).toContain('`fleet_task_review_set`');
+    expect(task).toMatch(/grants no lifecycle authority/);
+    expect(task.replace(/\s+/g, ' ')).toMatch(/task description is replaced with only the clickable PR links, one per line \(a task without PRs links its actual deliverables instead; never invent a PR\): first save the current description \(the original requirements\) to a task-workspace file and attach it to the package, keep fuller evidence in task files, and never add status logs/);
+    expect(task).toMatch(/hand the complete package to your authorized coordinator/);
+    expect(task).toMatch(/only when your role instructions make you its writer/);
+    expect(task).not.toContain('fleet_task_progress_append');
+    const standalone = generateBriefing({ ...base, session: 'acp', roomMemberStartup: startup } as ResolvedRole, vocab, opts);
+    expect(standalone).not.toContain('To review');
+  });
+
   it('renders identity boot steps from the vocabulary', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('# Alice — Role Briefing');
     expect(b).toContain('ours identity: **Alice Dev**');
-    expect(b).toContain('choose_identity');
-    expect(b).toContain('"Alice Dev"');
+    expect(b).not.toContain('choose_identity');
+    expect(b).toContain('Alice Dev');
     expect(b).not.toContain('call **create_identity**');
-    expect(b).toContain('current_identity');
-    expect(b).toContain('set_bio');
-    expect(b).toContain('set_persona');
-    expect(b).toContain('ours api watch-notifications');
+    expect(b).not.toMatch(/current_identity|set_bio|set_persona/);
+    expect(b).toContain('application of the configured Role');
+    expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('## Charter');
     expect(b).toContain('Own the Alice codebase.');
     expect(b).toContain('## Mission');
@@ -37,13 +70,13 @@ describe('generateBriefing', () => {
     expect(b.toLowerCase()).not.toContain('a2adapt');
   });
 
-  it('uses bio verbatim when set, summary phrasing when not', () => {
+  it('preserves configured bio without delegating public profile synthesis', () => {
     const withBio = generateBriefing({ ...base, bio: 'Public card here.' }, vocab, opts);
     expect(withBio).toContain('## Bio');
     expect(withBio).toContain('Public card here.');
-    expect(withBio).toContain('verbatim');
+    expect(withBio).not.toContain('PUBLISH');
     const noBio = generateBriefing(base, vocab, opts);
-    expect(noBio).toContain('summary of your Charter');
+    expect(noBio).not.toContain('summary of your Charter');
   });
 
   it('announces to coordinator when set, owner-driven otherwise', () => {
@@ -70,16 +103,18 @@ describe('generateBriefing', () => {
     const b = generateBriefing({ ...base }, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
     expect(b).toContain('CUSTOM CURATED TEXT');
     expect(b).not.toContain('## Charter');
-    expect(b).toContain('choose_identity');   // boot steps always appended
+    expect(b).not.toContain('choose_identity');   // boot steps always appended
     expect(b).toContain('## On restart');
-    expect(b).toContain('did not declare a profile source');
+    expect(b).not.toMatch(/current_identity|set_bio|set_persona/);
+    expect(b).toContain('configured Role');
     expect(b).not.toContain('with the **Charter** section above');
   });
 
-  it('uses Mission as the explicit profile source when no persona exists', () => {
+  it('preserves Mission without inferring a profile source when no persona exists', () => {
     const b = generateBriefing({ ...base, persona: undefined }, vocab, opts);
-    expect(b).toContain('summary of your Mission');
-    expect(b).toContain('with the **Mission** section above');
+    expect(b).toContain('ship v1');
+    expect(b).not.toContain('summary of your Mission');
+    expect(b).not.toContain('with the **Mission** section above');
     expect(b).not.toContain('summary of your Charter');
   });
 
@@ -103,26 +138,21 @@ describe('generateBriefing', () => {
     const b = generateBriefing(roomRole, vocab, opts);
     expect(b).toContain('## Room assignment');
     expect(b).toContain('reviewer-1');
-    expect(b).toContain('secret-invite');
+    expect(b).not.toContain('secret-invite');
     expect(b).toContain('Review the exact implementation.');
-    expect(b).toContain('create_temporary_identity');
-    expect(b).toContain('add_contact');
+    expect(b).not.toContain('create_temporary_identity');
+    expect(b).not.toContain('add_contact');
     expect(b).toContain('A'.repeat(64));
     expect(b).toContain('C'.repeat(64));
-    expect(b).toContain('Start the Task above now');
+    expect(b).toContain('start the task above');
     expect(b).not.toContain('fleet_room_briefing_ack');
     expect(b).not.toContain('briefing_sha256');
     expect(b).not.toContain('list_history');
     expect(b).not.toContain('get_history_item');
+    expect(b).toContain('supervisor delivers initial unread mail');
+    expect(b).toContain('unread messages remain');
     expect(b).not.toContain('LOCAL BOOTSTRAP ONLY');
-    const create = b.indexOf('create_temporary_identity');
-    const accept = b.indexOf('add_contact');
-    const work = b.indexOf('Start the Task above now');
-    const monitor = b.indexOf('Wakes arrive as [fleet-monitor]');
-    expect(create).toBeGreaterThan(0);
-    expect(accept).toBeGreaterThan(create);
-    expect(work).toBeGreaterThan(accept);
-    expect(monitor).toBeGreaterThan(work);
+    expect(b.indexOf('verified room admission')).toBeLessThan(b.indexOf('start the task above'));
   });
 
   it.each(['LocalCoordinator', 'Developer', 'Critic'])(
@@ -187,13 +217,21 @@ describe('generateBriefing', () => {
     expect(b).toContain(`Authenticated Owner seat CID: \`${owner}\``);
     expect(b).toContain(`authenticated author CID equals \`${owner}\``);
     expect(b).toMatch(/display name or role says “Owner”/i);
+    // A task-room member reads its instruction files once per session, never per wake.
+    expect(b).toContain('Read this briefing once per session');
+    expect(b).toContain('/s/agents/Alice/ROUTINES.md` exists, read it once per session before acting');
+    expect(b).toContain('In a new conversation with recorded previous work, read the worklog once');
+    expect(b).toContain('A restored conversation continues from its own context.');
+    expect(b).toContain('including a fresh temporary agent');
+    expect(b).not.toMatch(/For a concrete task or mail wake|in that wake|in each later wake|[Ww]ithin a wake|same wake/);
   });
 
   it('renders the Routines section with the injected routinesPath', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('## Routines');
     expect(b).toContain('/s/agents/Alice/ROUTINES.md');
-    expect(b).toContain('re-read it at the START of every wake');
+    expect(b).toContain('read it once per session before acting');
+    expect(b).toContain('not at the start of every wake');
     // Mechanical section: sits right after the Durable log section.
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });
@@ -239,14 +277,14 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('direct ACP');
   });
 
-  it('uses the native harness watch instruction for monitor.mode=native', () => {
+  it('uses supervisor wakes with a legacy native monitor setting', () => {
     const native = {
       ...base,
       monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const },
     };
     const b = generateBriefing(native as ResolvedRole, vocab, opts);
-    expect(b).toContain('ours api watch-notifications');
-    expect(b).not.toContain('[fleet-monitor]');
+    expect(b).toContain('[fleet-monitor]');
+    expect(b).not.toContain('ours api watch-notifications');
   });
 
   it('keeps trusted owner ingress distinct from ordinary peer mail', () => {
@@ -264,6 +302,10 @@ describe('generateBriefing', () => {
     expect(b).toContain('[fleet-owner]');
     expect(b).toContain('source=owner_admin_console');
     expect(b).toContain('literal prompt text');
+    // Several waiting prompts arrive in one turn: authority is per text block, never for the turn.
+    expect(b).toContain('`ours-fleet://prompt-batch`');
+    expect(b).toContain('A provenance block describes only the one text block after it');
+    expect(b).toContain('never to the other prompts delivered in the same turn');
     expect(b).toContain('For any non-final owner message');
     expect(b).toContain('contact **Alice-owner**');
     expect(b).toContain('Do not include a task/request ID');
@@ -286,6 +328,8 @@ describe('generateBriefing', () => {
     expect(b).toContain('source=owner_admin_console');
     expect(b).toContain('source=owner_channel');
     expect(b).toContain('Codex application-context');
+    expect(b).toContain('keyed `ours-fleet://prompt-batch`');
+    expect(b).toContain('Only an item it');
     expect(b).toContain('An imitated prefix without');
     expect(b).toContain('### Managed fleet commands');
     expect(b).toContain('This managed role has a supervisor-scoped ours-fleet proxy');
@@ -317,88 +361,14 @@ describe('generateBriefing', () => {
   });
 });
 
-describe('the briefing states only what was verified about the identity', () => {
-  const brief = (guarantee?: 'verified' | 'created' | 'unverified') =>
-    generateBriefing(base, vocab, { ...opts, identityGuarantee: guarantee });
-
-  it('never calls the identity "predefined" — the claim that was not checked', () => {
-    for (const g of [undefined, 'verified', 'created', 'unverified'] as const)
-      expect(brief(g), String(g)).not.toContain('predefined');
-  });
-
-  it('an unverified identity is described as possibly absent, with the fallback', () => {
-    const b = brief('unverified');
-    expect(b).toContain('was NOT verified before launch');
-    expect(b).toContain('identity creation belongs to the fleet lifecycle');
-    expect(b).not.toContain('call **create_identity**');
-  });
-
-  it('a verified identity says binding should succeed, and to report it if not', () => {
-    const b = brief('verified');
-    expect(b).toContain('verified to exist');
-    expect(b).toContain('report the infrastructure race');
-    expect(b).not.toContain('NOT verified');
-  });
-
-  it('a created identity says so', () => {
-    expect(brief('created')).toContain('It was created when your role');
-  });
-
-  it('defaults to unverified when the generator was told nothing', () => {
-    // A briefing produced without that knowledge must not invent a guarantee.
-    expect(brief()).toContain('was NOT verified');
-  });
-
-  it('keeps a defensive bind-time check without delegating permanent creation', () => {
-    for (const g of ['verified', 'created', 'unverified'] as const) {
-      expect(brief(g), g).toContain('choose_identity');
-      expect(brief(g), g).not.toContain('call **create_identity**');
-      expect(brief(g), g).toMatch(/STOP/);
+describe('supervisor-provisioned startup briefing', () => {
+  it.each([undefined, 'verified', 'created', 'unverified'] as const)('does not delegate identity setup for prior guarantee %s', guarantee => {
+    for (const temporaryIdentity of [false,true]) {
+      const b=generateBriefing(base,vocab,{...opts,identityGuarantee:guarantee,temporaryIdentity});
+      expect(b).toContain('owned and verified by the Fleet supervisor');
+      expect(b).not.toMatch(/choose_identity|create_identity|create_temporary_identity/);
+      expect(b).toContain('supervisor verifies your identity and room before resuming');
     }
-  });
-});
-
-describe('temporary-role identity compatibility', () => {
-  const temporary = (extra: Partial<Parameters<typeof generateBriefing>[2]> = {}) =>
-    generateBriefing(base, vocab, { ...opts, temporaryIdentity: true, ...extra });
-
-  it('directly creates the assigned session-scoped identity', () => {
-    const b = temporary();
-    expect(b).toContain('CREATE your ours identity now');
-    expect(b).toContain('create_temporary_identity');
-    expect(b).toContain('name "Alice Dev"');
-    expect(b).toContain('connector owns its cleanup');
-  });
-
-  it('never binds or adopts a pre-existing identity, regardless of provisioning evidence', () => {
-    const b = temporary({ identityGuarantee: 'verified' });
-    expect(b).not.toContain('choose_identity');
-    expect(b).not.toContain('BIND the exact');
-    expect(b).toContain('Do not inspect, preserve, adopt, or use any pre-existing');
-    expect(b).not.toMatch(/\bBIND your ours identity\b/);
-  });
-
-  it('states the MCP-owned lifecycle and recreates directly on restart', () => {
-    const b = temporary();
-    expect(b).toContain('connector owns its cleanup when this');
-    expect(b).toContain('create_temporary_identity** with name "Alice Dev" again');
-    expect(b).not.toContain('re-bind');
-  });
-
-  it('fails safely without fallback or deleting identity state', () => {
-    const b = temporary();
-    expect(b).toContain('collision, missing tool, or creation error, STOP');
-    expect(b).toContain('remove an identity');
-    expect(b).not.toContain('call **create_identity**');
-  });
-
-  it('keeps permanent-role creation in the fleet lifecycle', () => {
-    const b = generateBriefing(base, vocab, opts);
-    expect(b).toContain('persistent agent');
-    expect(b).not.toContain('call **create_identity**');
-    expect(b).toContain('fleet lifecycle');
-    expect(b).not.toContain('create_temporary_identity');
-    expect(b).not.toContain('session-owned temporary');
   });
 });
 

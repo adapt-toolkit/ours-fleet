@@ -1,6 +1,8 @@
+import { ensureFleetParent } from '../src/supervisor/fleet.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
@@ -10,6 +12,8 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 // ── Mock setup (vi.hoisted runs before vi.mock factories) ────────────────
 
 const mocks = vi.hoisted(() => ({
+  liveReadiness: vi.fn(),
+  coworkOptions: vi.fn(),
   createRoom: vi.fn(),
   acceptInvite: vi.fn(),
   setRoleCommands: vi.fn(),
@@ -27,11 +31,16 @@ const mocks = vi.hoisted(() => ({
   markdownRender: vi.fn(),
 }));
 
+// CLI lifecycle fixtures intentionally stub member provisioning. Live probes are
+// exercised by task-live-readiness and task-room-service-parity; this suite checks
+// their success/failure presentation through the real application/CLI boundary.
+vi.mock('../src/rooms-tasks/live-readiness.js', () => ({ taskLiveReadiness: mocks.liveReadiness }));
+
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/cowork-adapter.js')>();
   return {
     ...actual,
-    createCoworkAdapter: () => ({
+    createCoworkAdapter: (options: unknown) => { mocks.coworkOptions(options); return ({
       createRoom: mocks.createRoom,
       acceptInvite: mocks.acceptInvite,
       setRoleCommands: mocks.setRoleCommands,
@@ -41,7 +50,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
       getRoom: mocks.getRoom,
       listRooms: mocks.listRooms,
       getSeats: mocks.getSeats,
-    }),
+    }); },
   };
 });
 
@@ -92,7 +101,7 @@ vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import {
   createTask, getTask, startTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
-  updateTaskMembers, failTask,
+  updateTaskMembers, failTask, beginTaskDeletionIntent, setTaskDeletionError,
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
@@ -200,6 +209,7 @@ beforeEach(() => {
   vi.spyOn(process.stderr, 'write').mockImplementation((line: unknown) => { out.push(String(line)); return true; });
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
+  mocks.liveReadiness.mockReset().mockResolvedValue(undefined);
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
   mocks.acceptInvite.mockReset().mockResolvedValue({ seat_cid: 'a'.repeat(64) });
   mocks.setRoleCommands.mockReset().mockResolvedValue(undefined);
@@ -314,6 +324,10 @@ describe('room delete', () => {
     const { createRoomRecord, closeRoom } = await import('../src/rooms-tasks/room-state.js');
     createRoomRecord({ room_id: legacyId, room_name: 'Legacy closed room' });
     closeRoom(legacyId);
+    const legacyPath = join(dir, '.ours-fleet', 'rooms', `${legacyId}.json`);
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    delete legacy.workspace;
+    writeFileSync(legacyPath, JSON.stringify(legacy));
     mocks.listRooms.mockResolvedValue([
       {
         room_id: active.room_id, identity_name: 'active-room', identity_cid: 'c'.repeat(64),
@@ -457,6 +471,27 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(out.join('\n')).toContain('--anonymous/--no-anonymous cannot be combined with --no-room');
   });
 
+  it.each([false, true])('surfaces the actionable missing Fleet initialization at task start (json=%s)', async json => {
+    writeCustomTemplate();
+    await run('create', '--title', 'Before initialization', '--backlog', '--template', 'durable', '--json');
+    const id = JSON.parse(out.join('\n')).task.task_id; out = [];
+    const native = vi.fn(async () => ({ code: 0, stdout: '', stderr: '' }));
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      try { await ensureFleetParent(native, 'linux'); }
+      catch (error) {
+        setSagaError(roomId, (error as Error).message, 'Run ours-fleet init, then retry task start.', 'member_failed');
+        throw error;
+      }
+    });
+    await run('start', id, ...(json ? ['--json'] : []));
+    expect(native).not.toHaveBeenCalled();
+    const text = out.join('\n');
+    expect(text.replaceAll('\\_', '_')).toContain('FLEET_SERVICE_NOT_INSTALLED'); expect(text).toContain('run ours-fleet init');
+    if (json) expect(JSON.parse(text).provisioning).toMatchObject({
+      blocker: 'FLEET_SERVICE_NOT_INSTALLED: run ours-fleet init', next_action: expect.stringContaining('ours-fleet init'),
+    });
+  });
+
   it.each([false, true])('captures real task create/start transitions (json=%s)', async json => {
     writeCustomTemplate();
     beginFleetAuditCollection();
@@ -537,7 +572,8 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(out.join('\n')).toContain("unknown command 'recover'");
     expect(mocks.provisionMembers).not.toHaveBeenCalled();
     const task = makeProgram().commands.find(command => command.name() === 'task');
-    expect(task?.helpInformation()).not.toContain('recover');
+    expect(task?.commands.some(command => command.name() === 'recover')).toBe(false);
+    expect(task?.commands.some(command => command.name() === 'recover-members')).toBe(true);
   });
 
   it('rejects the removed task await subcommand before any provisioning effect', async () => {
@@ -861,7 +897,7 @@ describe('task work', () => {
     const taskPayload = JSON.parse(out.join('\n'));
     expect(taskPayload.orchestration.member_seats[0].briefing.state).toBe('relay_queued');
     expectExactJson({
-      schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID),
+      schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID), readiness: { state: 'ready' },
     });
 
     out = [];
@@ -910,6 +946,13 @@ describe('task work', () => {
     const after = getTask(t.task_id);
     expect(after.state).toBe('provisioning');
     expect(after.blocked?.reason).toContain('unavailable');
+  });
+
+  it('reports HTTP management unavailability without claiming a socket failure', async () => {
+    mocks.createRoom.mockRejectedValue(new CoworkUnavailableError('Cowork HTTP management failed; check the selected server and credential'));
+    const t = backlogTask();
+    await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
+    expect(getTask(t.task_id).blocked?.reason).toBe('Cowork management is unavailable');
   });
 
   it('retries provisioning for a blocked provisioning task', async () => {
@@ -1231,17 +1274,30 @@ describe('task delete', () => {
     const t = doneTask();
     mocks.launchFleetWorker.mockImplementation(async () => { /* worker never completes */ });
     vi.useFakeTimers();
+    // Admission awaits real filesystem work before installing its 100ms poll.
+    // Yield the real event loop without advancing the command's fake deadline.
+    const advanceAcceptedWait = async (command: Promise<void>) => {
+      const timers = vi.spyOn(globalThis, 'setTimeout');
+      while (!timers.mock.calls.some(([, delay]) => delay === 100)) {
+        await nextTurn();
+      }
+      timers.mockRestore();
+      let settled = false;
+      void command.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(59_900);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1_100);
+      await command;
+    };
     try {
       const pendingJson = run('delete', t.task_id, t.task_id, '--json');
-      await vi.advanceTimersByTimeAsync(61_000);
-      await pendingJson;
+      await advanceAcceptedWait(pendingJson);
       expectExactJson({
         schema_version: 1, task_id: t.task_id, accepted: true, deleted: false, pending: true,
       });
       out = [];
       const pendingHuman = run('delete', t.task_id, t.task_id);
-      await vi.advanceTimersByTimeAsync(61_000);
-      await pendingHuman;
+      await advanceAcceptedWait(pendingHuman);
     } finally { vi.useRealTimers(); }
     const text = out.join('\n');
     expect(text).toContain('deletion was accepted and cleanup is still settling');
@@ -1277,5 +1333,82 @@ describe('internal room deletion workers', () => {
     }));
     settle.mockRestore();
     record.mockRestore();
+  });
+});
+
+
+describe('live task readiness CLI failures', () => {
+  it.each(['start', 'work'])('renders %s failure as a safe state diagnostic, never ready', async command => {
+    const task = backlogTask();
+    await run('work', task.task_id);
+    out.length = 0;
+    mocks.provisionMembers.mockClear();
+    mocks.liveReadiness.mockResolvedValue({ state: 'unknown', reason: 'control_unavailable', member: 'dev' });
+    await expect(run(command, task.task_id)).rejects.toBeInstanceOf(ExitError);
+    expect(out.join('\n')).toContain('unknown');
+    expect(out.join('\n')).toContain('control\\_unavailable');
+    expect(out.join('\n')).toContain('Fleet Coordinator');
+    expect(out.join('\n')).not.toContain('already active');
+    expect(out.join('\n')).not.toContain('provisioning complete');
+    expect(mocks.provisionMembers).not.toHaveBeenCalled();
+    expect(getTask(task.task_id).state).toBe('active');
+  });
+});
+
+it.each(['ready', 'unknown', 'degraded'])('task show exposes %s health separately from active lifecycle', async state => {
+  const t = backlogTask(); startTask(t.task_id); activateTask(t.task_id);
+  mocks.liveReadiness.mockResolvedValue(state === 'ready' ? undefined : { state, reason: 'control_unavailable' });
+  out.length = 0;
+  await run('show', t.task_id, '--json');
+  const value = JSON.parse(out.join('\n'));
+  expect(value.task.state).toBe('active');
+  expect(value.readiness.state).toBe(state);
+  expect(mocks.coworkOptions).toHaveBeenLastCalledWith(expect.objectContaining({ timeoutMs: 2000 }));
+  expect(getTask(t.task_id).state).toBe('active');
+  out.length = 0;
+  await run('show', t.task_id);
+  expect(out.join('\n')).toContain('Readiness');
+  expect(out.join('\n')).toContain(state);
+});
+
+describe('pending task deletion status', () => {
+  it('includes unresolved deletions explicitly in list and grouped JSON', async () => {
+    const t = backlogTask();
+    beginTaskDeletionIntent(t.task_id, { kind: 'local_control', surface: 'cli' });
+    setTaskDeletionError(t.task_id, 'EACCES during cleanup', 'Retry explicit task deletion');
+    const before = getTask(t.task_id);
+    await runLocalTask('list', '--json');
+    expect(JSON.parse(out.join('\n')).tasks).toEqual([]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting', '--json');
+    expect(JSON.parse(out.join('\n')).tasks).toEqual([before]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting', '--group-by-list', '--json');
+    expect(JSON.parse(out.join('\n')).groups.flatMap((group: { tasks: unknown[] }) => group.tasks)).toEqual([before]);
+    out.length = 0;
+    await runLocalTask('list', '--include-deleting');
+    expect(out.join('\n')).toContain('Deletion pending');
+    expect(out.join('\n')).toContain('EACCES during cleanup');
+    expect(getTask(t.task_id)).toEqual(before);
+    expect(mocks.launchFleetWorker).not.toHaveBeenCalled();
+  });
+
+  it('shows pending cleanup/error/retry without probing the retiring active agent', async () => {
+    const t = backlogTask(); startTask(t.task_id); activateTask(t.task_id);
+    beginTaskDeletionIntent(t.task_id, { kind: 'local_control', surface: 'cli' });
+    setTaskDeletionError(t.task_id, 'EACCES during cleanup', 'Retry explicit task deletion');
+    const before = getTask(t.task_id);
+    await runLocalTask('show', t.task_id, '--json');
+    const shown = JSON.parse(out.join('\n'));
+    expect(shown.task.deletion).toEqual(before.deletion);
+    expect(shown.readiness).toBeUndefined();
+    out.length = 0;
+    await runLocalTask('show', t.task_id);
+    expect(out.join('\n')).toContain('cleanup is not complete');
+    expect(out.join('\n')).toContain('EACCES during cleanup');
+    expect(out.join('\n')).toContain(`ours-fleet task delete ${t.task_id} ${t.task_id}`);
+    expect(mocks.liveReadiness).not.toHaveBeenCalled();
+    expect(mocks.launchFleetWorker).not.toHaveBeenCalled();
+    expect(getTask(t.task_id)).toEqual(before);
   });
 });

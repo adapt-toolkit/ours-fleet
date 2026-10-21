@@ -1,3 +1,4 @@
+import { redactErasedContent, writePrivacyFilteredLedger } from '../erased-resources.js';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync } from 'node:fs';
 import { replaceFileAtomically } from '../atomic-file.js';
@@ -69,7 +70,7 @@ export class FleetLifecycleOutbox {
 
   pending(): readonly LifecycleOutboxEntry[] {
     this.assertHealthy();
-    return this.entries.filter(entry => entry.delivery === 'pending').map(entry => structuredClone(entry));
+    return redactErasedContent(this.entries).filter(entry => entry.delivery === 'pending').map(entry => structuredClone(entry));
   }
 
   finish(digest: string, delivery: Exclude<LifecycleDelivery, 'pending'>): void {
@@ -87,7 +88,7 @@ export class FleetLifecycleOutbox {
   }
 
   private persist(): void {
-    replaceFileAtomically(this.path,
-      `${JSON.stringify({ version: 1, entries: this.entries } satisfies LifecycleOutboxFile)}\n`, 0o600);
+    this.entries = redactErasedContent(this.entries);
+    writePrivacyFilteredLedger(this.path, { version: 1, entries: this.entries } satisfies LifecycleOutboxFile);
   }
 }

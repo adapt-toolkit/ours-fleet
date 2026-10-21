@@ -1,3 +1,6 @@
+import { ConversationObservation } from './conversation-observation.js';
+import type { FileDeliveryInput, CopyChatFile, DeliveredFile } from '../file-delivery/types.js';
+import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -13,10 +16,16 @@ import type { AcpMcpServer } from '../harness/types.js';
 import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
-  ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
-  SubmitPromptCommand,
+  ConversationEventV1, ConversationObservationState, ConversationSnapshot, ConversationSource,
+  PermissionRequestedPayload, PromptOrigin, PromptReceipt,
+  SubmitPromptCommand, TurnCompletedPayload,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import {
+  commandName, memberAuthority, memberBindings, pendingInventory, takeBatch, type PendingPrompt,
+  refuseAtRelease, RELEASE_GUARD_REFUSED,
+} from './prompt-batch.js';
+import { recordClaudeRateLimit } from '../subscriptions/observed.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
   type StallObservation, type StallStatus } from './stall-watchdog.js';
 import {
@@ -33,6 +42,7 @@ import type {
 } from './types.js';
 
 interface PendingPermission {
+  presented?: PermissionRequestedPayload;
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
   /** Real ACP ID used only for lifecycle tracking; never emit this for scheduled loops. */
@@ -82,7 +92,6 @@ const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 export const CODEX_DISABLE_INHERITED_MCP_ENV = 'OURS_FLEET_CODEX_DISABLE_INHERITED_MCP';
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
-const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
 const MAX_CANONICAL_SYMLINK_DEPTH = 40;
 
 const scheduledTurn = (turn: { origin?: PromptOrigin } | undefined): boolean =>
@@ -208,6 +217,9 @@ function conversationSource(origin: PromptOrigin | undefined): {
     case 'owner': return { source: 'owner_channel', persistBody: false };
     case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
     case 'scheduled-loop': return { source: 'scheduled_loop', persistBody: false };
+    // A supervisor wake like a monitor notice; the body is never retained, so
+    // restart recovery can never replay a reminder past its dispatch fence.
+    case 'self-reminder': return { source: 'fleet_monitor', persistBody: false };
     case 'local-console':
     default:
       return { source: 'local_console', persistBody: true };
@@ -224,6 +236,40 @@ export function promptContentBlocks(text: string, origin?: PromptOrigin): acp.Co
     description: 'Server-authenticated paired console provenance; accompanying text is direct owner input.',
     mimeType: 'application/vnd.ours-fleet.prompt-provenance+json',
   }, { type: 'text', text }];
+}
+
+/**
+ * One adapter turn that carries several admitted prompts.
+ *
+ * A single prompt's provenance block describes "the accompanying text", which
+ * is only unambiguous when there is one text. Here every member is one text
+ * block, unchanged, immediately preceded by its own server-generated block
+ * that names its route and binds its exact bytes — so a monitor wake next to
+ * an owner prompt is never read under the owner's authority, and text that
+ * imitates a marker stays text: it cannot produce a typed block.
+ */
+export function batchContentBlocks(
+  members: ReadonlyArray<Pick<PendingPrompt, 'text' | 'origin'>>,
+): acp.ContentBlock[] {
+  if (members.length === 1) return promptContentBlocks(members[0]!.text, members[0]!.origin);
+  const mimeType = 'application/vnd.ours-fleet.prompt-provenance+json';
+  return [{
+    type: 'resource_link',
+    uri: `ours-fleet://prompt-batch?members=${members.length}`,
+    name: 'Fleet queued prompt batch',
+    description: `Server-generated. This turn delivers ${members.length} separately admitted prompts in `
+      + 'submission order. Each prompt is one text block immediately preceded by its own '
+      + 'server-generated provenance block, which describes only that one text block.',
+    mimeType,
+  }, ...memberBindings(members, origin => conversationSource(origin).source).flatMap((binding, at) => [{
+    type: 'resource_link' as const,
+    uri: `ours-fleet://prompt-provenance?source=${binding.source}&member=${binding.index}`
+      + `&of=${binding.of}&bytes=${binding.bytes}&sha256=${binding.sha256}`,
+    name: binding.source === 'owner_admin_console' ? 'Direct owner admin console' : 'Fleet queued prompt',
+    description: `Server-generated provenance for prompt ${binding.index} of ${binding.of}: `
+      + `${memberAuthority(binding.source)}. Applies only to the text block that immediately follows.`,
+    mimeType,
+  }, { type: 'text' as const, text: members[at]!.text }])];
 }
 
 export function runtimeSelector(
@@ -261,6 +307,12 @@ export interface AcpSessionOptions {
   inheritEnvironment?: boolean;
   stateDir: string;
   mode: 'fresh' | 'resume';
+  requireResume?: boolean;
+  /**
+   * Hold never-started prompts recovered from a prior generation until the
+   * caller's control plane is listening; see activateRecoveredPrompts().
+   */
+  deferRecoveredPrompts?: boolean;
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
@@ -355,7 +407,16 @@ export class AcpSession implements AgentSession {
   private lastUpdateAt?: string;
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
+  /** Admitted prompts not yet handed to the adapter, in admission order. */
+  private readonly pendingPrompts: PendingPrompt[] = [];
+  /** Admitted prompt → the adapter turn that carries it, while that turn is open. */
+  private readonly sharedTurns = new Map<string, string>();
+  /** Commands the adapter currently advertises; only these are control operations. */
+  private advertisedCommands = new Set<string>();
+  private presentedCommands: ConversationObservationState['commands'] = [];
   private queueDepth = 0;
+  private readonly deferredRecovered: Array<{ promptId: string; text: string }> = [];
+  private readonly observation = new ConversationObservation(() => this.captureObservation());
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
   private agentCapabilities?: acp.AgentCapabilities;
@@ -398,10 +459,16 @@ export class AcpSession implements AgentSession {
     recoveryStartedAt?: number; resumed: boolean; blocked: boolean;
   };
   private readonly toolBoundaryWaiters = new Set<() => void>();
+  private fileExportBusy = false;
   private activeTurn?: {
+    fileDeliveryRevoked?: boolean;
     toolEvidence: Map<string, string>; planEvidence?: string;
     startedAt: number; toolIds: Set<string>; lastProgressAt: number; progressCount: number; transportFailures: number; boundaryUnknown: boolean;
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
+    /** Every admitted prompt this turn carries; `id` is the first. */
+    promptIds: string[];
+    /** Whether any member came from the paired console. */
+    console: boolean;
     cancellationSource?: TurnCancellationSource;
     cancellationWait?: Promise<void>;
     cancellationDeadlineExceeded?: boolean;
@@ -423,6 +490,9 @@ export class AcpSession implements AgentSession {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
     this.conversationStartCursor = this.conversation.lastCursor();
+    // A durable append can precede its inventory mutation. Capture only after
+    // the synchronous owner checkpoint, never the state at append notification.
+    this.conversation.subscribe(() => this.observation.scheduleCapture());
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
     // Nothing awaits this promise until a request races it; an unobserved
@@ -454,6 +524,7 @@ export class AcpSession implements AgentSession {
         acpSessionId: this.sessionId,
         payload: { status: 'failed', detail: this.lastError },
       });
+      this.observation.publish();
     });
   }
 
@@ -539,13 +610,27 @@ export class AcpSession implements AgentSession {
         });
         continue;
       }
-      const text = open.text;
-      const promptId = open.promptId;
-      this.queueDepth++;
-      const run = this.promptTail.then(() => this.runPrompt(text, promptId));
-      this.promptTail = run.then(() => undefined, () => undefined);
-      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
+      const recovered = { promptId: open.promptId, text: open.text };
+      if (this.options.deferRecoveredPrompts) this.deferredRecovered.push(recovered);
+      else this.dispatchRecovered(recovered);
     }
+  }
+
+  /**
+   * Dispatch recovered prompts held by deferRecoveredPrompts. A recovered turn
+   * can run tools at once, including the managed Fleet CLI, so it must not
+   * start before the supervisor's control socket accepts connections. Prompts
+   * never activated stay admitted-unstarted and recover again on next start.
+   */
+  activateRecoveredPrompts(): void {
+    for (const recovered of this.deferredRecovered.splice(0)) this.dispatchRecovered(recovered);
+  }
+
+  private dispatchRecovered({ promptId, text }: { promptId: string; text: string }): void {
+    this.queueDepth++;
+    const run = this.enqueue(promptId, text, undefined);
+    this.observation.publish();
+    void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); this.observation.publish(); });
   }
 
   isAlive(): boolean {
@@ -564,6 +649,7 @@ export class AcpSession implements AgentSession {
     if (this.closing || !this.isAlive()) return;
     this.steeringOccupied = true;
     this.refreshSteeringOccupancy();
+    this.observation.publish();
   }
 
   private refreshSteeringOccupancy(): void {
@@ -586,6 +672,7 @@ export class AcpSession implements AgentSession {
     this.steeringRelease = undefined;
     if (!this.steeringOccupied) return;
     this.steeringOccupied = false;
+    this.observation.publish();
     this.options.log(
       `[${this.options.name}] steering-started turn no longer holds the adapter (${reason})`);
   }
@@ -601,6 +688,9 @@ export class AcpSession implements AgentSession {
       readiness: this.readiness === 'idle' && this.steeringOccupied
         ? 'running' : this.readiness,
       sessionId: this.sessionId,
+      // A shared turn is a human console turn if any member is: inbox traffic must not cut it short.
+      ...(this.activeTurn?.origin ? { activePromptSource: this.activeTurn.console
+        ? 'owner-admin-console' as const : this.activeTurn.origin.kind } : {}),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -714,6 +804,11 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
+    // A tool-boundary wait may outlive its original turn. Recheck the current
+    // typed source at delivery, since an Owner turn can begin during the wait.
+    // `console` covers a shared turn whose first member is not the console prompt.
+    if (options.origin?.kind === 'fleet-monitor' && this.activeTurn?.console)
+      return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);
@@ -782,6 +877,8 @@ export class AcpSession implements AgentSession {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
+    // A guarded prompt must reach the model only through the release fence.
+    if (options.releaseGuard) options = { ...options, interrupt: false, steer: false };
     if (this.stallRecoveryClaimed && options.origin?.kind === 'fleet-monitor')
       options = { ...options, interrupt: false, steer: false };
     if (this.cancelRecoveryReason)
@@ -808,14 +905,20 @@ export class AcpSession implements AgentSession {
     }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth;
-    this.admitToLedger(promptId, text, queuedBehind, options);
-    this.queueDepth++;
-    const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
-    this.promptTail = run.then(() => undefined, () => undefined);
+    const run = this.observation.checkpoint(() => {
+      this.admitToLedger(promptId, text, queuedBehind, options);
+      this.queueDepth++;
+      return this.enqueue(promptId, text, options.origin, options.releaseGuard);
+    });
     const completion = run.then(
-      result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
+      result => {
+        this.queueDepth = Math.max(0, this.queueDepth - 1);
+        this.observation.publish();
+        return result;
+      },
       error => {
         this.queueDepth = Math.max(0, this.queueDepth - 1);
+        this.observation.publish();
         return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
       },
     );
@@ -823,6 +926,58 @@ export class AcpSession implements AgentSession {
       promptId, queuedBehind, completion, origin: options.origin,
       delivery: delivery ?? (queuedBehind > 0 ? 'queued' : 'started'),
     };
+  }
+
+  /** The turn whose events and result answer this admitted prompt; itself unless a release shared it. */
+  sharedTurnId(promptId: string): string | undefined {
+    return this.sharedTurns.get(promptId);
+  }
+
+  /**
+   * Queue an admitted prompt behind the current work. Each prompt keeps its
+   * own step in the chain, so its place in line is unchanged; what the step
+   * does when it is reached is release a whole snapshot, not one prompt.
+   */
+  private enqueue(
+    promptId: string, text: string, origin: PromptOrigin | undefined, releaseGuard?: () => boolean,
+  ): Promise<TurnResult> {
+    const entry: PendingPrompt = {
+      promptId, text, origin, ...conversationSource(origin), admittedAt: new Date().toISOString(),
+      command: this.advertisedCommands.has(commandName(text) ?? ''),
+      ...(releaseGuard ? { releaseGuard } : {}),
+    };
+    this.pendingPrompts.push(entry);
+    const run = this.promptTail.then(() => this.release(entry));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * The turn boundary. The first waiting prompt to get here takes every
+   * pending prompt delivered with it, synchronously, and they share one adapter
+   * turn. A prompt admitted after that — while the turn runs, or while a
+   * cancellation settles — stays pending for the next boundary. A step whose
+   * prompt an earlier boundary already took just reports that turn's result.
+   */
+  private release(entry: PendingPrompt): Promise<TurnResult> {
+    if (entry.released) return entry.released;
+    const refused = refuseAtRelease(this.pendingPrompts, entry, Boolean(this.sessionId && this.isAlive()));
+    if (refused) {
+      this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration, acpSessionId: this.sessionId,
+        promptId: entry.promptId, turnId: entry.promptId,
+        payload: { outcome: 'cancelled', stopReason: RELEASE_GUARD_REFUSED },
+      });
+      entry.released = Promise.resolve(refused);
+      return entry.released;
+    }
+    const members = takeBatch(this.pendingPrompts, entry);
+    for (const member of members) this.sharedTurns.set(member.promptId, members[0]!.promptId);
+    const run = this.runPrompt(members).finally(() => {
+      for (const member of members) this.sharedTurns.delete(member.promptId);
+    });
+    for (const member of members) member.released = run;
+    return run;
   }
 
   /**
@@ -907,11 +1062,16 @@ export class AcpSession implements AgentSession {
     const bodyDigest = ConversationEventStore.bodyDigest(command.text);
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
+    if (command.expectedSessionGeneration !== undefined && command.expectedSessionGeneration !== this.conversationSnapshot().sessionGeneration)
+      throw new Error('session_changed: Agent session changed. Record a new voice message.');
+    if (command.requireIdle && (this.queueDepth > 0 || this.conversationSnapshot().readiness !== 'idle'))
+      throw new Error('voice_busy: Agent is already working. Wait for the current turn.');
     const queued = await this.queuePrompt(command.text, {
       origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },
     });
     const receipt: PromptReceipt = {
+      sessionGeneration: this.sessionGeneration,
       commandId: command.commandId,
       promptId: queued.promptId,
       state: queued.queuedBehind > 0 ? 'queued' : 'starting',
@@ -939,6 +1099,14 @@ export class AcpSession implements AgentSession {
    * (`queuePrompt({ interrupt: true })`) needs the typed error, because only it
    * still owes an undelivered message a replay.
    */
+  readonly liveVoiceSupported = true;
+
+  async interruptPrompt(generation: string, promptId: string): Promise<InterruptOutcome> {
+    if (generation !== this.sessionGeneration) throw new Error('session_changed: Agent session changed.');
+    if (!this.activeTurn?.promptIds.includes(promptId)) return { state: 'settled' };
+    return this.interrupt('local-console');
+  }
+
   async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     try {
       await this.cancelActive(source);
@@ -956,6 +1124,7 @@ export class AcpSession implements AgentSession {
       this.stallAttempt.superseded = true;
     if (!this.sessionId) return;
     const active = this.activeTurn;
+    if (active) active.fileDeliveryRevoked = true;
     const previousSource = active?.cancellationSource;
     if (active && (source === 'owner' || source === 'local-console' || !previousSource))
       active.cancellationSource = source;
@@ -1045,6 +1214,7 @@ export class AcpSession implements AgentSession {
     const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
     if (decision === 'allowed') this.allowPermission(pending.toolCallId, permissionId);
     else this.releasePermission(pending.toolCallId, permissionId);
+    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -1061,7 +1231,7 @@ export class AcpSession implements AgentSession {
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
       payload: { decision, decisionSource: 'manual', optionId },
     });
-    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
+    this.observation.publish();
     return true;
   }
 
@@ -1134,6 +1304,8 @@ export class AcpSession implements AgentSession {
       : { outcome: { outcome: 'cancelled' } });
     const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
     this.releasePermission(pending.toolCallId, permissionId);
+    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
+      this.readiness = 'running';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -1157,12 +1329,46 @@ export class AcpSession implements AgentSession {
         ...(rejectOption ? { optionId: rejectOption.optionId } : {}),
       },
     });
-    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
-      this.readiness = 'running';
+    this.observation.publish();
   }
 
   exitResult(): ExitRecord | null {
     return this.exit;
+  }
+
+  /** One attempt, tied to the managed live turn captured before any approval/read. */
+  async sendFileToChat(input: FileDeliveryInput, signal: AbortSignal, copy: CopyChatFile, policy: CommonPermissions): Promise<DeliveredFile> {
+    const active = this.activeTurn, sessionId = this.sessionId;
+    const check = () => {
+      signal.throwIfAborted();
+      if (!active || !sessionId || this.activeTurn !== active || this.sessionId !== sessionId || active.fileDeliveryRevoked
+          || active.cancellationSource || this.closing || !this.isAlive() || this.replaying || this.steeringOccupied
+          || active.origin?.kind === 'scheduled-loop' || policy.approval === 'deny') throw Error('CURRENT_CHAT_DELIVERY_UNAVAILABLE');
+    };
+    check(); if (this.fileExportBusy) throw Error('FILE_DELIVERY_BUSY');
+    this.fileExportBusy = true;
+    const toolCallId = 'fleet-file-export-' + randomUUID();
+    try {
+      const onAbort = () => { for (const [id, pending] of this.pendingPermissions) if (pending.toolCallId === toolCallId)
+        this.settlePendingAutomatically(id, pending, 'cancelled', undefined, 'File send cancelled'); };
+      signal.addEventListener('abort', onAbort, { once: true });
+      let answer: acp.RequestPermissionResponse;
+      try {
+        answer = await this.requestPermission({ sessionId: sessionId!, toolCall: {
+          toolCallId, title: 'Send file to this ACP chat: ' + (input.filename ?? input.path), kind: 'read', status: 'pending',
+          locations: [{ path: resolve(this.options.cwd, input.path) }],
+        }, options: [ { optionId: 'send', name: 'Send file', kind: 'allow_once' }, { optionId: 'deny', name: 'Do not send', kind: 'reject_once' } ] }, policy);
+      } finally { signal.removeEventListener('abort', onAbort); }
+      check();
+      if (answer.outcome.outcome !== 'selected' || answer.outcome.optionId !== 'send') throw Error('FILE_SEND_DENIED');
+      const attachment = await copy({ sessionGeneration: this.sessionGeneration, acpSessionId: sessionId!, turnId: active!.id });
+      // Synchronous check + durable append establishes order with cancellation/stop.
+      // No await, pending-send journal, replay or recovery exists after this point.
+      check();
+      this.conversation.append({ kind: 'file.attached', source: 'agent', sessionGeneration: this.sessionGeneration,
+        acpSessionId: sessionId, promptId: active!.id, turnId: active!.id, payload: { attachment } });
+      return attachment;
+    } finally { this.releaseTool(toolCallId); this.fileExportBusy = false; }
   }
 
   async close(): Promise<void> {
@@ -1218,6 +1424,8 @@ export class AcpSession implements AgentSession {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
+    if (this.options.requireResume && (!persisted || !(this.agentCapabilities?.sessionCapabilities?.resume != null || this.agentCapabilities?.loadSession)))
+      throw new Error('TASK_CONTEXT_RESUME_UNAVAILABLE');
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
     let advertisedModes: acp.SessionModeState | null | undefined;
     let advertisedModelId: string | undefined;
@@ -1322,6 +1530,7 @@ export class AcpSession implements AgentSession {
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId, payload: { status: 'idle' },
     });
+    this.observation.publish();
   }
 
   private captureRuntimeMetadata(
@@ -1424,10 +1633,9 @@ export class AcpSession implements AgentSession {
   }
 
   /** Keep the original queue slot (including startup) until recovery finishes. */
-  private async runPrompt(
-    text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
-  ): Promise<TurnResult> {
-    const result = await this.runSinglePrompt(text, turnId, origin);
+  private async runPrompt(members: PendingPrompt[]): Promise<TurnResult> {
+    const { text, promptId: turnId, origin } = members[0]!;
+    const result = await this.runSinglePrompt(text, turnId, origin, members);
     const attempt = this.stallAttempt;
     if (!attempt || attempt.turnId !== turnId) return result;
     const ready = await attempt.ready;
@@ -1447,8 +1655,11 @@ export class AcpSession implements AgentSession {
       attempt.recoveryStartedAt = Date.now();
       const recoveryOrigin: PromptOrigin = origin?.kind === 'scheduled-loop'
         ? origin : { kind: 'stall-watchdog' };
-      this.admitToLedger(attempt.recoveryId, STALL_RECOVERY_PROMPT, 0, { origin: recoveryOrigin });
-      const recovered = await this.runSinglePrompt(STALL_RECOVERY_PROMPT, attempt.recoveryId, recoveryOrigin);
+      const recovery = this.observation.checkpoint(() => {
+        this.admitToLedger(attempt.recoveryId, STALL_RECOVERY_PROMPT, 0, { origin: recoveryOrigin });
+        return this.runSinglePrompt(STALL_RECOVERY_PROMPT, attempt.recoveryId, recoveryOrigin);
+      });
+      const recovered = await recovery;
       attempt.report(attempt.superseded ? 'superseded'
         : recovered.succeeded && attempt.resumed ? 'recovery_completed' : 'blocked_recovery');
       // A failed diagnostic turn must not make startup tear down the session.
@@ -1460,9 +1671,24 @@ export class AcpSession implements AgentSession {
     }
   }
 
+  /**
+   * One adapter turn. `members` are the admitted prompts it carries, the first
+   * being the turn's own id; each keeps its own started and completed records
+   * so none is left open and none is reported delivered that was not sent.
+   */
   private async runSinglePrompt(
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
+    members: Array<Pick<PendingPrompt, 'promptId' | 'text' | 'origin'>> = [{ promptId: turnId, text, origin }],
   ): Promise<TurnResult> {
+    let completionPayload: TurnCompletedPayload | undefined;
+    const closeMembers = (payload: TurnCompletedPayload): void => {
+      for (const member of members) this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, promptId: member.promptId, turnId, payload,
+      });
+    };
+    // Not handed to the adapter and not closed: the members stay admitted, and
+    // the next session generation dispatches them again.
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
@@ -1470,18 +1696,20 @@ export class AcpSession implements AgentSession {
     this.retryNativeTurnId = undefined;
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
-    this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle };
+    this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle, promptIds: members.map(member => member.promptId), console: members.some(member => member.origin?.kind === 'owner-admin-console') };
+    this.observation.publish();
     this.events.emit('state', { turnId, status: 'running', origin });
-    this.conversation.appendSafe({
+    members.forEach((member, index) => this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
-      acpSessionId: this.sessionId, promptId: turnId, turnId,
-      source: conversationSource(origin).source, payload: {},
-    });
+      acpSessionId: this.sessionId, promptId: member.promptId, turnId,
+      source: conversationSource(member.origin).source,
+      payload: members.length > 1 ? { batch: { turnId, index, size: members.length } } : {},
+    }));
     try {
       const response = await Promise.race([
         this.connection.agent.request(acp.methods.agent.session.prompt, {
           sessionId: this.sessionId,
-          prompt: promptContentBlocks(text, origin),
+          prompt: batchContentBlocks(members),
         }),
         this.terminated,
       ]);
@@ -1492,15 +1720,11 @@ export class AcpSession implements AgentSession {
         turnId, stopReason: response.stopReason, origin, cancellationSource,
       });
       this.events.emit('state', { status: 'idle' });
-      this.conversation.appendSafe({
-        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-        acpSessionId: this.sessionId, promptId: turnId, turnId,
-        payload: {
-          outcome: classifyStopReason(response.stopReason),
-          stopReason: response.stopReason,
-          ...(cancellationSource ? { cancellationSource } : {}),
-        },
-      });
+      completionPayload = {
+        outcome: classifyStopReason(response.stopReason),
+        stopReason: response.stopReason,
+        ...(cancellationSource ? { cancellationSource } : {}),
+      };
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
       return turnResult(
@@ -1521,11 +1745,7 @@ export class AcpSession implements AgentSession {
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      this.conversation.appendSafe({
-        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
-        acpSessionId: this.sessionId, promptId: turnId, turnId,
-        payload: { outcome: 'failed', stopReason: this.lastError },
-      });
+      completionPayload = { outcome: 'failed', stopReason: this.lastError };
       return turnResult(
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
@@ -1541,11 +1761,14 @@ export class AcpSession implements AgentSession {
         this.cancelEscalation = undefined;
         this.activeTurn = undefined;
       }
+      if (completionPayload) closeMembers(completionPayload);
+      this.observation.publish();
     }
   }
 
   private async steerPrompt(text: string): Promise<TurnResult> {
     this.steeringWasUsed = true;
+    if (this.activeTurn) this.activeTurn.fileDeliveryRevoked = true;
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.steeringRequests++;
@@ -1576,7 +1799,7 @@ export class AcpSession implements AgentSession {
     } finally { this.steeringRequests--; }
   }
 
-  private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+  private requestPermission(params: acp.RequestPermissionRequest, neutralPolicy?: CommonPermissions): Promise<acp.RequestPermissionResponse> {
     // `kinds` is a PRIORITY order. Scanning the agent's option array instead
     // (`options.find(o => kinds.includes(o.kind))`) hands the choice to whatever
     // order the agent happened to list, which is exactly how an automatic denial
@@ -1593,7 +1816,7 @@ export class AcpSession implements AgentSession {
     // Permission is part of the tool lifecycle. Reserve before any policy or
     // human decision so a monitor wake cannot slip between request and answer.
     this.reservePermission(toolCallId, permissionId);
-    if (this.isEffectiveCodexProtectedMcpApproval(params)) {
+    if (!neutralPolicy && this.isEffectiveCodexProtectedMcpApproval(params)) {
       // Protected MCP approval is already the tool's narrow gate. Never turn
       // this one decision into an adapter-wide standing grant.
       const option = choose(['allow_once']);
@@ -1604,11 +1827,11 @@ export class AcpSession implements AgentSession {
       else this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
     }
-    if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
+    if ((neutralPolicy ?? this.options.permissions).approval === 'allow' && this.withinAutomaticBoundary(params, neutralPolicy)) {
       const option = choose(['allow_always', 'allow_once']);
       const response = this.settleAutomatically(params, option, 'allowed',
         'permissions.approval=allow',
-        `the request is inside the ${this.options.permissions.filesystem} boundary`);
+        `the request is inside the ${(neutralPolicy ?? this.options.permissions).filesystem} boundary`);
       if (option) this.allowPermission(toolCallId, permissionId);
       else this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
@@ -1616,8 +1839,8 @@ export class AcpSession implements AgentSession {
     // A live grace window still counts as attended: the controller may be
     // mid-reconnect, and denying instantly is exactly what the grace prevents.
     const unattended = this.controllerCount === 0 && !this.controllerGrace
-      && this.options.permissions.unattended === 'deny';
-    if (this.options.permissions.approval === 'deny' || unattended) {
+      && (neutralPolicy ?? this.options.permissions).unattended === 'deny';
+    if ((neutralPolicy ?? this.options.permissions).approval === 'deny' || unattended) {
       // reject_once FIRST: `reject_always` teaches the agent a standing rule from
       // a decision no human made, so one unattended denial would silently disable
       // the tool for the rest of the session.
@@ -1633,42 +1856,20 @@ export class AcpSession implements AgentSession {
 
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
-    this.readiness = 'awaiting_permission';
-    this.events.emit('permission', {
-      turnId: this.activeTurn?.id,
-      origin: this.activeTurn?.origin,
-      permissionId,
-      toolCallId: this.activeTurn?.origin?.kind === 'scheduled-loop'
-        ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-      title: this.activeTurn?.origin?.kind === 'scheduled-loop'
+    const presented: PermissionRequestedPayload = {
+      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
+      title: scheduledTurn(this.activeTurn)
         ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
-      status: 'pending',
       options: params.options.map(option => ({
         optionId: option.optionId,
-        name: this.activeTurn?.origin?.kind === 'scheduled-loop' ? option.kind : option.name,
+        name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
         kind: option.kind,
       })),
-    });
-    this.conversation.appendSafe({
-      kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
-      acpSessionId: this.sessionId, permissionId,
-      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
-      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-      payload: {
-        toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
-        title: scheduledTurn(this.activeTurn)
-          ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
-        options: params.options.map(option => ({
-          optionId: option.optionId,
-          name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
-          kind: option.kind,
-        })),
-        expiresAt,
-      },
-    });
+      expiresAt,
+    };
     return new Promise(resolve => {
       const pending: PendingPermission = {
-        options: params.options, resolve,
+        options: params.options, resolve, presented,
         toolCallId,
         eventToolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
       };
@@ -1678,6 +1879,18 @@ export class AcpSession implements AgentSession {
       }, timeoutMs);
       pending.expiry.unref?.();
       this.pendingPermissions.set(permissionId, pending);
+      this.readiness = 'awaiting_permission';
+      this.events.emit('permission', {
+        turnId: this.activeTurn?.id, origin: this.activeTurn?.origin,
+        permissionId, ...presented, status: 'pending',
+      });
+      this.conversation.appendSafe({
+        kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, permissionId,
+        promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+        toolCallId: presented.toolCallId, payload: presented,
+      });
+      this.observation.publish();
     });
   }
 
@@ -1730,8 +1943,8 @@ export class AcpSession implements AgentSession {
       : { outcome: { outcome: 'cancelled' } };
   }
 
-  private withinAutomaticBoundary(params: acp.RequestPermissionRequest): boolean {
-    const filesystem = this.options.permissions.filesystem;
+  private withinAutomaticBoundary(params: acp.RequestPermissionRequest, policy?: CommonPermissions): boolean {
+    const filesystem = (policy ?? this.options.permissions).filesystem;
     if (filesystem === 'unrestricted') return true;
     if (filesystem === 'read-only' && params.toolCall.kind !== 'read') return false;
     const locations = params.toolCall.locations ?? [];
@@ -1850,9 +2063,18 @@ export class AcpSession implements AgentSession {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;
-    this.recordConversationUpdate(update, scheduled, messagePhase === 'commentary');
+    // Install live capability state before the durable append can synchronously
+    // notify a subscriber that reenters observation at the new ledger barrier.
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
+    if (update.sessionUpdate === 'available_commands_update')
+      this.advertisedCommands = new Set((update.availableCommands ?? []).map(command => command.name));
+    this.recordConversationUpdate(update, scheduled);
+    if (update.sessionUpdate === 'usage_update') {
+      // Claude subscription rate-limit snapshot (claude-agent-acp forwards the SDK rate_limit_event).
+      const rateLimit = (update._meta as Record<string, unknown> | null | undefined)?.['_claude/rateLimit'];
+      if (rateLimit) recordClaudeRateLimit(this.options.stateDir, rateLimit);
+    }
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
         const phase = messagePhase;
@@ -1906,6 +2128,7 @@ export class AcpSession implements AgentSession {
       default:
         break;
     }
+    this.observation.publish();
   }
 
   /**
@@ -1924,16 +2147,18 @@ export class AcpSession implements AgentSession {
     return phase === 'commentary' || phase === 'final_answer' ? phase : 'ambiguous';
   }
 
-  /** Normalize every ACP update losslessly into the durable ledger. */
-  private recordConversationUpdate(
-    update: acp.SessionUpdate, scheduled: boolean, commentary = false,
-  ): void {
+  /**
+   * Normalize every ACP update losslessly into the durable ledger. The ledger is the conversation the
+   * owner reads, so the agent's commentary between its tools is kept as written, like its final answer.
+   */
+  private recordConversationUpdate(update: acp.SessionUpdate, scheduled: boolean): void {
     const normalized = normalizeSessionUpdate(update,
       scheduled ? {
         redactText: SCHEDULED_LOOP_REDACTION,
         redactToolCallId: 'scheduled-loop-tool',
-      }
-        : commentary ? { redactText: OWNER_COMMENTARY_REDACTION } : {});
+      } : {});
+    if (normalized.kind === 'capabilities.updated' && 'commands' in normalized.payload)
+      this.presentedCommands = normalized.payload.commands ?? [];
     this.conversation.appendSafe({
       kind: normalized.kind,
       sessionGeneration: this.sessionGeneration,
@@ -1948,6 +2173,11 @@ export class AcpSession implements AgentSession {
   }
 
   // ── conversation ledger access (AgentSession) ─────────────────────────────
+
+  taskNoticeBinding():TaskNoticeBinding|undefined {
+    return this.activeTurn&&this.sessionId?{sessionGeneration:this.sessionGeneration,acpSessionId:this.sessionId,promptId:this.activeTurn.id}:undefined;
+  }
+  recordTaskCreated(binding:TaskNoticeBinding,notice:TaskCreatedNotice):void {appendTaskCreated(this.conversation,binding,notice);}
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);
@@ -1974,12 +2204,48 @@ export class AcpSession implements AgentSession {
     };
   }
 
+  subscribeConversationFailure(listener: (generation: string) => void) {
+    return this.conversation.subscribeFailure(listener);
+  }
+
+  conversationReplayAvailable(expectedGeneration: string): boolean {
+    return expectedGeneration === this.sessionGeneration && this.conversation.generationDurable(expectedGeneration);
+  }
+
+  replayConversation(request: import('./conversation-replay.js').ConversationReplayRequest) {
+    if (request.expectedGeneration !== this.sessionGeneration) throw new Error('session generation changed');
+    return this.conversation.replay(request);
+  }
+
+  observeConversation(listener: (state: ConversationObservationState) => void) {
+    return this.observation.observe(listener);
+  }
+
+  private captureObservation(): Omit<ConversationObservationState, 'stateRevision'> {
+    const snapshot = this.snapshot();
+    return {
+      ...this.conversationSnapshot(),
+      ...pendingInventory(this.pendingPrompts),
+      ledgerBarrier: Number(this.conversation.lastCursor() ?? 0),
+      alive: snapshot.alive,
+      readiness: snapshot.alive ? snapshot.readiness : 'offline',
+      activePromptIds: [...(this.activeTurn?.promptIds ?? [])],
+      pendingPermissions: [...this.pendingPermissions].flatMap(([permissionId, pending]) =>
+        pending.presented ? [{ permissionId, ...pending.presented }] : []),
+      commands: this.presentedCommands,
+      runtimeModel: snapshot.runtimeModel,
+      reasoningEffort: snapshot.reasoningEffort,
+      permissionMode: snapshot.permissionMode,
+    };
+  }
+
   conversationSnapshot(): ConversationSnapshot {
     return {
       sessionGeneration: this.sessionGeneration,
       readiness: this.isAlive() ? this.readiness : 'offline',
       queueDepth: this.queueDepth,
       pendingPermissionIds: [...this.pendingPermissions.keys()],
+      ...pendingInventory(this.pendingPrompts),
       ...(this.conversation.degraded ? { historyDegraded: true } : {}),
     };
   }

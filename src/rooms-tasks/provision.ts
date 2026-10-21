@@ -1,3 +1,5 @@
+import { readRoomReadiness } from '../agent-ours/service.js';
+import { ensureWorkspace, validateWorkspace } from './workspace.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,7 +17,8 @@ import type {
   TemplateSnapshot, TemplateMemberSlot,
 } from './types.js';
 import { storedRoomLaunchPolicy } from './types.js';
-import { spawnTemp } from '../spawn.js';
+import { spawnTemp, resumeTaskSupervisor } from '../spawn.js';
+import { adoptLegacyTaskMember } from './legacy-task-member.js';
 import type { SpawnOpts } from '../spawn.js';
 import { type FleetConfig, type RoomMemberStartup } from '../config.js';
 import type { AgentDefinition, ResolvedRole } from '../config.js';
@@ -31,7 +34,7 @@ import {
 } from '../fleet-proxy.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError } from '../session/types.js';
-import { closeManagedRoom } from './close.js';
+import { closeManagedRoom, roomCloseLockPath, CLOSE_LOCK_STALE_MS } from './close.js';
 import { withFileLock } from '../atomic-file.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import { TaskStateError, taskDeletionState } from './task-state.js';
@@ -48,6 +51,7 @@ export function getBinPath(): string {
 }
 
 export interface ProvisionMembersInput {
+  configPath?: string;
   cfg: FleetConfig;
   cowork: CoworkAdapter;
   roomId: string;
@@ -57,6 +61,8 @@ export interface ProvisionMembersInput {
   brief?: string;
   goal?: string;
   startupWait?: Partial<StartupWaitPolicy>;
+  /** Append only the supplied new slots to an already active room. */
+  append?: boolean;
 }
 
 export interface StartupWaitPolicy {
@@ -216,6 +222,7 @@ function roomTask(
   anonymous: boolean,
 ): string {
   return buildRoomMemberTask({
+    workspace: getRoomRecord(input.roomId)?.workspace?.path,
     taskId: input.taskId,
     roomId: input.roomId,
     roomIdentityCid,
@@ -229,7 +236,7 @@ function roomTask(
       cowork_role: member.coworkRole,
       persona: settings.persona,
     },
-    roster: members.map(candidate => ({
+    roster: [...(input.append ? (getRoomRecord(input.roomId)?.member_seats ?? []).filter(seat => !members.some(m => m.name === seat.role_name)).map(seat => ({name:seat.role_name,coworkRole:seat.cowork_role})) : []), ...members].map(candidate => ({
       role_name: candidate.name,
       cowork_role: candidate.coworkRole,
     })),
@@ -238,7 +245,7 @@ function roomTask(
 
 function launchMatches(
   dir: string,
-  member: ExpandedMember,
+  member: Pick<ExpandedMember, 'name' | 'coworkRole'>,
   actionId: string,
   taskSha: string,
   roomId: string,
@@ -251,10 +258,14 @@ function launchMatches(
   try {
     const role = parse(readFileSync(`${dir}/role.yaml`, 'utf8')) as {
       identity?: unknown;
+      cwd?: unknown;
       mission?: unknown;
       roomMemberStartup?: Partial<RoomMemberStartup>;
     };
     const startup = role.roomMemberStartup;
+    const workspace = getRoomRecord(roomId)?.workspace;
+    if (workspace && (role.cwd !== workspace.path
+      || JSON.stringify(startup?.workspace) !== JSON.stringify(workspace))) return false;
     return role.identity === member.name
       && startup?.room_id === roomId
       && startup.room_identity_cid === roomIdentityCid
@@ -263,8 +274,7 @@ function launchMatches(
       && (startup.anonymous ?? false) === anonymous
       && sha256Text(startup.task ?? '') === taskSha
       && (expectedInviteId === undefined || startup.invite_id === expectedInviteId)
-      && typeof startup.invite === 'string'
-      && startup.invite.length > 0;
+      && startup.invite === '';
   } catch { return false; }
 }
 
@@ -326,6 +336,21 @@ async function retainRunningLaunch(input: {
       } });
       return true;
     }
+    if (supervisor.taskOwner) {
+      await resumeTaskSupervisor(member.name, provision.binPath);
+      updateMemberStartup(provision.roomId, member.name, { launch: {
+        ...retainedLaunch, state: 'launched', launch_id: supervisor.launchId,
+        presentation: retainedLaunch.presentation ?? presentationFromStatePath(dir, settings, member.coworkRole),
+        updated_at: new Date().toISOString(),
+      } });
+      return true;
+    }
+    if (provision.taskId) {
+      const adopted = await adoptLegacyTaskMember({ taskId: provision.taskId, roomId: provision.roomId,
+        roomIdentityCid, creationActionId: retainedLaunch.action_id! }, member.name);
+      if (adopted !== 'running-legacy') await resumeTaskSupervisor(member.name, provision.binPath);
+      return true;
+    }
     await secureStoppedTempArchive(member.name, supervisor.launchId);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       ...retainedLaunch, state: 'stopped', launch_id: supervisor.launchId,
@@ -335,6 +360,7 @@ async function retainRunningLaunch(input: {
   }
 
   if (seat.launch?.state === 'launched' && !existsSync(dir)) {
+    if (provision.taskId) throw Error(`retained task member ${member.name} is missing; explicit reconciliation required`);
     if (!seat.launch.launch_id || !seat.launch.action_id)
       throw new Error(`missing durable launch identity for disappeared ${member.name}`);
     const archive = await secureStoppedTempArchive(member.name, seat.launch.launch_id);
@@ -370,43 +396,21 @@ async function retainRunningLaunch(input: {
   return false;
 }
 
-/**
- * Member-launch publication window: for a task-bound room, the durable launch
- * intent, spawn, and launch record publish under the common task-operation
- * lock so an accepted deletion linearizes strictly before (bounded abort — no
- * spawn happens) or strictly after (the seat's launch record is visible to
- * deletion retirement). The lock is held per member only, never across
- * seat-wait loops.
- */
 async function launchMember(input: {
   provision: ProvisionMembersInput;
   member: ExpandedMember;
   settings: MemberSettings;
   startup: RoomMemberStartup;
 }): Promise<void> {
-  const taskId = input.provision.taskId;
-  if (!taskId) return launchMemberUnlocked(input);
-  return withFileLock(taskOperationLockPath(taskId), () => {
-    if (taskDeletionState(taskId) !== 'none')
-      throw new Error(
-        `task ${taskId} is pending deletion; aborting member launch for ${input.member.name}`,
-      );
-    return launchMemberUnlocked(input);
-  }, {}, TASK_OPERATION_LOCK_STALE_MS);
-}
-
-async function launchMemberUnlocked(input: {
-  provision: ProvisionMembersInput;
-  member: ExpandedMember;
-  settings: MemberSettings;
-  startup: RoomMemberStartup;
-}): Promise<void> {
+  // provisionMembers holds the task and room lifecycle locks through every launch.
+  assertProvisioningOpen(input.provision);
   const { provision, member, settings, startup } = input;
   const seat = getRoomRecord(provision.roomId)!.member_seats
     .find(candidate => candidate.role_name === member.name)!;
   const actionId = randomUUID();
   let effectiveActionId: string = actionId;
   const attempt = (seat.launch?.attempt ?? 0) + 1;
+  const taskSupervised = Boolean(provision.taskId) && process.env.OURS_FLEET_SUPERVISOR !== 'none';
   const taskSha = sha256Text(startup.task);
   const effectiveAgentDefinition = structuredClone(settings.definition);
   const { projection: agentDefinition, fingerprint: agentFingerprint } =
@@ -415,6 +419,7 @@ async function launchMemberUnlocked(input: {
     ? process.env[FLEET_PROXY_CALLER_ENV] : undefined;
   updateMemberStartup(provision.roomId, member.name, { launch: {
     state: 'intent', attempt, action_id: actionId, mission_sha256: taskSha,
+    ...(taskSupervised ? { task_supervised: true } : {}),
     agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
     agent_template: settings.template, agent_template_hash: settings.templateHash,
     ...(proxyCaller ? { caller_role: proxyCaller } : {}),
@@ -423,6 +428,7 @@ async function launchMemberUnlocked(input: {
   try {
     const launched = await spawnRoomMember({
       name: member.name,
+      configPath: provision.configPath,
       temp: true,
       identity: member.name,
       agentDefinition: settings.definition,
@@ -438,6 +444,7 @@ async function launchMemberUnlocked(input: {
     if (launched.creationActionId !== actionId) {
       updateMemberStartup(provision.roomId, member.name, { launch: {
         state: 'intent', attempt, action_id: launched.creationActionId,
+        ...(taskSupervised ? { task_supervised: true } : {}),
         mission_sha256: taskSha, agent_definition: agentDefinition,
         agent_fingerprint: agentFingerprint,
         agent_template: settings.template, agent_template_hash: settings.templateHash,
@@ -458,6 +465,7 @@ async function launchMemberUnlocked(input: {
       : presentationFromStatePath(launchedDir, settings, member.coworkRole);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
+      ...(taskSupervised ? { task_supervised: true } : {}),
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
       presentation,
@@ -467,6 +475,7 @@ async function launchMemberUnlocked(input: {
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
+      ...(taskSupervised ? { task_supervised: true } : {}),
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
       ...(proxyCaller ? { caller_role: proxyCaller } : {}),
@@ -505,7 +514,11 @@ function reconcileMemberSeats(
       && seat.seat_state === 'active');
   const seats = current.member_seats.map(seat => {
     const member = members.find(candidate => candidate.name === seat.role_name)!;
+    if (!member) return seat;
+    const readiness = readRoomReadiness(current.room_identity_cid!, member.name);
+    if (!readiness || readiness.room !== roomId || readiness.invite !== seat.invite_id) { complete = false; return seat; }
     const found = exactCoworkSeat(observed, member, seat.invite_id);
+    if (found && found.identity_cid !== readiness.cid) throw new Error('Cowork seat CID does not match supervisor provisioned identity');
     if (!found || found.seat_state !== 'active') {
       complete = false;
       return seat;
@@ -529,11 +542,43 @@ function assertCoworkRoomPolicy(
     throw new Error(`Cowork anonymity (${String(room.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(expectedAnonymous)})`);
 }
 
-export async function provisionMembers(
-  input: ProvisionMembersInput,
-): Promise<RoomOrchestrationRecord> {
+function assertProvisioningOpen(input: ProvisionMembersInput): void {
+  if (input.taskId && getTask(input.taskId).terminal_intent)
+    throw new Error(`task ${input.taskId} has an accepted terminal intent; refusing to provision members`);
+  const room = getRoomRecord(input.roomId);
+  if (room?.state === 'closing' || room?.state === 'closed')
+    throw new Error(`room ${input.roomId} is ${room.state}; refusing to provision members`);
+}
+
+export async function provisionMembers(input: ProvisionMembersInput): Promise<RoomOrchestrationRecord> {
+  // Same lock order as terminal/deletion settlement. Serialize concurrent retries
+  // and standalone retirement as well as member publication. Seat waits are bounded.
+  const run = () => withFileLock(roomCloseLockPath(input.roomId), () => {
+    assertProvisioningOpen(input);
+    if (input.append) {
+      const task = input.taskId ? getTask(input.taskId) : undefined;
+      const room = getRoomRecord(input.roomId);
+      if (!task || !['active', 'review'].includes(task.state) || room?.state !== 'active'
+          || room.task_id !== task.task_id || room.room_identity_cid !== task.room_identity_cid)
+        throw new Error('Adding an agent requires the exact active task room');
+      const names = expandMembers(input.template, shortId(task.task_id)).map(m => m.name);
+      if (room.member_seats.some(seat => names.includes(seat.role_name)))
+        throw new Error('Member slot is already recorded; inspect its existing launch');
+      if (room.member_seats.some(seat => seat.seat_state !== 'active'))
+        throw new Error('Existing member admission must finish before adding an agent');
+    }
+    if (!getRoomRecord(input.roomId))
+      throw new Error(`room ${input.roomId} is missing; refusing provisioning`);
+    return provisionMembersUnlocked(input);
+  }, {}, CLOSE_LOCK_STALE_MS);
+  return input.taskId
+    ? withFileLock(taskOperationLockPath(input.taskId), run, {}, TASK_OPERATION_LOCK_STALE_MS)
+    : run();
+}
+
+async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<RoomOrchestrationRecord> {
   const { cfg, cowork, roomId, taskId, template } = input;
-  // Deletion-epoch pre-check; each member launch re-checks under the lock.
+  // The common task-operation lock protects this epoch through all member launches.
   if (taskId && taskDeletionState(taskId) !== 'none')
     throw new Error(`task ${taskId} is pending deletion; refusing to provision members`);
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
@@ -545,6 +590,11 @@ export async function provisionMembers(
   const existing = getRoomRecord(roomId);
   if (!existing?.room_identity_cid)
     throw new Error(`room ${roomId} has no pinned room identity CID`);
+  if (existing.workspace) {
+    validateWorkspace(existing.workspace, taskId ? 'task' : 'room', taskId ?? roomId);
+    ensureWorkspace(existing.workspace);
+    for (const setting of settings.values()) setting.definition.cwd = existing.workspace.path;
+  }
   const roomIdentityCid = existing.room_identity_cid;
   const ownerSeatCid = existing.owner_seat_cid ?? null;
   const roomPolicy = storedRoomLaunchPolicy(existing.room_policy);
@@ -553,8 +603,8 @@ export async function provisionMembers(
   const resuming = members.length > 0
     && members.every(member => persistedNames.has(member.name));
   if (!resuming) {
-    advanceSaga(roomId, 'create_members', 3);
-    updateMemberSeats(roomId, members.map(member => {
+    if (!input.append) advanceSaga(roomId, 'create_members', 3);
+    updateMemberSeats(roomId, [...(input.append ? existing.member_seats : []), ...members.map(member => {
       const memberSettings = settings.get(member.name)!;
       const evidence = launchDefinition(memberSettings.definition);
       return ({
@@ -567,7 +617,7 @@ export async function provisionMembers(
         agent_template: memberSettings.template,
         agent_template_hash: memberSettings.templateHash,
         updated_at: new Date().toISOString() },
-    }); }));
+    }); })], input.append ? template : undefined);
   } else {
     for (const member of members) {
       const seat = existing.member_seats.find(candidate => candidate.role_name === member.name)!;
@@ -589,7 +639,7 @@ export async function provisionMembers(
     sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
   };
 
-  advanceSaga(roomId, 'join_role_groups', 4);
+  if (!input.append) advanceSaga(roomId, 'join_role_groups', 4);
   try {
     const initialRoom = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(initialRoom, roomPolicy.anonymous);
@@ -610,18 +660,34 @@ export async function provisionMembers(
         provision: input, member, settings: settings.get(member.name)!, task, roomIdentityCid,
       })) continue;
 
+      // A previous failed launch keeps its invite pointer durably. Never
+      // overwrite that requirement until the supported revoke has succeeded;
+      // a transport failure must fence subsequent invite issuance too.
+      if (currentSeat.invite_id) {
+        const observed = await cowork.getRoom(roomId);
+        if (!observed || observed.identity_cid !== roomIdentityCid)
+          throw new Error('cannot verify room before failed-attempt invite cleanup');
+        if (observed.seats.some(seat => seat.invite_id === currentSeat.invite_id
+          && seat.seat_state !== 'removed'))
+          throw new Error('failed-attempt invite has an admitted seat; reconcile before replacing the member');
+        await cowork.revokeInvite(roomId, currentSeat.invite_id);
+      }
+
       const issued = await cowork.issueInvite(roomId, {
         mode: 'one_time', role: member.coworkRole, min_accepts: 1,
       });
-      const seats = getRoomRecord(roomId)!.member_seats.map(seat =>
-        seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id } : seat);
-      updateMemberSeats(roomId, seats);
       try {
+        assertProvisioningOpen(input);
+        const seats = getRoomRecord(roomId)!.member_seats.map(seat =>
+          seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id } : seat);
+        updateMemberSeats(roomId, seats);
         await launchMember({
           provision: input,
           member,
           settings: settings.get(member.name)!,
           startup: {
+            ...(taskId ? { task_id: taskId } : {}),
+            workspace: existing.workspace,
             room_id: roomId,
             room_identity_cid: roomIdentityCid,
             identity_name: member.name,
@@ -634,7 +700,12 @@ export async function provisionMembers(
           },
         });
       } catch (error) {
-        await cowork.revokeInvite(roomId, issued.invite_id).catch(() => {});
+        try {
+          await cowork.revokeInvite(roomId, issued.invite_id);
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError],
+            'member launch failed and invite cleanup is unresolved; retry must revoke the retained requirement first');
+        }
         throw error;
       }
     }
@@ -652,19 +723,19 @@ export async function provisionMembers(
     throw error;
   }
 
-  advanceSaga(roomId, 'wait_seats', 5);
+  if (!input.append) advanceSaga(roomId, 'wait_seats', 5);
   const deadline = policy.now() + policy.timeoutMs;
   let delay = policy.initialDelayMs;
   for (;;) {
     const remote = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(remote, roomPolicy.anonymous);
     const reconciled = reconcileMemberSeats(roomId, members, remote.seats, ownerSeatCid ?? undefined);
-    if (reconciled.complete) break;
+    if (reconciled.complete && remote.state === 'active') break;
     if (policy.now() >= deadline) {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+      if (!input.append) advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;
     }
-    advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+    if (!input.append) advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
     await policy.sleep(delay);
     delay = Math.min(policy.maxDelayMs, Math.max(delay + 1, delay * 2));
   }
@@ -690,13 +761,87 @@ export async function provisionMembers(
       };
     });
     updateTaskMembers(taskId, taskMembers);
-    if (getTask(taskId).blocked) unblockTask(taskId);
+    if (!input.append && getTask(taskId).blocked) unblockTask(taskId);
   }
 
+  if (input.append) return getRoomRecord(roomId)!;
   advanceSaga(roomId, 'activate', 6);
   const record = activateRoom(roomId);
   if (taskId) activateTask(taskId);
   return record;
+}
+
+/** Reconcile proven, admitted launches without any spawn, archive, invite or recovery path. */
+export async function reconcileExistingTaskMembers(input: {
+  taskId: string;
+  checkOnly?: boolean;
+  cowork: Pick<CoworkAdapter, 'getRoom'>;
+  expectedLaunches: ReadonlyArray<{ role_name: string; launch_id: string; identity_cid: string }>;
+}): Promise<RoomOrchestrationRecord> {
+  return withFileLock(taskOperationLockPath(input.taskId), async () => {
+    const task = getTask(input.taskId);
+    if (!['provisioning', 'active'].includes(task.state) || task.terminal_intent || taskDeletionState(input.taskId) !== 'none'
+      || !task.room_id) throw new Error('task is not open for existing-member reconciliation');
+    const roomId = task.room_id;
+    return withFileLock(roomCloseLockPath(roomId), async () => {
+      const current = getRoomRecord(roomId);
+      if (!current || !['provisioning', 'active'].includes(current.state) || current.close
+        || current.task_id !== input.taskId || !current.room_identity_cid
+        || task.room_identity_cid !== current.room_identity_cid)
+        throw new Error('room is not open for existing-member reconciliation');
+      const names = new Set(input.expectedLaunches.map(seat => seat.role_name));
+      if (!names.size || names.size !== input.expectedLaunches.length
+        || current.member_seats.length !== names.size
+        || current.member_seats.some(seat => !names.has(seat.role_name)))
+        throw new Error('expected launch roster does not match the persisted room');
+      const remote = await input.cowork.getRoom(roomId);
+      if (!remote || remote.room_id !== roomId || remote.identity_cid !== current.room_identity_cid
+        || remote.state !== 'active') throw new Error('Cowork room is not the exact active room');
+      assertCoworkRoomPolicy(remote, storedRoomLaunchPolicy(current.room_policy).anonymous);
+      if (current.owner_seat_cid && !remote.seats.some(seat =>
+        seat.identity_cid.toLowerCase() === current.owner_seat_cid!.toLowerCase() && seat.seat_state === 'active'))
+        throw new Error('expected Owner seat is not active');
+      const seats: RoomMemberSeat[] = [];
+      for (const seat of current.member_seats) {
+        const expected = input.expectedLaunches.find(item => item.role_name === seat.role_name)!;
+        const launch = seat.launch;
+        if (seat.seat_state === 'removed' || !seat.invite_id || launch?.state !== 'launched'
+          || launch.launch_id !== expected.launch_id || !launch.action_id || !launch.mission_sha256
+          || (seat.identity_cid && seat.identity_cid !== expected.identity_cid))
+          throw new Error('persisted member launch does not match reconciliation evidence');
+        const dir = agentDir(seat.role_name, true);
+        if (!launchMatches(dir, { name: seat.role_name, coworkRole: seat.cowork_role },
+          launch.action_id, launch.mission_sha256, roomId, current.room_identity_cid,
+          seat.invite_id, storedRoomLaunchPolicy(current.room_policy).anonymous))
+          throw new Error('member startup provenance mismatch');
+        const supervisor = readTempSupervisor(dir);
+        if (!supervisor || supervisor.role !== seat.role_name || supervisor.launchId !== expected.launch_id
+          || await tempSupervisorLiveness(dir) !== 'running')
+          throw new Error('expected member supervisor is not running');
+        const ready = readRoomReadiness(current.room_identity_cid, seat.role_name);
+        const matches = remote.seats.filter(item => item.display_name === seat.role_name
+          && item.seat_state !== 'removed');
+        const found = matches[0];
+        if (!ready || ready.room !== roomId || ready.invite !== seat.invite_id
+          || ready.cid !== expected.identity_cid || matches.length !== 1 || !found
+          || found.identity_cid !== expected.identity_cid || found.role !== seat.cowork_role
+          || found.seat_state !== 'active' || found.invite_id !== seat.invite_id)
+          throw new Error('member readiness or authenticated Cowork seat mismatch');
+        seats.push({ ...seat, identity_cid: expected.identity_cid, seat_state: 'active' });
+      }
+      if (input.checkOnly) return current;
+      // No mutation until the complete roster has passed; these writes are replayable
+      // under the same task/room lifecycle locks if interrupted between files.
+      updateMemberSeats(roomId, seats);
+      updateTaskMembers(input.taskId, seats.map(seat => ({ name: seat.role_name,
+        identity_cid: seat.identity_cid!, slot: seat.slot, cowork_role: seat.cowork_role })));
+      if (getTask(input.taskId).blocked) unblockTask(input.taskId);
+      if (current.state !== 'active') advanceSaga(roomId, 'activate', 6);
+      const activated = current.state === 'active' ? getRoomRecord(roomId)! : activateRoom(roomId);
+      if (task.state !== 'active') activateTask(input.taskId);
+      return activated;
+    }, {}, TASK_OPERATION_LOCK_STALE_MS);
+  }, {}, TASK_OPERATION_LOCK_STALE_MS);
 }
 
 export async function cleanupMembers(input: {

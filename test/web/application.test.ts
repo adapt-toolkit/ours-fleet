@@ -1,9 +1,13 @@
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { preparePermanentAssignment } from '../../src/agent-ours/service.js';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { RoleRepository } from '../../src/application/role-repository.js';
+import { FleetQueryService } from '../../src/application/fleet-query-service.js';
+import { deriveTopology } from '../../src/web/topology.js';
+import { loadConfig } from '../../src/config.js';
 import { FleetError, normalizeError } from '../../src/application/errors.js';
 import { roleCapabilities } from '../../src/application/capabilities.js';
 import { RoleCreationService } from '../../src/application/role-creation-service.js';
@@ -11,6 +15,7 @@ import type { SupervisorBackend } from '../../src/supervisor/types.js';
 import type { OpsDeps } from '../../src/ops.js';
 import { SessionControlError } from '../../src/session/types.js';
 import { writeV2Fixture } from '../v2-fixture.js';
+import '../../src/harness/hermes.js';
 
 let oldHome: string | undefined;
 afterEach(() => {
@@ -54,6 +59,37 @@ function canonicalWeb(input: Record<string, any>): Record<string, any> {
 }
 
 describe('application services', () => {
+  it('keeps durable task members out of standalone agent lists and topology across repository reloads', async () => {
+    const root = fixture();
+    const configPath = join(root, 'fleet.yaml');
+    writeV2Fixture(configPath, 'roles:\n  PersonalAssistant:\n    session: acp\n');
+    const dir = join(root, '.ours-fleet', 'tmp', 'task-worker');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'role.yaml'), 'harness: codex\nsession: acp\nidentity: task-worker\n');
+    writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: 'task-worker',
+      launchId: 'retained-launch', kind: 'fleet-managed', taskOwner: {
+        taskId: '0mv03vs1e34acae5c', layout: { runId: 'task-0mv03vs1e34acae5c', participant: 'developer' }, creationActionId: 'retained-action',
+      } }));
+    for (let restart = 0; restart < 2; restart++) {
+      const repository = new RoleRepository({ configPath });
+      const query = new FleetQueryService({ repository, supervisor: backend,
+        control: async () => ({ ok: true, result: { backend: 'acp', alive: true, readiness: 'idle' } }) });
+      const listed = await query.list();
+      expect(listed.map(item => item.role.id)).toEqual(['PersonalAssistant']);
+      expect(listed[0].role.taskId).toBeUndefined();
+      expect(deriveTopology(loadConfig(configPath), listed).nodes.filter(node => node.kind === 'agent').map(node => node.label))
+        .toEqual(['PersonalAssistant']);
+      const detail = (await query.detail('task-worker')).role;
+      expect(detail).toMatchObject({ configured: false, lifetime: 'temporary', taskId: '0mv03vs1e34acae5c' });
+      expect(JSON.stringify(detail)).not.toContain('retained-action');
+      expect(JSON.stringify(detail)).not.toContain('participant');
+      expect((await query.list(true)).map(item => item.role.id)).toEqual(['PersonalAssistant', 'task-worker']);
+    }
+    const metadata = join(dir, '.temp-supervisor.json'), target = join(root, 'untrusted-metadata');
+    writeFileSync(target, readFileSync(metadata)); unlinkSync(metadata); symlinkSync(target, metadata);
+    expect((await new RoleRepository({ configPath }).get('task-worker'))?.taskId).toBeUndefined();
+  });
+
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
     const root = fixture();
     writeV2Fixture(join(root, 'fleet.yaml'), `
@@ -85,6 +121,36 @@ identity: Temp
     expect(roles.find(role => role.id === 'Orphan')?.lifetime).toBe('orphan');
     expect(roles.find(role => role.id === 'Broken')?.stateHealth).toBe('corrupt');
     expect(JSON.stringify(roles)).not.toContain('never-return-this');
+  });
+
+  it('builds one role by id without probing the other roles', async () => {
+    const root = fixture();
+    writeV2Fixture(join(root, 'fleet.yaml'), `
+roles:
+  ConfigOnly:
+    session: acp
+  Permanent:
+    session: acp
+`);
+    mkdirSync(join(root, '.ours-fleet', 'agents', 'Permanent'));
+    mkdirSync(join(root, '.ours-fleet', 'agents', 'Orphan'));
+    mkdirSync(join(root, '.ours-fleet', 'tmp', 'Temp'), { recursive: true });
+    writeFileSync(join(root, '.ours-fleet', 'tmp', 'Temp', 'role.yaml'), 'harness: codex\nsession: acp\n');
+    const probed: string[] = [];
+    const repo = new RoleRepository({
+      configPath: join(root, 'fleet.yaml'),
+      probeBackend: async (name, intended) => { probed.push(name); return { acp: intended === 'acp' }; },
+    });
+    const listed = await repo.list();
+    for (const id of ['ConfigOnly', 'Orphan', 'Permanent', 'Temp']) {
+      probed.length = 0;
+      expect(await repo.get(id)).toEqual(listed.find(role => role.id === id));
+      expect(probed).toEqual([id]);
+    }
+    probed.length = 0;
+    expect(await repo.get('Missing')).toBeUndefined();
+    expect(await repo.get('../Temp')).toBeUndefined();
+    expect(probed).toEqual([]);
   });
 
   it('keeps timeout/control failures distinct from proof of offline', () => {
@@ -153,6 +219,7 @@ identity: Temp
         journalDir: join(root, '.ours-fleet', 'web-actions'),
         probeReady: async () => flow.probe,
       });
+      vi.mocked(preparePermanentAssignment).mockResolvedValue('unverified');
       const request = {
         name: `Created_${flow.lifetime}_${flow.session}`,
         harness: flow.harness, session: flow.session, lifetime: flow.lifetime,
@@ -200,19 +267,12 @@ identity: Temp
         root, '.ours-fleet', flow.lifetime === 'permanent' ? 'agents' : 'tmp', request.name,
       );
       const briefing = readFileSync(join(stateDir, 'briefing.md'), 'utf8');
-      if (flow.lifetime === 'permanent') {
-        expect(briefing).toContain('choose_identity');
-        expect(briefing).not.toContain('call **create_identity**');
-        expect(briefing).toContain('It was created when your role');
-      } else {
-        expect(briefing).toContain('create_temporary_identity');
-        expect(briefing).not.toContain('choose_identity');
-        expect(briefing).not.toContain('call **create_identity**');
-      }
+      expect(briefing).toContain('owned and verified by the Fleet supervisor');
+      expect(briefing).not.toMatch(/choose_identity|create_temporary_identity|create_identity/);
       expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
         'identity_bootstrap_pending',
       );
-      expect(mutationCalls).toBe(flow.lifetime === 'permanent' ? 1 : 0);
+      expect(mutationCalls).toBe(0); // Creation is owned by the launched supervisor.
       const written = flow.lifetime === 'permanent'
         ? parse(readFileSync(join(root, 'fleet', 'agents', `${request.name}.yaml`), 'utf8'))
         : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));
@@ -225,6 +285,23 @@ identity: Temp
       });
     });
   }
+
+  it('previews Hermes creation with its non-interrupting default', async () => {
+    const root = fixture();
+    writeV2Fixture(join(root, 'fleet.yaml'), 'roles:\n  Existing: {}\n');
+    const service = new RoleCreationService({
+      configPath: join(root, 'fleet.yaml'),
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
+      identityProvisioner: { async exists() { return false; } },
+      journalDir: join(root, '.ours-fleet', 'web-actions'),
+    });
+    const preview = await service.preview(canonicalWeb({
+      name: 'HermesPreview', harness: 'hermes', session: 'acp', model: 'fixture-model',
+      lifetime: 'temporary', openAfterCreate: true,
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+    }) as any);
+    expect(preview.effective.monitor).toMatchObject({ interrupt: false });
+  });
 
   it('previews monitor defaults/provenance and rejects unsupported or invalid web monitor input', async () => {
     const root = fixture();
@@ -255,12 +332,12 @@ roles:
       },
     };
     const inherited = await service.preview(canonicalWeb(base) as any);
-    expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000 });
+    expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000, interrupt: 'after_tool' });
     expect(inherited.provenance.monitor).toBe('fleet-default');
     const creationCapabilities = await service.capabilities();
     expect(creationCapabilities.monitor).toMatchObject({
       modes: ['fleet', 'native'], injectModes: ['notification'],
-      defaults: { mode: 'native', batch_ms: 5000 },
+      defaults: { mode: 'native', batch_ms: 5000, interrupt: 'after_tool' },
     });
     const explicit = await service.preview({
       ...canonicalWeb(base),
@@ -406,7 +483,7 @@ roles: {}
       name: 'TrustedCaller', harness: 'codex', session: 'acp', identity: 'TrustedCaller',
       agentSelections: { brain: { inline: { harness: 'codex' } }, role: { inline: {} } },
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
-      monitor: { mode: 'native', interrupt: false }, sourceFile: configPath,
+      monitor: { mode: 'native', interrupt: 'after_tool' }, sourceFile: configPath,
     } as any;
     const managedPlan = direct.previewSpawn({ origin: 'managed', caller,
       options: { name: 'ManagedParity', temp: true } });
@@ -436,6 +513,9 @@ roles: {}
     const directRole = role('DirectParity');
     const managedRole = role('ManagedParity');
     const webRole = role('WebParity');
+    // Without an explicit interrupt, every creation path persists the after_tool default.
+    expect(directRole.monitor).toMatchObject({ interrupt: 'after_tool' });
+    expect(preview.effective.monitor).toMatchObject({ interrupt: 'after_tool' });
     for (const key of ['harness', 'session', 'permissions', 'monitor']) {
       expect(webRole[key]).toEqual(directRole[key]);
       expect(managedRole[key]).toEqual(directRole[key]);
@@ -443,3 +523,10 @@ roles: {}
     expect(launches).toBe(3);
   });
 });
+
+vi.mock('../../src/agent-ours/service.js', async importOriginal => ({
+ ...await importOriginal(),
+ preparePermanentAssignment: vi.fn(async () => 'verified'),
+ prepareManagedAgent: async () => ({descriptor:'/test/descriptor',privatePaths:[],runtime:{startHarness:async start=>start(),admit:async()=>()=>{}},close:async()=>{}}),
+ releaseManagedAgent:async()=>{},
+}));
