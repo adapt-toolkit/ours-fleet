@@ -1,6 +1,6 @@
 {
   "name": "ours-fleet",
   "description": "Spawn and oversee ours-fleet agents from inside Claude Code",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "author": { "name": "Adapt Framework Solutions Ltd", "url": "https://ours.network" }
 }
