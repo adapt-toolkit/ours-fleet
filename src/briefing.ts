@@ -41,6 +41,24 @@ function selfReminderGuidance(role: ResolvedRole): string[] {
   ];
 }
 
+/** Public, deployed app help; its source is ours-app `web/public/llms.txt`. */
+export const APP_GUIDE_URL = 'https://app.ours.network/llms.txt';
+
+/** Every role answers app questions from the public guide; standalone roles also learn the demo recipe. */
+function appHelpGuidance(standalone: boolean): string[] {
+  return [
+    '', '## ours app help',
+    'For questions about using the ours app (where something is, how to invite, accept, create, review,',
+    `finish or delete), first fetch ${APP_GUIDE_URL} and answer from it, naming the exact path and`,
+    'labels. If it cannot be fetched, say so and answer only from what you can verify (what the user',
+    'sees, `ours-fleet docs`); never invent controls. Never put invitation codes or secrets in answers.',
+    ...(standalone ? [
+      'If you are the Fleet Coordinator and the user asks for a guided demo task, follow the',
+      '"Guided demo task" section of `ours-fleet docs`.',
+    ] : []),
+  ];
+}
+
 function adminConsoleAuthority(session: ResolvedRole['session']): string[] {
   if (session === 'codex-app-server') return [
     '- A paired web admin-console prompt carries a server-generated Codex application-context entry',
@@ -203,6 +221,7 @@ function generateRoomMemberBriefing(
   }
   L.push(...taskReviewGuidance(startup.task_id));
   L.push(...selfReminderGuidance(role));
+  L.push(...appHelpGuidance(false));
   L.push('', '## Durable log');
   L.push('Append important commands / decisions / results to `' + opts.worklogPath + '` as you go —');
   L.push('it survives restarts. Never store invite material or secrets there.');
@@ -349,6 +368,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   }
 
   L.push(...selfReminderGuidance(role));
+  L.push(...appHelpGuidance(true));
   L.push('', '## Durable log');
   L.push(`Append important commands / decisions / results to \`${opts.worklogPath}\` as you go —`);
   L.push('it survives restarts.');

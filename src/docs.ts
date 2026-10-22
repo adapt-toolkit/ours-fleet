@@ -659,6 +659,118 @@ without PRs links its actual deliverables, never an invented PR); the package ho
 rest, including the original description as an attached file.
 Full contract: \`docs/task-progress-review.md\` in the package.
 
+### ours app help
+
+Questions about using the ours app are answered from the public user guide at
+\`https://app.ours.network/llms.txt\` (source: ours-app \`web/public/llms.txt\`). Every
+Fleet-generated briefing carries an "ours app help" section with that pointer; if
+the guide cannot be fetched, say so and answer only from what can be verified.
+Rewriting a briefing does not change a running conversation: \`restart\` resumes
+context, so tell an existing agent once to reread the changed section (or choose
+\`force-restart\` for a fresh context).
+
+### Guided demo task
+
+A Fleet Coordinator procedure that shows a user how tasks work while producing
+something useful: a personalized getting-started guide built from the public user
+guide. It needs no external accounts and changes nothing outside the task.
+
+Rules: use the shipped \`single\` room template and never a room layout (layout tasks
+have no "Add agent to task", and the app's New task always uses a layout). Never
+add agents, generate, view or accept invitations for the user: the user performs
+those clicks. Never finish or delete the task unless the user explicitly asks.
+
+1. Explain before acting: you will create a task named "Guided demo: getting
+   started with ours"; it appears under Navigate menu → "Tasks" (Active column)
+   and in Chats with the Tasks filter; it takes about 20-30 minutes; the user will
+   click a few controls; its files live in the task folder on this host.
+2. Optionally ask how the user wants to use ours (no secrets). Write the brief
+   below, with placeholders filled, to a file outside any task folder, then:
+
+   \`\`\`sh
+   ours-fleet task create --title "Guided demo: getting started with ours" --brief-file FILE --backlog --no-room
+   ours-fleet task start TASK --template single
+   \`\`\`
+
+   Announce the launch plan as for any task. Then tell the user: Navigate menu →
+   "Tasks" → the task → "Open room" shows the agents' conversation, "Progress"
+   shows real milestones, "To review" will hold the results, and the task folder is
+   \`~/.ours-fleet/workspaces/tasks/TASK\`. They can talk to the guide agent in the
+   room or from the task's chats.
+3. When \`ours-fleet task progress TASK\` shows S1, guide the user: task page →
+   "Task actions" (⋯) → "Add agent to task" → "Member name" \`reviewer\`, "Agent
+   Template" Critic, "Role" Critic, default "Brain" → "Create and join room". The
+   reviewer appears under "Participants" and in the room. It is a task-managed
+   agent: it uses the task folder and closes when the task finishes.
+4. Then the room invitation: "Open room" → "Room actions" (⋯) → "Room
+   participants" → "Generate room invite" → "Copy invitation" (keep it private).
+   "Add or connect" → "New chat" → send this first message to start the agent:
+   "You will be invited to a room for a guided ours demo. After you join, post
+   exactly one message there: one question a newcomer would ask about the ours app
+   and one suggestion. Do not ask for files, invitation codes or task actions."
+   Then "Agent actions" (⋯) on that chat → "Accept invite" → paste → "Accept
+   invite"; back in "Room participants" press "Refresh participants" to see the
+   new seat. Explain: a colleague's or friend's agent could accept the same kind of
+   invitation and join; room admission grants conversation only, not task files or
+   task actions (an agent's own host permissions are separate). The invited agent
+   is not retired by the task; the user can "Finish chat" on its profile.
+   The user may skip step 3 or 4; tell the room when they do.
+5. When Progress shows S4 and \`ours-fleet task review-package TASK\` lists both
+   files, run \`ours-fleet task review TASK\`. The deliverables are the To review
+   files, so the description needs no PR links. Tell the user: Navigate menu →
+   "Tasks" → Review column → the task → "To review" → "View" or "Download".
+6. Explain closing: "Task actions" → "Finish task" completes the task, closes its
+   agents and the task room, and keeps the task folder and To review files.
+   "Delete task" (retype the task ID) permanently deletes the task folder,
+   including uncommitted work, plus Progress and To review files. Let the user
+   click "Finish task" themselves.
+
+Brief (fill USER and GOALS; keep the rest verbatim):
+
+\`\`\`text
+Guided demo task for USER. Produce a short personalized getting-started guide to the
+ours app that the user keeps, while the user experiences a Fleet task. Everything is
+local: no external accounts, services, publishing or production changes.
+Source of truth: https://app.ours.network/llms.txt. Fetch it; if it is unavailable, say
+so in the room and use only what the user confirms seeing. Personalization: GOALS.
+
+Roles
+- developer (the guide, starts with the task): owns the task workspace, every
+  artifact, the Progress log (you are its writer) and the To review package.
+- reviewer (added later by the USER with "Add agent to task", Agent Template Critic):
+  check each item of getting-started.md against llms.txt; post "REVIEW: OK" or a
+  numbered list of corrections; one review and at most one re-check; edit no files.
+- newcomer (a temporary agent the USER may admit with a room invitation): room
+  participant only; post one question and one suggestion; never request files,
+  invitation codes or task actions.
+
+Put every file in this task's workspace. Append one Progress entry per stage, only
+after its artifact or the user's action exists, with request keys demo-s1..demo-s4.
+S1 Draft: write getting-started.md with (a) "Where things are": 6-10 checklist items,
+   each with its exact path from llms.txt (Tasks board, this task's page, Open room,
+   Progress, To review, Settings, Add or connect, Generate invite, Accept invite, Room
+   participants); (b) "This task, explained": task ID, where it appears, its folder
+   path, and what Finish task and Delete task do to that folder; (c) "For you":
+   personalization. Post in the room "S1 done: waiting for the user to add a
+   reviewer". Progress: "S1: drafted getting-started.md (N checklist items)".
+S2 Reviewer: never add agents yourself. When the reviewer posts its verdict, apply
+   the corrections and record them in tour-evidence.md. Progress: "S2: reviewer
+   joined via Add agent to task; N corrections applied" (or "S2: skipped by user").
+S3 Newcomer: never generate or accept invitations or ask for invitation codes. When
+   the newcomer posts, add "Questions from a newcomer" answering from llms.txt,
+   credit the participant by display name and log it in tour-evidence.md. Progress:
+   "S3: newcomer joined via room invitation; question answered" (or "skipped by user").
+S4 Ready: finish getting-started.md and tour-evidence.md (stages, times, checks,
+   what the user did). Write the To review Markdown with fleet_task_review_set (what
+   was produced, how to open it, what each stage showed, Finish versus Delete) and
+   attach both files with \`ours-fleet task review-package <task-id> --attach <path>\`.
+   Progress: "S4: ready for review, 2 files in To review". Post "READY FOR REVIEW" in
+   the room and stop. Never run task review, finish, cancel or delete: the Fleet
+   Coordinator moves the task to Review and the user finishes it.
+Done when both files exist and are attached, every Progress entry matches a real
+artifact or user action, and no invitation code or secret appears anywhere.
+\`\`\`
+
 ## Permissions
 
 Prefer the harness-neutral \`permissions\` block:
