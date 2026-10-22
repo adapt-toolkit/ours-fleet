@@ -46,5 +46,15 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(brief).toMatch(/Never run task review, finish, cancel or delete/);
     expect(brief).toMatch(/never generate or accept invitations/);
     expect(brief).not.toMatch(/\$\{/);
+    expect(brief).toMatch(/original-description\.md/);
+    expect(brief).toMatch(/attach all three files/);
+  });
+
+  it('follows the supported Review handoff: complete package and deliverable-only description', () => {
+    const demo = section('Guided demo task');
+    expect(demo).toMatch(/lists all three files/);
+    expect(demo).toMatch(/replace the description with only its\s+actual deliverables/);
+    expect(demo).toMatch(/Never invent a PR/);
+    expect(demo.indexOf('"Edit description"')).toBeLessThan(demo.indexOf('ours-fleet task review TASK'));
   });
 });

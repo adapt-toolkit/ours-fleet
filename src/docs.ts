@@ -715,10 +715,17 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    task actions (an agent's own host permissions are separate). The invited agent
    is not retired by the task; the user can "Finish chat" on its profile.
    The user may skip step 3 or 4; tell the room when they do.
-5. When Progress shows S4 and \`ours-fleet task review-package TASK\` lists both
-   files, run \`ours-fleet task review TASK\`. The deliverables are the To review
-   files, so the description needs no PR links. Tell the user: Navigate menu →
-   "Tasks" → Review column → the task → "To review" → "View" or "Download".
+5. When Progress shows S4, follow the normal Review handoff. Check that
+   \`ours-fleet task review-package TASK\` lists all three files
+   (\`getting-started.md\`, \`tour-evidence.md\`, \`original-description.md\`) and
+   that its Markdown lets the user review without the room. Otherwise ask the room
+   to complete it. The task has no PRs, so replace the description with only its
+   actual deliverables, one per line: \`To review: getting-started.md\` and
+   \`To review: tour-evidence.md\`. Never invent a PR. Fleet has no CLI command for
+   descriptions: if you have no supported way to edit it, give the user that exact
+   text to paste with "Edit description" on the task page. Then run
+   \`ours-fleet task review TASK\` and tell the user: Navigate menu → "Tasks" →
+   Review column → the task → "To review" → "View" or "Download".
 6. Explain closing: "Task actions" → "Finish task" completes the task, closes its
    agents and the task room, and keeps the task folder and To review files.
    "Delete task" (retype the task ID) permanently deletes the task folder,
@@ -761,13 +768,16 @@ S3 Newcomer: never generate or accept invitations or ask for invitation codes. W
    credit the participant by display name and log it in tour-evidence.md. Progress:
    "S3: newcomer joined via room invitation; question answered" (or "skipped by user").
 S4 Ready: finish getting-started.md and tour-evidence.md (stages, times, checks,
-   what the user did). Write the To review Markdown with fleet_task_review_set (what
-   was produced, how to open it, what each stage showed, Finish versus Delete) and
-   attach both files with \`ours-fleet task review-package <task-id> --attach <path>\`.
-   Progress: "S4: ready for review, 2 files in To review". Post "READY FOR REVIEW" in
-   the room and stop. Never run task review, finish, cancel or delete: the Fleet
+   what the user did). Save this task's current description (the brief above, the
+   original requirements) unchanged as original-description.md. Write the To review
+   Markdown with fleet_task_review_set (what was produced, how to open it, what each
+   stage showed, Finish versus Delete) and attach all three files with
+   \`ours-fleet task review-package <task-id> --attach <path>\`. Check that the package
+   lists them. Progress: "S4: ready for review, 3 files in To review". Post "READY
+   FOR REVIEW" in the room and stop. Never run task review, finish, cancel or delete: the Fleet
    Coordinator moves the task to Review and the user finishes it.
-Done when both files exist and are attached, every Progress entry matches a real
+Done when getting-started.md, tour-evidence.md and original-description.md exist in
+the workspace and are attached to To review, every Progress entry matches a real
 artifact or user action, and no invitation code or secret appears anywhere.
 \`\`\`
 
