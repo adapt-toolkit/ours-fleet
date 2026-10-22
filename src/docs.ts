@@ -733,8 +733,9 @@ step to the user and waits for their clicks.
      "View" or "Download".
    If the room instead shows "DEMO STOPPED (INCOMPLETE)", say plainly which steps
    were not done and that the completion criteria were not met. Offer to start a new
-   demo later; move this task to Review only if the user wants to inspect the
-   partial files, with the same description and save steps.
+   demo later. Move this task to Review only if the user asks to inspect the partial
+   files. Use the same copy-and-save steps, but the link text names only the files
+   that really exist (for example \`[Incomplete demo, To review: getting-started.md](<copied URL>)\`).
 5. Explain closing: "Task actions" → "Finish task" completes the task, closes its
    agents (including the added helper) and the task room, and keeps the task folder
    and To review files. "Delete task" (retype the task ID) permanently deletes the
@@ -760,15 +761,16 @@ Roles
   their clicks or handle invitation codes. Sequence the team, write the Progress log
   (request keys demo-s1..demo-s5, one entry per stage, only after its artifact or the
   user's action exists) and write the To review Markdown.
-- developer (the member in slot developer, present from the start): owns the task
-  workspace and writes getting-started.md, tour-evidence.md and
+- developer (the member whose name ends in -developer-1, present from the start):
+  owns the task workspace and writes getting-started.md, tour-evidence.md and
   original-description.md. Attaches files to To review.
 - critic: checks every file against llms.txt; posts "CHECK: OK" or numbered
   corrections; one check and at most one re-check per file; edits no files.
-- helper (the member named helper, added during the demo by the USER with "Add agent
-  to task"; it also has the Developer role): writes quick-reference.md and edits no
-  other file. If your member name is helper, this is your only job; the developer
-  duties above belong to the member in slot developer.
+- helper (added during the demo by the USER with "Add agent to task" and Member name
+  helper, so its name ends in -helper-1; it also has the Developer role): writes
+  quick-reference.md and edits no other file. If your name ends in -helper-1, this is
+  your only job; the developer duties above belong to the member whose name ends in
+  -developer-1.
 - newcomer (a temporary agent the USER admits with a room invitation): a room
   participant only. Posts one question and one suggestion; never requests files,
   invitation codes or task actions.

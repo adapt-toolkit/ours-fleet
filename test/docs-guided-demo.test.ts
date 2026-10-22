@@ -48,7 +48,8 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(b).toMatch(/helper writes\s+quick-reference\.md/);
     expect(b).toMatch(/Never add agents yourselves/);
     expect(b).toMatch(/edits no\s+other file/);
-    expect(b).toMatch(/If your member name is helper, this is your only job/);
+    expect(b).toMatch(/If your name ends in -helper-1, this is\s+your only job/);
+    expect(b).toMatch(/name ends in -developer-1, present from the start/);
   });
 
   it('keeps the declined-checkpoint branches truthful', () => {
@@ -60,6 +61,7 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(b).toMatch(/attaches only the files that really exist/);
     expect(b).toMatch(/Never present work as done by a participant who did not do it/);
     expect(demo()).toMatch(/completion criteria were not met/);
+    expect(demo()).toMatch(/link text names only the files\s+that really exist/);
   });
 
   it('explains real external collaboration and requires the temporary-agent join exercise', () => {
