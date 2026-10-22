@@ -731,6 +731,10 @@ step to the user and waits for their clicks.
    - Wait until the save succeeds, then run \`ours-fleet task review TASK\` and tell
      the user: Navigate menu → "Tasks" → Review column → the task → "To review" →
      "View" or "Download".
+   If the room instead shows "DEMO STOPPED (INCOMPLETE)", say plainly which steps
+   were not done and that the completion criteria were not met. Offer to start a new
+   demo later; move this task to Review only if the user wants to inspect the
+   partial files, with the same description and save steps.
 5. Explain closing: "Task actions" → "Finish task" completes the task, closes its
    agents (including the added helper) and the task room, and keeps the task folder
    and To review files. "Delete task" (retype the task ID) permanently deletes the
@@ -756,12 +760,15 @@ Roles
   their clicks or handle invitation codes. Sequence the team, write the Progress log
   (request keys demo-s1..demo-s5, one entry per stage, only after its artifact or the
   user's action exists) and write the To review Markdown.
-- developer: owns the task workspace and writes getting-started.md, tour-evidence.md
-  and original-description.md. Attaches files to To review.
+- developer (the member in slot developer, present from the start): owns the task
+  workspace and writes getting-started.md, tour-evidence.md and
+  original-description.md. Attaches files to To review.
 - critic: checks every file against llms.txt; posts "CHECK: OK" or numbered
   corrections; one check and at most one re-check per file; edits no files.
-- helper (added during the demo by the USER with "Add agent to task"): writes
-  quick-reference.md.
+- helper (the member named helper, added during the demo by the USER with "Add agent
+  to task"; it also has the Developer role): writes quick-reference.md and edits no
+  other file. If your member name is helper, this is your only job; the developer
+  duties above belong to the member in slot developer.
 - newcomer (a temporary agent the USER admits with a room invitation): a room
   participant only. Posts one question and one suggestion; never requests files,
   invitation codes or task actions.
@@ -822,8 +829,15 @@ S5 Ready: the developer attaches getting-started.md, quick-reference.md,
    that the package lists all four files. Progress: "S5: ready for review, 4 files in
    To review". Post "READY FOR REVIEW" in the room and tell the user: go back to your
    Fleet Coordinator chat and say "check the demo". Then stop.
-If the user declines S2 or S3, record "skipped by user" in Progress and
-tour-evidence.md and continue. Never run task review, finish, cancel or delete: the
+If the user declines S2 or S3, pause: the local_coordinator says the demo is
+incomplete without that step and asks whether to resume it now or stop the demo.
+Nobody substitutes for the helper or the newcomer. To resume, continue from that
+step. To stop, the local_coordinator records "Demo stopped by the user at S<n>; S<n>
+and later not exercised" in Progress; the developer writes tour-evidence.md saying
+the same and attaches only the files that really exist, together with
+original-description.md; the local_coordinator writes To review Markdown headed
+"Incomplete demo", posts "DEMO STOPPED (INCOMPLETE)" and tells the user to tell their
+Fleet Coordinator. Never present work as done by a participant who did not do it. Never run task review, finish, cancel or delete: the
 Fleet Coordinator moves the task to Review and the user finishes it.
 Done when getting-started.md, quick-reference.md, tour-evidence.md and
 original-description.md exist in the workspace and are attached to To review, every

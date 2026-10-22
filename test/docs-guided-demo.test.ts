@@ -47,6 +47,19 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(b).toMatch(/"Member\s+name" helper, "Agent Template" Developer/);
     expect(b).toMatch(/helper writes\s+quick-reference\.md/);
     expect(b).toMatch(/Never add agents yourselves/);
+    expect(b).toMatch(/edits no\s+other file/);
+    expect(b).toMatch(/If your member name is helper, this is your only job/);
+  });
+
+  it('keeps the declined-checkpoint branches truthful', () => {
+    const b = brief();
+    expect(b).toMatch(/If the user declines S2 or S3, pause/);
+    expect(b).toMatch(/Nobody substitutes for the helper or the newcomer/);
+    expect(b).toMatch(/resume it now or stop the demo/);
+    expect(b).toContain('DEMO STOPPED (INCOMPLETE)');
+    expect(b).toMatch(/attaches only the files that really exist/);
+    expect(b).toMatch(/Never present work as done by a participant who did not do it/);
+    expect(demo()).toMatch(/completion criteria were not met/);
   });
 
   it('explains real external collaboration and requires the temporary-agent join exercise', () => {
