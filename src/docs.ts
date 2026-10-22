@@ -693,8 +693,9 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    \`\`\`
 
    Before \`task start\`, run \`ours-fleet template show single\`, which shows the
-   installed members' slot, Role and Agent Template. Resolve each Agent Template's
-   Brain and permissions for the launch plan as for any task. The recipe expects exactly one Developer member; if the
+   installed members' slot, Role and Agent Template. Look up each Agent Template's
+   Brain and permissions in \`ours-fleet config --json\` (template show does not
+   print them) and include them in the launch plan as for any task. The recipe expects exactly one Developer member; if the
    installed \`single\` differs, tell the user and stop rather than editing their
    configuration. Then tell the user: Navigate menu →
    "Tasks" → the task → "Open room" shows the agents' conversation, "Progress"
