@@ -692,9 +692,9 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    ours-fleet task start TASK --template single
    \`\`\`
 
-   Before \`task start\`, run \`ours-fleet template show single\` and announce the
-   installed template's actual members (role, Agent Template, Brain, permissions)
-   in the launch plan. The recipe expects exactly one Developer member; if the
+   Before \`task start\`, run \`ours-fleet template show single\`, which shows the
+   installed members' slot, Role and Agent Template. Resolve each Agent Template's
+   Brain and permissions for the launch plan as for any task. The recipe expects exactly one Developer member; if the
    installed \`single\` differs, tell the user and stop rather than editing their
    configuration. Then tell the user: Navigate menu →
    "Tasks" → the task → "Open room" shows the agents' conversation, "Progress"
