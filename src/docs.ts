@@ -732,13 +732,14 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    \`ours-fleet task review-package TASK\` lists all three files
    (\`getting-started.md\`, \`tour-evidence.md\`, \`original-description.md\`) and
    that its Markdown lets the user review without the room. Otherwise ask the room
-   to complete it. The task has no PRs, so replace the description with only its
-   actual deliverables, one per line: \`To review: getting-started.md\` and
-   \`To review: tour-evidence.md\`. Never invent a PR. Fleet offers no stable URL
-   for a To review file that you can build, so name the files instead of
-   inventing links. Fleet has no CLI command for
-   descriptions: if you have no supported way to edit it, give the user that exact
-   text to paste with "Edit description" on the task page. Then run
+   to complete it. The task has no PRs, so the description becomes one clickable
+   link to its actual deliverables. Ask the user to open the task's "To review"
+   page and copy the browser address (an absolute https URL); never guess a host or
+   workspace. Never invent a PR. The description renders only absolute links, so
+   use exactly
+   \`[To review: getting-started.md, tour-evidence.md](<copied URL>)\`.
+   Fleet has no CLI command for descriptions, so the user applies it: task page →
+   "Edit description" → paste → "Save". Wait until the save succeeds, then run
    \`ours-fleet task review TASK\` and tell the user: Navigate menu → "Tasks" →
    Review column → the task → "To review" → "View" or "Download".
 6. Explain closing: "Task actions" → "Finish task" completes the task, closes its
@@ -788,7 +789,9 @@ S4 Ready: finish getting-started.md and tour-evidence.md (stages, times, checks,
    Markdown with fleet_task_review_set (what was produced, how to open it, what each
    stage showed, Finish versus Delete) and attach all three files with
    \`ours-fleet task review-package <task-id> --attach <path>\`. Check that the package
-   lists them. Progress: "S4: ready for review, 3 files in To review". Post "READY
+   lists them, then link each file in the Markdown by its retained path
+   /api/v1/tasks/<task-id>/review/artifacts/<artifact-id>, using the artifact IDs
+   from \`ours-fleet task review-package <task-id> --json\`. Progress: "S4: ready for review, 3 files in To review". Post "READY
    FOR REVIEW" in the room and stop. Never run task review, finish, cancel or delete: the Fleet
    Coordinator moves the task to Review and the user finishes it.
 Done when getting-started.md, tour-evidence.md and original-description.md exist in

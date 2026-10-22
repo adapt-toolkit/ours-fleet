@@ -48,14 +48,16 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(brief).not.toMatch(/\$\{/);
     expect(brief).toMatch(/original-description\.md/);
     expect(brief).toMatch(/attach all three files/);
+    expect(brief).toContain('/api/v1/tasks/<task-id>/review/artifacts/<artifact-id>');
   });
 
   it('follows the supported Review handoff: complete package and deliverable-only description', () => {
     const demo = section('Guided demo task');
     expect(demo).toMatch(/lists all three files/);
-    expect(demo).toMatch(/replace the description with only its\s+actual deliverables/);
+    expect(demo).toMatch(/the description becomes one clickable\s+link to its actual deliverables/);
     expect(demo).toMatch(/Never invent a PR/);
-    expect(demo.indexOf('"Edit description"')).toBeLessThan(demo.indexOf('ours-fleet task review TASK'));
+    expect(demo).toMatch(/never guess a host or\s+workspace/);
+    expect(demo).toMatch(/Wait until the save succeeds, then run\s+`ours-fleet task review TASK`/);
   });
 
   it('checks the installed template and observes stages without wakes or executor messages', () => {
