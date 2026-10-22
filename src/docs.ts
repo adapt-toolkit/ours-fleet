@@ -692,25 +692,38 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    ours-fleet task start TASK --template single
    \`\`\`
 
-   Announce the launch plan as for any task. Then tell the user: Navigate menu →
+   Before \`task start\`, run \`ours-fleet template show single\` and announce the
+   installed template's actual members (role, Agent Template, Brain, permissions)
+   in the launch plan. The recipe expects exactly one Developer member; if the
+   installed \`single\` differs, tell the user and stop rather than editing their
+   configuration. Then tell the user: Navigate menu →
    "Tasks" → the task → "Open room" shows the agents' conversation, "Progress"
    shows real milestones, "To review" will hold the results, and the task folder is
    \`~/.ours-fleet/workspaces/tasks/TASK\`. They can talk to the guide agent in the
    room or from the task's chats.
+   Room posts do not wake you, and executors do not message you. Ask the user to
+   come back to this chat and say "check the demo" when the room shows "S1 done"
+   and again at "READY FOR REVIEW". Then read \`ours-fleet task progress TASK\` and
+   the To review package before the next step. Optionally set one
+   \`fleet_reminder_create\` self-reminder about 10 minutes ahead, renewed only
+   while the demo waits on a stage. Never busy-poll.
 3. When \`ours-fleet task progress TASK\` shows S1, guide the user: task page →
    "Task actions" (⋯) → "Add agent to task" → "Member name" \`reviewer\`, "Agent
    Template" Critic, "Role" Critic, default "Brain" → "Create and join room". The
    reviewer appears under "Participants" and in the room. It is a task-managed
    agent: it uses the task folder and closes when the task finishes.
 4. Then the room invitation: "Open room" → "Room actions" (⋯) → "Room
-   participants" → "Generate room invite" → "Copy invitation" (keep it private).
+   participants" → "Generate room invite" → choose "Room role" (Participant) and
+   "Invitation type" (One-time) → "Generate one-time room invite" → "Copy
+   invitation" (keep it private).
    "Add or connect" → "New chat" → send this first message to start the agent:
    "You will be invited to a room for a guided ours demo. After you join, post
    exactly one message there: one question a newcomer would ask about the ours app
    and one suggestion. Do not ask for files, invitation codes or task actions."
    Then "Agent actions" (⋯) on that chat → "Accept invite" → paste → "Accept
-   invite"; back in "Room participants" press "Refresh participants" to see the
-   new seat. Explain: a colleague's or friend's agent could accept the same kind of
+   invite"; back in "Room participants" press "Refresh participants" until the
+   new seat shows active (it can stay pending until the connection completes; a
+   successful Accept alone is not membership). Explain: a colleague's or friend's agent could accept the same kind of
    invitation and join; room admission grants conversation only, not task files or
    task actions (an agent's own host permissions are separate). The invited agent
    is not retired by the task; the user can "Finish chat" on its profile.
@@ -721,7 +734,9 @@ those clicks. Never finish or delete the task unless the user explicitly asks.
    that its Markdown lets the user review without the room. Otherwise ask the room
    to complete it. The task has no PRs, so replace the description with only its
    actual deliverables, one per line: \`To review: getting-started.md\` and
-   \`To review: tour-evidence.md\`. Never invent a PR. Fleet has no CLI command for
+   \`To review: tour-evidence.md\`. Never invent a PR. Fleet offers no stable URL
+   for a To review file that you can build, so name the files instead of
+   inventing links. Fleet has no CLI command for
    descriptions: if you have no supported way to edit it, give the user that exact
    text to paste with "Edit description" on the task page. Then run
    \`ours-fleet task review TASK\` and tell the user: Navigate menu → "Tasks" →

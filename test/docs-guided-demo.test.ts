@@ -57,4 +57,16 @@ describe('ours-fleet docs: app help and guided demo task', () => {
     expect(demo).toMatch(/Never invent a PR/);
     expect(demo.indexOf('"Edit description"')).toBeLessThan(demo.indexOf('ours-fleet task review TASK'));
   });
+
+  it('checks the installed template and observes stages without wakes or executor messages', () => {
+    const demo = section('Guided demo task');
+    expect(demo).toContain('ours-fleet template show single');
+    expect(demo).toMatch(/stop rather than editing their\s+configuration/);
+    expect(demo).toMatch(/Room posts do not wake you/);
+    expect(demo).toContain('say "check the demo"');
+    expect(demo).toContain('fleet_reminder_create');
+    expect(demo).toMatch(/Never busy-poll/);
+    expect(demo).toContain('"Generate one-time room invite"');
+    expect(demo).toMatch(/until the\s+new seat shows active/);
+  });
 });
