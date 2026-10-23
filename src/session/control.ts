@@ -232,6 +232,8 @@ export class RoleControlServer {
   private readonly sockets = new Set<Socket>();
   /** Interrupt idempotency: same command id returns the first receipt. */
   private readonly interruptCommands = new Map<string, unknown>();
+  /** A Stop retried while its first attempt is settling joins that attempt instead of cancelling the next turn. */
+  private readonly interruptsInFlight = new Map<string, Promise<unknown>>();
   private correspondence?: SupervisorCorrespondence;
   setCorrespondence(value: SupervisorCorrespondence):void { this.correspondence=value; }
   private ownerChannel?: OwnerChannelHandle;
@@ -684,17 +686,21 @@ export class RoleControlServer {
             this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
             return;
           }
-          const outcome = await interruptSession(this.session, 'local-console');
-          const receipt = {
-            accepted: true, commandId: request.commandId, at: new Date().toISOString(),
-            ...outcome,
-          };
-          this.interruptCommands.set(request.commandId, receipt);
-          if (this.interruptCommands.size > 200) {
-            const oldest = this.interruptCommands.keys().next().value as string;
-            this.interruptCommands.delete(oldest);
+          const commandId = request.commandId;
+          let attempt = this.interruptsInFlight.get(commandId);
+          if (!attempt) {
+            attempt = interruptSession(this.session, 'local-console').then(outcome => {
+              const receipt = { accepted: true, commandId, at: new Date().toISOString(), ...outcome };
+              this.interruptCommands.set(commandId, receipt);
+              if (this.interruptCommands.size > 200) {
+                const oldest = this.interruptCommands.keys().next().value as string;
+                this.interruptCommands.delete(oldest);
+              }
+              return receipt;
+            }).finally(() => this.interruptsInFlight.delete(commandId));
+            this.interruptsInFlight.set(commandId, attempt);
           }
-          this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
+          this.write(socket, { version: 1, id: request.id, ok: true, result: await attempt });
           return;
         }
         case 'respond_permission_v2': {
