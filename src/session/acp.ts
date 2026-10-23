@@ -1175,7 +1175,54 @@ export class AcpSession implements AgentSession {
     if (active && this.activeTurn === active) {
       active.cancellationWait ??= this.awaitCancellationSettlement(active);
       await active.cancellationWait;
+    } else if (!active && this.steeringOccupied) {
+      // Steering raced the end of an owned turn and started one only the
+      // adapter knows about. Nothing will report its end, so no interrupt can
+      // see it settle; a resumed adapter restart does end it.
+      throw this.forceCancellationRecovery(undefined, 'steering-started ACP turn cannot report its cancellation');
     }
+  }
+
+  /**
+   * Restart a cancelled adapter whose turn cannot be seen to settle. The child
+   * exit releases any steering lease and the runner resumes the context; the
+   * returned error is the caller's typed `forced` outcome.
+   */
+  private forceCancellationRecovery(
+    active: NonNullable<AcpSession['activeTurn']> | undefined, reason: string,
+  ): SessionControlError {
+    const error = new SessionControlError(
+      'control-unavailable',
+      'ACP adapter restart is in progress after the cancellation deadline',
+      ACP_CANCEL_DEADLINE_EXCEEDED,
+    );
+    if (this.cancelRecoveryReason) return error;
+    this.cancelRecoveryReason = ACP_CANCEL_DEADLINE_EXCEEDED;
+    this.readiness = 'failed';
+    this.lastError = `${ACP_CANCEL_DEADLINE_EXCEEDED}: ${reason}`;
+    this.options.log(`[${this.options.name}] ${this.lastError}; restarting adapter with resume`);
+    this.events.emit('error', {
+      turnId: active?.id, origin: active?.origin, status: ACP_CANCEL_DEADLINE_EXCEEDED,
+      text: this.lastError,
+    });
+    this.conversation.appendSafe({
+      kind: 'session.state', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId,
+      ...(active ? { promptId: active.id, turnId: active.id } : {}),
+      payload: { status: 'failed', detail: this.lastError },
+    });
+    this.observation.publish();
+    this.child.kill('SIGTERM');
+    const terminateMs = this.options.cancelTerminateGraceMs ?? CANCEL_TERMINATE_GRACE_MS;
+    this.cancelForceKill = setTimeout(() => {
+      if (this.child.exitCode === null) {
+        this.options.log(`[${this.options.name}] ${ACP_CANCEL_DEADLINE_EXCEEDED}: `
+          + `adapter ignored SIGTERM for ${terminateMs}ms; sending SIGKILL`);
+        this.child.kill('SIGKILL');
+      }
+    }, terminateMs);
+    this.cancelForceKill.unref?.();
+    return error;
   }
 
   /**
@@ -1195,35 +1242,7 @@ export class AcpSession implements AgentSession {
         if (this.activeTurn !== active) { resolve(); return; }
         if (!this.isAlive()) { resolve(); return; }
         active.cancellationDeadlineExceeded = true;
-        this.cancelRecoveryReason = ACP_CANCEL_DEADLINE_EXCEEDED;
-        this.readiness = 'failed';
-        this.lastError = `${ACP_CANCEL_DEADLINE_EXCEEDED}: ACP turn did not settle within ${settleMs}ms`;
-        this.options.log(`[${this.options.name}] ${this.lastError}; restarting adapter with resume`);
-        this.events.emit('error', {
-          turnId: active.id, origin: active.origin, status: ACP_CANCEL_DEADLINE_EXCEEDED,
-          text: this.lastError,
-        });
-        this.conversation.appendSafe({
-          kind: 'session.state', sessionGeneration: this.sessionGeneration,
-          acpSessionId: this.sessionId,
-          promptId: active.id, turnId: active.id,
-          payload: { status: 'failed', detail: this.lastError },
-        });
-        this.child.kill('SIGTERM');
-        const terminateMs = this.options.cancelTerminateGraceMs ?? CANCEL_TERMINATE_GRACE_MS;
-        this.cancelForceKill = setTimeout(() => {
-          if (this.child.exitCode === null) {
-            this.options.log(`[${this.options.name}] ${ACP_CANCEL_DEADLINE_EXCEEDED}: `
-              + `adapter ignored SIGTERM for ${terminateMs}ms; sending SIGKILL`);
-            this.child.kill('SIGKILL');
-          }
-        }, terminateMs);
-        this.cancelForceKill.unref?.();
-        reject(new SessionControlError(
-          'control-unavailable',
-          'ACP adapter restart is in progress after the cancellation deadline',
-          ACP_CANCEL_DEADLINE_EXCEEDED,
-        ));
+        reject(this.forceCancellationRecovery(active, `ACP turn did not settle within ${settleMs}ms`));
       }, settleMs);
       this.cancelEscalation.unref?.();
     });

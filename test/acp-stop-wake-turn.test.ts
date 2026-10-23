@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
+import { ACP_CANCEL_DEADLINE_EXCEEDED } from '../src/session/types.js';
 import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import { RoleControlServer, controlRequest } from '../src/session/control.js';
 import type { ConversationObservationState } from '../src/session/conversation-types.js';
@@ -142,6 +143,52 @@ describe('Stop on a mail wake turn', () => {
     notify.mockRestore();
     expect(await r.stop('stop-retry')).toMatchObject({ ok: true, result: { state: 'settled' } });
     expect(r.latest().readiness).toBe('idle');
+  });
+
+  it('joins a concurrent duplicate Stop instead of cancelling the queued next turn', async () => {
+    const r = await role();
+    await r.wake('[fleet-monitor] new mail block 60000');
+    await until(() => r.latest().readiness === 'running');
+    const next = await r.request({
+      command: 'submit_prompt_v2', commandId: 'queued', text: 'block 300', actor: 'browser', source: 'owner_admin_console',
+    });
+    const nextId = (next.result as { promptId: string }).promptId;
+    expect(r.latest().queueDepth).toBe(2);
+
+    // Hold the provider cancel until the retried command has also arrived.
+    const agent = (r.session as unknown as { connection: { agent: { notify: (...args: any[]) => Promise<void> } } })
+      .connection.agent;
+    const notify = agent.notify.bind(agent);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const gate = vi.spyOn(agent, 'notify').mockImplementationOnce(async (...args) => { await held; return notify(...args); });
+    const first = r.stop('stop-dup');
+    await until(() => gate.mock.calls.length === 1);
+    const retry = r.stop('stop-dup');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    release();
+    const [firstReceipt, retryReceipt] = await Promise.all([first, retry]);
+    expect(retryReceipt).toMatchObject({ ok: true, result: firstReceipt.result });
+    await until(() => r.events().some(event => event.kind === 'turn.completed' && event.promptId === nextId));
+    const completed = r.events().filter(event => event.kind === 'turn.completed');
+    expect(completed.map(event => event.payload?.outcome)).toEqual(['cancelled', 'completed']);
+    expect(r.events().filter(event => event.kind === 'prompt.interrupt_requested')).toHaveLength(1);
+  });
+
+  it('reports Stop of a turn only the adapter owns as forced recovery, never settled', async () => {
+    const r = await role();
+    // Steering that races the end of an owned turn starts a turn Fleet cannot address.
+    const steered = await (r.session as unknown as { steerPrompt(text: string): Promise<{ detail?: string }> })
+      .steerPrompt('[fleet-monitor] new mail');
+    expect(steered.detail).toBe('startedNewTurn');
+    await until(() => r.latest().readiness === 'running');
+
+    expect(await r.stop('stop-orphan')).toMatchObject({
+      ok: true, result: { accepted: true, state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED },
+    });
+    expect(r.latest().readiness).not.toBe('running');
+    await until(() => !r.session.isAlive());
+    expect(r.session.snapshot().readiness).not.toBe('running');
   });
 
   it('still steers further mail into the running wake turn', async () => {
