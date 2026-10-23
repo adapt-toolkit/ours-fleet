@@ -811,6 +811,13 @@ export class AcpSession implements AgentSession {
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
+    if (!this.activeTurn) {
+      try { return (await this.startOwnedWake(text, options)).result; }
+      catch (error) {
+        if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
+        throw error;
+      }
+    }
     const steered = await this.steerPrompt(text);
     if (steered.accepted || steered.detail !== 'ACP steering failed'
         || this.closing || !this.isAlive()) return steered;
@@ -872,6 +879,21 @@ export class AcpSession implements AgentSession {
   }
 
   /**
+   * Start a wake as a turn this client owns when none is running. Steering an
+   * idle adapter starts a turn only the adapter knows about: its stopReason
+   * never reaches Fleet, so an interrupt could cancel it but never see it
+   * settle, and the role stayed `running` for the whole occupancy lease. Like
+   * a steered start, the caller learns only that the turn began.
+   */
+  private async startOwnedWake(
+    text: string, options: SubmitPromptOptions,
+  ): Promise<{ queued: QueuedPrompt; result: TurnResult }> {
+    const queued = await this.queuePrompt(text, { ...options, interrupt: false, steer: false });
+    void queued.completion.catch(() => undefined);
+    return { queued, result: turnResult(true, 'inconclusive', 'startedNewTurn') };
+  }
+
+  /**
    * Accept responsibility for a prompt, then return. The turn itself may run
    * for minutes behind other queued turns; making an interactive caller wait
    * for it is what turned a busy agent into a timeout and then into "dead".
@@ -896,6 +918,10 @@ export class AcpSession implements AgentSession {
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
     // the entire wake-triggered turn terminated.
+    if (options.steer && this.steeringSupported && !this.activeTurn) {
+      const { queued, result } = await this.startOwnedWake(text, options);
+      return { ...queued, completion: Promise.resolve(result), ...(delivery ? { delivery } : {}) };
+    }
     if (options.steer && this.steeringSupported) {
       const promptId = randomUUID();
       return {

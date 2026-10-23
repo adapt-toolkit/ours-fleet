@@ -64,6 +64,15 @@ async function startSession(
   });
 }
 
+/**
+ * An idle wake is now admitted as a turn Fleet owns. A turn only the adapter
+ * knows about remains possible when steering races the end of an owned turn;
+ * drive the steering request directly to hold the lease that covers it.
+ */
+const orphanSteeredTurn = (session: AcpSession) =>
+  (session as unknown as { steerPrompt(text: string): Promise<{ detail?: string }> })
+    .steerPrompt('[fleet-monitor] new mail');
+
 const scheduled = (runId: string) =>
   ({ kind: 'scheduled-loop', loop: 'health', runId }) as const;
 
@@ -170,7 +179,7 @@ describe('FLEET-003 scheduled-loop admission after a steered wake', () => {
     }, 200);
     const arbiter = new RoleTurnArbiter(session);
 
-    await session.submitPromptAfterTool('[fleet-monitor] new mail');
+    expect((await orphanSteeredTurn(session)).detail).toBe('startedNewTurn');
     expect((await arbiter.tryScheduled('health pass', scheduled('sl_busy'))).state)
       .toBe('skipped_busy');
 
@@ -200,7 +209,7 @@ describe('FLEET-003 scheduled-loop admission after a steered wake', () => {
     }, 10 * 60_000);
     const arbiter = new RoleTurnArbiter(session);
 
-    await session.submitPromptAfterTool('[fleet-monitor] new mail');
+    expect((await orphanSteeredTurn(session)).detail).toBe('startedNewTurn');
     expect(session.snapshot().readiness).toBe('running');
     // Once the steered turn is over the adapter answers prompts again; that
     // owned turn's completion is the boundary that clears the lease. The lease
@@ -223,7 +232,7 @@ describe('FLEET-003 scheduled-loop admission after a steered wake', () => {
     const closing = await startSession(closeDir, logs, {
       ACP_FIXTURE_STEERING_OCCUPIES: '1', ACP_FIXTURE_STEERING_TURN_MS: '60000',
     }, 10 * 60_000);
-    await closing.submitPromptAfterTool('[fleet-monitor] new mail');
+    expect((await orphanSteeredTurn(closing)).detail).toBe('startedNewTurn');
     expect(closing.snapshot().readiness).toBe('running');
     await closing.close();
     expect(logs.join('\n')).toContain('no longer holds the adapter (session closed)');
@@ -234,7 +243,7 @@ describe('FLEET-003 scheduled-loop admission after a steered wake', () => {
     const dying = await startSession(exitDir, exitLogs, {
       ACP_FIXTURE_STEERING_OCCUPIES: '1', ACP_FIXTURE_STEERING_TURN_MS: '60000',
     }, 10 * 60_000);
-    await dying.submitPromptAfterTool('[fleet-monitor] new mail');
+    expect((await orphanSteeredTurn(dying)).detail).toBe('startedNewTurn');
     expect(dying.snapshot().readiness).toBe('running');
     process.kill(dying.pid!, 'SIGKILL');
     for (let i = 0; i < 200 && dying.isAlive(); i++)
