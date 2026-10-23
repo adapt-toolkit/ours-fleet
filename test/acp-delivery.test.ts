@@ -61,7 +61,7 @@ describe('AcpSession live delivery', () => {
         return { outcome: 'injected' };
       },
       notify: async () => {},
-    });
+    }, { activeTurn: trackedTurn() });
 
     const result = await session.submitPrompt('new mail', { steer: true });
 
@@ -120,7 +120,7 @@ describe('AcpSession live delivery', () => {
           : { stopReason: 'end_turn' };
       },
       notify: async () => {},
-    }, { promptTail: active, queueDepth: 1 });
+    }, { promptTail: active, queueDepth: 1, activeTurn: trackedTurn() });
 
     const wake = session.submitPromptAfterTool('direct fallback', {
       origin: { kind: 'fleet-monitor' }, steer: true,
@@ -158,6 +158,7 @@ describe('AcpSession live delivery', () => {
       activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
       promptTail: active,
       queueDepth: 1,
+      activeTurn: trackedTurn(),
       events: { emit: (kind: string, event: { status?: string }) => {
         if (kind === 'monitor_delivery' && event.status) statuses.push(event.status);
       } },
@@ -194,7 +195,7 @@ describe('AcpSession live delivery', () => {
           : { stopReason: 'refusal' };
       },
       notify: async () => {},
-    });
+    }, { activeTurn: trackedTurn() });
 
     const result = await session.submitPromptAfterTool('refused fallback', {
       origin: { kind: 'fleet-monitor' }, steer: true,
