@@ -137,6 +137,8 @@ export interface OursOps {
   start(): Promise<void>;
   /** Bind this session's identity. Throws `BOUND_ELSEWHERE` when it is held live. */
   bindIdentity(name: string): Promise<void>;
+  /** CID returned by the current successful mailbox binding; absent while unbound. */
+  boundIdentityCid?(): string | undefined;
   /** Replace the bound identity's advertised typed-command catalog and handlers. */
   registerCommands(commands: OursRegisteredCommand[]): Promise<void>;
   listContacts(): Promise<OursContactsView>;
@@ -208,6 +210,7 @@ export interface OursSdkClientDeps {
  */
 export class OursSdkClient implements OursOps {
   private client?: OursClient;
+  private boundCid?: string;
   // Disposing a transport does not discharge this owner's terminal cleanup.
   private terminalReleasePending = false;
   private readonly leaseToken = `ours-fleet-owner-${process.pid}-${randomUUID()}`;
@@ -234,8 +237,13 @@ export class OursSdkClient implements OursOps {
   async bindIdentity(name: string): Promise<void> {
     // force is pinned off: the owner channel never evicts another live session
     // from an identity, it waits for the bounded handoff window and then fails.
-    await this.ops().chooseIdentity({ name, force: false });
+    this.boundCid = undefined;
+    const result = await this.ops().chooseIdentity({ name, force: false });
+    if (typeof result.cid === 'string' && /^[a-f0-9]{64}$/i.test(result.cid))
+      this.boundCid = result.cid.toLowerCase();
   }
+
+  boundIdentityCid(): string | undefined { return this.boundCid; }
 
   async registerCommands(commands: OursRegisteredCommand[]): Promise<void> {
     await this.ops().registerCommands(commands);
@@ -333,6 +341,7 @@ export class OursSdkClient implements OursOps {
   }
 
   async close(options: { releaseLease?: boolean } = {}): Promise<void> {
+    this.boundCid = undefined;
     const terminal = options.releaseLease !== false;
     // A failed recovery may have disposed its client before normal shutdown.
     // Reattach the same owner through ordinary verified selection; no rebind is

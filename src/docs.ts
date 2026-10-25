@@ -1171,6 +1171,11 @@ migration from the standalone \`self-reminders\` worker skill: \`docs/self-remin
 
 ## Trusted owner channel
 
+Routine tool activity is displayed as one updating app status outside chat history.
+Periodic tool-counter messages and the progress_interval_ms setting have been removed.
+Remove that key from role/default configuration; meaningful commentary and final
+answers continue through this channel.
+
 Any managed role may declare a separate ours identity which fleet — never the agent —
 creates when missing and binds:
 
@@ -1180,7 +1185,6 @@ owner_channel:
   owners: [authenticated-owner-contact-cid]
   agent: authenticated-managed-agent-cid
   interrupt: false
-  progress_interval_ms: 30000
   comments: true
   attachments:
     enabled: true

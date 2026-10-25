@@ -59,6 +59,27 @@ async function recoveryStatus(body: object) {
 }
 
 describe('authoritative session liveness precedence', () => {
+  it.each(['acp', 'codex-app-server'] as const)('projects the bound owner mailbox for %s, never the configured agent identity', async backend => {
+    const query = new FleetQueryService({
+      repository: { stateDir: () => undefined } as never, supervisor,
+    });
+    const stateDir = mkdtempSync(join(tmpdir(), 'owner-cid-query-'));
+    let cid = 'B'.repeat(64);
+    const live = new FleetQueryService({
+      repository: { stateDir: () => stateDir } as never, supervisor,
+      control: async () => ({ ok: true, result: {
+        backend, alive: true, readiness: 'running', ownerChannelCid: cid,
+        activity: { activeToolCalls: 1, lastUpdateAt: '2026-10-25T12:00:00Z' },
+      } }) as never,
+    });
+    const record = { ...role(), configuredBackend: backend };
+    const observed = await live.status(record);
+    expect(observed.session.ownerChannelCid).toBe('b'.repeat(64));
+    expect(observed.session.activity.activeToolCalls).toBe(1);
+    cid = 'Role-owner';
+    expect((await live.status(record)).session.ownerChannelCid).toBeUndefined();
+    expect((await query.status(record)).session.ownerChannelCid).toBeUndefined();
+  });
   it('bare query list projects only configured permanent Agents', async () => {
     const permanent = role();
     const temporary = { ...role(), id: 'RoomWorker', configured: false,

@@ -40,7 +40,7 @@ import {
 } from './ours-client.js';
 import {
   ownerNotices,
-  type OwnerCommentsState, type OwnerProgressPhase, type OwnerUpdatePhase,
+  type OwnerCommentsState, type OwnerUpdatePhase,
 } from './notices.js';
 import {
   DuplicateSendError, OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
@@ -109,6 +109,7 @@ export interface OwnerChannelOptions {
 
 export interface OwnerChannelHandle {
   start(): Promise<void>;
+  ownerChannelCid?(): string | undefined;
   drain(): Promise<void>;
   close(): Promise<void>;
   /** Reattach this same supervisor-owned channel after a daemon generation change. */
@@ -1319,7 +1320,6 @@ export class OwnerChannel implements OwnerChannelHandle {
       const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
       outbox = this.outboxDir(originWireId);
       await mkdir(outbox, { recursive: true, mode: 0o700 });
-      const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
       const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
@@ -1341,7 +1341,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       this.activeRequests.set(requestId, active);
       const cleanupDir = requestDir;
       let completed = false;
-      const task = this.complete(active, outbox, queued, activityCursor)
+      const task = this.complete(active, outbox, queued)
         .then(() => { completed = true; })
         .catch(error => this.logError(`attachment request ${requestId.slice(0, 12)} completion failed`, error))
         .finally(async () => {
@@ -1433,7 +1433,6 @@ export class OwnerChannel implements OwnerChannelHandle {
     const outbox = this.outboxDir(wireId);
     await mkdir(outbox, { recursive: true, mode: 0o700 });
     let queued;
-    const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
@@ -1470,7 +1469,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       commentaryDisabled: false,
     };
     this.activeRequests.set(requestId, active);
-    const task = this.complete(active, outbox, queued, activityCursor)
+    const task = this.complete(active, outbox, queued)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
@@ -2148,17 +2147,12 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async complete(
-    active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
+    active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt,
   ): Promise<void> {
-    const progressMs = this.options.config.progress_interval_ms;
-    let lastSeq = activityCursor;
-    let startedAt: number | undefined;
     // When one turn delivers several waiting prompts, its events carry the turn's
     // id, not this request's: follow the turn that actually carries this request.
     const inTurn = (turnId: string | undefined): boolean =>
       turnId === (this.options.session.sharedTurnId?.(queued.promptId) ?? queued.promptId);
-    let phase: OwnerProgressPhase = 'starting request';
-    let timer: ReturnType<typeof setInterval> | undefined;
 
     const flushCommentary = () => {
       if (active.commentaryTimer) clearTimeout(active.commentaryTimer);
@@ -2244,59 +2238,19 @@ export class OwnerChannel implements OwnerChannelHandle {
       }
     };
 
-    const reportProgress = () => {
-      const events = this.options.session.eventsSince(lastSeq);
-      lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
-      const activity = events.filter(event => inTurn(event.turnId));
-      if (!activity.length) return;
-      startedAt ??= Date.parse(activity[0].at) || Date.now();
-      phase = this.progressPhase(activity) ?? phase;
-      const started = activity.filter(event => event.kind === 'tool_call').length;
-      const completed = activity.filter(event =>
-        event.kind === 'tool_update' && event.status === 'completed').length;
-      // Token/thought chunks are transport activity, not evidence of progress.
-      // Permission transitions and errors are material even without a tool.
-      const activityUpdates = activity.filter(event =>
-        event.kind === 'permission' || event.kind === 'error').length;
-      if (!started && !completed && !activityUpdates) return;
-      const notice = ownerNotices.progress(
-        Date.now() - startedAt, phase, started, completed, activityUpdates);
-      // Preserve wire ordering if a progress send overlaps turn completion.
-      active.outboundTail = active.outboundTail
-        .then(async () => { await this.send(active.contact, notice, active.wireId); })
-        .catch(error => this.logError('progress notice failed', error));
-    };
-
-    // A queued request used to create its 30-second interval immediately. A
-    // backlog of three requests therefore produced three permanent notice
-    // streams saying "waiting behind earlier requests" without any work. Arm
-    // the interval only after this exact prompt emits its first session event.
-    const startProgress = (event?: SessionEvent) => {
-      if (timer || progressMs <= 0) return;
-      if (event && !inTurn(event.turnId)) return;
-      const observed = event ? [event] : this.options.session.eventsSince(activityCursor)
-        .filter(item => inTurn(item.turnId));
-      if (!observed.length) return;
-      startedAt = Date.parse(observed[0].at) || Date.now();
-      timer = setInterval(reportProgress, progressMs);
-      timer.unref();
-    };
     const unsubscribe = typeof this.options.session.subscribe === 'function'
       ? this.options.session.subscribe(event => {
-        startProgress(event);
         // Automatic commentary is an ACP phase extension. Other backends and
         // older adapters retain their established final-only behavior.
         if (this.options.session.capabilities?.messagePhases
             ?? this.options.session.backend === 'acp') acceptCommentary(event);
       })
       : () => undefined;
-    startProgress();
 
     let result: TurnResult;
     try { result = await queued.completion; }
     finally {
       unsubscribe();
-      if (timer) clearInterval(timer);
       if (active.commentaryTimer) clearTimeout(active.commentaryTimer);
     }
     flushCommentary();
@@ -2427,6 +2381,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     return createHash('sha256').update(wireId).digest('hex');
   }
 
+  ownerChannelCid(): string | undefined {
+    return this.ready && !this.stopping ? this.client.boundIdentityCid?.() : undefined;
+  }
+
   private send(contact: string, text: string, replyTo?: string): Promise<void> {
     return this.client.sendMessage({
       contact, text, ...(replyTo ? { replyToWireId: replyTo } : {}),
@@ -2472,33 +2430,6 @@ export class OwnerChannel implements OwnerChannelHandle {
     const source = message.from as { id?: unknown; name?: unknown } | undefined;
     const id = String(source?.id ?? '');
     return { id, name: String(source?.name ?? id) };
-  }
-
-  private latestEventSeq(events: SessionEvent[]): number {
-    return events.reduce((latest, event) => Math.max(latest, event.seq), 0);
-  }
-
-  /** Map only event shape and allowlisted status to owner-safe phase text. */
-  private progressPhase(events: SessionEvent[]): OwnerProgressPhase | undefined {
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i];
-      switch (event.kind) {
-        case 'tool_call': return 'using tools';
-        case 'tool_update':
-          return event.status === 'completed' ? 'reviewing tool results' : 'using tools';
-        case 'permission':
-          return event.status === 'pending'
-            ? 'waiting for approval' : 'resuming after permission decision';
-        case 'agent_text': return 'drafting response';
-        case 'thought': return 'planning next step';
-        case 'error': return 'recovering from session error';
-        case 'state':
-          if (event.status === 'running') return 'working on request';
-          break;
-        case 'turn_stop': break;
-      }
-    }
-    return undefined;
   }
 
   private async watchLoop(generation: number): Promise<void> {

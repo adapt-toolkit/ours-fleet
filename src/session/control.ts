@@ -369,6 +369,7 @@ export class RoleControlServer {
             version: 1, id: request.id, ok: true,
             result: {
               ...this.session.snapshot(),
+              ownerChannelCid: this.ownerChannel?.ownerChannelCid?.(),
               protocolVersion: this.session.conversationPage ? 3 : 2,
               features: [
                 'events_since', 'observer_follow', 'retained_range',

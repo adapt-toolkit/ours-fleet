@@ -187,6 +187,7 @@ export class FleetQueryService {
         if (!response.ok) throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'snapshot failed');
         const snapshot = response.result as SessionSnapshot & {
           protocolVersion?: number; features?: string[];
+          ownerChannelCid?: string;
         };
         if (snapshot.backend !== intended)
           throw new SessionControlError('backend',
@@ -194,6 +195,8 @@ export class FleetQueryService {
         return {
           backend: intended, reachability: snapshot.alive ? 'online' : 'offline',
           readiness: snapshot.readiness, evidence: 'authoritative',
+          ...(typeof snapshot.ownerChannelCid === 'string' && /^[a-f0-9]{64}$/i.test(snapshot.ownerChannelCid)
+            ? { ownerChannelCid: snapshot.ownerChannelCid.toLowerCase() } : {}),
           sessionId: snapshot.sessionId, lastError: snapshot.lastError,
           pendingPermissionId: snapshot.pendingPermissionId,
           protocolVersion: snapshot.protocolVersion, features: snapshot.features,

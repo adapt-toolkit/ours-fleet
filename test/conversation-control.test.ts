@@ -54,6 +54,19 @@ async function startArbiterServer() {
 }
 
 describe('role-control conversation v3', () => {
+  it('adds the current owner mailbox CID to the authenticated session snapshot and removes it on detach', async () => {
+    const { stateDir, server } = await startServer();
+    server.setOwnerChannel({
+      start: async () => {}, drain: async () => {}, close: async () => {},
+      manage: async () => { throw new Error('not used'); },
+      ownerChannelCid: () => 'a'.repeat(64),
+    });
+    expect((await controlRequest(stateDir, { command: 'snapshot' })).result).toMatchObject({
+      ownerChannelCid: 'a'.repeat(64), backend: 'acp',
+    });
+    server.setOwnerChannel(undefined);
+    expect((await controlRequest(stateDir, { command: 'snapshot' })).result).not.toHaveProperty('ownerChannelCid');
+  });
   it.each(['interrupt', 'after-tool'])('queues a monitor wake during active voice despite a timed-out member spawn: %s', async policy => {
     const { stateDir, session, server, arbiter } = await startArbiterServer();
     const generation = session.conversationSnapshot().sessionGeneration;

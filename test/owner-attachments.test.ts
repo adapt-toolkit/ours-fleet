@@ -168,7 +168,7 @@ async function setup(
     queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
   } as unknown as SessionHandle;
   const config: OwnerChannelConfig = {
-    identity: 'Role-owner', owners, interrupt: false, progress_interval_ms: 0,
+    identity: 'Role-owner', owners, interrupt: false,
     attachments, ...(agent ? { agent } : {}),
   };
   if (recover) new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
@@ -792,7 +792,7 @@ describe('managed-agent attachment egress', () => {
       role: 'Role', harness: 'claude-code',
       config: {
         identity: 'Role-owner', owners: [OWNER], agent: AGENT,
-        interrupt: false, progress_interval_ms: 0, attachments: attachmentConfig,
+        interrupt: false, attachments: attachmentConfig,
       },
       session: {
         backend: 'acp', pid: 1, isAlive: () => true,
