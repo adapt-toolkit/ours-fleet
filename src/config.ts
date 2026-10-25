@@ -1222,6 +1222,10 @@ export function resolveOwnerChannelConfig(
   const allowed = [
     'identity', 'owners', 'agent', 'interrupt', 'comments', 'attachments',
   ];
+  if ('progress_interval_ms' in merged)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.progress_interval_ms has been removed; delete it. `
+      + 'Routine tool activity is shown as one status in the app instead of periodic chat messages');
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);

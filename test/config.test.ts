@@ -58,7 +58,9 @@ describe('loadConfig', () => {
 
   it('rejects the removed periodic chat progress setting', () => {
     base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], progress_interval_ms: 30000 }\n');
-    expect(() => loadConfig()).toThrow(/unknown key.*progress_interval_ms/);
+    expect(() => loadConfig()).toThrow(/owner_channel\.progress_interval_ms has been removed; delete it/);
+    base('defaults:\n  owner_channel: { progress_interval_ms: 0 }\nroles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(() => loadConfig()).toThrow(/progress_interval_ms has been removed/);
   });
 
   it('requires an exact managed-agent CID distinct from owner authority', () => {

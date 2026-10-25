@@ -602,7 +602,6 @@ function liveSetup(options: {
     config: {
       identity: 'Coordinator-owner', owners: options.owners ?? [OWNER_CID],
       interrupt: options.interrupt ?? true,
-
       ...(options.comments === undefined ? {} : { comments: options.comments }),
     },
     session, stateDir: dir, client, log: () => undefined,
@@ -1921,6 +1920,34 @@ describe('OwnerChannel notice presentation', () => {
     // owner can identify exactly which messages /comments controls.
     expect(texts.filter(text => text.startsWith(OWNER_COMMENT_LABEL))).toHaveLength(2);
     expect(texts).toContain('Final answer');
+  });
+
+  it('relays commentary from the shared turn that delivers this request with other waiting prompts', async () => {
+    vi.useFakeTimers();
+    // The request is prompt-1, but the turn that carries it is another member's.
+    const { channel, client, completions, emit } = liveSetup({
+      sharedTurnId: promptId => (promptId === 'prompt-1' ? 'shared-turn' : undefined),
+    });
+    client.batches.push([ownerMessage(1, 'wire-shared', 'Work safely')]);
+    await channel.drain();
+    const origin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-shared').digest('hex'),
+    };
+    // Activity under the request's own id belongs to no running turn and is not relayed.
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'stale', text: 'Stale comment.' });
+    emit({ kind: 'agent_text', turnId: 'shared-turn', origin,
+      messagePhase: 'commentary', messageId: 'shared', text: 'Shared comment.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[0](done('Answer to everything delivered together'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts).toContain('🟡 Live update: Shared comment.');
+    expect(texts.some(text => text.includes('Stale comment.'))).toBe(false);
+    expect(lastReply(client)).toBe('Answer to everything delivered together');
   });
 
   it('suppresses live comments when the fleet.yaml baseline disables them', async () => {
