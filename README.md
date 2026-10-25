@@ -485,7 +485,6 @@ Additional operational field inventory (schematic, not one YAML document):
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
-      progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
       comments: true                    # relay live "🟡 Live update:" structured commentary (default true);
                                         #   restart baseline for /comments on|off
       attachments:                      # secure inbound documents, images, and voice
@@ -1962,3 +1961,13 @@ App released. The currently pinned Fleet nightly.41 does not support v2 grants.
 These source changes do not publish, merge, or deploy any component.
 
 See [ACP file sending](docs/acp-files.md) for the same-chat `send_file` flow, available to every Agent by default, and its supported sessions.
+
+### Owner-channel activity display
+
+Routine tool activity is shown as one updating status in the app, outside message
+history. Fleet no longer sends periodic tool-counter messages. The
+`owner_channel.progress_interval_ms` setting has been removed; remove it from
+existing role/default configuration when applying this change. Meaningful agent
+commentary, attention requests and final answers continue to be delivered.
+The app associates activity with the channel's bound CID, never a display name.
+It shows unavailable status when the directory observation disconnects.

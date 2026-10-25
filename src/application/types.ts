@@ -52,6 +52,8 @@ export interface RoleStatus {
     detail: string;
   };
   session: {
+    /** Supervisor-bound owner mailbox, distinct from the managed agent identity. */
+    ownerChannelCid?: string;
     backend: SessionBackendId | 'unknown';
     reachability: 'online' | 'offline' | 'unavailable' | 'unknown';
     readiness: 'starting' | 'idle' | 'running' | 'awaiting_permission' | 'failed' | 'unknown';

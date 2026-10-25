@@ -138,8 +138,6 @@ export interface OwnerChannelConfig {
   agent?: string;
   /** Cancel active work before each owner request instead of queueing it. */
   interrupt: boolean;
-  /** Deterministic in-progress notice interval; 0 disables progress notices. */
-  progress_interval_ms: number;
   /**
    * Relay the agent's live ACP commentary to the owner while a turn runs.
    * This is the RESTART BASELINE only: `/comments on|off` changes the running
@@ -1222,7 +1220,7 @@ export function resolveOwnerChannelConfig(
     ...(role ?? {}),
   };
   const allowed = [
-    'identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'comments', 'attachments',
+    'identity', 'owners', 'agent', 'interrupt', 'comments', 'attachments',
   ];
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
@@ -1248,11 +1246,6 @@ export function resolveOwnerChannelConfig(
       `${file}: role '${name}' owner_channel.owners must contain exact 64-hex CIDs when agent relay is configured`);
   if (merged.interrupt !== undefined && typeof merged.interrupt !== 'boolean')
     throw new ConfigError(`${file}: role '${name}' owner_channel.interrupt must be true or false`);
-  if (merged.progress_interval_ms !== undefined
-      && (typeof merged.progress_interval_ms !== 'number'
-        || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
   if (merged.comments !== undefined && typeof merged.comments !== 'boolean')
     throw new ConfigError(`${file}: role '${name}' owner_channel.comments must be true or false`);
   if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
@@ -1297,7 +1290,6 @@ export function resolveOwnerChannelConfig(
     owners,
     ...(agent ? { agent } : {}),
     interrupt: merged.interrupt ?? false,
-    progress_interval_ms: merged.progress_interval_ms ?? 30_000,
     // Default true preserves the established live-commentary behavior; an
     // upgrade never silently goes quiet on an owner who relied on it.
     comments: merged.comments ?? true,

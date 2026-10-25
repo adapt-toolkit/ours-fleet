@@ -21,34 +21,6 @@ export interface OwnerCommentsState {
   supported: boolean;
 }
 
-export type OwnerProgressPhase =
-  | 'starting request'
-  | 'waiting behind earlier requests'
-  | 'working on request'
-  | 'planning next step'
-  | 'using tools'
-  | 'reviewing tool results'
-  | 'drafting response'
-  | 'waiting for approval'
-  | 'resuming after permission decision'
-  | 'recovering from session error';
-
-const duration = (elapsedMs: number): string => {
-  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
-  const hours = Math.floor(seconds / 3_600);
-  const minutes = Math.floor((seconds % 3_600) / 60);
-  const remainder = seconds % 60;
-  return [hours ? `${hours}h` : '', minutes ? `${minutes}m` : '', remainder ? `${remainder}s` : '']
-    .filter(Boolean).join(' ') || '0s';
-};
-
-const count = (value: number, singular: string, plural = `${singular}s`): string =>
-  `${value} ${value === 1 ? singular : plural}`;
-
-const joinCounts = (parts: string[]): string => parts.length < 2
-  ? parts[0] ?? ''
-  : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1)}`;
-
 export const ownerNotices = {
   receivedStarted: () =>
     'ℹ️ Message received. The agent has started working on this request now. '
@@ -117,21 +89,6 @@ export const ownerNotices = {
   attachmentRejected: (reason: string) => `⚠️ Attachment rejected: ${reason}.`,
   attachmentFailed: () => '⚠️ Could not securely retrieve or admit this attachment request.',
   deliveryFailed: (role: string) => `⚠️ Could not deliver this request to ${role}.`,
-
-  progress: (
-    elapsedMs: number, phase: OwnerProgressPhase, started: number, completed: number,
-    activityUpdates = 0,
-  ) => {
-    const counts: string[] = [];
-    if (started) counts.push(`${count(started, 'tool action')} started`);
-    if (completed) counts.push(`${count(completed, 'tool action')} completed`);
-    if (activityUpdates) counts.push(
-      `${count(activityUpdates, counts.length ? 'additional activity update' : 'activity update')} observed`);
-    const activity = counts.length
-      ? `${joinCounts(counts)} since the last update.`
-      : 'no new reportable activity since the last update.';
-    return `⏳ Working for ${duration(elapsedMs)} · ${phase} · ${activity}`;
-  },
 
   /** The labeled form of one relayed ACP live comment. */
   comment: (message: string) => `${OWNER_COMMENT_LABEL} ${message}`,

@@ -315,7 +315,6 @@ describe('generateBriefing', () => {
       owner_channel: {
         identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
         agent: 'A'.repeat(64),
-        progress_interval_ms: 30_000,
       },
     }, vocab, opts);
     expect(b).toContain('separate **Alice-owner** owner-channel identity');
@@ -343,7 +342,6 @@ describe('generateBriefing', () => {
       session: 'codex-app-server',
       owner_channel: {
         identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
-        progress_interval_ms: 30_000,
       },
     }, vocab, opts);
     expect(b).toContain('source=owner_admin_console');

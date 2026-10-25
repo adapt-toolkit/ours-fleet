@@ -192,7 +192,7 @@ function setup(messages: unknown[], result = {
     harness: 'claude-code',
     config: {
       identity: 'Coordinator-owner', owners: [OWNER_CID],
-      interrupt: options.interrupt ?? false, progress_interval_ms: 0,
+      interrupt: options.interrupt ?? false,
     },
     session, stateDir: dir, client, log: () => undefined,
     startupPending: options.startupPending,
@@ -565,7 +565,7 @@ describe('owner channel daemon-generation recovery', () => {
 });
 
 function liveSetup(options: {
-  interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
+  interrupt?: boolean; owners?: string[];
   comments?: boolean; stateDir?: string; backend?: string;
   sharedTurnId?: (promptId: string) => string | undefined;
 } = {}) {
@@ -602,7 +602,7 @@ function liveSetup(options: {
     config: {
       identity: 'Coordinator-owner', owners: options.owners ?? [OWNER_CID],
       interrupt: options.interrupt ?? true,
-      progress_interval_ms: options.progressIntervalMs ?? 0,
+
       ...(options.comments === undefined ? {} : { comments: options.comments }),
     },
     session, stateDir: dir, client, log: () => undefined,
@@ -1813,8 +1813,6 @@ describe('OwnerChannel notice presentation', () => {
       ownerNotices.status('Coordinator', { backend: 'acp', alive: true, readiness: 'running' }),
       ownerNotices.interrupted('Coordinator'), ownerNotices.interruptFailed('Coordinator'),
       ownerNotices.deliveryFailed('Coordinator'),
-      ownerNotices.progress(90_000, 'using tools', 4, 2, 1),
-      ownerNotices.progress(120_000, 'using tools', 0, 0),
       ownerNotices.authoredUpdate('working', 'Focused verification is running.'),
       ownerNotices.authoredUpdate('approval', 'Permission is required to continue.'),
       ownerNotices.authoredUpdate('blocked', 'An external dependency is unavailable.'),
@@ -2067,101 +2065,26 @@ describe('OwnerChannel notice presentation', () => {
     await vi.advanceTimersByTimeAsync(0);
   });
 
-  it('reports only structured activity for the matching turn across multiple intervals', async () => {
+  it('never turns tool activity into periodic chat messages, while keeping the final reply', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
-    const { channel, client, completions, emit } = liveSetup({ progressIntervalMs: 30_000 });
+    const { channel, client, completions, emit } = liveSetup();
     client.batches.push([ownerMessage(1, 'wire-progress', 'Work safely')]);
     await channel.drain();
-
-    emit({ kind: 'tool_call', turnId: 'another-turn', toolCallId: 'foreign',
-      title: 'send SECRET_TOKEN=leak', status: 'in_progress' });
-    emit({ kind: 'thought', turnId: 'prompt-1', text: 'private chain of thought' });
-    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'ours',
-      title: 'run curl https://user:password@example.test', status: 'in_progress' });
-    await vi.advanceTimersByTimeAsync(30_000);
-
-    const first = String(client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args?.text);
-    expect(first).toBe(
-      '⏳ Working for 30s · using tools · 1 tool action started since the last update.');
-    expect(first).not.toMatch(/SECRET_TOKEN|password|curl|chain of thought|another-turn/);
-
-    const sentAfterActivity = client.calls.filter(call => call.name === 'sendMessage').length;
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(sentAfterActivity);
-
+    const acceptedMessages = client.calls.filter(call => call.name === 'sendMessage').length;
+    for (let i = 0; i < 4; i++) {
+      emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: `tool-${i}`,
+        title: 'private tool details', status: 'in_progress' });
+      emit({ kind: 'tool_update', turnId: 'prompt-1', toolCallId: `tool-${i}`, status: 'completed' });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(acceptedMessages);
+    }
     completions[0](done('Finished'));
     await vi.advanceTimersByTimeAsync(0);
-    const sentBefore = client.calls.filter(call => call.name === 'sendMessage').length;
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(sentBefore);
-  });
-
-  it('follows the shared turn when one turn delivers this request with other waiting prompts', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
-    // The request is prompt-1, but the turn that carries it is another member's.
-    const { channel, client, completions, emit } = liveSetup({
-      progressIntervalMs: 30_000,
-      sharedTurnId: promptId => (promptId === 'prompt-1' ? 'shared-turn' : undefined),
-    });
-    client.batches.push([ownerMessage(1, 'wire-shared', 'Work safely')]);
-    await channel.drain();
-
-    // Activity under the request's own id belongs to no running turn and is not reported.
-    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'stale', title: 'stale', status: 'in_progress' });
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(client.calls.filter(call => call.name === 'sendMessage')
-      .some(call => String(call.args?.text).startsWith('⏳'))).toBe(false);
-
-    emit({ kind: 'tool_call', turnId: 'shared-turn', toolCallId: 'ours', title: 'run', status: 'in_progress' });
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(lastReply(client)).toBe(
-      '⏳ Working for 30s · using tools · 1 tool action started since the last update.');
-
-    completions[0](done('Answer to everything delivered together'));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(lastReply(client)).toBe('Answer to everything delivered together');
-  });
-
-  it('keeps concurrent request progress isolated and correlated', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
-    const { channel, client, completions, emit } = liveSetup({
-      interrupt: false, progressIntervalMs: 20_000,
-    });
-    client.batches.push([ownerMessage(1, 'wire-first-progress', 'First')]);
-    await channel.drain();
-    client.batches.push([ownerMessage(2, 'wire-second-progress', 'Second')]);
-    await channel.drain();
-
-    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'first-tool',
-      title: 'private first-turn command', status: 'in_progress' });
-    await vi.advanceTimersByTimeAsync(20_000);
-    const secondProgress = client.calls.filter(call => call.name === 'sendMessage'
-      && call.args?.replyToWireId === 'wire-second-progress'
-      && String(call.args?.text).startsWith('⏳ ')).at(-1);
-    expect(secondProgress).toBeUndefined();
-
-    completions[0](done('First done'));
-    completions[1](done('Second done'));
-    await vi.advanceTimersByTimeAsync(0);
-  });
-
-  it('does not arm progress timers for requests still waiting in the ACP queue', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
-    const { channel, client } = liveSetup({ progressIntervalMs: 30_000 });
-    client.batches.push([
-      ownerMessage(1, 'wire-queued-one', 'First'),
-      ownerMessage(2, 'wire-queued-two', 'Second'),
-      ownerMessage(3, 'wire-queued-three', 'Third'),
-    ]);
-    await channel.drain();
-
+    expect(lastReply(client)).toBe('Finished');
+    const finishedMessages = client.calls.filter(call => call.name === 'sendMessage').length;
     await vi.advanceTimersByTimeAsync(90 * 60_000);
-    const progress = client.calls.filter(call =>
-      call.name === 'sendMessage' && String(call.args?.text).startsWith('⏳ '));
-    expect(progress).toEqual([]);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(finishedMessages);
   });
+
 });
