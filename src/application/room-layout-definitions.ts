@@ -14,6 +14,7 @@ import { loadConfig, splitRootFor } from '../config.js';
 import { assertLayoutFile, validLayoutKey, validateRoomLayout, type RoomLayoutDefinition } from '../rooms-tasks/layout-config.js';
 import { FleetError } from './errors.js';
 import { layoutDefinitionHash } from './task-layouts.js';
+import { EMPTY_TASK_LAYOUT } from '../rooms-tasks/empty-layout.js';
 
 export const ABSENT_REVISION = 'absent';
 export type LayoutDefinitionBody = Omit<RoomLayoutDefinition, 'sourceFile'>;
@@ -29,6 +30,7 @@ export class RoomLayoutDefinitions {
   private root(): string { return join(splitRootFor(this.configPath ?? defaultConfigPath()), 'room_layouts'); }
 
   private pathFor(name: string): string {
+    if (name === EMPTY_TASK_LAYOUT) throw new FleetError('invalid_request', 'the built-in empty layout cannot be edited or deleted');
     if (!validLayoutKey(name)) throw new FleetError('invalid_request', 'layout name must start with a letter and use letters, digits, - or _');
     return join(this.root(), `${name}.yaml`);
   }
@@ -67,6 +69,7 @@ export class RoomLayoutDefinitions {
     return readdirSync(root).filter(file => /\.ya?ml$/.test(file)).sort().map(file => {
       const name = basename(file, extname(file)), path = join(root, file);
       try {
+        if (name === EMPTY_TASK_LAYOUT) throw Error('reserved built-in layout name');
         if (!validLayoutKey(name)) throw Error(`invalid room layout id: ${name}`);
         assertLayoutFile(path);
         const bytes = readFileSync(path);

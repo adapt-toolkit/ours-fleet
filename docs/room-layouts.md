@@ -3,6 +3,40 @@
 Room Layout describes room goals, participants and their shared or independent
 sessions. Rooms and agents have independent lifecycles.
 
+## Empty mission layout
+
+`POST /api/v1/tasks` may omit `layout`. Fleet then assigns the reserved built-in
+`builtin-empty` layout: one `mission` room and no agent participants. It is a real
+task layout with the usual pinned definition, private run snapshot, room ownership,
+and finish/cancel/delete cleanup. The built-in source cannot be edited or deleted;
+explicit saved-layout names select their configured rooms and participants.
+
+Starting this default mission creates its native room and admits the configured
+Owner CID before reporting Active. Starting a saved layout likewise initializes all
+its rooms and required agents automatically, in definition order. Shared
+participants are reused across their rooms. The HTTP request accepts startup
+promptly and a detached worker completes it; the task remains Provisioning until
+all rooms are ready. No agents are spawned. Owner attachment must be
+enabled and an Owner invite configured; an empty ownerless room is rejected.
+Saving with `backlog: true` creates no native room or agents until Start. Unknown
+native mutation outcomes retain the existing reconciliation marker and are not
+blindly replayed. Repeated requests with the same idempotency key reuse the task.
+
+An active built-in empty mission accepts agents later through
+`POST /api/v1/tasks/:id/members` and the existing durable member-addition receipt
+API. These explicit additions retain their own launch snapshots alongside the
+original empty definition. They use the mission workspace and existing agent
+ownership, admission, assignment and retirement checks. A repeated request ID
+observes the original receipt; an uncertain launch requires inspection, not a
+second automatic launch. The retained room-opening endpoint remains available for recovery of older
+active tasks whose rooms were declared but never initialized. New missions do not
+require a separate room-opening action.
+
+Layout YAML may also describe a single Owner room using `participants: {}` and
+`members: []`. Other layouts continue to require valid participant references.
+
+## Saved layouts
+
 Place a layout at `fleet/room_layouts/<name>.yaml` beside the split configuration
 for `fleet.yaml`. Agent Templates remain in `fleet/agent_templates/`.
 

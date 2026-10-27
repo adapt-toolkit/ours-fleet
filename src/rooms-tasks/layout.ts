@@ -33,7 +33,7 @@ export interface LayoutSupervisor {
   id: string;
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
-  spawn(key: string, template: string): Promise<LayoutInstance>;
+  spawn(key: string, template: string, definition?: import('../config.js').AgentTemplateDefinition): Promise<LayoutInstance>;
   join(instance: LayoutInstance, invite: string, roomCid: string, membership?: { roomId: string; role: string }): Promise<void>;
   assign(instance: LayoutInstance, assignment: LayoutAssignment): Promise<void>;
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
@@ -48,23 +48,27 @@ type RoomState = {
 export interface RoomLayoutState {
   version: 1; owner?: ReturnType<typeof ownerReference>; agent_templates?: Record<string, import('../config.js').AgentTemplateDefinition>; definition: LayoutDefinition; controller: string;
   participants: Record<string, ParticipantState>; rooms: Record<string, RoomState>;
+  /** Runtime additions leave the pinned source definition unchanged. */
+  additional_members?: Record<string, { room: string; role: string; template: string; request_id: string; hash: string }>;
   order: string[]; closed: boolean; closing?: boolean; uncertain?: string;
 }
 const own = (o: object, key: string) => Object.hasOwn(o, key);
 function need(ok: unknown, message: string): asserts ok { if (!ok) throw Error(message); }
 /** Room/participant keys cannot contain ':', so scoped instance keys cannot collide. */
 function instanceKey(definition: LayoutDefinition, participant: string, room: string): string {
-  return definition.participants[participant].instance_scope === 'room' ? `${room}:${participant}` : participant;
+  return definition.participants[participant]?.instance_scope === 'room' ? `${room}:${participant}` : participant;
 }
 export function validateLayout(def: LayoutDefinition): void {
-  need(Object.keys(def.rooms).length && Object.keys(def.participants).length, 'rooms and participants required');
+  need(Object.keys(def.rooms).length, 'rooms required');
+  const empty = Object.keys(def.participants).length === 0;
+  if (empty) need(Object.keys(def.rooms).length === 1, 'an empty layout requires exactly one room');
   for (const [key, participant] of Object.entries(def.participants)) {
     need(participant.instance_scope === undefined || ['layout', 'room'].includes(participant.instance_scope), `invalid instance_scope for ${key}`);
     if (participant.instance_scope === 'room')
       need(typeof participant.agent_template === 'string' && participant.agent_template.trim(), `room-scoped participant ${key} requires agent_template`);
   }
   for (const [key, room] of Object.entries(def.rooms)) {
-    need(key.length && room.goal.trim() && room.members.length, 'room goal and members required');
+    need(key.length && room.goal.trim() && (empty || room.members.length), 'room goal and members required');
     need(new Set(room.members).size === room.members.length, 'duplicate participant in room');
     for (const member of room.members) need(own(def.participants, member), `unknown participant ${member}`);
   }
@@ -116,6 +120,8 @@ export class RoomLayout {
     });
   }
   private checkOwnerRoles(definition: LayoutDefinition): void {
+    if (!Object.keys(definition.participants).length)
+      need(this.owner, 'an empty layout requires an attached room owner');
     if (!this.owner) return;
     for (const room of Object.values(definition.rooms))
       need(room.members.every(member => (room.roles?.[member] ?? member) !== this.owner!.role), 'participant cannot use the owner role');
@@ -136,6 +142,9 @@ export class RoomLayout {
     const result = await work(); commit(result); delete s.uncertain; this.save(s);
   }
   private async activateRoom(s: RoomLayoutState, key: string, spec: LayoutRoom): Promise<void> {
+    const additions = Object.entries(s.additional_members ?? {}).filter(([, member]) => member.room === key);
+    spec = { ...spec, members: [...spec.members, ...additions.map(([name]) => name)],
+      roles: { ...spec.roles, ...Object.fromEntries(additions.map(([name, member]) => [name, member.role])) } };
     if (s.owner) need(this.owner && canonicalJson(s.owner) === canonicalJson(ownerReference(this.owner)), 'room owner configuration changed');
     this.checkOwnerRoles(s.definition);
     need(s.rooms[key]?.state !== 'closed', 'room closed');
@@ -146,14 +155,17 @@ export class RoomLayout {
     }
     if (s.rooms[key]?.state === 'active') { await this.assertRoomActive(s, key); return; }
     const room = s.rooms[key] ??= { spec, state: 'provisioning', ready: [] };
+    room.spec = spec;
     this.save(s);
     for (const member of spec.members) {
       const resolvedKey = instanceKey(s.definition, member, key), p = s.participants[resolvedKey];
       if (!p.instance) {
-        const template = s.definition.participants[member]?.agent_template;
+        const template = s.definition.participants[member]?.agent_template ?? s.additional_members?.[member]?.template;
         need(template, `no factory for ${member}`);
         if (this.supervisor.taskSupervised) p.task_supervised = true;
-        await this.mutation(s, `spawn:${resolvedKey}`, () => this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
+        await this.mutation(s, `spawn:${resolvedKey}`, () => s.additional_members?.[member]
+          ? this.supervisor.spawn(resolvedKey, template, s.agent_templates?.[template])
+          : this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
         await this.verify(p.instance!);
       }
     }
@@ -162,7 +174,8 @@ export class RoomLayout {
       room_name: `${key.slice(0, 24)}-${createHash('sha256').update(this.file + '\0' + key).digest('hex').slice(0, 24)}`,
       goal: spec.goal, briefing: JSON.stringify({ goal: spec.goal, contract: spec.contract }),
       quiet_membership: spec.quiet_membership ?? true, anonymous: spec.anonymous ?? false,
-      activation_requirements: [...new Set(spec.members.map(roleFor))].map(role => ({ role, count: spec.members.filter(m => roleFor(m) === role).length })),
+      activation_requirements: !spec.members.length && s.owner ? [{ role: s.owner.role, count: 1 }]
+        : [...new Set(spec.members.map(roleFor))].map(role => ({ role, count: spec.members.filter(m => roleFor(m) === role).length })),
     }), native => { room.native = native; s.order.push(key); });
     if (s.owner && !room.owner_ready) await this.mutation(s, `owner:${key}`, async () => {
       await this.cowork.acceptInvite(room.native!.room_id, this.owner!.invite, { role: s.owner!.role, expected_cid: s.owner!.cid });
@@ -197,6 +210,28 @@ export class RoomLayout {
     return this.operation(actor, async s => {
       need(own(s.definition.rooms, key), 'unknown room');
       await this.activateRoom(s, key, s.definition.rooms[key]);
+    });
+  }
+  /** Append an explicitly requested agent to an active owner-only room, with durable retry identity. */
+  addMember(actor: string, input: { key: string; room: string; role: string; requestId: string; hash: string;
+    definition: import('../config.js').AgentTemplateDefinition }): Promise<void> {
+    return this.operation(actor, async s => {
+      need(!Object.keys(s.definition.participants).length, 'manual layout additions require an empty source layout');
+      need(/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(input.key) && !['constructor', 'prototype', '__proto__'].includes(input.key), 'invalid member key');
+      need(s.owner && input.role !== s.owner.role, 'participant cannot use the owner role');
+      const existing = s.additional_members?.[input.key];
+      if (existing) need(existing.request_id === input.requestId && existing.hash === input.hash, 'this member slot already exists');
+      else {
+        need(s.rooms[input.room]?.state === 'active', 'adding an agent requires an active layout room');
+        await this.assertRoomActive(s, input.room);
+        const template = `added-${input.key}`;
+        (s.additional_members ??= {})[input.key] = { room: input.room, role: input.role, template, request_id: input.requestId, hash: input.hash };
+        (s.agent_templates ??= {})[template] = structuredClone(input.definition);
+        s.participants[input.key] = { owned: true };
+        s.rooms[input.room].state = 'provisioning';
+        this.save(s);
+      }
+      await this.activateRoom(s, input.room, s.definition.rooms[input.room]);
     });
   }
   private async assertRoomActive(s: RoomLayoutState, key: string): Promise<void> {
