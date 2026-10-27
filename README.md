@@ -100,7 +100,8 @@ The maintained Codex and Claude ACP adapters remain bundled optional dependencie
 and are resolved internally; users do not install adapter commands or add them to
 `PATH`. Explicit `session_options.codex_app_server.command` and
 `session_options.acp.command` overrides remain available. ours-fleet and its
-maintained adapters require Node 22 or newer.
+maintained adapters require a patched Node.js 22.23.4+, 24.22.1+ or 26.12.1+
+release (see [Security version requirements](#security-version-requirements)).
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -1737,7 +1738,7 @@ These package checks do not replace native Fleet/harness or platform acceptance.
 
 ### Build with selected SDK and CLI archives
 
-Run in the build container with Node 22+, npm and tar available:
+Run in the build container with a patched Node.js (22.23.4+, 24.22.1+ or 26.12.1+), npm and tar available:
 
 ```sh
 node scripts/build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz --out-dir /artifacts/consumer
@@ -1971,3 +1972,41 @@ existing role/default configuration when applying this change. Meaningful agent
 commentary, attention requests and final answers continue to be delivered.
 The app associates activity with the channel's bound CID, never a display name.
 It shows unavailable status when the directory observation disconnects.
+
+## Security version requirements
+
+Ours refuses to run on Node.js or cloudflared releases with known security
+defects that affect it. The checks run before setup changes anything and
+again before every tunnel start, and the refusal names the minimum version,
+the version found and where to update.
+
+**Node.js.** Only reviewed stable release lines are accepted, each with its
+own patched floor: 22 (22.23.4+), 24 (24.22.1+) and 26 (26.12.1+). Earlier
+patch levels of these lines, end-of-life lines (20, 21, 23, 25), prerelease
+or nightly builds and release lines that have not been reviewed yet (such as
+27) are refused. A new line is admitted by a reviewed change that adds its
+floor, never by a single global "newer than" comparison. The
+[October 2026 Node.js security releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
+fix CVE-2026-111497: the bundled Brotli decoder can write out of bounds when
+decompressing attacker-controlled data, which can cause memory corruption,
+crashes, information disclosure and potentially remote code execution.
+Update from [nodejs.org](https://nodejs.org/en/download) or your package
+manager. The `engines` field in `package.json` records the same floors but
+is advisory; the runtime checks enforce them.
+
+**cloudflared.** A tunnel requires cloudflared **2026.10.2 or later**, as
+reported by `cloudflared --version` for the executable found on the PATH of
+the process that starts the tunnel. Older, prerelease, unrecognized, failing,
+missing or timed-out version checks are refused.
+[Cloudflare's eMudhra incident explanation](https://blog.cloudflare.com/emudhra-certificate-compromise/)
+describes why: earlier releases trust compromised eMudhra intermediate
+certificates, which allows server impersonation. Update with your package
+manager or
+[Cloudflare's update instructions](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/update-cloudflared/),
+then check `cloudflared --version` again.
+
+These checks do not install or upgrade prerequisites, disable TLS
+verification, rotate credentials or restart services. A process that is
+already running keeps the binaries it started with: update Node.js and
+cloudflared, then restart the affected services (and rebuild or recreate
+containers) yourself.

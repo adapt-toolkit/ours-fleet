@@ -88,6 +88,20 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
 
 describe('doctor', () => {
 
+  it('checks the PATH cloudflared only when a workspace tunnel is configured', async () => {
+    const unsafe = execWith({ 'cloudflared --version': { code: 0, stdout: 'cloudflared version 2026.7.2 (built 2026-07-15-1200 UTC)\n', stderr: '' } });
+    expect((await doctor({}, unsafe, 'darwin')).checks.find(c => c.name === 'cloudflared')).toBeUndefined();
+    mkdirSync(join(dir, '.ours-fleet', 'workspace'), { recursive: true });
+    writeFileSync(join(dir, '.ours-fleet', 'workspace', 'tunnel.json'), '{}');
+    const refused = (await doctor({}, unsafe, 'darwin')).checks.find(c => c.name === 'cloudflared')!;
+    expect(refused.ok).toBe(false);
+    expect(refused.detail).toMatch(/cloudflared version 2026\.7\.2 is not permitted.*2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/);
+    const missing = (await doctor({}, execWith({ 'cloudflared --version': { code: 127, stdout: '', stderr: '' } }), 'darwin')).checks.find(c => c.name === 'cloudflared')!;
+    expect(missing).toMatchObject({ ok: false, detail: expect.stringMatching(/could not be verified \(not found\)/) });
+    const patched = (await doctor({}, execWith({ 'cloudflared --version': { code: 0, stdout: 'cloudflared version 2026.10.2\n', stderr: '' } }), 'darwin')).checks.find(c => c.name === 'cloudflared')!;
+    expect(patched).toEqual({ name: 'cloudflared', ok: true, detail: 'version 2026.10.2' });
+  });
+
   it('marks a service whose current definition still awaits a daemon reload as unhealthy', async () => {
     const unitDir = join(dir, '.config', 'systemd', 'user');
     mkdirSync(unitDir, { recursive: true });

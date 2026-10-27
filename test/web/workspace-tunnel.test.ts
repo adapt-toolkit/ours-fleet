@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -13,11 +13,13 @@ vi.mock('node:child_process', async importOriginal => ({
   spawn: launch,
 }));
 
+import type { Exec } from '../../src/exec.js';
 import { startWorkspaceTunnel } from '../../src/web/workspace-tunnel.js';
 import { stateRoot } from '../../src/paths.js';
 
 let dir: string;
 let stop: (() => Promise<void>) | undefined;
+const currentConnector: Exec = async () => ({code:0,stdout:'cloudflared version 2026.10.2 (built fixture)',stderr:''});
 const origin = 'https://fixture.ours-tunnel.com';
 const failedChild = () => Object.assign(new EventEmitter(), {
   pid: undefined, exitCode: null, signalCode: null, kill: vi.fn(() => false),
@@ -48,7 +50,7 @@ afterEach(async () => {
 it('handles repeated spawn errors and schedules only one retry per child', async () => {
   const first = failedChild(), second = failedChild();
   launch.mockReturnValueOnce(first).mockReturnValueOnce(second);
-  stop = startWorkspaceTunnel(origin);
+  stop = await startWorkspaceTunnel(origin, currentConnector);
   const missing = Object.assign(new Error('spawn cloudflared ENOENT'), { code: 'ENOENT' });
   first.emit('error', missing);
   expect(() => first.emit('error', missing)).not.toThrow();
@@ -70,7 +72,7 @@ it('handles repeated spawn errors and schedules only one retry per child', async
 it('stops before a pending failed spawn reports its error without signalling a nonexistent process', async () => {
   const child = failedChild();
   launch.mockReturnValue(child);
-  stop = startWorkspaceTunnel(origin);
+  stop = await startWorkspaceTunnel(origin, currentConnector);
   const closing = stop();
   child.emit('error', Object.assign(new Error('spawn cloudflared ENOENT'), { code: 'ENOENT' }));
   child.emit('close', -2, null);
@@ -85,7 +87,8 @@ it('closes a real missing-executable spawn promptly without leaving retry work',
   const module = pathToFileURL(resolve('dist/web/workspace-tunnel.js')).href;
   const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
     import { startWorkspaceTunnel } from ${JSON.stringify(module)};
-    const stop = startWorkspaceTunnel(${JSON.stringify(origin)});
+    // A verified connector that disappears before spawn: the real spawn fails with ENOENT.
+    const stop = await startWorkspaceTunnel(${JSON.stringify(origin)}, async () => ({ code: 0, stdout: 'cloudflared version 2026.10.2', stderr: '' }));
     const started = performance.now();
     await stop();
     await new Promise(resolve => setTimeout(resolve, 25));
@@ -93,6 +96,109 @@ it('closes a real missing-executable spawn promptly without leaving retry work',
   `], { env: { ...process.env, PATH: dir }, encoding: 'utf8', timeout: 10000 });
   expect(JSON.parse(output).elapsed).toBeLessThan(2000);
 }, 15000);
+
+it('refuses a real missing connector before starting or scheduling retries', () => {
+  const module = pathToFileURL(resolve('dist/web/workspace-tunnel.js')).href;
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import { startWorkspaceTunnel } from ${JSON.stringify(module)};
+    try { await startWorkspaceTunnel(${JSON.stringify(origin)}); process.exitCode=2; }
+    catch(error) { console.log(error.message); }
+  `], { env: { ...process.env, PATH: dir }, encoding:'utf8',timeout:10000 });
+  expect(output).toMatch(/cloudflared could not be verified \(not found\).*2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/);
+},15000);
+
+it('refuses a real unsafe connector on PATH and never spawns it', () => {
+  const bin = join(dir, 'bin');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'cloudflared'), '#!/bin/sh\nif [ "$1" = --version ]; then echo "cloudflared version 2026.7.2 (built 2026-07-15-1200 UTC)"; else touch "$0.ran"; fi\n', { mode: 0o700 });
+  const module = pathToFileURL(resolve('dist/web/workspace-tunnel.js')).href;
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import { startWorkspaceTunnel } from ${JSON.stringify(module)};
+    try { await startWorkspaceTunnel(${JSON.stringify(origin)}); process.exitCode=2; }
+    catch(error) { console.log(error.message); }
+  `], { env: { ...process.env, PATH: bin }, encoding:'utf8',timeout:10000 });
+  expect(output).toMatch(/cloudflared version 2026\.7\.2 is not permitted/);
+  expect(existsSync(join(bin, 'cloudflared.ran'))).toBe(false);
+},15000);
+
+it.each([
+  ['cloudflared version 2026.7.2', /cloudflared version 2026\.7\.2 is not permitted/],
+  ['cloudflared version 2026.10.2-rc.1', /cloudflared with an unrecognized version is not permitted/],
+])('rejects an installed unsafe connector %j without spawning a tunnel', async (stdout, found) => {
+  const refusal = startWorkspaceTunnel(origin, async () => ({ code: 0, stdout, stderr: '' }));
+  await expect(refusal).rejects.toThrow(found);
+  await expect(refusal).rejects.toThrow(/2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('rejects a failing version check without spawning a tunnel', async () => {
+  await expect(startWorkspaceTunnel(origin, async () => ({ code: 1, stdout: '', stderr: 'timed out' }))).rejects.toThrow(/cloudflared could not be verified \(version check failed\)/);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('rechecks before reconnecting, keeps refusing a downgraded connector and resumes once it is upgraded', async () => {
+  const unsafe = { code: 0, stdout: 'cloudflared version 2026.7.2', stderr: '' };
+  const exec = vi.fn<Exec>().mockResolvedValueOnce({ code: 0, stdout: 'cloudflared version 2026.10.2', stderr: '' })
+    .mockResolvedValueOnce(unsafe).mockResolvedValueOnce(unsafe)
+    .mockResolvedValue({ code: 0, stdout: 'cloudflared version 2026.10.3', stderr: '' });
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const first = failedChild(), second = failedChild();
+  launch.mockReturnValueOnce(first).mockReturnValueOnce(second);
+  stop = await startWorkspaceTunnel(origin, exec);
+  first.emit('exit', 1, null);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(exec).toHaveBeenCalledTimes(2);
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(log).toHaveBeenCalledTimes(1);
+  expect(log).toHaveBeenCalledWith(expect.stringMatching(/cloudflared version 2026\.7\.2 is not permitted.*emudhra-certificate-compromise/));
+  expect(vi.getTimerCount()).toBe(1);
+  // The same refusal is not logged again on every retry.
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(exec).toHaveBeenCalledTimes(3);
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(log).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(4000);
+  expect(exec).toHaveBeenCalledTimes(4);
+  expect(launch).toHaveBeenCalledTimes(2);
+  expect(launch).toHaveBeenLastCalledWith('cloudflared', ['tunnel', '--no-autoupdate', 'run', '--token-file', join(stateRoot(), 'workspace', 'connector')], { stdio: 'ignore' });
+  log.mockRestore();
+});
+
+it('stopping during a pending reconnect check never starts the connector', async () => {
+  let release!: (value: { code: number; stdout: string; stderr: string }) => void;
+  const exec = vi.fn<Exec>().mockResolvedValueOnce({ code: 0, stdout: 'cloudflared version 2026.10.2', stderr: '' })
+    .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const child = failedChild();
+  launch.mockReturnValue(child);
+  stop = await startWorkspaceTunnel(origin, exec);
+  child.emit('exit', 1, null);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(exec).toHaveBeenCalledTimes(2);
+  await stop();
+  release({ code: 0, stdout: 'cloudflared version 2026.10.2', stderr: '' });
+  await vi.advanceTimersByTimeAsync(30000);
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('stopping while a refused connector waits for its retry clears the retry', async () => {
+  const exec = vi.fn<Exec>().mockResolvedValueOnce({ code: 0, stdout: 'cloudflared version 2026.10.2', stderr: '' })
+    .mockResolvedValue({ code: 127, stdout: '', stderr: '' });
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const child = failedChild();
+  launch.mockReturnValue(child);
+  stop = await startWorkspaceTunnel(origin, exec);
+  child.emit('exit', 1, null);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(log).toHaveBeenCalledWith(expect.stringMatching(/cloudflared could not be verified \(not found\)/));
+  expect(vi.getTimerCount()).toBe(1);
+  await stop();
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(30000);
+  expect(exec).toHaveBeenCalledTimes(2);
+  expect(launch).toHaveBeenCalledTimes(1);
+  log.mockRestore();
+});
 
 it('waits for a running child to close and never retries after shutdown', async () => {
   const child = failedChild();
@@ -103,7 +209,7 @@ it('waits for a running child to close and never retries after shutdown', async 
     return true;
   });
   launch.mockReturnValue(child);
-  stop = startWorkspaceTunnel(origin);
+  stop = await startWorkspaceTunnel(origin, currentConnector);
   await stop();
   child.emit('error', new Error('late child error'));
   await vi.advanceTimersByTimeAsync(30000);

@@ -1,3 +1,4 @@
+import { cloudflaredUnavailableError, cloudflaredVersionError, CLOUDFLARED_VERSION_TIMEOUT_MS, isSecureCloudflaredVersion, isSecureNodeVersion, nodeVersionError } from './security-versions.js';
 import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -15,9 +16,7 @@ const UNCHANGED = 'Nothing was changed and this host was not bound.';
 export async function setupTunnelPreflight(
   { exec = realExec, platform = process.platform, node = process.versions.node }: { exec?: Exec; platform?: NodeJS.Platform; node?: string } = {},
 ): Promise<void> {
-  const [major, minor] = node.split('.').map(Number);
-  if (major < 22 || (major === 22 && minor < 13))
-    throw Error(`Tunnel setup requires Node.js 22.13 or newer; this is ${node}. Update Node.js, then run a fresh tunnel setup command. ${UNCHANGED}`);
+  if (!isSecureNodeVersion(node)) throw Error(`${nodeVersionError(node)} ${UNCHANGED}`);
   if (platform === 'linux') {
     const manager = await exec('systemctl', ['--user', 'show-environment'], { timeout: 10_000 });
     if (manager.code !== 0)
@@ -25,6 +24,11 @@ export async function setupTunnelPreflight(
         + `Log in directly as ${userInfo().username} (not through su or sudo), or run: sudo loginctl enable-linger ${userInfo().username} && export XDG_RUNTIME_DIR=/run/user/${process.getuid?.()} `
         + `Then run a fresh tunnel setup command. ${UNCHANGED}`);
   }
+  // Refuse an unsafe connector before anything is redeemed; the service checks its own
+  // PATH-selected cloudflared again before every tunnel start.
+  const version = await exec('cloudflared', ['--version'], { timeout: CLOUDFLARED_VERSION_TIMEOUT_MS });
+  if (version.code !== 0) throw Error(`${cloudflaredUnavailableError(version.code === 127 ? 'not found' : 'version check failed')} ${UNCHANGED}`);
+  if (!isSecureCloudflaredVersion(version.stdout)) throw Error(`${cloudflaredVersionError(version.stdout)} ${UNCHANGED}`);
   const help = await exec('cloudflared', ['tunnel', 'run', '--help'], { timeout: 10_000 });
   if (help.code === 127) throw Error(`cloudflared is not installed or not on PATH. Install it, then run a fresh tunnel setup command. ${UNCHANGED}`);
   if (help.code !== 0 || !`${help.stdout}\n${help.stderr}`.includes('--token-file'))

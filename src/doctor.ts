@@ -1,3 +1,4 @@
+import { cloudflaredUnavailableError, cloudflaredVersionError, CLOUDFLARED_VERSION_TIMEOUT_MS, isSecureCloudflaredVersion, isSecureNodeVersion, nodeVersionError, parseCloudflaredVersion } from './security-versions.js';
 import { describeRegistration, refreshServiceRegistrations, registrationDrift, type RefreshOptions } from './supervisor/registration-refresh.js';
 import { join } from 'node:path';
 import { userInfo, homedir } from 'node:os';
@@ -12,7 +13,7 @@ import { getAdapter, productionAdapters } from './harness/registry.js';
 import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { managedCliReport } from './managed-cli.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
-import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
+import { agentDir, home, deriveXdgRuntimeDir, stateRoot } from './paths.js';
 import { resolveIsolation, harnessRuntimeDir } from './isolation/policy.js';
 import { hermesConfiguredProvider } from './harness/hermes-startup.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
@@ -147,11 +148,22 @@ export async function doctor(
     }
   }
 
-  const major = Number(process.versions.node.split('.')[0]);
+  const secureNode = isSecureNodeVersion(process.versions.node);
   checks.push({
-    name: 'node', ok: major >= 20,
-    detail: major >= 20 ? `v${process.versions.node}` : `v${process.versions.node} — need >= 20`,
+    name: 'node', ok: secureNode,
+    detail: secureNode ? `v${process.versions.node}` : nodeVersionError(process.versions.node),
   });
+  // A configured workspace tunnel starts the cloudflared found on PATH.
+  if (existsSync(join(stateRoot(), 'workspace', 'tunnel.json'))) {
+    const connector = await exec('cloudflared', ['--version'], { timeout: CLOUDFLARED_VERSION_TIMEOUT_MS });
+    const secure = connector.code === 0 && isSecureCloudflaredVersion(connector.stdout);
+    checks.push({
+      name: 'cloudflared', ok: secure,
+      detail: secure ? `version ${parseCloudflaredVersion(connector.stdout)!.join('.')}`
+        : connector.code !== 0 ? cloudflaredUnavailableError(connector.code === 127 ? 'not found' : 'version check failed')
+          : cloudflaredVersionError(connector.stdout),
+    });
+  }
 
   // The configuration is a checked prerequisite in its own right. A config the
   // `config` command rejects must fail here too, with the same cause — while the
