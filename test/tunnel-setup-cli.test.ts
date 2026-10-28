@@ -12,7 +12,7 @@ describe('setup-tunnel positional grant CLI', () => {
     const capture = join(root, 'fetch.json');
     const preload = join(root, 'capture.mjs');
     writeFileSync(join(bin, 'systemctl'), '#!/bin/sh\nexit "${FAIL_PREFLIGHT:-0}"\n', {mode: 0o700});
-    writeFileSync(join(bin, 'cloudflared'), '#!/bin/sh\n[ "${FAIL_PREFLIGHT:-0}" = 0 ] || exit 1\necho --token-file\n', {mode: 0o700});
+    writeFileSync(join(bin, 'cloudflared'), '#!/bin/sh\n[ "${FAIL_PREFLIGHT:-0}" = 0 ] || exit 1\n[ "$1" = --version ] && { echo "cloudflared version ${CF_VERSION:-2026.10.2} (built fixture)"; exit 0; }\necho --token-file\n', {mode: 0o700});
     writeFileSync(preload, `import {writeFileSync} from 'node:fs';
       globalThis.fetch=async(url,init)=>{writeFileSync(process.env.FETCH_CAPTURE,JSON.stringify({url,init}));
       if(process.env.THROW_FETCH)throw Error(process.env.THROW_FETCH);
@@ -36,6 +36,14 @@ describe('setup-tunnel positional grant CLI', () => {
       }
       expect(run(encode(grant),[],{FAIL_PREFLIGHT:'1'})).toContain('Nothing was changed');
       expect(existsSync(capture)).toBe(false);
+      // A vulnerable host connector stops setup before the one-use grant is redeemed.
+      for(const version of ['2026.7.2','2026.10.1']){
+        const refused=run(encode(grant),[],{CF_VERSION:version});
+        expect(refused).toContain(`cloudflared version ${version} is not permitted`);
+        expect(refused).toContain('https://blog.cloudflare.com/emudhra-certificate-compromise/');
+        expect(refused).toContain('Nothing was changed');
+        expect(existsSync(capture)).toBe(false);
+      }
       expect(run(encode(grant),['--stdin'])).toContain('Use one payload');expect(existsSync(capture)).toBe(false);
       expect(run('--'+encode(grant))).toContain('Invalid setup-tunnel command');expect(existsSync(capture)).toBe(false);
       expect(run(encode(grant))).toContain('already used');
@@ -61,7 +69,7 @@ describe('setup-tunnel positional grant CLI', () => {
     const root=mkdtempSync(join(tmpdir(),'tunnel-inspect-')),workspace=join(root,'state','.ours-fleet','workspace'),bin=join(root,'bin');mkdirSync(workspace,{recursive:true});mkdirSync(bin);
     const binding={workspaceId:'w'.repeat(43),hostWorkspaceId:'h'.repeat(43),serverCid:'a'.repeat(64),appOrigin:'https://app.ours-tunnel.com'};
     const before=JSON.stringify(binding);writeFileSync(join(workspace,'binding.json'),before,{mode:0o600});writeFileSync(join(workspace,'connector'),'fixture-retained',{mode:0o600});
-    writeFileSync(join(bin,'systemctl'),'#!/bin/sh\nexit 0\n',{mode:0o700});writeFileSync(join(bin,'cloudflared'),'#!/bin/sh\n[ "${FAIL_PREFLIGHT:-0}" = 0 ] || exit 1\necho --token-file\n',{mode:0o700});
+    writeFileSync(join(bin,'systemctl'),'#!/bin/sh\nexit 0\n',{mode:0o700});writeFileSync(join(bin,'cloudflared'),'#!/bin/sh\n[ "${FAIL_PREFLIGHT:-0}" = 0 ] || exit 1\n[ "$1" = --version ] && { echo "cloudflared version 2026.10.2 (built fixture)"; exit 0; }\necho --token-file\n',{mode:0o700});
     const capture=join(root,'requests.json'),preload=join(root,'fetch.mjs');
     const payload={version:1,appOrigin:binding.appOrigin,hostname:'home-test.ours-tunnel.com',rootName:'alice@home',name:'Alice',surname:'Tester',connectorToken:'fixture-new-private',invitation:'fixture-invite',serverCid:binding.serverCid,challenge:{workspaceId:'z'.repeat(43),accountId:'c'.repeat(43),nonce:'n'.repeat(43),expiresAt:Date.now()+600000}};
     writeFileSync(preload,`import {writeFileSync} from 'node:fs';const calls=[];globalThis.fetch=async(url)=>{calls.push(String(url));writeFileSync(process.env.FETCH_CAPTURE,JSON.stringify(calls));if(String(url).endsWith('workspace-install-inspect'))return Response.json({workspaceId:process.env.INSPECT_WORKSPACE,serverCid:process.env.INSPECT_SERVER});if(process.env.REDEEM_PAYLOAD)return Response.json({payload:process.env.REDEEM_PAYLOAD});return new Response(null,{status:410});};`);

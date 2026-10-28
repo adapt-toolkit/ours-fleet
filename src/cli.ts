@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './runtime-security.js';
 import { beginWorkspaceReplacement, abandonWorkspaceReplacement, discardRetiredWorkspaceReplacement, clearWorkspaceReplacement, confirmWorkspaceReplacement, finishWorkspaceReplacement, readWorkspaceBinding, readWorkspaceReplacement, requiresWorkspaceReplacement, refreshWorkspaceReplacement } from './workspace-replacement.js';
 import { completeTunnelSetup } from './tunnel-setup-completion.js';
 import { readTunnelSetupFile, readTunnelSetupStdin, readTunnelSetupArgument, redeemTunnelSetup, inspectTunnelSetup, verifyTunnelSetupTarget } from './tunnel-setup-input.js';

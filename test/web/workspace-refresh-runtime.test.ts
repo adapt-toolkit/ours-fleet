@@ -1,7 +1,7 @@
 import {it,expect} from 'vitest';
 import {createServer,request} from 'node:http';
 import {createHash} from 'node:crypto';
-import {mkdtempSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {once} from 'node:events';
@@ -24,6 +24,8 @@ it('serves rotating workspace credentials to the account server only, through th
  provider.listen(0,'127.0.0.1');await once(provider,'listening');const providerOrigin='http://127.0.0.1:'+(provider.address() as {port:number}).port;
  try{
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];
+  // A patched fixture connector, never the host's cloudflared with a fixture token.
+  const bin=join(dir,'bin');mkdirSync(bin);writeFileSync(join(bin,'cloudflared'),'#!/bin/sh\n[ "$1" = --version ] && { echo "cloudflared version 2026.10.2 (built fixture)"; exit 0; }\nexec /bin/sleep 600\n',{mode:0o700});process.env.PATH=bin+':'+process.env.PATH;
   process.env.OURS_FLEET_HOME=dir;const profile=join(dir,'profile.json'),credential=join(dir,'server-credential');writeFileSync(credential,'fixture-server-credential-32-characters\n',{mode:0o600});writeFileSync(profile,JSON.stringify({serverUrl:providerOrigin,endpoint:providerOrigin+'/daemon',expectedInstanceId:'12345678-1234-1234-1234-123456789abc',credentialPath:credential}),{mode:0o600});process.env.OURS_CONFIG=profile;
   const config=join(dir,'fleet.yaml');await ensureMinimalSetup(config);
   new WebAccessStore().write({version:1,mode:'pairing'});

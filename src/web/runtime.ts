@@ -299,7 +299,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw error;
   }
   let stopTunnel:()=>Promise<void>;
-  try { stopTunnel=startWorkspaceTunnel(browserOrigin); }
+  try { stopTunnel=await startWorkspaceTunnel(browserOrigin); }
   catch(error) {
     try { await control?.close(); await gateway?.close(); await server.close(); }
     finally { lock.release(); }
