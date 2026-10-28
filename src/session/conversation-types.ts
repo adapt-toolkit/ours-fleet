@@ -22,7 +22,7 @@ export type ConversationEventKind =
   | 'monitor.delivery'
   | 'usage.updated'
   | 'turn.state' | 'turn.completed'
-  | 'session.state' | 'session.info' | 'capabilities.updated'
+  | 'session.state' | 'session.info' | 'session.ownership' | 'capabilities.updated'
   | 'error'
   /** A well-formed transport update this version cannot represent. Bounded, never a crash. */
   | 'unsupported';
@@ -173,6 +173,13 @@ export interface SessionStatePayload {
   currentModeId?: string;
 }
 
+/** First event of a generation: the launch it belongs to and that launch's task, or null for a non-task role. */
+export interface SessionOwnershipPayload {
+  /** Null for a role without temp-supervisor metadata (explicitly standalone). */
+  launchId: string | null;
+  taskId: string | null;
+}
+
 export interface SessionInfoPayload {
   title?: string | null;
   updatedAt?: string | null;
@@ -267,7 +274,7 @@ export interface BoundedJson {
 export type ConversationPayload =
   | { attachment: import('../file-delivery/types.js').DeliveredFile }
   | MessageChunkPayload | ThoughtChunkPayload | PlanReplacePayload | ToolUpsertPayload
-  | UsageUpdatedPayload | SessionStatePayload | SessionInfoPayload
+  | UsageUpdatedPayload | SessionStatePayload | SessionInfoPayload | SessionOwnershipPayload
   | CapabilitiesUpdatedPayload | UnsupportedPayload | PromptAdmittedPayload
   | PromptStartedPayload | PromptInterruptRequestedPayload | PermissionRequestedPayload
   | PermissionResolvedPayload | TurnStatePayload | TurnCompletedPayload

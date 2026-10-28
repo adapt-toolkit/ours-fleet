@@ -3,7 +3,7 @@ import { publishFleetResourceCommit } from '../application/resource-observer.js'
 import { stateRoot, defaultConfigPath } from '../paths.js';
 import { EMPTY_TASK_LAYOUT } from '../rooms-tasks/empty-layout.js';
 import type { FleetResourceScope } from '../application/resource-observer.js';
-import { conversationPreview } from '../application/conversation-history.js';
+import { conversationActivity, conversationPreview } from '../application/conversation-history.js';
 import { registerConversationStream } from './conversation-stream.js';
 import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
 import { conversationHasAttachment } from '../application/conversation-history.js';
@@ -47,7 +47,7 @@ import type { TaskRoomApplicationService } from '../application/task-room-servic
 import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
-import { TaskStateError } from '../rooms-tasks/task-state.js';
+import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, TaskStateError } from '../rooms-tasks/task-state.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import {
   appendTaskProgress, getTaskReview, listTaskProgress, publicProgressEntry, publicReview, readTaskReviewArtifact,
@@ -429,9 +429,12 @@ export async function buildWebServer(
     const filter = { strict, ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
       ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
     const api = requireTaskRooms();
+    // Navigation totals cover every task in scope, not only the filtered or visible cards.
+    const unreadTotal = () => api.listTasks({ strict, ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) })
+      .reduce((sum, task) => { const unread = contributionUnread(task); return sum + unread.progress + (unread.review ? 1 : 0); }, 0);
     return taskApi(() => query.groupByList === 'true'
-      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })) }
-      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))) });
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })), contribution_unread_total: unreadTotal() }
+      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))), contribution_unread_total: unreadTotal() });
   };
   const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
     signal.throwIfAborted(); services.invalidateResourceCaches?.();
@@ -464,7 +467,8 @@ export async function buildWebServer(
         return {...services.configuration.read(descriptor.includeDefinitions??false), provenance:services.presetProvenance?.read() ?? null};
       case 'directory': {
         const [roles,tasks]=await Promise.all([services.query.list(true,true),projectTasks({})]);
-        return {roles,tasks:(tasks as {tasks:unknown[]}).tasks,lists:requireTaskRooms().listTaskLists()};
+        const {tasks:rows,contribution_unread_total}=tasks as {tasks:unknown[];contribution_unread_total:number};
+        return {roles,tasks:rows,contribution_unread_total,lists:requireTaskRooms().listTaskLists()};
       }
       case 'previews': {
         const roles=await services.repository.list(true),selected=new Map(roles.map(role=>[role.id,role]));
@@ -473,13 +477,14 @@ export async function buildWebServer(
           signal.throwIfAborted(); const role=selected.get(id),dir=role && services.repository.stateDir(role);
           if(!role)continue;
           try {
-            previews[id]=dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
+            previews[id]=descriptor.activityOnly ? (dir ? await conversationActivity(dir,signal) : {at:''})
+              : dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
           } catch {
             signal.throwIfAborted();
             // A damaged/unreadable ledger is unavailable, not empty or removed.
             // Keep this selected row observable so a repair can refresh it,
             // without retiring previews for the other selected roles.
-            previews[id]={text:'Preview unavailable',at:'',unavailable:true};
+            previews[id]=descriptor.activityOnly ? {at:'',unavailable:true} : {text:'Preview unavailable',at:'',unavailable:true};
           }
         }
         return {previews};
@@ -527,7 +532,7 @@ export async function buildWebServer(
   });
   for(const resource of ['task-layout','creation-action','action','member-addition','login','onboarding-health'] as const) app.get('/api/v1/'+resource,async()=>{throw new ResourceBindingError(409,'resource binding required');});
   app.get('/api/v1/directory',async request=>{auth.authenticate(request);return project({viewId:'read',resource:'directory'},new AbortController().signal);});
-  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const ids=String((request.query as any).ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids}),new AbortController().signal);});
+  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const query=request.query as any,ids=String(query.ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids,...(query.activityOnly==='true'?{activityOnly:true}:{})}),new AbortController().signal);});
   app.get('/api/v1/task-lists', async request => {
     auth.authenticate(request);
     return project({viewId:'read',resource:'task-lists'},new AbortController().signal);
@@ -638,6 +643,21 @@ export async function buildWebServer(
     }));
     if (!result.replayed) reply.code(201);
     return { entry: publicProgressEntry(result.entry), replayed: result.replayed };
+  });
+  /** Acknowledge Progress entries the browser actually showed; returns the task's remaining unread. */
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress/read', async request => {
+    auth.authenticate(request, true);
+    const ids = (request.body as { ids?: unknown })?.ids;
+    if (!Array.isArray(ids) || ids.length > 200 || ids.some(id => typeof id !== 'string' || id.length > 64))
+      throw new FleetError('invalid_request', 'ids must be at most 200 progress entry IDs');
+    return { unread: await reviewApi(() => acknowledgeTaskProgress(request.params.id, ids as string[])) };
+  });
+  /** Acknowledge the To review revision the browser fetched and rendered. */
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/review/read', async request => {
+    auth.authenticate(request, true);
+    const revision = (request.body as { revision?: unknown })?.revision;
+    if (!Number.isSafeInteger(revision) || (revision as number) < 0) throw new FleetError('invalid_request', 'revision must be a non-negative integer');
+    return { unread: await reviewApi(() => acknowledgeTaskReview(request.params.id, revision as number)) };
   });
   app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
     auth.authenticate(request);

@@ -1,35 +1,36 @@
 import { observeFleetResources } from '../application/resource-observer.js';
-import { roomsDir } from '../rooms-tasks/room-state.js';
 import { cleanupDir, drainNotificationTargetCleanup, notificationAgentId, hasPendingNotificationTargetCleanup } from './target-cleanup.js';
 import { closeSync, existsSync, lstatSync, openSync, readSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { NotificationOutbox, type ProducerConfig } from './outbox.js';
 import type { ConversationEventV1 } from '../session/conversation-types.js';
+import { readSessionOwnership, validOwnerTask } from '../session/session-ownership.js';
 
-interface Checkpoint { segment: string; offset: number; prompts: string[]; discarding?: boolean; messages?: Record<string, string>; }
+/** `bindings`: session generation → its launch's task (null for a non-task role), from `session.ownership`.
+ * Saved in the same atomic checkpoint as the offset that passed the binding, so it survives restart and rotation. */
+interface Checkpoint { segment: string; offset: number; prompts: string[]; discarding?: boolean; messages?: Record<string, string>; bindings?: Record<string, string | null>; }
+const MAX_BINDINGS = 16;
 const BATCH_BYTES = 256 * 1024;
 const TURN_ROLES = 4, TURN_MS = 8;
-const RUNTIME_FILES = new Set(['.monitor-status', '.monitor-state.json', '.notify-cursor', '.session-events.jsonl', '.session-events.jsonl.1', '.subscription-usage.json']);
-/** Unlike a UI inventory, unread classification must not treat unreadable records as absence. */
-function taskRoleAssociations():Map<string,string>{
-  const dir=roomsDir(),result=new Map<string,string>();let files:string[];
-  try{files=readdirSync(dir);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return result;throw error;}
-  for(const name of files.filter(name=>name.endsWith('.json'))){
-    const file=join(dir,name),stat=lstatSync(file);
-    if(!stat.isFile() || stat.isSymbolicLink() || stat.size>1024*1024)throw Error('Unreadable room association');
-    const room=JSON.parse(readFileSync(file,'utf8'));
-    if(!room || typeof room.room_id!=='string' || !Array.isArray(room.member_seats))throw Error('Invalid room association');
-    if(room.task_id===undefined)continue;
-    if(typeof room.task_id!=='string' || !/^[A-Za-z0-9_-]{1,120}$/.test(room.task_id))throw Error('Invalid task association');
-    for(const seat of room.member_seats){
-      if(typeof seat.role_name!=='string')throw Error('Invalid member association');
-      if(result.has(seat.role_name) && result.get(seat.role_name)!==room.task_id)throw Error('Ambiguous task association');
-      result.set(seat.role_name,room.task_id);
-    }
-  }
-  return result;
+const RUNTIME_FILES = new Set(['.session-ownership.json', '.monitor-status', '.monitor-state.json', '.notify-cursor', '.session-events.jsonl', '.session-events.jsonl.1', '.subscription-usage.json']);
+function bind(bindings: Record<string, string | null>, event: ConversationEventV1): void {
+  const payload = event.payload as { launchId?: unknown; taskId?: unknown } | undefined;
+  const taskId = payload?.taskId;
+  if (!(payload?.launchId === null || typeof payload?.launchId === 'string') || !(taskId === null || validOwnerTask(taskId))
+    || (taskId !== null && payload?.launchId === null)) return;
+  bindings[event.sessionGeneration] = taskId;
+  const keys = Object.keys(bindings);
+  for (const key of keys.slice(0, Math.max(0, keys.length - MAX_BINDINGS))) delete bindings[key];
 }
+/** Startup skips earlier history, where a live generation's binding may lie: seed from the durable sidecar, keyed by
+ * exact generation. An absent sidecar is legacy history (generations stay unknown); an unreadable or invalid one is
+ * unavailable evidence and returns undefined, so the caller holds its checkpoint instead of emitting unowned work. */
+function seedBindings(roleDir: string): Record<string, string | null> | undefined {
+  try { return Object.fromEntries(Object.entries(readSessionOwnership(roleDir)).map(([generation, owner]) => [generation, owner.taskId])); }
+  catch { return undefined; }
+}
+
 /** Read durable supervisor ledgers without restarting agents or attaching a
  * conversation controller. Each tick reads at most 256 KiB per role, from its
  * checkpoint; it never loads a complete transcript or requests model history. */
@@ -41,14 +42,13 @@ export class FleetNotificationProducer {
   private readonly dirty = new Set<string>();
   private readonly retryAt = new Map<string, number>();
   private discoveryNeeded = true;
-  private taskRoles?: Map<string, string>;
   private stopped = false;
   private readonly existing = new Map<string, Checkpoint | null>();
   private cleanup?: Promise<void>;
   constructor(private readonly roots: string[], private readonly stateDir: string,
     private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {}) {
     let healthy = true;
-    observeFleetResources({ retryWatchFailures: true, roots, paths:[...roots,roomsDir(),cleanupDir()],
+    observeFleetResources({ retryWatchFailures: true, roots, paths:[...roots,cleanupDir()],
       onInvalidated:path=>this.accept(path) }, state => {
       if (state.health !== 'healthy') {
         healthy = false;
@@ -126,8 +126,6 @@ export class FleetNotificationProducer {
     });
     if (this.discoveryNeeded) {
       this.discoveryNeeded = false;
-      try { this.taskRoles = taskRoleAssociations(); }
-      catch { this.taskRoles = undefined; this.warn('Notification task association unavailable; delivering unclassified events'); }
       for (const root of this.roots) for (const name of this.names(root)) this.dirty.add(join(root, name));
     }
     // A turn reads at most four 256KiB batches (1MiB). The time bound is checked
@@ -162,10 +160,16 @@ export class FleetNotificationProducer {
         if (!outbox.checkpoint) {
           const initial = this.existing.get(roleDir);
           if (initial === null) throw Error('Notification startup ledger boundary unavailable');
-          outbox.saveCheckpoint(initial ?? {segment:segments[0], offset:0, prompts:[]});
+          // History before the startup boundary is skipped, but the live generation's binding may lie in it:
+          // seed it from the role's durable ownership sidecar.
+          if (initial) {
+            const bindings = seedBindings(roleDir);
+            if (!bindings) { this.warn('Notification ownership evidence unavailable; ledger admission held'); this.retryAt.set(roleDir, Date.now() + 30_000); this.dirty.add(roleDir); return; }
+            outbox.saveCheckpoint({ ...initial, bindings });
+          } else outbox.saveCheckpoint({segment:segments[0], offset:0, prompts:[]});
         }
         const saved = outbox.checkpoint as Checkpoint;
-        const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages } };
+        const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages }, bindings: { ...saved.bindings } };
         let index = segments.indexOf(current.segment);
         if (index < 0) { this.warn('Notification ledger segment unavailable; checkpoint retained'); return; }
         const file = join(dir, current.segment), size = statSync(file).size;
@@ -182,7 +186,7 @@ export class FleetNotificationProducer {
         const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(Math.min(BATCH_BYTES, remaining));
         let count: number;
         try { count = readSync(fd, buffer, 0, buffer.length, current.offset); } finally { closeSync(fd); }
-        let position = 0, blocked = false;
+        let position = 0, blocked = false, admitted = false, unavailable = false, sidecar: Record<string, string | null> | undefined;
         while (position < count) {
           const end = buffer.indexOf(10, position);
           if (end < 0 || end >= count) {
@@ -200,20 +204,36 @@ export class FleetNotificationProducer {
           const event = JSON.parse(buffer.subarray(position, end).toString('utf8')) as ConversationEventV1;
           if (event.schemaVersion !== 1 || event.roleId !== roleId) throw new Error('invalid ledger event');
           const prompt = `${event.sessionGeneration}:${event.promptId}`;
+          if (event.kind === 'session.ownership') bind(current.bindings, event);
           if (event.kind === 'prompt.admitted' && event.promptId && ['browser', 'owner_admin_console', 'owner_channel'].includes(event.source ?? '')) {
             if (!current.prompts.includes(prompt)) current.prompts.push(prompt);
           }
           if (['message.chunk', 'message.replace'].includes(event.kind) && event.promptId && event.messageId && current.prompts.includes(prompt)) current.messages[prompt] = event.messageId;
           if (event.kind === 'turn.completed' && event.promptId && current.prompts.includes(prompt)) {
-            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...(this.taskRoles?{taskId:this.taskRoles.get(roleId)??null}:{}), anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {blocked=true;break;}
+            // Task association only from this generation's own binding: a task, null (non-task role), or unknown (omitted).
+            // A generation bound before this checkpoint (an older checkpoint, or startup history) is recovered from the
+            // durable sidecar by exact generation; other generations are never relabelled.
+            // Unavailable sidecar evidence holds the checkpoint before this completion: nothing unowned is emitted.
+            if (!Object.hasOwn(current.bindings, event.sessionGeneration)) {
+              sidecar ??= seedBindings(roleDir);
+              if (!sidecar) { unavailable = true; break; }
+              if (Object.hasOwn(sidecar, event.sessionGeneration)) current.bindings[event.sessionGeneration] = sidecar[event.sessionGeneration];
+            }
+            const binding = Object.hasOwn(current.bindings, event.sessionGeneration) ? { taskId: current.bindings[event.sessionGeneration] } : {};
+            if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...binding, anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {blocked=true;break;}
+            admitted = true;
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
           if (performance.now() >= deadline) break;
         }
         if (current.segment !== saved.segment || current.offset !== saved.offset) outbox.saveCheckpoint(current);
-        if (blocked) {
-          this.retryAt.set(roleDir, Date.now() + 1000); this.dirty.add(roleDir);
+        // Prompt only after both completion and checkpoint have been durably recorded.
+        if (admitted) outbox.prompt();
+        if (unavailable) this.warn('Notification ownership evidence unavailable; ledger admission held');
+        if (blocked || unavailable) {
+          // Corrupt evidence needs an operator repair: re-check it slowly rather than spin.
+          this.retryAt.set(roleDir, Date.now() + (unavailable ? 30_000 : 1000)); this.dirty.add(roleDir);
         } else if ((current.segment !== saved.segment || current.offset !== saved.offset)
           && (current.offset < statSync(join(dir, current.segment)).size || index < segments.length - 1)) this.dirty.add(roleDir);
       } catch {

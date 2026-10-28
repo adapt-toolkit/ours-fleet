@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { pendingMissionCleanups } from '../src/rooms-tasks/notification-manifest.js';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const fault = vi.hoisted(() => ({ unlink: '', rename: '' }));
@@ -25,16 +26,16 @@ it('failed atomic state rename leaves both status and event unchanged', () => {
   expect(() => startTask(task.task_id)).toThrow('injected rename failure');
   expect(getTask(task.task_id).state).toBe('backlog'); expect(pendingTaskNotifications()).toEqual(before);
 });
-it('failed unlink never admits the prepared deleted event; retry preserves acknowledgement and stable final event', () => {
+it('failed unlink keeps the merged cleanup intent and produces no deletion event; the retry settles idempotently', () => {
   const task = create(); cancelTask(task.task_id); beginTaskDeletionIntent(task.task_id, {kind:'local_control',surface:'cli'});
+  expect(pendingTaskNotifications().flatMap(t => t.events)).toEqual([]);
   fault.unlink = join(tasksDir(), task.task_id + '.json');
   expect(() => unlinkDeletedTask(task.task_id)).toThrow('injected unlink failure');
-  const prepared = JSON.parse(readFileSync(join(tasksDir(), '.notification-retired', task.task_id + '.json'), 'utf8')).notification_events;
-  expect(prepared.at(-1).body).toContain('deleting → deleted');
-  expect(pendingTaskNotifications().flatMap(t => t.events).some(e => e.eventId.endsWith(':deleted'))).toBe(false);
-  for (const e of pendingTaskNotifications().flatMap(t => t.events)) acknowledgeTaskNotification(task.task_id, e.eventId);
+  expect(pendingMissionCleanups().map(intent => intent.taskId)).toEqual([task.task_id]);
+  expect(existsSync(join(tasksDir(), '.notification-retired', task.task_id + '.json'))).toBe(false);
   fault.unlink = ''; expect(unlinkDeletedTask(task.task_id)).toBe(true);
-  expect(pendingTaskNotifications().flatMap(t => t.events)).toEqual([prepared.at(-1)]);
+  expect(pendingTaskNotifications().flatMap(t => t.events)).toEqual([]);
+  expect(pendingMissionCleanups().map(intent => intent.taskId)).toEqual([task.task_id]);
 });
 it('acceptance then failed acknowledgement replays identical event after producer restart', async () => {
   const task = create(); fault.rename = join(tasksDir(), task.task_id + '.json');

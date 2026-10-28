@@ -51,6 +51,7 @@ import type {
 import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
 import { storedRoomLaunchPolicy, TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 import { deriveTaskRoomName } from '../rooms-tasks/task-room-name.js';
+import { associateRoomNotifications } from '../notifications/mission-ownership.js';
 
 // Cowork 1.3.0+ stores this selector verbatim and matches future room commands.
 const OWNER_ROOM_COMMANDS = ['*'] as const;
@@ -168,6 +169,8 @@ export interface TaskRoomServiceDeps {
   launchDeletionWorker?(taskId: string): Promise<void>;
   sleep?(ms: number): Promise<void>;
   now?(): number;
+  /** Test seam: register a task room with the notification service before the Owner joins. */
+  associateRoomNotifications?(taskId: string, roomCid: string): Promise<void>;
 }
 
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
@@ -829,6 +832,20 @@ export class TaskRoomApplicationService {
     }
   }
 
+  /**
+   * Before the Owner can join, register the room as this task's with the notification service, so own-room message
+   * preferences apply to its first message. An unreachable service stops here and the saga retries from this step.
+   */
+  private async associateRoomNotifications(room: RoomOrchestrationRecord): Promise<void> {
+    if (!room.task_id || !room.room_identity_cid) return;
+    try { await (this.deps.associateRoomNotifications ?? associateRoomNotifications)(room.task_id, room.room_identity_cid); }
+    catch (error) {
+      setSagaError(room.room_id, error instanceof Error ? error.message : String(error),
+        `Start or repair the notification service, then run ours-fleet task start ${room.task_id}.`, 'waiting_cowork');
+      throw error;
+    }
+  }
+
   private async setOwnerRoomCommands(cowork: CoworkAdapter, roomId: string, role: string): Promise<void> {
     try {
       await cowork.setRoleCommands(roomId, { role, commands: [...OWNER_ROOM_COMMANDS] });
@@ -874,6 +891,7 @@ export class TaskRoomApplicationService {
     if (!existing && !cfg.ownerInvite)
       throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before continuing task provisioning');
     await this.setOwnerRoomCommands(cowork, roomId, existing?.role ?? cfg.rooms.owner.role);
+    if (!existing) await this.associateRoomNotifications(room);
     const acceptedCid = existing?.identity_cid ?? (await cowork.acceptInvite(roomId, cfg.ownerInvite!, {
       role: cfg.rooms.owner.role, expected_cid: cfg.rooms.owner.expected_cid,
     })).seat_cid;
@@ -1318,6 +1336,7 @@ export class TaskRoomApplicationService {
     if (attachOwner) {
       room = advanceSaga(room.room_id, 'attach_owner', 2);
       await this.setOwnerRoomCommands(cowork, room.room_id, rooms.owner.role);
+      await this.associateRoomNotifications(room);
       try {
         const accepted = await cowork.acceptInvite(room.room_id, cfg.ownerInvite!, {
           role: rooms.owner.role, expected_cid: rooms.owner.expected_cid,

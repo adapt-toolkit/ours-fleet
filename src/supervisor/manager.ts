@@ -135,7 +135,15 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
   try {
     try {
       const config = producerConfig(process.env, undefined, log);
-      if (config) notifications = new TaskNotificationProducer(config, log);
+      if (config) {
+        const [{ listTasks }, { TaskLayouts }] = await Promise.all([import('../rooms-tasks/task-state.js'), import('../application/task-layouts.js')]);
+        const layouts = new TaskLayouts();
+        notifications = new TaskNotificationProducer(config, log, fetch, {
+          // Unreadable task or layout evidence is not an empty inventory: it throws and the bootstrap run stays incomplete.
+          tasks: () => listTasks({ strict: true }),
+          layoutRooms: task => (layouts.view(task)?.rooms ?? []).flatMap(room => room.identity_cid ? [room.identity_cid] : []),
+        });
+      }
     } catch { log('[fleet] task notifications unavailable; committed events retained'); }
     try {
       const { resumeFleetTransfers } = await import('./adoption.js');

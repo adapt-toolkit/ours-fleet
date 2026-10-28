@@ -184,13 +184,16 @@ export interface ResourceDescriptor {
   list?: string;
   groupByList?: boolean;
   includeDeleting?: boolean;
+  /** Previews: each agent's newest assistant message time only, without its text. */
+  activityOnly?: boolean;
 }
 export function canonicalResourceDescriptor(input: unknown): ResourceDescriptor {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('invalid resource descriptor');
   const value = input as ResourceDescriptor;
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(value.viewId) || !['directory','roles','tasks','task-lists','configuration','previews','task-layout','creation-action','action','member-addition','login','onboarding-health','subscriptions'].includes(value.resource)
-    || Object.keys(value).some(key => !['viewId','resource','includeTemporary','includeDefinitions','ids','state','list','groupByList','includeDeleting','entityId','receiptId','provider'].includes(key))) throw Error('invalid resource descriptor');
-  for (const key of ['includeTemporary','includeDefinitions','groupByList','includeDeleting'] as const) if (value[key] !== undefined && typeof value[key] !== 'boolean') throw Error('invalid resource descriptor');
+    || Object.keys(value).some(key => !['viewId','resource','includeTemporary','includeDefinitions','ids','state','list','groupByList','includeDeleting','entityId','receiptId','provider','activityOnly'].includes(key))) throw Error('invalid resource descriptor');
+  if (value.activityOnly !== undefined && value.resource !== 'previews') throw Error('invalid resource descriptor');
+  for (const key of ['includeTemporary','includeDefinitions','groupByList','includeDeleting','activityOnly'] as const) if (value[key] !== undefined && typeof value[key] !== 'boolean') throw Error('invalid resource descriptor');
   if (value.ids !== undefined && (!Array.isArray(value.ids) || value.ids.length > 500 || value.ids.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,120}$/.test(id)))) throw Error('invalid resource ids');
   if (value.state !== undefined && !['all','backlog','provisioning','active','review','done','cancelled','failed'].includes(value.state)) throw Error('invalid resource state');
   if (value.list !== undefined && (typeof value.list !== 'string' || value.list.length > 256)) throw Error('invalid resource list');

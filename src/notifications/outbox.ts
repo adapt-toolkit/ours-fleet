@@ -87,6 +87,9 @@ export class NotificationOutbox {
   checkpoint?: unknown;
   private running?: Promise<void>;
   private retired=false;
+  private again = false;
+  private failed = false;
+  private closed = false;
   private timer: ReturnType<typeof setInterval>;
   constructor(private readonly file: string, private readonly config: ProducerConfig,
     private readonly project: (value: unknown, id: string) => Promise<NotificationInput>,
@@ -117,11 +120,26 @@ export class NotificationOutbox {
     this.persist([...this.entries, { id, value, targetVersion: 1 }], cursor);
     return true;
   }
+  /**
+   * Deliver soon after a durable enqueue instead of at the next recovery tick. A request
+   * during a pass (which iterates its own snapshot) runs one follow-up pass after it;
+   * after a failed pass only the recovery timer retries, so arrivals during an outage
+   * add no attempts.
+   */
+  prompt(): void {
+    if (this.closed || this.retired || this.failed) return;
+    if (this.running) { this.again = true; return; }
+    void this.drain();
+  }
   drain(): Promise<void> {
     if(this.retired)return Promise.resolve();
-    return this.running ??= this.drainOnce().finally(() => { this.running = undefined; });
+    return this.running ??= this.drainOnce().finally(() => {
+      this.running = undefined;
+      if (this.again) { this.again = false; this.prompt(); }
+    });
   }
   private async drainOnce(): Promise<void> {
+    this.failed = false;
     let attempts = 0;
     for (const entry of [...this.entries]) {
       if (!supported(entry)) continue;
@@ -144,10 +162,10 @@ export class NotificationOutbox {
         await response.body?.cancel();
         if (!response.ok) throw new Error('notification service rejected event');
         this.persist(this.entries.filter(e => !same(entry.id)(e)));
-      } catch { this.warn('Notification producer delivery pending; retrying from durable outbox'); break; }
+      } catch { this.failed = true; this.warn('Notification producer delivery pending; retrying from durable outbox'); break; }
     }
   }
   /** Wait for the current send before clearing queued sends and retiring its target. */
   async retire():Promise<void>{this.retired=true;clearInterval(this.timer);await this.running;this.persist(this.entries.filter(entry => !supported(entry)));}
-  async close(): Promise<void> { clearInterval(this.timer); await this.running; }
+  async close(): Promise<void> { this.closed = true; clearInterval(this.timer); await this.running; }
 }

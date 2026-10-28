@@ -3,7 +3,6 @@ import { appendFileSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { FleetNotificationProducer } from '../src/notifications/fleet-producer.js';
-import { roomsDir } from '../src/rooms-tasks/room-state.js';
 
 const observation = vi.hoisted(() => ({callback:undefined as any, accepts:undefined as any, route:undefined as any, position:0, selected:0}));
 vi.mock('../src/application/resource-observer.js', () => ({observeFleetResources:(scope:any, callback:any) => {
@@ -47,12 +46,8 @@ it('does not open caught-up ledgers or allocate a batch on an explicit discovery
 });
 it('ignores known unrelated runtime writes and queues only the changed ledger role',async()=>{
   const f=fixture(3);await vi.advanceTimersByTimeAsync(50);
-  mkdirSync(roomsDir(),{recursive:true});const room=join(roomsDir(),'routing.json');
-  writeFileSync(room,JSON.stringify({room_id:'room',task_id:'task',member_seats:[{role_name:'Role0'}]}));
-  wake(room);await vi.advanceTimersByTimeAsync(20);
-  expect(vi.mocked(readFileSync).mock.calls.some(([path])=>String(path)===room)).toBe(true);
   vi.mocked(openSync).mockClear();
-  const metadata=()=>[...vi.mocked(readdirSync).mock.calls,...vi.mocked(statSync).mock.calls,...vi.mocked(lstatSync).mock.calls,...vi.mocked(readFileSync).mock.calls].map(args=>String(args[0])).filter(path=>path===f.root||path.startsWith(f.root+'/')||path===roomsDir()||path.startsWith(roomsDir()+'/'));
+  const metadata=()=>[...vi.mocked(readdirSync).mock.calls,...vi.mocked(statSync).mock.calls,...vi.mocked(lstatSync).mock.calls,...vi.mocked(readFileSync).mock.calls].map(args=>String(args[0])).filter(path=>path===f.root||path.startsWith(f.root+'/'));
   for(const method of [readdirSync,statSync,lstatSync,readFileSync])vi.mocked(method).mockClear();
   for(let n=0;n<40;n++)wake(join(f.root,'Role0','.monitor-status'));
   await vi.advanceTimersByTimeAsync(20);expect(f.opens()).toEqual([]);expect(metadata()).toEqual([]);
@@ -97,11 +92,14 @@ it('keeps full-role backoff despite same-role wakes while ready roles progress, 
   expect(f.opens().filter(path=>path.includes('/Role0/'))).toEqual([]);
   expect(blocked.entries).toHaveLength(2000);expect(blocked.checkpoint.offset).toBe(retained);
   expect(f.queues().get(join(f.root,'Role1')).entries.map((entry:any)=>entry.id)).toEqual(['Role1:g:3']);
+  expect(vi.mocked(fetch).mock.calls.map(([,init])=>JSON.parse(String(init?.body)).eventId)).toEqual(['Role1:g:3']);
   blocked.entries=[];await vi.advanceTimersByTimeAsync(550);
   expect(blocked.entries.map((entry:any)=>entry.id)).toEqual(['Role0:g:2']);
   f.producer.poll();await vi.advanceTimersByTimeAsync(20);
   expect(blocked.entries.map((entry:any)=>entry.id)).toEqual(['Role0:g:2']);
-  expect(fetch).not.toHaveBeenCalled();
+  // Each newly admitted completion prompts one send. Failed sends remain
+  // durable, and same-role wakes or an explicit poll add no retry attempts.
+  expect(vi.mocked(fetch).mock.calls.map(([,init])=>JSON.parse(String(init?.body)).eventId)).toEqual(['Role1:g:3','Role0:g:2']);
 });
 it('retains conservative unknown discovery, rotation and observation recovery',async()=>{
   const f=fixture(1);await vi.advanceTimersByTimeAsync(50);
@@ -125,18 +123,13 @@ it('does not lose unknown discovery while another role is blocked',async()=>{
   expect(f.queues().get(join(f.root,'New')).entries[0].id).toBe('New:g:2');
   expect(blocked.entries).toHaveLength(2000);
 });
-it('refreshes room association metadata on a room wake and freezes each admitted value',async()=>{
+it('a cold start seeds a live generation binding from the durable sidecar, not the skipped history',async()=>{
   const f=fixture(1);await vi.advanceTimersByTimeAsync(50);
-  mkdirSync(roomsDir(),{recursive:true});const room=join(roomsDir(),'room.json');
-  const association=(taskId:string)=>JSON.stringify({room_id:'room',task_id:taskId,member_seats:[{role_name:'Role0'}]});
-  writeFileSync(room,association('task-one'));wake(room);
+  const task='0mvrpv4kt1f567911';
+  writeFileSync(join(f.root,'Role0','.session-ownership.json'),JSON.stringify({schema:1,generations:{g:{launchId:'launch',taskId:task}}}));
   appendFileSync(f.ledger('Role0'),f.event('Role0',2,'prompt.admitted')+f.event('Role0',3,'turn.completed'));wake(f.ledger('Role0'));
   await vi.advanceTimersByTimeAsync(20);
-  const queue=f.queues().get(join(f.root,'Role0'));expect(queue.entries[0].value.taskId).toBe('task-one');
-  writeFileSync(room,association('task-two'));wake(room);
-  appendFileSync(f.ledger('Role0'),f.event('Role0',4,'prompt.admitted')+f.event('Role0',5,'turn.completed'));wake(f.ledger('Role0'));
-  await vi.advanceTimersByTimeAsync(20);
-  expect(queue.entries.map((entry:any)=>entry.value.taskId)).toEqual(['task-one','task-two']);
+  const queue=f.queues().get(join(f.root,'Role0'));expect(queue.entries[0].value.taskId).toBe(task);
 });
 for(const rotate of [false,true])it(`retains the startup EOF boundary for a deferred existing role, rotation=${rotate}`,async()=>{
   const f=fixture(8,true);
