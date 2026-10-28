@@ -783,14 +783,23 @@ export async function controlRequest(
   const socket = createConnection(controlSocketPath(stateDir));
   socket.setEncoding('utf8');
   return new Promise<ControlResponse>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false, expiry: ReturnType<typeof setImmediate> | undefined;
+    const settle = () => { settled = true; clearTimeout(timer); if (expiry) clearImmediate(expiry); };
+    // Timers run before pending I/O. When this process was busy past the deadline, a reply
+    // already waiting on the socket is still unread: give it the next poll phase before
+    // declaring the supervisor silent. That is one event-loop turn, not added time; a reply
+    // arriving within that turn is accepted, and a silent supervisor fails in the same turn.
+    const timer = setTimeout(() => { expiry = setImmediate(() => {
+      if (settled) return;
+      settle();
       socket.destroy();
       reject(new SessionControlError('timeout',
         `the role control plane did not answer '${request.command}' within ${timeoutMs}ms`));
-    }, timeoutMs);
+    }); }, timeoutMs);
     let buffer = '';
     socket.once('error', error => {
-      clearTimeout(timer);
+      if (settled) return;
+      settle();
       const code = (error as NodeJS.ErrnoException).code;
       const permissionHint = code === 'EPERM' || code === 'EACCES'
         ? `; the operating system denied access before '${request.command}' reached the supervisor. `
@@ -805,8 +814,8 @@ export async function controlRequest(
     socket.on('data', chunk => {
       buffer += chunk;
       const newline = buffer.indexOf('\n');
-      if (newline < 0) return;
-      clearTimeout(timer);
+      if (newline < 0 || settled) return;
+      settle();
       try { resolve(JSON.parse(buffer.slice(0, newline)) as ControlResponse); }
       catch (error) {
         reject(new SessionControlError('backend',

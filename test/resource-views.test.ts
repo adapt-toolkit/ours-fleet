@@ -618,3 +618,85 @@ describe('activity follow-up coalescing', () => {
     expect(project).toHaveBeenCalledTimes(1);
   });
 });
+it('qualifies an active unchanged directory with the source each completed capture read',async()=>{
+  vi.useFakeTimers({toFake:['setTimeout','clearTimeout','setInterval','clearInterval','Date','performance']});clean.push(()=>vi.useRealTimers());
+  // Wakes whose capture leaves the payload unchanged arrive faster than the activity interval,
+  // so the view is dirty at every health tick.
+  const read:number[]=[];
+  const f=fixture(async()=>{read.push(view().source.snapshot().position);return {roles:[{id:'a',readiness:'running'}]};},undefined,undefined,1000);
+  const view=()=>(f.resources as any).connections.get(f.connection.connectionId).views.get('view');
+  const binding=f.register();await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  f.response.write.mockClear();
+  const start=Date.now(),seen:number[]=[];
+  for(let at=0;at<120_000;at+=500){
+    publishFleetResourceCommit(join(f.root,'a','.session-events.jsonl'));await vi.advanceTimersByTimeAsync(500);
+    if(f.response.write.mock.calls.length>seen.length)seen.push(Date.now()-start);
+    while(seen.length<f.response.write.mock.calls.length)seen.push(Date.now()-start);
+  }
+  const writes=f.response.write.mock.calls.map(([s]:[string])=>s);
+  expect(writes.some(s=>s.startsWith('event: resource\n'))).toBe(false);
+  const batches=writes.filter(s=>s.startsWith('event: resource-coverage\n')).map(s=>JSON.parse(s.split('data: ')[1]));
+  const times=writes.map((s,i)=>[s,seen[i]] as const).filter(([s])=>s.startsWith('event: resource-coverage\n')).map(([,t])=>t);
+  // The client recovers a healthy view after 45s without qualification.
+  expect(Math.max(...[0,...times,120_000].slice(1).map((t,i)=>t-[0,...times][i]))).toBeLessThan(45_000);
+  expect(batches.length).toBeLessThanOrEqual(9);
+  const sources=batches.map(b=>b.views[0].source.position);
+  for(const position of sources)expect(read).toContain(position);
+  expect(sources).toEqual([...sources].sort((a,b)=>a-b));
+  expect(batches.map(b=>b.views[0].sequence)).toEqual(batches.map((_,i)=>i+3));
+});
+it('does not qualify an unchanged capture that was replaced while it ran',async()=>{
+  vi.useFakeTimers({toFake:['setInterval','clearInterval','Date']});clean.push(()=>vi.useRealTimers());
+  let hold=false,release!:(payload:unknown)=>void;
+  const f=fixture(async()=>hold?new Promise(r=>release=r):({rows:['same']}),undefined,undefined,0);
+  const binding=f.register();await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  await vi.advanceTimersByTimeAsync(16_000);f.response.write.mockClear();
+  hold=true;publishFleetResourceCommit(f.root);await expect.poll(()=>typeof release).toBe('function');
+  const replacement=f.register(2);hold=false;
+  await f.resources.bound('owner',f.connection.connectionId,'view',2,replacement.baselineId);
+  const coverage=()=>f.response.write.mock.calls.map(([s]:[string])=>s).filter(s=>s.startsWith('event: resource-coverage\n')).flatMap(s=>JSON.parse(s.split('data: ')[1]).views);
+  // The obsolete capture completes unchanged after its qualification interval.
+  release({rows:['same']});await new Promise(setImmediate);await new Promise(setImmediate);
+  expect(coverage().filter((v:any)=>v.subscriptionEpoch===1)).toEqual([]);
+  // The replacement was qualified by its ready at about 16s; the first tick due for it is at 45s.
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(coverage().length).toBeGreaterThan(0);
+  expect(coverage().every((v:any)=>v.subscriptionEpoch===2)).toBe(true);
+});
+it('does not qualify an unchanged capture whose observation failed while it ran',async()=>{
+  vi.useFakeTimers({toFake:['setInterval','clearInterval','Date']});clean.push(()=>vi.useRealTimers());
+  let hold=false,release!:(payload:unknown)=>void;
+  const f=fixture(async()=>hold?new Promise(r=>release=r):({rows:['same']}),undefined,undefined,0);
+  const binding=f.register();await f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId);
+  await vi.advanceTimersByTimeAsync(16_000);f.response.write.mockClear();
+  hold=true;publishFleetResourceCommit(f.root);await expect.poll(()=>typeof release).toBe('function');
+  f.handles[0].emit('error',Error('failed'));await new Promise(setImmediate);
+  release({rows:['same']});await new Promise(setImmediate);await vi.advanceTimersByTimeAsync(30_000);
+  const writes=f.response.write.mock.calls.map(([s]:[string])=>s);
+  expect(writes.some(s=>s.startsWith('event: resource-coverage\n'))).toBe(false);
+  expect(f.frames().map(f=>f.kind)).toEqual(['health']);
+});
+it('keeps a capture qualification behind a backpressured chunked record',async()=>{
+  // Only Date is fake: the sparse health timer never fires, so coverage comes from the capture.
+  vi.useFakeTimers({toFake:['Date']});clean.push(()=>vi.useRealTimers());
+  const f=fixture(async d=>({rows:[d.viewId==='large'?'x'.repeat(900000):'quiet']}),undefined,undefined,0);
+  const quiet=f.resources.register('owner',f.connection.connectionId,'quiet',1,{viewId:'quiet',resource:'directory'});
+  await f.resources.bound('owner',f.connection.connectionId,'quiet',1,quiet.baselineId);
+  vi.setSystemTime(Date.now()+16_000);
+  f.response.write.mockClear();f.response.write.mockImplementationOnce(()=>false);
+  const large=f.resources.register('owner',f.connection.connectionId,'large',1,{viewId:'large',resource:'directory'});
+  await expect.poll(()=>f.response.write.mock.calls.length).toBe(1);
+  // Wakes both views; the quiet capture is unchanged and due for qualification.
+  publishFleetResourceCommit(join(f.root,'quiet','.session-events.jsonl'));
+  for(let i=0;i<5;i++)await new Promise(setImmediate);
+  expect(f.response.write.mock.calls).toHaveLength(1);
+  f.response.emit('drain');await f.resources.bound('owner',f.connection.connectionId,'large',1,large.baselineId);
+  const writes=()=>f.response.write.mock.calls.map(([s]:[string])=>s);
+  await expect.poll(()=>writes().some(s=>s.startsWith('event: resource-coverage\n'))).toBe(true);
+  const commit=writes().findIndex(s=>s.startsWith('event: resource-chunk\n')&&JSON.parse(s.split('data: ')[1]).type==='commit');
+  const batch=writes().findIndex(s=>s.startsWith('event: resource-coverage\n'));
+  expect(commit).toBeGreaterThan(0);expect(batch).toBeGreaterThan(commit);
+  const views=JSON.parse(writes()[batch].split('data: ')[1]).views;
+  expect(views.map((v:any)=>v.viewId)).toEqual(['quiet']);
+  expect(views[0].sequence).toBe(3);
+});
