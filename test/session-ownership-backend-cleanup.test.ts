@@ -23,11 +23,27 @@ import { FakeAppServer } from './fixtures/codex-app-server.js';
 // is the one OS-level exit proof; fd checks read this process's real descriptors; fake children/transports prove call
 // order and error shape only.
 const dirs: string[] = [];
-afterEach(() => {
+/** Bounded wait for a captured child's exit event (Node reaps it on exit). */
+const exitWithin = (child: ChildProcess, ms: number) => new Promise<boolean>(resolve => {
+  if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+  const settle = (exited: boolean) => { clearTimeout(timer); child.off('exit', onExit); resolve(exited); };
+  const onExit = () => settle(true), timer = setTimeout(() => settle(false), ms);
+  child.on('exit', onExit);
+});
+afterEach(async () => {
   vi.useRealTimers(); vi.restoreAllMocks();
-  // Only children this file spawned, and only if an assertion left one running.
-  for (const child of spawned.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  // Only children this file spawned. Any still running (an assertion failed first, or a close only sent TERM) is stopped
+  // TERM, then KILL, each with a bounded wait; a child not proven exited fails the test with its pid.
+  const survivors: number[] = [];
+  for (const child of spawned.splice(0)) {
+    if (await exitWithin(child, 0)) continue;
+    child.kill('SIGTERM');
+    if (await exitWithin(child, 2_000)) continue;
+    child.kill('SIGKILL');
+    if (!await exitWithin(child, 2_000)) survivors.push(child.pid ?? -1);
+  }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  expect(survivors, 'captured children not proven exited').toEqual([]);
 });
 const OWNED = JSON.stringify({ version: 1, role: 'member', launchId: 'l', taskOwner: { taskId: '0mvrpv4kt1f567911', creationActionId: 'a' } });
 type Failure = 'metadata' | 'sidecar' | 'append';
