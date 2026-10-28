@@ -1,6 +1,7 @@
 import { FleetResourceViews, ResourceBindingError, canonicalResourceDescriptor, type ResourceDescriptor } from './resource-views.js';
 import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import { stateRoot, defaultConfigPath } from '../paths.js';
+import { EMPTY_TASK_LAYOUT } from '../rooms-tasks/empty-layout.js';
 import type { FleetResourceScope } from '../application/resource-observer.js';
 import { conversationPreview } from '../application/conversation-history.js';
 import { registerConversationStream } from './conversation-stream.js';
@@ -581,9 +582,9 @@ export async function buildWebServer(
     const body = request.body as Record<string, unknown>;
     if (typeof body?.title !== 'string' || !body.title)
       throw new FleetError('invalid_request', 'title is required');
-    // Every task runs a saved Room Layout; rooms are never defined inline or from room templates here.
-    if (typeof body.layout !== 'string' || !body.layout)
-      throw new FleetError('invalid_request', 'layout is required: choose a room layout from Settings › Room layouts');
+    // Omission selects a real built-in layout, never a legacy no-room task.
+    if (body.layout !== undefined && (typeof body.layout !== 'string' || !body.layout))
+      throw new FleetError('invalid_request', 'layout must be a non-empty room layout name, or omitted for the empty layout');
     if (body.template !== undefined || body.noRoom !== undefined)
       throw new FleetError('invalid_request', 'tasks use room layouts; template and noRoom are not accepted');
     const task = await taskApi(() => requireTaskRooms().createTask({
@@ -591,7 +592,8 @@ export async function buildWebServer(
       brief: typeof body.brief === 'string' ? body.brief : undefined,
       backlog: body.backlog === true,
       list: typeof body.list === 'string' ? body.list : undefined,
-      layout: body.layout as string,
+      layout: body.layout === undefined ? EMPTY_TASK_LAYOUT : body.layout as string,
+      deferLayoutStart: true,
       idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
         ? request.headers['idempotency-key'] : undefined,
       origin: { type: 'web' },
@@ -759,7 +761,7 @@ export async function buildWebServer(
             // A task's layout can be chosen or changed but never removed, so this check cannot go stale.
             if (!api.getTask(taskId).task.layout)
               throw new FleetError('conflict', 'choose a room layout for this task before starting it');
-            const task = await api.startTask(input);
+            const task = await api.startTask({ ...input, deferLayoutStart: true });
             const provisioning = await api.launchTaskProvisioning(taskId);
             if (provisioning.kind !== 'ready') reply.code(202);
             return { task, provisioning };

@@ -14,6 +14,7 @@ import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-bin
 import { readClientProfile } from '../client-profile.js';
 import { tempSupervisorLiveness } from '../temp-lifecycle.js';
 import { layoutOwnedMemberName, retireOwnedLayoutMember } from './layout-member-retirement.js';
+import { EMPTY_TASK_LAYOUT, emptyTaskLayout } from './empty-layout.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
   readonly taskSupervised: boolean;
@@ -37,8 +38,8 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     return this.request(i.agent, i.temporary, { ...request, instance: i });
   }
   async verify(i: LayoutInstance): Promise<void> { await this.call(i, { action: 'verify' }); }
-  async spawn(key: string, template: string): Promise<LayoutInstance> {
-    const definition = this.templates[template];
+  async spawn(key: string, template: string, snapshot?: AgentTemplateDefinition): Promise<LayoutInstance> {
+    const definition = snapshot ?? this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
     const name = layoutOwnedMemberName(this.runId, key);
     const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
@@ -110,6 +111,7 @@ export class RoomLayoutService {
   }
   /** Reads only the named file, so an unrelated broken layout cannot block this one. */
   definition(name: string): RoomLayoutDefinition {
+    if (name === EMPTY_TASK_LAYOUT) return emptyTaskLayout();
     if (!validLayoutKey(name)) throw Error(`room layout not found: ${name}`);
     const root = join(splitRootFor(this.configPath ?? defaultConfigPath()), 'room_layouts');
     const files = existsSync(root) ? (assertLayoutFile(root, true), readdirSync(root).filter(f => f === `${name}.yaml` || f === `${name}.yml`)) : [];

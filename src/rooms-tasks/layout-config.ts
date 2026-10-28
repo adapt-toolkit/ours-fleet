@@ -22,8 +22,8 @@ export function validateRoomLayout(raw: unknown, label = 'room layout'): RoomLay
   if (doc.description !== undefined) text(doc.description, `${label}.description`);
   for (const section of ['participants', 'rooms']) {
     const value = doc[section];
-    if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length)
-      throw Error(`${label}.${section}: non-empty mapping required`);
+    if (!value || typeof value !== 'object' || Array.isArray(value) || (section === 'rooms' && !Object.keys(value).length))
+      throw Error(`${label}.${section}: ${section === 'rooms' ? 'non-empty ' : ''}mapping required`);
     for (const key of Object.keys(value)) if (!validLayoutKey(key)) throw Error(`${label}: invalid key ${key}`);
   }
   for (const [key, rawParticipant] of Object.entries(doc.participants as object)) {

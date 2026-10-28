@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { canonicalJson } from '../canonical-json.js';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { assertLayoutFile, type RoomLayoutDefinition } from '../rooms-tasks/layout-config.js';
-import { getTask as readTask } from '../rooms-tasks/task-state.js';
+import { getTask as readTask, activateTask, blockTask } from '../rooms-tasks/task-state.js';
 import { stateRoot } from '../paths.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import { layoutSupervisorId } from '../rooms-tasks/layout-control.js';
@@ -22,8 +22,9 @@ import type { TaskLayoutLink, TaskRecord } from '../rooms-tasks/types.js';
 import { ownedLayoutRetirementSeats } from '../rooms-tasks/layout-member-retirement.js';
 import { eraseMemberArtifacts } from '../rooms-tasks/erasure.js';
 import { assertTaskRegistrationsAbsent } from '../supervisor/catalog.js';
+import { EMPTY_TASK_LAYOUT, EMPTY_TASK_ROOM } from '../rooms-tasks/empty-layout.js';
 
-export type TaskLayoutOperation = 'open' | 'close-room' | 'close';
+export type TaskLayoutOperation = 'start' | 'open' | 'close-room' | 'close';
 export interface TaskLayoutOperationRecord {
   /** Only the worker holding the current ID may update the record. */
   id: string; operation: TaskLayoutOperation; room?: string;
@@ -122,10 +123,35 @@ export class TaskLayouts {
       if (layoutDefinitionHash(source) !== link.definition_hash)
         throw Error(`room layout ${link.name} changed before this task's layout run was created; create a new task to use the edited layout`);
       const scoped = taskScopedDefinition(structuredClone(source), current);
+      if (link.name === EMPTY_TASK_LAYOUT) scoped.rooms[EMPTY_TASK_ROOM].goal = current.brief?.trim() || current.title;
       const provenance: RunProvenance = { task_id: current.task_id, source_hash: link.definition_hash, scoped_hash: layoutDefinitionHash(scoped) };
       // Provenance precedes the run: a crash in between is re-derived from the same pinned source.
       replaceFileAtomically(this.provenancePath(link.run_id), JSON.stringify(provenance), 0o600);
       await service.create(link.name, {}, link.run_id, { source: scoped, cwd: current.workspace?.path });
+    });
+  }
+
+  /** Starting a mission initializes every room and its required agents before Active. */
+  async initializeRooms(task: TaskRecord): Promise<void> {
+    await this.withTaskLock(task.layout!.run_id, async () => {
+      const current = readTask(task.task_id);
+      if (current.deletion?.status === 'pending' || current.terminal_intent || !['provisioning', 'active'].includes(current.state))
+        throw new FleetError('conflict', 'task is no longer starting; its room cannot be opened');
+      this.verifyProvenance(current);
+      const engine = this.service().open(task.layout!.run_id);
+      for (const key of Object.keys(engine.snapshot().definition.rooms))
+        await engine.activate(layoutSupervisorId(), key);
+    });
+  }
+
+  async addMember(task: TaskRecord, input: { key: string; role: string; requestId: string; hash: string;
+    definition: import('../config.js').AgentTemplateDefinition }): Promise<void> {
+    const link = task.layout!;
+    await this.withTaskLock(link.run_id, async () => {
+      const current = readTask(task.task_id);
+      assertLayoutOpenable(current);
+      this.verifyProvenance(current);
+      await this.service().open(link.run_id).addMember(layoutSupervisorId(), { ...input, room: EMPTY_TASK_ROOM });
     });
   }
 
@@ -170,15 +196,18 @@ export class TaskLayouts {
       ...(state.uncertain ? { uncertain: state.uncertain } : {}),
       rooms: Object.entries(state.definition.rooms).map(([key, spec]) => {
         const room = state.rooms[key];
+        const additions = Object.entries(state.additional_members ?? {}).filter(([, member]) => member.room === key);
+        const roles = { ...spec.roles, ...Object.fromEntries(additions.map(([name, member]) => [name, member.role])) };
         return {
-          key, goal: spec.goal, members: [...spec.members], ...(spec.roles ? { roles: { ...spec.roles } } : {}),
+          key, goal: spec.goal, members: [...spec.members, ...additions.map(([name]) => name)],
+          ...(Object.keys(roles).length ? { roles } : {}),
           state: room?.state ?? 'declared', ready: [...(room?.ready ?? [])],
           ...(room?.native ? { room_id: room.native.room_id, identity_cid: room.native.identity_cid } : {}),
         };
       }),
       participants: Object.entries(state.participants).map(([key, p]) => ({
         key, ...(p.participant ? { participant: p.participant, room: p.room } : {}),
-        agent_template: state.definition.participants[p.participant ?? key]?.agent_template, owned: p.owned, retired: Boolean(p.retired),
+        agent_template: state.definition.participants[p.participant ?? key]?.agent_template ?? state.additional_members?.[key]?.template, owned: p.owned, retired: Boolean(p.retired),
         ...(p.instance?.agent ? { agent: p.instance.agent } : {}), ...(p.instance?.cid ? { cid: p.instance.cid } : {}),
       })),
     };
@@ -188,19 +217,25 @@ export class TaskLayouts {
   async launch(task: TaskRecord, operation: TaskLayoutOperation, room?: string): Promise<TaskLayoutOperationRecord> {
     const link = task.layout;
     if (!link) throw Error(`task ${task.task_id} has no layout`);
-    if (operation !== 'close' && (!room || !ROOM_KEY.test(room))) throw new FleetError('invalid_request', 'a valid room key is required');
+    if (!['start', 'close'].includes(operation) && (!room || !ROOM_KEY.test(room))) throw new FleetError('invalid_request', 'a valid room key is required');
     if (room) {
       const definition = this.runExists(link) ? this.service().open(link.run_id, true).snapshot().definition : undefined;
       if (definition && !Object.hasOwn(definition.rooms, room)) throw new FleetError('resource_not_found', `unknown layout room: ${room}`);
     }
     const record = { id: randomUUID(), operation, ...(room ? { room } : {}), status: 'launching' as const };
-    await withFileLock(this.operationPath(link.run_id) + '.lock', () => {
+    let accepted = false;
+    const selected = await withFileLock(this.operationPath(link.run_id) + '.lock', () => {
       const current = this.readOperation(link.run_id);
       // Full close always proceeds: terminal cleanup must not wait behind an open; the engine lock serializes them.
+      if (operation === 'start' && current?.operation === 'start' && ['launching', 'running'].includes(current.status) && Date.now() - Date.parse(current.updated_at) < 10 * 60_000)
+        return current;
       if (operation !== 'close' && current && ['launching', 'running'].includes(current.status) && Date.now() - Date.parse(current.updated_at) < 10 * 60_000)
         throw new FleetError('conflict', `layout operation already in progress: ${current.operation}${current.room ? ' ' + current.room : ''}`);
       this.writeOperation(link.run_id, record);
+      accepted = true;
+      return record;
     });
+    if (!accepted) return selected as TaskLayoutOperationRecord;
     const args = ['task', '_layout', task.task_id, operation, ...(room ? [room] : []), '--operation-id', record.id];
     const launch = this.deps.launch
       ?? ((cli: string[], name: string) => launchFleetWorker(cli, name, this.configPath, this.deps.binPath?.()));
@@ -231,6 +266,18 @@ export class TaskLayouts {
 
   private async perform(task: TaskRecord, operation: TaskLayoutOperation, room?: string): Promise<void> {
     const link = task.layout!;
+    if (operation === 'start') {
+      try {
+        await this.initializeRooms(task);
+        if (readTask(task.task_id).state !== 'active') activateTask(task.task_id);
+      } catch (error) {
+        const current = readTask(task.task_id);
+        if (current.state === 'provisioning' && !current.terminal_intent && current.deletion?.status !== 'pending')
+          blockTask(task.task_id, `layout startup failed: ${(error as Error).message}`);
+        throw error;
+      }
+      return;
+    }
     if (operation === 'open') {
       // Re-read under the task-layout lock: a deletion or terminal action accepted after HTTP admission wins.
       await this.ensureRun(task, assertLayoutOpenable);
