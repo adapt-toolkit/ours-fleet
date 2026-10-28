@@ -20,8 +20,8 @@ import { TEMP_SUPERVISOR_FILE } from '../src/temp-lifecycle.js';
 import { FakeAppServer } from './fixtures/codex-app-server.js';
 
 // A start whose ownership binding fails must release everything it acquired. Evidence classes: the ACP real-child case
-// is the one OS-level exit proof; fd checks read this process's real descriptors; fake children/transports prove call
-// order and error shape only.
+// is the one OS-level exit proof; fd checks read this process's real descriptors (acquired-then-released, not fsync
+// failure); fake children/transports prove call order and error shape only.
 const dirs: string[] = [];
 /** Bounded wait for a captured child's exit event (Node reaps it on exit). */
 const exitWithin = (child: ChildProcess, ms: number) => new Promise<boolean>(resolve => {
@@ -65,8 +65,10 @@ const ledgerFds = (dir: string) => readdirSync('/proc/self/fd').flatMap(fd => {
 });
 const aggregate = (error: unknown) => error instanceof AggregateError ? error.errors : [error];
 const expected: Record<Failure, RegExp> = { metadata: /session ownership unavailable/, sidecar: /JSON/, append: /durable append failed/ };
-/** The real append runs (opening the ledger descriptor and writing), then fails as a lost durable write would. Records the
- * descriptors held at that moment, so a test can prove one was acquired before asserting it was released. */
+/** The real append runs (opening the ledger descriptor and writing), then the call throws. This proves only that an
+ * acquired ledger descriptor is released when the ownership append fails; it does not simulate a real write/fsync
+ * failure or cover the durability fence (the existing conversation-store fence tests do). Records the descriptors held
+ * at that moment, so a test can prove one was acquired before asserting it was released. */
 function failAppend(dir: string): { held: string[] } {
   const seen = { held: [] as string[] }, real = ConversationEventStore.prototype.append;
   vi.spyOn(ConversationEventStore.prototype, 'append').mockImplementation(function (this: ConversationEventStore, draft) {
