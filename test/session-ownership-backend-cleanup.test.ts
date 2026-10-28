@@ -197,7 +197,15 @@ const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ac
 it('control: valid standalone metadata starts Codex and binds the generation in the ledger', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fleet-ownership-ok-')); dirs.push(dir);
   const session = await codexStart(dir, async options => new FakeAppServer(options));
-  try { expect(ledger(dir).find(event => event.kind === 'session.ownership')?.payload).toEqual({ launchId: null, taskId: null }); }
+  try {
+    const binding = ledger(dir).find(event => event.kind === 'session.ownership');
+    expect(binding?.payload).toEqual({ launchId: null, taskId: null });
+    const page = session.conversationPage({ limit: 1000 });
+    expect(page.events.find(event => event.kind === 'session.ownership')).toEqual(binding);
+    expect(page.events.map(event => event.seq)).toEqual(ledger(dir)
+      .filter(event => event.sessionGeneration === page.snapshot.sessionGeneration && event.source !== 'agent_replay')
+      .map(event => event.seq));
+  }
   finally { await session.close(); }
 });
 
@@ -207,6 +215,14 @@ it('control: valid standalone metadata starts ACP (real fixture agent) and binds
     name: 'A', argv: [process.execPath, acpFixture], cwd: dir, stateDir: dir, mode: 'fresh',
     permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, env: {}, log: () => {},
   } as Parameters<typeof AcpSession.start>[0]);
-  try { expect(ledger(dir).find(event => event.kind === 'session.ownership')?.payload).toEqual({ launchId: null, taskId: null }); }
+  try {
+    const binding = ledger(dir).find(event => event.kind === 'session.ownership');
+    expect(binding?.payload).toEqual({ launchId: null, taskId: null });
+    const page = session.conversationPage({ limit: 1000 });
+    expect(page.events.find(event => event.kind === 'session.ownership')).toEqual(binding);
+    expect(page.events.map(event => event.seq)).toEqual(ledger(dir)
+      .filter(event => event.sessionGeneration === page.snapshot.sessionGeneration && event.source !== 'agent_replay')
+      .map(event => event.seq));
+  }
   finally { await session.close(); }
 });

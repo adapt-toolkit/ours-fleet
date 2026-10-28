@@ -136,7 +136,7 @@ describe('secure local web host', () => {
     const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
     try {
       const created=await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload:{title:'Ship',layout:'work'}});
-      expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task:{...task,progress_count:0,review:{has_markdown:false,artifact_count:0,revision:0}}});
+      expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task:{...task,progress_count:0,progress_unread:0,review_unread:false,review:{has_markdown:false,artifact_count:0,revision:0}}});
       expect(taskRooms.createTask).toHaveBeenCalledWith(expect.objectContaining({layout:'work',title:'Ship'}));
       expect(taskRooms.launchTaskProvisioning).not.toHaveBeenCalled();
       // Every task needs a saved layout; room templates and inline room plans are refused before the service.

@@ -45,8 +45,15 @@ describe('task progress', () => {
     expect(new Set(listed.map(entry => entry.id)).size).toBe(2);
     expect(Date.parse(listed[0]!.at)).toBeLessThanOrEqual(Date.parse(listed[1]!.at));
     expect(first.replayed).toBe(false); expect(second.replayed).toBe(false);
-    // Lifecycle state and other fields are untouched.
-    expect(getTask(t.task_id)).toEqual({ ...t, progress: listed });
+    // The first new entry initializes the durable read boundary; lifecycle and other fields stay intact.
+    expect(getTask(t.task_id)).toEqual({
+      ...t, progress: listed, contribution_reads: { progress_read: [], review_revision: 0 },
+      notification_events: [...t.notification_events!, ...listed.map(entry => ({
+        eventId: `task:${t.task_id}:progress:${entry.id}`, taskId: t.task_id,
+        title: 'Progress: work', body: entry.text.trim(),
+        target: { kind: 'task', taskId: t.task_id }, delivery: 'push-only',
+      }))],
+    });
   });
 
   it('rejects empty, oversized and malformed input without writing', () => {
@@ -102,13 +109,14 @@ describe('task progress', () => {
     const t = task();
     const path = join(tasksDir(), `${t.task_id}.json`);
     const legacy = JSON.parse(readFileSync(path, 'utf8'));
-    delete legacy.progress; delete legacy.review;
+    delete legacy.progress; delete legacy.review; delete legacy.contribution_reads;
     writeFileSync(path, JSON.stringify(legacy));
     expect(listTaskProgress(t.task_id)).toEqual([]);
     expect(getTaskReview(t.task_id)).toBeUndefined();
-    expect(taskContributionSummary(getTask(t.task_id))).toEqual({ progress_count: 0, review: { has_markdown: false, artifact_count: 0, revision: 0 } });
+    expect(taskContributionSummary(getTask(t.task_id))).toEqual({ progress_count: 0, progress_unread: 0, review_unread: false, review: { has_markdown: false, artifact_count: 0, revision: 0 } });
     appendTaskProgress(t.task_id, { text: 'first milestone', author: developer });
-    expect(taskContributionSummary(getTask(t.task_id)).progress_count).toBe(1);
+    expect(taskContributionSummary(getTask(t.task_id))).toEqual({ progress_count: 1, progress_unread: 1, review_unread: false, review: { has_markdown: false, artifact_count: 0, revision: 0 } });
+    expect(getTask(t.task_id).contribution_reads).toEqual({ progress_read: [], review_revision: 0 });
   });
 });
 

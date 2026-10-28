@@ -490,10 +490,12 @@ export class AcpSession implements AgentSession {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
+    // Only earlier generations are below the page floor. The current ownership
+    // binding must be visible through both canonical pages and passive replay.
+    this.conversationStartCursor = this.conversation.lastCursor();
     // Unavailable ownership refuses the start; release the ledger descriptor this constructor opened.
     try { recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir); }
     catch (error) { this.conversation.close(); throw error; }
-    this.conversationStartCursor = this.conversation.lastCursor();
     // A durable append can precede its inventory mutation. Capture only after
     // the synchronous owner checkpoint, never the state at append notification.
     this.conversation.subscribe(() => this.observation.scheduleCapture());

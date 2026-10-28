@@ -52,7 +52,7 @@ it('authenticates description writes and reloads persisted metadata through HTTP
   expect((await server.app.inject({method:'PATCH',url,headers:{host:boundary.host,origin:boundary.origin},payload})).statusCode).toBe(401);
   expect((await server.app.inject({method:'PATCH',url,headers,payload:{brief:4,expectedBrief:'Before'}})).statusCode).toBe(400);
   expect((await server.app.inject({method:'PATCH',url,headers,payload})).statusCode).toBe(200);
-  expect((await server.app.inject({method:'GET',url:`/api/v1/tasks/${task.task_id}`,headers})).json().task).toEqual({...task,brief:payload.brief,progress_count:0,review:{has_markdown:false,artifact_count:0,revision:0}});
+  expect((await server.app.inject({method:'GET',url:`/api/v1/tasks/${task.task_id}`,headers})).json().task).toEqual({...task,brief:payload.brief,progress_count:0,progress_unread:0,review_unread:false,review:{has_markdown:false,artifact_count:0,revision:0}});
   expect((await server.app.inject({method:'PATCH',url,headers,payload:{brief:'Conflicting',expectedBrief:'Before'}})).statusCode).toBe(409);
  }finally{await server?.app.close();if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;rmSync(dir,{recursive:true,force:true});}
 });
