@@ -466,7 +466,8 @@ export async function buildWebServer(
         return {...services.configuration.read(descriptor.includeDefinitions??false), provenance:services.presetProvenance?.read() ?? null};
       case 'directory': {
         const [roles,tasks]=await Promise.all([services.query.list(true,true),projectTasks({})]);
-        return {roles,tasks:(tasks as {tasks:unknown[]}).tasks,lists:requireTaskRooms().listTaskLists()};
+        const {tasks:rows,contribution_unread_total}=tasks as {tasks:unknown[];contribution_unread_total:number};
+        return {roles,tasks:rows,contribution_unread_total,lists:requireTaskRooms().listTaskLists()};
       }
       case 'previews': {
         const roles=await services.repository.list(true),selected=new Map(roles.map(role=>[role.id,role]));
