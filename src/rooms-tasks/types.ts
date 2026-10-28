@@ -133,7 +133,12 @@ export interface TaskLayoutLink {
 
 export interface TaskNotificationEvent {
   eventId: string; title: string; body: string; target: { kind: 'task' | 'task-deleted'; taskId: string }; taskId: string;
+  /** Born read in the notification service: pushed, never an unread item. Absent on events queued before it. */
+  delivery?: 'push-only';
 }
+
+/** Persisted reads of Progress entries and To review revisions; absent until the first post-upgrade change. */
+export interface TaskContributionReads { progress_read: string[]; review_revision: number; }
 
 /** Who wrote a progress entry or review change, as established by the Fleet surface. */
 export type TaskContributionAuthor =
@@ -179,6 +184,9 @@ export interface TaskRecord {
   review?: TaskReview;
   /** Pending lifecycle events, committed atomically with their task change. */
   notification_events?: TaskNotificationEvent[];
+  contribution_reads?: TaskContributionReads;
+  /** Rooms whose notifications belong to this task; only grows. */
+  notification_manifest?: import('./notification-manifest.js').TaskNotificationManifest;
   workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */

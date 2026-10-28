@@ -75,7 +75,9 @@ export function validateLayout(def: LayoutDefinition): void {
 export class RoomLayout {
   private coworkAdapter?: CoworkAdapter;
   private readonly coworkFactory: () => CoworkAdapter;
-  constructor(private file: string, cowork: CoworkAdapter | (() => CoworkAdapter), private supervisor: LayoutSupervisor, private owner?: LayoutOwner) {
+  constructor(private file: string, cowork: CoworkAdapter | (() => CoworkAdapter), private supervisor: LayoutSupervisor, private owner?: LayoutOwner,
+    /** Runs before the Owner may join each room; a failure stops here and the next pass retries it. */
+    private beforeOwner?: (roomCid: string) => Promise<void>) {
     this.coworkFactory = typeof cowork === 'function' ? cowork : () => cowork;
   }
   private get cowork(): CoworkAdapter { return this.coworkAdapter ??= this.coworkFactory(); }
@@ -164,6 +166,7 @@ export class RoomLayout {
       quiet_membership: spec.quiet_membership ?? true, anonymous: spec.anonymous ?? false,
       activation_requirements: [...new Set(spec.members.map(roleFor))].map(role => ({ role, count: spec.members.filter(m => roleFor(m) === role).length })),
     }), native => { room.native = native; s.order.push(key); });
+    if (s.owner && !room.owner_ready && this.beforeOwner) await this.beforeOwner(room.native!.identity_cid);
     if (s.owner && !room.owner_ready) await this.mutation(s, `owner:${key}`, async () => {
       await this.cowork.acceptInvite(room.native!.room_id, this.owner!.invite, { role: s.owner!.role, expected_cid: s.owner!.cid });
       await this.cowork.setRoleCommands(room.native!.room_id, { role: s.owner!.role, commands: ['*'] });

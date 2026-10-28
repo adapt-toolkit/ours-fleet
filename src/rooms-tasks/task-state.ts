@@ -14,6 +14,7 @@ import type {
 } from './types.js';
 import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
+import { queueMissionCleanup, withManifestRooms, type TaskNotificationManifest } from './notification-manifest.js';
 
 export const tasksDir = () => join(stateRoot(), 'tasks');
 
@@ -151,24 +152,101 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
   const status = (task: StoredTaskRecord) => task.deletion?.status === 'pending' ? 'deleting' : task.blocked ? `${task.state} (blocked)` : task.state;
   // Read pending events under the same task lock as every mutation. Metadata edits
   // and retries preserve the queue; acknowledgement cannot be resurrected by stale input.
-  const pending = [...(previous?.notification_events ?? [])];
-  if (!previous || status(previous) !== status(record)) {
-    const next = status(record), before = previous ? status(previous) : undefined;
-    pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
-      title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
-      body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
-      target: { kind: 'task', taskId: record.task_id } });
+  let pending = [...(previous?.notification_events ?? [])];
+  if (record.deletion?.status === 'pending') {
+    // Deletion acceptance is the notification fence: queued transitions are obsolete and nothing new is produced.
+    pending = [];
+  } else {
+    if (!previous || status(previous) !== status(record)) {
+      const next = status(record), before = previous ? status(previous) : undefined;
+      pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
+        title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
+        body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
+        target: { kind: 'task', taskId: record.task_id }, delivery: 'push-only' });
+    }
+    pending.push(...contributionEvents(previous, record));
   }
+  if (previous && !previous.contribution_reads && contributionsChanged(previous, record))
+    // First post-upgrade change: everything that existed before it counts as read, under this same lock.
+    persisted.contribution_reads = { progress_read: (previous.progress ?? []).map(entry => entry.id), review_revision: reviewRevision(previous.review) };
   if (pending.length) persisted.notification_events = pending;
   else delete persisted.notification_events;
   replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
   publishFleetResourceCommit(taskPath(record.task_id));
 }
 
+/** Packages written before revisions existed count as revision 1; their next change becomes 2. No package is 0. */
+export const reviewRevision = (review: { revision?: number } | undefined): number => review ? review.revision ?? 1 : 0;
+
+const contributionsChanged = (previous: StoredTaskRecord, record: TaskRecord | StoredTaskRecord) =>
+  (record.progress ?? []).some(entry => !(previous.progress ?? []).some(old => old.id === entry.id))
+  || reviewRevision(record.review) !== reviewRevision(previous.review);
+
+/** New Progress entries and new To review revisions push once each; reads and replays produce nothing. */
+function contributionEvents(previous: StoredTaskRecord | undefined, record: TaskRecord | StoredTaskRecord): TaskNotificationEvent[] {
+  if (!previous) return [];
+  const id = record.task_id, events: TaskNotificationEvent[] = [];
+  for (const entry of record.progress ?? []) {
+    if ((previous.progress ?? []).some(old => old.id === entry.id)) continue;
+    events.push({ eventId: `task:${id}:progress:${entry.id}`, taskId: id, title: `Progress: ${record.title}`.slice(0, 160),
+      body: (entry.text.trim() || 'New progress entry').slice(0, 512), target: { kind: 'task', taskId: id }, delivery: 'push-only' });
+  }
+  const revision = reviewRevision(record.review);
+  if (revision > reviewRevision(previous.review))
+    events.push({ eventId: `task:${id}:review:${revision}`, taskId: id, title: `To review updated: ${record.title}`.slice(0, 160),
+      body: `Task ${id}: the review package changed.`, target: { kind: 'task', taskId: id }, delivery: 'push-only' });
+  return events;
+}
+
+/** Item-based Progress unread and revision-based To review unread. An absent read state means nothing is unread. */
+export function contributionUnread(task: Pick<TaskRecord, 'progress' | 'review' | 'contribution_reads'>): { progress: number; review: boolean } {
+  const reads = task.contribution_reads;
+  if (!reads) return { progress: 0, review: false };
+  const seen = new Set(reads.progress_read);
+  return { progress: (task.progress ?? []).filter(entry => !seen.has(entry.id)).length, review: reviewRevision(task.review) > reads.review_revision };
+}
+
+/** Acknowledge Progress entries the user actually viewed; unknown IDs are ignored and the set only grows. */
+export function acknowledgeTaskProgress(id: string, ids: string[]): { progress: number; review: boolean } {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    // Without a read state everything present already counts as read: there is nothing to record.
+    const reads = task.contribution_reads;
+    if (!reads) return contributionUnread(task);
+    const present = new Set((task.progress ?? []).map(entry => entry.id));
+    const added = [...new Set(ids.filter(entryId => present.has(entryId) && !reads.progress_read.includes(entryId)))];
+    if (added.length) {
+      task.contribution_reads = { ...reads, progress_read: [...reads.progress_read, ...added] };
+      writeTask(task);
+    }
+    return contributionUnread(task);
+  });
+}
+
+/** Acknowledge the To review revision the user saw. Only moves forward; a revision newer than current is refused. */
+export function acknowledgeTaskReview(id: string, revision: number): { progress: number; review: boolean } {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    const current = reviewRevision(task.review);
+    if (!Number.isSafeInteger(revision) || revision < 0 || revision > current) throw new TaskStateError('That review revision does not exist.');
+    const reads = task.contribution_reads;
+    if (reads && revision > reads.review_revision) {
+      task.contribution_reads = { ...reads, review_revision: Math.max(reads.review_revision, revision) };
+      writeTask(task);
+    }
+    return contributionUnread(task);
+  });
+}
+
 const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
 
 function typedTaskNotification(value: TaskNotificationEvent, id: string): boolean {
-  if (!value || typeof value !== 'object' || Object.keys(value).some(key => !['eventId', 'title', 'body', 'target', 'taskId'].includes(key))) return false;
+  if (!value || typeof value !== 'object' || Object.keys(value).some(key => !['eventId', 'title', 'body', 'target', 'taskId', 'delivery'].includes(key))) return false;
+  if (value.delivery !== undefined && value.delivery !== 'push-only') return false;
   const target = value.target;
   return typeof value.eventId === 'string' && value.eventId.startsWith(`task:${id}:`) && value.eventId.length <= 512
     && value.taskId === id && !!target && typeof target === 'object' && !Array.isArray(target)
@@ -181,7 +259,7 @@ function typedTaskNotification(value: TaskNotificationEvent, id: string): boolea
 /** Atomic snapshots contain the events, including intermediate states between polls. */
 export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[] }> {
   const result: Array<{ taskId: string; events: TaskNotificationEvent[] }> = [];
-  for (const dir of [tasksDir(), retiredNotificationsDir()]) {
+  for (const dir of [tasksDir()]) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter(file => TASK_ID_PATTERN.test(file.slice(0, -5)) && file.endsWith('.json'))) {
       try {
@@ -203,6 +281,24 @@ export function pendingTaskNotifications(warn: (line: string) => void = () => {}
     }
   }
   return result;
+}
+
+/** Earlier releases kept a deleted task's queued events in `.notification-retired`. They are obsolete: each
+ * becomes a cleanup intent for its task and is never delivered. Returns the number converted. */
+export function convertRetiredTaskNotifications(): number {
+  const dir = retiredNotificationsDir();
+  if (!existsSync(dir)) return 0;
+  let converted = 0;
+  for (const file of readdirSync(dir).filter(file => file.endsWith('.json') && TASK_ID_PATTERN.test(file.slice(0, -5)))) {
+    const id = file.slice(0, -5);
+    withTaskLock(id, () => {
+      if (existsSync(taskPath(id))) return;            // a prepared copy has no authority while the task exists
+      queueMissionCleanup(id, []);
+      rmSync(join(dir, file), { force: true });
+      converted++;
+    });
+  }
+  return converted;
 }
 
 /** Service event-id dedupe covers acceptance followed by a crash before this acknowledgement. */
@@ -605,9 +701,27 @@ export function updateTaskRoom(
   assertNoPendingTerminalIntent(t);
   t.room_id = roomId;
   t.room_identity_cid = roomIdentityCid;
+  t.notification_manifest = withManifestRooms(t.notification_manifest, [roomIdentityCid]);
   writeTask(t);
   return t;
   });
+}
+
+/** Record room CIDs as this task's notification-owned rooms (union only). Returns the manifest to register. */
+export function recordNotificationRooms(id: string, cids: string[]): TaskNotificationManifest {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const t = readTask(id);
+    assertNoPendingDeletion(t);
+    const next = withManifestRooms(t.notification_manifest, cids);
+    if (next !== t.notification_manifest) { t.notification_manifest = next; writeTask(t); }
+    return next;
+  });
+}
+
+/** Every room this task ever recorded, including the current one from records written before manifests existed. */
+export function notificationRoomCids(task: Pick<TaskRecord, 'notification_manifest' | 'room_identity_cid'>): string[] {
+  return withManifestRooms(task.notification_manifest, task.room_identity_cid ? [task.room_identity_cid] : []).room_cids;
 }
 
 export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskRecord {
@@ -774,6 +888,7 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
   if (stored.deletion?.status === 'pending') {
     // Heal a crash between the intent write and the receipt write.
     if (!readTaskDeletionReceipt(id)) writeDeletionReceiptForIntent(stored);
+    queueMissionCleanup(id, notificationRoomCids(stored));
     return { status: 'pending', task: presentTaskLenient(stored) };
   }
   const now = new Date().toISOString();
@@ -786,7 +901,9 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
       name: member.name, identity_cid: member.identity_cid, phase: 'pending', updated_at: now,
     })),
   };
+  // The task write drops queued transitions; the cleanup intent then retires everything already delivered.
   writeTask(stored);
+  queueMissionCleanup(id, notificationRoomCids(stored));
   writeDeletionReceiptForIntent(stored);
   return { status: 'accepted', task: presentTaskLenient(stored) };
   });
@@ -1048,13 +1165,9 @@ export function unlinkDeletedTask(id: string): boolean {
   }
   if (stored.deletion?.status !== 'pending')
     throw new TaskStateError(`task ${id} has no pending deletion`);
-  // Preserve committed deliveries outside the record before deletion. A crash
-  // before unlink may replay two copies; both carry identical service dedupe IDs.
-  const removed: TaskNotificationEvent = { eventId: `task:${id}:deleted`, taskId: id,
-    title: `Task deleted: ${stored.title}`.slice(0, 160), body: `Task ${id}: deleting → deleted.`,
-    target: { kind: 'task-deleted', taskId: id } };
-  replaceFileAtomically(join(retiredNotificationsDir(), `${id}.json`),
-    JSON.stringify({ notification_events: [...(stored.notification_events ?? []), removed] }) + '\n');
+  // Merge rooms proven since acceptance into the durable cleanup intent before the record disappears.
+  // No deletion notification is produced: deleting retires the task's notifications instead.
+  queueMissionCleanup(id, notificationRoomCids(stored));
   try {
     unlinkSync(taskPath(id));
   } catch (error) {

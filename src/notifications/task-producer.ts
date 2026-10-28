@@ -1,6 +1,8 @@
 import { observeFleetResources } from '../application/resource-observer.js';
 import { tasksDir } from '../rooms-tasks/task-state.js';
-import { acknowledgeTaskNotification, pendingTaskNotifications } from '../rooms-tasks/task-state.js';
+import { acknowledgeTaskNotification, convertRetiredTaskNotifications, pendingTaskNotifications } from '../rooms-tasks/task-state.js';
+import type { TaskRecord } from '../rooms-tasks/types.js';
+import { bootstrapMissionRooms, drainMissionCleanup } from './mission-ownership.js';
 import type { ProducerConfig } from './outbox.js';
 
 /** The Fleet manager owns this sender even when the web console is stopped.
@@ -13,8 +15,11 @@ export class TaskNotificationProducer {
   private offset = 0;
   private stopped = false;
   private readonly shutdown = new AbortController();
+  private bootstrapped = false;
   constructor(private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {},
-    private readonly request: typeof fetch = fetch) {
+    private readonly request: typeof fetch = fetch,
+    /** Existing tasks and their layout room CIDs, registered once per start before own-room OFF can be chosen. */
+    private readonly missions?: { tasks: () => TaskRecord[]; layoutRooms: (task: TaskRecord) => string[] }) {
     // Subscribe before startup replay: a commit while fetch is pending needs a second pass.
     observeFleetResources({ retryWatchFailures: true, paths: [tasksDir()], roots: [] }, state => {
       if (state.health !== 'healthy') this.warn('Task notification observation unavailable; committed events retained');
@@ -43,6 +48,12 @@ export class TaskNotificationProducer {
   }
   private async drainOnce(): Promise<void> {
     if (this.stopped) return;
+    // Deletion first: a retired task's notifications go before any other delivery work in this pass.
+    if (convertRetiredTaskNotifications() || await drainMissionCleanup(this.config, this.warn, this.request)) this.retry();
+    if (this.missions && !this.bootstrapped && !this.stopped) {
+      try { await bootstrapMissionRooms(this.config, this.missions.tasks, this.missions.layoutRooms, this.request); this.bootstrapped = true; }
+      catch { this.warn('Mission room registration pending; own-room message preference stays unavailable'); this.retry(); }
+    }
     const pending = pendingTaskNotifications(this.warn);
     if (!pending.length) return;
     const start = this.offset % pending.length;
@@ -65,7 +76,9 @@ export class TaskNotificationProducer {
             });
             await response.body?.cancel();
             if (!response.ok) {
-              this.warn(`Task notification delivery pending (HTTP ${response.status}); committed event retained`);
+              this.warn(response.status === 400 && event.delivery
+                ? 'Notification service does not support push-only task events; committed events retained'
+                : `Task notification delivery pending (HTTP ${response.status}); committed event retained`);
               break;
             }
             acknowledgeTaskNotification(task.taskId, event.eventId);

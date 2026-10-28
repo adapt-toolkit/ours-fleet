@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import {
@@ -57,15 +57,12 @@ it('acknowledges under task lock without losing a newer state or reviving delive
   acknowledgeTaskNotification(task.task_id, first.eventId); expect(events(task.task_id)).toHaveLength(1);
 });
 
-it('keeps events across removal and acknowledges duplicate pre-unlink copies', () => {
+it('deletion acceptance retires queued events and removal produces no deletion event', () => {
   const task = create(); cancelTask(task.task_id);
+  expect(events(task.task_id).length).toBeGreaterThan(0);
   beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
-  const pending = events(task.task_id);
+  expect(events(task.task_id)).toEqual([]);
   expect(unlinkDeletedTask(task.task_id)).toBe(true);
-  expect(events(task.task_id).slice(0, -1)).toEqual(pending);
-  expect(events(task.task_id).at(-1)?.body).toContain('deleting → deleted');
-  expect(events(task.task_id).at(-1)?.target).toEqual({kind:'task-deleted',taskId:task.task_id});
-  for (const e of events(task.task_id)) acknowledgeTaskNotification(task.task_id, e.eventId);
   expect(events(task.task_id)).toEqual([]);
 });
 
@@ -109,7 +106,7 @@ it('continues admitted task deliveries when another task record is corrupt', asy
   expect(warnings.some(line => line.includes('other task deliveries continue'))).toBe(true);
 });
 
-it('retains unsupported task journal entries across typed delivery, acknowledgement and deletion',async()=>{
+it('retains unsupported task journal entries across typed delivery and acknowledgement, and deletion retires them',async()=>{
  const task=create(),file=join(tasksDir(),task.task_id+'.json'),stored=JSON.parse(readFileSync(file,'utf8'));
  const legacy=Array.from({length:40},(_,i)=>({eventId:`task:${task.task_id}:old-${i}`,title:'Old',body:'Retain',taskId:task.task_id,url:`/fleet/tasks/${task.task_id}`}));
  stored.notification_events=[...legacy,...stored.notification_events];writeFileSync(file,JSON.stringify(stored));
@@ -118,7 +115,8 @@ it('retains unsupported task journal entries across typed delivery, acknowledgem
  acknowledgeTaskNotification(task.task_id,legacy[0].eventId);expect(JSON.parse(readFileSync(file,'utf8')).notification_events).toEqual(legacy);
  cancelTask(task.task_id);beginTaskDeletionIntent(task.task_id,{kind:'local_control',surface:'cli'});unlinkDeletedTask(task.task_id);
  for(const event of events(task.task_id))acknowledgeTaskNotification(task.task_id,event.eventId);
- expect(JSON.parse(readFileSync(join(tasksDir(),'.notification-retired',task.task_id+'.json'),'utf8')).notification_events).toEqual(legacy);
+ // Deletion retires the whole journal, including entries this release never sends.
+ expect(existsSync(join(tasksDir(),'.notification-retired',task.task_id+'.json'))).toBe(false);
  expect(pendingTaskNotifications()).toEqual([]);
 });
 

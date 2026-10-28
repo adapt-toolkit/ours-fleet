@@ -133,12 +133,17 @@ export class RoomLayoutService {
   }
   private engine(id: string, cleanup = false): RoomLayout {
     const path = layoutRunPath(id); if (existsSync(path)) assertLayoutFile(path);
-    return new RoomLayout(path, () => createCoworkAdapter(), this.supervisor(id), cleanup ? undefined : this.owner());
+    return new RoomLayout(path, () => createCoworkAdapter(), this.supervisor(id), cleanup ? undefined : this.owner(), this.beforeOwner(id));
+  }
+  /** A task's layout rooms are registered with the notification service before the Owner can join them. */
+  private beforeOwner(id: string): ((roomCid: string) => Promise<void>) | undefined {
+    const taskId = /^task-([0-9a-z]{9}[0-9a-f]{8})$/.exec(id)?.[1];
+    return taskId ? async roomCid => (await import('../notifications/mission-ownership.js')).associateRoomNotifications(taskId, roomCid) : undefined;
   }
   open(id: string, cleanup = false): RoomLayout {
     const initial = this.engine(id, cleanup), snapshot = initial.snapshot();
     return new RoomLayout(layoutRunPath(id), () => createCoworkAdapter(),
-      this.supervisor(id, snapshot.agent_templates ?? {}), cleanup ? undefined : this.owner());
+      this.supervisor(id, snapshot.agent_templates ?? {}), cleanup ? undefined : this.owner(), this.beforeOwner(id));
   }
   /** `scope` lets an owner (e.g. a Task) snapshot an adjusted definition and pin agent working directories. */
   async create(name: string, bindings: Record<string, LayoutInstance> = {}, id = `run-${randomUUID()}`,

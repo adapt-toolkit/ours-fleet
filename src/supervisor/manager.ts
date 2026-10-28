@@ -135,7 +135,15 @@ export async function runFleetManager(entrypoint: string, deps: ManagerDeps = {}
   try {
     try {
       const config = producerConfig(process.env, undefined, log);
-      if (config) notifications = new TaskNotificationProducer(config, log);
+      if (config) {
+        const [{ listTasks }, { TaskLayouts }] = await Promise.all([import('../rooms-tasks/task-state.js'), import('../application/task-layouts.js')]);
+        const layouts = new TaskLayouts();
+        notifications = new TaskNotificationProducer(config, log, fetch, {
+          tasks: () => listTasks({ strict: false }),
+          // An unreadable layout run proves nothing about its rooms; its manifest rooms are still registered.
+          layoutRooms: task => { try { return (layouts.view(task)?.rooms ?? []).flatMap(room => room.identity_cid ? [room.identity_cid] : []); } catch { return []; } },
+        });
+      }
     } catch { log('[fleet] task notifications unavailable; committed events retained'); }
     try {
       const { resumeFleetTransfers } = await import('./adoption.js');

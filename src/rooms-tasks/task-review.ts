@@ -12,7 +12,7 @@ import { open, type FileHandle } from 'node:fs/promises';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { stateRoot } from '../paths.js';
 import { MAX_FILE_BYTES, openDirectory } from '../file-delivery/reader.js';
-import { getTask, TaskStateError, updateTaskContribution } from './task-state.js';
+import { contributionUnread, getTask, reviewRevision, TaskStateError, updateTaskContribution } from './task-state.js';
 import { assertWorkspacePresent } from './workspace.js';
 import type {
   TaskContributionAuthor, TaskProgressEntry, TaskRecord, TaskReview, TaskReviewArtifact,
@@ -123,7 +123,7 @@ export function appendTaskProgress(taskId: string, input: {
 
 /** Every change to the package gets the next revision, so readers can tell any two states apart. */
 function nextRevision(review: TaskReview | undefined): number {
-  return (review?.revision ?? 0) + 1;
+  return reviewRevision(review) + 1;
 }
 
 export function getTaskReview(taskId: string): TaskReview | undefined {
@@ -501,20 +501,23 @@ export function publicProgressEntry(entry: TaskProgressEntry): Omit<TaskProgress
   return rest;
 }
 export function publicReview(review: TaskReview): TaskReview {
-  return { ...review, revision: review.revision ?? 1, artifacts: review.artifacts.map(({ request_key: _key, ...rest }) => rest) };
+  return { ...review, revision: reviewRevision(review), artifacts: review.artifacts.map(({ request_key: _key, ...rest }) => rest) };
 }
 
 /** Compact summary for list and detail payloads; bodies are fetched separately. */
 export function taskContributionSummary(task: TaskRecord): {
-  progress_count: number; review: { has_markdown: boolean; artifact_count: number; revision: number; updated_at?: string };
+  progress_count: number; progress_unread: number; review_unread: boolean;
+  review: { has_markdown: boolean; artifact_count: number; revision: number; updated_at?: string };
 } {
+  const unread = contributionUnread(task);
   return {
     progress_count: task.progress?.length ?? 0,
+    progress_unread: unread.progress,
+    review_unread: unread.review,
     review: {
       has_markdown: !!task.review?.markdown.trim(),
       artifact_count: task.review?.artifacts.length ?? 0,
-      // Packages written before revisions existed count as revision 1 until their next change.
-      revision: task.review ? task.review.revision ?? 1 : 0,
+      revision: reviewRevision(task.review),
       ...(task.review ? { updated_at: task.review.updated_at } : {}),
     },
   };

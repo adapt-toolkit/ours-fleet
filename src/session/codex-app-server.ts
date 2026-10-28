@@ -1,4 +1,5 @@
 import { ConversationObservation } from './conversation-observation.js';
+import { recordSessionOwnership } from './session-ownership.js';
 import {appendTaskCreated,type TaskNoticeBinding,type TaskCreatedNotice} from './task-notice.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -264,6 +265,7 @@ export class CodexAppServerSession implements AgentSession {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
+    recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir);
     this.conversationStartCursor = this.conversation.lastCursor();
     // A durable append can precede its inventory mutation. Capture only after
     // the synchronous owner checkpoint, never the state at append notification.

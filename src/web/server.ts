@@ -46,7 +46,7 @@ import type { TaskRoomApplicationService } from '../application/task-room-servic
 import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
-import { TaskStateError } from '../rooms-tasks/task-state.js';
+import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, TaskStateError } from '../rooms-tasks/task-state.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import {
   appendTaskProgress, getTaskReview, listTaskProgress, publicProgressEntry, publicReview, readTaskReviewArtifact,
@@ -428,9 +428,12 @@ export async function buildWebServer(
     const filter = { strict, ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
       ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
     const api = requireTaskRooms();
+    // Navigation totals cover every task in scope, not only the filtered or visible cards.
+    const unreadTotal = () => api.listTasks({ strict, ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) })
+      .reduce((sum, task) => { const unread = contributionUnread(task); return sum + unread.progress + (unread.review ? 1 : 0); }, 0);
     return taskApi(() => query.groupByList === 'true'
-      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })) }
-      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))) });
+      ? { groups: api.groupedTasks(filter).map(group => ({ ...group, tasks: group.tasks.map(task => wireTask(api.withLayoutRooms(task))) })), contribution_unread_total: unreadTotal() }
+      : { tasks: api.listTasks(filter).map(task => wireTask(api.withLayoutRooms(task))), contribution_unread_total: unreadTotal() });
   };
   const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
     signal.throwIfAborted(); services.invalidateResourceCaches?.();
@@ -636,6 +639,21 @@ export async function buildWebServer(
     }));
     if (!result.replayed) reply.code(201);
     return { entry: publicProgressEntry(result.entry), replayed: result.replayed };
+  });
+  /** Acknowledge Progress entries the browser actually showed; returns the task's remaining unread. */
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress/read', async request => {
+    auth.authenticate(request, true);
+    const ids = (request.body as { ids?: unknown })?.ids;
+    if (!Array.isArray(ids) || ids.length > 200 || ids.some(id => typeof id !== 'string' || id.length > 64))
+      throw new FleetError('invalid_request', 'ids must be at most 200 progress entry IDs');
+    return { unread: await reviewApi(() => acknowledgeTaskProgress(request.params.id, ids as string[])) };
+  });
+  /** Acknowledge the To review revision the browser fetched and rendered. */
+  app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/review/read', async request => {
+    auth.authenticate(request, true);
+    const revision = (request.body as { revision?: unknown })?.revision;
+    if (!Number.isSafeInteger(revision) || (revision as number) < 0) throw new FleetError('invalid_request', 'revision must be a non-negative integer');
+    return { unread: await reviewApi(() => acknowledgeTaskReview(request.params.id, revision as number)) };
   });
   app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
     auth.authenticate(request);

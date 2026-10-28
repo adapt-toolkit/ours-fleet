@@ -33,7 +33,7 @@ it('produces only user-correlated completions, retries, and recovers delivery af
   const restarted = new FleetNotificationProducer([root], join(dir, 'outboxes'), config);
   cleanup.push(() => restarted.close()); fail = false; await restarted.drain();
   expect(accepted).toHaveLength(1); expect(accepted[0].eventId).toBe(`agent-one:g:${done.seq}`);
-  expect(accepted[0].target).toEqual({kind:'agent',agentId:'agent-one'});expect(accepted[0].anchor).toEqual({kind:'fleet-message',messageId:'reply-human'});expect(accepted[0]).not.toHaveProperty('url');expect(accepted[0].taskId).toBeNull();
+  expect(accepted[0].target).toEqual({kind:'agent',agentId:'agent-one'});expect(accepted[0].anchor).toEqual({kind:'fleet-message',messageId:'reply-human'});expect(accepted[0]).not.toHaveProperty('url');expect(accepted[0]).not.toHaveProperty('taskId');
 
 });
 
@@ -97,36 +97,42 @@ it('retires a deleted target after the in-flight send and clears persisted pendi
   const saved=JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8'));expect(saved.entries).toEqual([]);
 });
 
-it('freezes task association before delivery and preserves it across a retry after the room inventory changes',async()=>{
-  const {roomsDir}=await import('../src/rooms-tasks/room-state.js');const previous=process.env.OURS_FLEET_HOME;
-  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','task-badge-'));process.env.OURS_FLEET_HOME=dir;
-  cleanup.push(async()=>{if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;});
-  mkdirSync(roomsDir(),{recursive:true});const room=join(roomsDir(),'room.json');writeFileSync(room,JSON.stringify({room_id:'room-one',task_id:'task-one',member_seats:[{role_name:'task-member'}]}));
+it('labels a completion only from its own generation binding and freezes it across a retry',async()=>{
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','task-binding-'));
   let fail=true;const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;if(fail){res.statusCode=503;}else accepted.push(JSON.parse(raw));res.end('{}');});server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
   const root=join(dir,'agents');mkdirSync(root);const config={origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)},state=join(dir,'outboxes');
   let producer=new FleetNotificationProducer([root],state,config);cleanup.push(()=>producer.close());
   const store=new ConversationEventStore(join(root,'task-member','.conversation'),{roleId:'task-member'});cleanup.push(async()=>store.close());
-  store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
-  // A slow turn can stop between prompt and completion; the association is frozen once the completion is queued.
-  await vi.waitFor(()=>{producer.poll();expect(JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8')).entries).toHaveLength(1);});
-  await producer.drain();await producer.close();writeFileSync(room,JSON.stringify({room_id:'room-one',member_seats:[]}));
+  const task='0mvrpv4kt1f567911';
+  // An older generation of the same role, still running a prompt when the task launch starts, stays unlabelled.
+  store.append({kind:'prompt.admitted',promptId:'old',source:'browser',sessionGeneration:'g0',payload:{}});
+  store.append({kind:'session.ownership',sessionGeneration:'g1',payload:{launchId:'launch-1',taskId:task}});
+  store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g1',payload:{}});
+  store.append({kind:'turn.completed',promptId:'old',sessionGeneration:'g0',payload:{outcome:'completed'}});
+  store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g1',payload:{outcome:'completed'}});
+  store.append({kind:'session.ownership',sessionGeneration:'g2',payload:{launchId:null,taskId:null}});
+  store.append({kind:'prompt.admitted',promptId:'q',source:'browser',sessionGeneration:'g2',payload:{}});
+  store.append({kind:'turn.completed',promptId:'q',sessionGeneration:'g2',payload:{outcome:'completed'}});
+  await vi.waitFor(()=>{producer.poll();expect(JSON.parse(readFileSync(join(state,readdirSync(state)[0]),'utf8')).entries).toHaveLength(3);});
+  await producer.drain();await producer.close();
   producer=new FleetNotificationProducer([root],state,config);fail=false;await producer.drain();await producer.close();
-  expect(accepted).toHaveLength(1);expect(accepted[0].taskId).toBe('task-one');expect(accepted[0].target).toEqual({kind:'agent',agentId:'task-member'});
+  expect(accepted).toHaveLength(3);
+  expect(accepted.map(a=>Object.hasOwn(a,'taskId')?a.taskId:'unknown')).toEqual(['unknown',task,null]);
 });
 
-it('delivers completions without optional task metadata when the room inventory is corrupt',async()=>{
-  const {roomsDir}=await import('../src/rooms-tasks/room-state.js');const previous=process.env.OURS_FLEET_HOME;
-  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','corrupt-task-metadata-'));process.env.OURS_FLEET_HOME=dir;
-  cleanup.push(async()=>{if(previous===undefined)delete process.env.OURS_FLEET_HOME;else process.env.OURS_FLEET_HOME=previous;});
-  mkdirSync(roomsDir(),{recursive:true});writeFileSync(join(roomsDir(),'broken.json'),'{');
+it('a malformed binding never labels a completion',async()=>{
+  mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','corrupt-binding-'));
   const accepted:any[]=[];const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;accepted.push(JSON.parse(raw));res.end('{}');});
   server.listen(0,'127.0.0.1');await once(server,'listening');cleanup.push(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));});
   const root=join(dir,'agents');mkdirSync(root);const producer=new FleetNotificationProducer([root],join(dir,'outboxes'),{origin:`http://127.0.0.1:${(server.address() as any).port}`,token:'t'.repeat(40)});cleanup.push(()=>producer.close());
   const store=new ConversationEventStore(join(root,'member','.conversation'),{roleId:'member'});cleanup.push(async()=>store.close());
+  for(const payload of [{launchId:null,taskId:'0mvrpv4kt1f567911'},{launchId:'l',taskId:'not-a-task'},{taskId:'0mvrpv4kt1f567911'}])
+    store.append({kind:'session.ownership',sessionGeneration:'g',payload:payload as any});
   store.append({kind:'prompt.admitted',promptId:'p',source:'browser',sessionGeneration:'g',payload:{}});const done=store.append({kind:'turn.completed',promptId:'p',sessionGeneration:'g',payload:{outcome:'completed'}});
   producer.poll();await producer.drain();producer.poll();await producer.drain();
   expect(accepted).toHaveLength(1);expect(accepted[0].eventId).toBe(`member:g:${done.seq}`);expect(accepted[0]).not.toHaveProperty('taskId');
 });
+
 
 it('never sends, reprojects or converts unversioned and URL-shaped entries',async()=>{
   mkdirSync('.test-artifacts',{recursive:true});const dir=mkdtempSync(join('.test-artifacts','pending-url-'));
