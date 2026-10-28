@@ -26,30 +26,43 @@ export interface MissionCleanupIntent { schema: 1; taskId: string; contactIds: s
 export const missionCleanupDir = () => join(stateRoot(), 'notifications', 'mission-cleanup');
 const TASK_ID = /^[0-9a-z]{9}[0-9a-f]{8}$/;
 
+/** Merge rooms into the task's intent. An existing intent that cannot be read is never replaced: this throws and the
+ * file keeps its bytes, so a later writer with only some rooms cannot erase coverage recorded earlier. */
 export function queueMissionCleanup(taskId: string, contactIds: string[], dir = missionCleanupDir()): void {
   if (!TASK_ID.test(taskId)) throw new Error('invalid task ID');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, `${taskId}.json`), previous = readMissionCleanup(path);
-  const merged = [...new Set([...(previous?.contactIds ?? []), ...contactIds.filter(validRoomCid).map(canonicalCid)])];
-  if (previous && merged.length === previous.contactIds.length) return;
+  const path = join(dir, `${taskId}.json`), previous = readMissionCleanup(path, taskId);
+  if (previous === 'unavailable') throw new Error(`mission cleanup intent for ${taskId} is unreadable; file retained`);
+  const known = previous === 'absent' ? [] : previous.contactIds;
+  const merged = [...new Set([...known, ...contactIds.filter(validRoomCid).map(canonicalCid)])];
+  if (previous !== 'absent' && merged.length === known.length) return;
   replaceFileAtomically(path, JSON.stringify({ schema: 1, taskId, contactIds: merged } satisfies MissionCleanupIntent) + '\n', 0o600);
 }
-function readMissionCleanup(path: string): MissionCleanupIntent | undefined {
+/** Only a missing file is absent. Unreadable, malformed or mismatched content is unavailable, never "no intent". */
+function readMissionCleanup(path: string, taskId: string): MissionCleanupIntent | 'absent' | 'unavailable' {
+  let text: string;
+  try { text = readFileSync(path, 'utf8'); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : 'unavailable'; }
   try {
-    const value = JSON.parse(readFileSync(path, 'utf8'));
-    if (value?.schema === 1 && TASK_ID.test(value.taskId) && Array.isArray(value.contactIds) && value.contactIds.every(validRoomCid)) return value;
-  } catch { /* absent or unreadable: not an intent */ }
-  return undefined;
+    const value = JSON.parse(text);
+    if (value?.schema === 1 && value.taskId === taskId && Array.isArray(value.contactIds) && value.contactIds.every(validRoomCid)) return value;
+  } catch { /* malformed */ }
+  return 'unavailable';
 }
+const intentFiles = (dir: string) => existsSync(dir) ? readdirSync(dir).filter(name => /^[0-9a-z]{9}[0-9a-f]{8}\.json$/.test(name)) : [];
+/** Readable intents, in directory order. Unreadable ones are reported by `unavailableMissionCleanups`, never dropped. */
 export function pendingMissionCleanups(dir = missionCleanupDir()): MissionCleanupIntent[] {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter(name => /^[0-9a-z]{9}[0-9a-f]{8}\.json$/.test(name))
-    .map(name => readMissionCleanup(join(dir, name))).filter((intent): intent is MissionCleanupIntent => !!intent);
+  return intentFiles(dir).map(name => readMissionCleanup(join(dir, name), name.slice(0, -5)))
+    .filter((intent): intent is MissionCleanupIntent => typeof intent === 'object');
 }
-/** Remove only the exact intent the service acknowledged; a merge since then keeps the file for another pass. */
+/** Task IDs whose intent file exists but cannot be read. Their bytes are kept; they block nothing else but stay pending. */
+export function unavailableMissionCleanups(dir = missionCleanupDir()): string[] {
+  return intentFiles(dir).filter(name => readMissionCleanup(join(dir, name), name.slice(0, -5)) === 'unavailable').map(name => name.slice(0, -5));
+}
+/** Remove only the exact intent the service acknowledged; a merge since then, or an unreadable file, keeps it for another pass. */
 export function settleMissionCleanup(intent: MissionCleanupIntent, dir = missionCleanupDir()): boolean {
-  const path = join(dir, `${intent.taskId}.json`), current = readMissionCleanup(path);
-  if (!current || current.contactIds.length !== intent.contactIds.length) return false;
+  const path = join(dir, `${intent.taskId}.json`), current = readMissionCleanup(path, intent.taskId);
+  if (typeof current !== 'object' || current.contactIds.length !== intent.contactIds.length) return false;
   rmSync(path, { force: true });
   return true;
 }

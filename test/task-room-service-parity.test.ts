@@ -1174,3 +1174,20 @@ it('task health rejects persisted records changed while probing and sanitizes un
   const unavailable = new TaskRoomApplicationService(undefined, { loadConfiguration: () => { throw Error('private detail'); } });
   await expect(unavailable.observeTaskReadiness(task.task_id)).resolves.toEqual({ state: 'unknown', reason: 'readiness_unavailable' });
 });
+
+it('never invites the Owner into a room whose notification registration was refused; registration precedes the invite', async () => {
+  const cfg = { ...config(), ownerInvite: 'OWNER-INVITE', rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: true } } } as FleetConfig;
+  const h = cowork();
+  vi.mocked(h.adapter.acceptInvite).mockResolvedValue({ seat_cid: 'owner-cid', seat_state: 'active' });
+  const refused = vi.fn(async () => { throw new Error('Waiting for notification service to register the mission room'); });
+  const refusing = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg, cowork: () => h.adapter, binPath: () => '/fleet',
+    provisionMembers: vi.fn(async ({ roomId }) => getRoomRecord(roomId)!), associateRoomNotifications: refused });
+  await expect(refusing.createTask({ actor: { kind: 'local_control', surface: 'cli' }, title: 'Refused', origin: { type: 'cli' } })).rejects.toThrow();
+  expect(refused).toHaveBeenCalledWith(expect.any(String), 'room-cid');
+  expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+  const accepted = vi.fn(async () => {});
+  const admitting = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg, cowork: () => h.adapter, binPath: () => '/fleet',
+    provisionMembers: vi.fn(async ({ roomId }) => getRoomRecord(roomId)!), associateRoomNotifications: accepted });
+  await admitting.createTask({ actor: { kind: 'local_control', surface: 'cli' }, title: 'Admitted', origin: { type: 'cli' } });
+  expect(accepted.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(h.adapter.acceptInvite).mock.invocationCallOrder[0]);
+});

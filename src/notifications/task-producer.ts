@@ -16,6 +16,7 @@ export class TaskNotificationProducer {
   private stopped = false;
   private readonly shutdown = new AbortController();
   private bootstrapped = false;
+  private bootstrapAt = 0;
   constructor(private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {},
     private readonly request: typeof fetch = fetch,
     /** Existing tasks and their layout room CIDs, registered once per start before own-room OFF can be chosen. */
@@ -41,9 +42,9 @@ export class TaskNotificationProducer {
     });
     return this.running;
   }
-  private retry() {
+  private retry(delay = 3000) {
     if (this.stopped || this.timer) return;
-    this.timer = setTimeout(() => { this.timer = undefined; void this.drain(); }, 3000);
+    this.timer = setTimeout(() => { this.timer = undefined; void this.drain(); }, delay);
     this.timer.unref();
   }
   private async drainOnce(): Promise<void> {
@@ -51,8 +52,13 @@ export class TaskNotificationProducer {
     // Deletion first: a retired task's notifications go before any other delivery work in this pass.
     if (convertRetiredTaskNotifications() || await drainMissionCleanup(this.config, this.warn, this.request)) this.retry();
     if (this.missions && !this.bootstrapped && !this.stopped) {
-      try { await bootstrapMissionRooms(this.config, this.missions.tasks, this.missions.layoutRooms, this.request); this.bootstrapped = true; }
-      catch { this.warn('Mission room registration pending; own-room message preference stays unavailable'); this.retry(); }
+      // A failed run waits 30s: unavailable inventory or a refused registration needs repair, not a tight loop.
+      const wait = this.bootstrapAt - Date.now();
+      if (wait > 0) this.retry(wait);
+      else {
+        try { await bootstrapMissionRooms(this.config, this.missions.tasks, this.missions.layoutRooms, this.request); this.bootstrapped = true; }
+        catch { this.warn('Mission room registration pending; own-room message preference stays unavailable'); this.bootstrapAt = Date.now() + 30_000; this.retry(30_000); }
+      }
     }
     const pending = pendingTaskNotifications(this.warn);
     if (!pending.length) return;
@@ -75,6 +81,13 @@ export class TaskNotificationProducer {
               body: JSON.stringify(event),
             });
             await response.body?.cancel();
+            // An upgraded legacy event refused as a reused ID: the service already holds this event ID, admitted by the
+            // earlier release in its original form (IDs are unique per event). Acknowledge; never resend it as inbox.
+            if (response.status === 409 && task.upgraded.includes(event.eventId)) {
+              this.warn('Legacy task event already admitted by the notification service; acknowledged');
+              acknowledgeTaskNotification(task.taskId, event.eventId);
+              continue;
+            }
             if (!response.ok) {
               this.warn(response.status === 400 && event.delivery
                 ? 'Notification service does not support push-only task events; committed events retained'

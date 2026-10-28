@@ -24,10 +24,11 @@ function bind(bindings: Record<string, string | null>, event: ConversationEventV
   for (const key of keys.slice(0, Math.max(0, keys.length - MAX_BINDINGS))) delete bindings[key];
 }
 /** Startup skips earlier history, where a live generation's binding may lie: seed from the durable sidecar, keyed by
- * exact generation. Unreadable evidence leaves every generation unbound (unknown), never assigned to a task. */
-function seedBindings(roleDir: string): Record<string, string | null> {
+ * exact generation. An absent sidecar is legacy history (generations stay unknown); an unreadable or invalid one is
+ * unavailable evidence and returns undefined, so the caller holds its checkpoint instead of emitting unowned work. */
+function seedBindings(roleDir: string): Record<string, string | null> | undefined {
   try { return Object.fromEntries(Object.entries(readSessionOwnership(roleDir)).map(([generation, owner]) => [generation, owner.taskId])); }
-  catch { return {}; }
+  catch { return undefined; }
 }
 
 /** Read durable supervisor ledgers without restarting agents or attaching a
@@ -161,7 +162,11 @@ export class FleetNotificationProducer {
           if (initial === null) throw Error('Notification startup ledger boundary unavailable');
           // History before the startup boundary is skipped, but the live generation's binding may lie in it:
           // seed it from the role's durable ownership sidecar.
-          outbox.saveCheckpoint(initial ? { ...initial, bindings: seedBindings(roleDir) } : {segment:segments[0], offset:0, prompts:[]});
+          if (initial) {
+            const bindings = seedBindings(roleDir);
+            if (!bindings) { this.warn('Notification ownership evidence unavailable; ledger admission held'); this.retryAt.set(roleDir, Date.now() + 30_000); this.dirty.add(roleDir); return; }
+            outbox.saveCheckpoint({ ...initial, bindings });
+          } else outbox.saveCheckpoint({segment:segments[0], offset:0, prompts:[]});
         }
         const saved = outbox.checkpoint as Checkpoint;
         const current = { ...saved, prompts: [...saved.prompts], messages: { ...saved.messages }, bindings: { ...saved.bindings } };
@@ -181,7 +186,7 @@ export class FleetNotificationProducer {
         const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(Math.min(BATCH_BYTES, remaining));
         let count: number;
         try { count = readSync(fd, buffer, 0, buffer.length, current.offset); } finally { closeSync(fd); }
-        let position = 0, blocked = false, sidecar: Record<string, string | null> | undefined;
+        let position = 0, blocked = false, unavailable = false, sidecar: Record<string, string | null> | undefined;
         while (position < count) {
           const end = buffer.indexOf(10, position);
           if (end < 0 || end >= count) {
@@ -208,8 +213,10 @@ export class FleetNotificationProducer {
             // Task association only from this generation's own binding: a task, null (non-task role), or unknown (omitted).
             // A generation bound before this checkpoint (an older checkpoint, or startup history) is recovered from the
             // durable sidecar by exact generation; other generations are never relabelled.
+            // Unavailable sidecar evidence holds the checkpoint before this completion: nothing unowned is emitted.
             if (!Object.hasOwn(current.bindings, event.sessionGeneration)) {
               sidecar ??= seedBindings(roleDir);
+              if (!sidecar) { unavailable = true; break; }
               if (Object.hasOwn(sidecar, event.sessionGeneration)) current.bindings[event.sessionGeneration] = sidecar[event.sessionGeneration];
             }
             const binding = Object.hasOwn(current.bindings, event.sessionGeneration) ? { taskId: current.bindings[event.sessionGeneration] } : {};
@@ -220,8 +227,10 @@ export class FleetNotificationProducer {
           if (performance.now() >= deadline) break;
         }
         if (current.segment !== saved.segment || current.offset !== saved.offset) outbox.saveCheckpoint(current);
-        if (blocked) {
-          this.retryAt.set(roleDir, Date.now() + 1000); this.dirty.add(roleDir);
+        if (unavailable) this.warn('Notification ownership evidence unavailable; ledger admission held');
+        if (blocked || unavailable) {
+          // Corrupt evidence needs an operator repair: re-check it slowly rather than spin.
+          this.retryAt.set(roleDir, Date.now() + (unavailable ? 30_000 : 1000)); this.dirty.add(roleDir);
         } else if ((current.segment !== saved.segment || current.offset !== saved.offset)
           && (current.offset < statSync(join(dir, current.segment)).size || index < segments.length - 1)) this.dirty.add(roleDir);
       } catch {

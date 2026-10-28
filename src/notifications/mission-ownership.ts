@@ -2,8 +2,8 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
-import { pendingMissionCleanups, settleMissionCleanup } from '../rooms-tasks/notification-manifest.js';
-import { notificationRoomCids, recordNotificationRooms } from '../rooms-tasks/task-state.js';
+import { canonicalCid, pendingMissionCleanups, settleMissionCleanup, unavailableMissionCleanups, validRoomCid, type TaskNotificationManifest } from '../rooms-tasks/notification-manifest.js';
+import { advanceNotificationRevision, notificationRoomCids, recordNotificationRooms } from '../rooms-tasks/task-state.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import { producerConfig, type ProducerConfig } from './outbox.js';
 
@@ -28,10 +28,27 @@ export async function missionRequest(config: ProducerConfig, path: string, body:
 }
 
 /**
+ * Register the task's current manifest. Only a 2xx response whose `contactIds` include every requested room proves
+ * coverage. A 409 (mission deleted, stale or conflicting revision) proves nothing about these rooms: the local revision
+ * is moved past the refused one, so a later retry registers the full union under a newer revision, and this attempt fails.
+ */
+async function registerMission(config: ProducerConfig, taskId: string, manifest: TaskNotificationManifest, request?: typeof fetch): Promise<void> {
+  const { status, data } = await missionRequest(config, '/api/v1/missions/associate',
+    { taskId, revision: manifest.revision, contactIds: manifest.room_cids }, request);
+  if (status >= 200 && status < 300) {
+    const registered = Array.isArray(data?.contactIds) ? new Set((data.contactIds as unknown[]).filter(validRoomCid).map(canonicalCid)) : undefined;
+    if (registered && manifest.room_cids.every(cid => registered.has(cid))) return;
+    throw new MissionOwnershipUnavailable('notification service did not confirm every mission room');
+  }
+  if (status === 409) advanceNotificationRevision(taskId, manifest.revision);
+  throw new MissionOwnershipUnavailable(`notification service refused room registration (HTTP ${status})`);
+}
+
+/**
  * Register a room as this task's before the Owner can join it: with own-room messages off, the service must know
- * the room before the room can message the Owner. Unreachable service → throws, so room activation waits and retries.
- * No producer configured → nothing to gate. An older service without the route → admitted with a warning (it cannot
- * suppress own-room messages either).
+ * the room before the room can message the Owner. Unreachable service or unconfirmed coverage → throws, so room
+ * activation waits and retries. No producer configured → nothing to gate. An older service without the route →
+ * admitted with a warning (it cannot suppress own-room messages either).
  */
 export async function associateRoomNotifications(taskId: string, roomCid: string, options: {
   config?: ProducerConfig | undefined; warn?: (line: string) => void; request?: typeof fetch;
@@ -39,14 +56,8 @@ export async function associateRoomNotifications(taskId: string, roomCid: string
   const manifest = recordNotificationRooms(taskId, [roomCid]);
   const config = 'config' in options ? options.config : producerConfig();
   if (!config) return;
-  try {
-    const { status } = await missionRequest(config, '/api/v1/missions/associate',
-      { taskId, revision: manifest.revision, contactIds: manifest.room_cids }, options.request);
-    // 409 stale: a newer manifest revision is already registered. 409 deleted: the task is being retired.
-    if (status >= 200 && status < 300) return;
-    if (status === 409) return;
-    throw new MissionOwnershipUnavailable(`notification service refused room registration (HTTP ${status})`);
-  } catch (error) {
+  try { await registerMission(config, taskId, manifest, options.request); }
+  catch (error) {
     if (error instanceof MissionOwnershipUnsupported) { options.warn?.('Notification service does not support mission rooms; own-room message preferences are unavailable'); return; }
     if (error instanceof MissionOwnershipUnavailable) throw new Error('Waiting for notification service to register the mission room');
     throw error;
@@ -68,13 +79,27 @@ export async function drainMissionCleanup(config: ProducerConfig, warn: (line: s
     }
     return true;
   }
-  return pending || pendingMissionCleanups().length > 32;
+  // An unreadable intent stays pending (and its file retained): overall cleanup is never reported done around it.
+  const unavailable = unavailableMissionCleanups();
+  if (unavailable.length) warn(`Mission notification cleanup unavailable for ${unavailable.length} unreadable intent(s); files retained`);
+  return pending || unavailable.length > 0 || pendingMissionCleanups().length > 32;
 }
 
 const bootstrapFile = () => join(stateRoot(), 'notifications', 'mission-bootstrap.json');
+/** Only a missing file starts at 0. Unreadable, corrupt or out-of-range state is refused and its bytes are kept. */
 function nextGeneration(): number {
+  let text: string | undefined;
+  try { text = readFileSync(bootstrapFile(), 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new MissionOwnershipUnavailable('mission bootstrap state unreadable'); }
   let generation = 0;
-  try { const value = JSON.parse(readFileSync(bootstrapFile(), 'utf8')); if (Number.isSafeInteger(value?.generation)) generation = value.generation; } catch { /* first run */ }
+  if (text !== undefined) {
+    let value: unknown;
+    try { value = JSON.parse(text); } catch { throw new MissionOwnershipUnavailable('mission bootstrap state corrupt; file retained'); }
+    const stored = value && typeof value === 'object' && !Array.isArray(value) ? (value as { generation?: unknown }).generation : undefined;
+    if (typeof stored !== 'number' || !Number.isSafeInteger(stored) || stored < 0) throw new MissionOwnershipUnavailable('mission bootstrap state invalid; file retained');
+    generation = stored;
+  }
+  if (!Number.isSafeInteger(generation + 1)) throw new MissionOwnershipUnavailable('mission bootstrap generation exhausted');
   mkdirSync(dirname(bootstrapFile()), { recursive: true, mode: 0o700 });
   replaceFileAtomically(bootstrapFile(), JSON.stringify({ generation: generation + 1 }) + '\n', 0o600);
   return generation + 1;
@@ -83,21 +108,17 @@ function nextGeneration(): number {
 /**
  * Register every existing task's rooms under one numbered run, then mark the run complete. Until a run completes
  * the service refuses own-room OFF, so no room that existed before this release can escape the preference.
+ * The inventory is read in full before the run starts: an unreadable task or layout throws, and the run never
+ * completes on partial evidence. Every task must be confirmed by the service before completion.
  */
 export async function bootstrapMissionRooms(config: ProducerConfig, tasks: () => TaskRecord[], layoutRooms: (task: TaskRecord) => string[],
   request: typeof fetch = fetch): Promise<void> {
+  const inventory = tasks().filter(task => task.deletion?.status !== 'pending')
+    .map(task => ({ task, cids: [...notificationRoomCids(task), ...layoutRooms(task)] })).filter(entry => entry.cids.length);
   const generation = nextGeneration();
   const begin = await missionRequest(config, '/api/v1/missions/bootstrap', { generation, complete: false }, request);
   if (begin.status < 200 || begin.status >= 300) throw new MissionOwnershipUnavailable(`bootstrap refused (HTTP ${begin.status})`);
-  for (const task of tasks()) {
-    if (task.deletion?.status === 'pending') continue;
-    const cids = [...notificationRoomCids(task), ...layoutRooms(task)];
-    if (!cids.length) continue;
-    const manifest = recordNotificationRooms(task.task_id, cids);
-    const { status } = await missionRequest(config, '/api/v1/missions/associate',
-      { taskId: task.task_id, revision: manifest.revision, contactIds: manifest.room_cids }, request);
-    if ((status < 200 || status >= 300) && status !== 409) throw new MissionOwnershipUnavailable(`room registration refused (HTTP ${status})`);
-  }
+  for (const { task, cids } of inventory) await registerMission(config, task.task_id, recordNotificationRooms(task.task_id, cids), request);
   const done = await missionRequest(config, '/api/v1/missions/bootstrap', { generation, complete: true }, request);
   if (done.status < 200 || done.status >= 300) throw new MissionOwnershipUnavailable(`bootstrap completion refused (HTTP ${done.status})`);
 }

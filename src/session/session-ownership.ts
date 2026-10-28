@@ -11,10 +11,11 @@ const MAX_GENERATIONS = 16;
 /** Canonical Fleet task identity; a task owner always has a launch. */
 export const validOwnerTask = (taskId: unknown): taskId is string => typeof taskId === 'string' && /^[0-9a-z]{9}[0-9a-f]{8}$/.test(taskId);
 
+/** Absent evidence is `{}` (no file: ENOENT only). Unreadable or invalid evidence throws and is never treated as absent. */
 export function readSessionOwnership(stateDir: string): Record<string, SessionOwnership> {
-  const path = join(stateDir, SESSION_OWNERSHIP_FILE);
-  if (!existsSync(path)) return {};
-  const text = readFileSync(path, 'utf8');
+  let text: string;
+  try { text = readFileSync(join(stateDir, SESSION_OWNERSHIP_FILE), 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}; throw error; }
   if (text.length > 64 * 1024) throw new Error('session ownership evidence too large');
   const value = JSON.parse(text);
   if (value?.schema !== 1 || !value.generations || typeof value.generations !== 'object' || Array.isArray(value.generations)) throw new Error('invalid session ownership evidence');
@@ -45,8 +46,9 @@ export function recordSessionOwnership(conversation: ConversationEventStore, ses
   }
   const draft = { kind: 'session.ownership' as const, sessionGeneration, payload: owner };
   if (!owner.taskId) {
-    // A standalone role keeps the existing degrade-not-die behaviour; missing evidence then means "unknown", never a task.
-    try { writeSidecar(stateDir, sessionGeneration, owner); } catch { /* evidence unavailable: completions stay unlabelled */ }
+    // A standalone role keeps the existing degrade-not-die behaviour. A sidecar that cannot be updated is left exactly as
+    // it was (never reset): the ledger event still binds this generation, and the observer refuses to guess from it.
+    try { writeSidecar(stateDir, sessionGeneration, owner); } catch { /* evidence preserved; the ledger binding remains */ }
     conversation.appendSafe(draft);
     return;
   }
@@ -54,9 +56,9 @@ export function recordSessionOwnership(conversation: ConversationEventStore, ses
   conversation.append(draft);
 }
 
+/** Initializes only on proven absence. Corrupt or unreadable prior evidence throws and its bytes stay untouched. */
 function writeSidecar(stateDir: string, sessionGeneration: string, owner: SessionOwnership): void {
-  let generations: Record<string, SessionOwnership> = {};
-  try { generations = readSessionOwnership(stateDir); } catch { generations = {}; }
+  const generations = readSessionOwnership(stateDir);
   delete generations[sessionGeneration];
   const kept = Object.entries(generations).slice(-(MAX_GENERATIONS - 1));
   replaceFileAtomically(join(stateDir, SESSION_OWNERSHIP_FILE),

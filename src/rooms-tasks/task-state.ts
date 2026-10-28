@@ -257,8 +257,10 @@ function typedTaskNotification(value: TaskNotificationEvent, id: string): boolea
 }
 
 /** Atomic snapshots contain the events, including intermediate states between polls. */
-export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[] }> {
-  const result: Array<{ taskId: string; events: TaskNotificationEvent[] }> = [];
+/** `upgraded`: IDs of events queued by an earlier release without a delivery policy. They are sent push-only under the
+ * same event ID (state transitions never count as unread); the queued record itself is not rewritten. */
+export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[]; upgraded: string[] }> {
+  const result: Array<{ taskId: string; events: TaskNotificationEvent[]; upgraded: string[] }> = [];
   for (const dir of [tasksDir()]) {
     if (!existsSync(dir)) continue;
     for (const file of readdirSync(dir).filter(file => TASK_ID_PATTERN.test(file.slice(0, -5)) && file.endsWith('.json'))) {
@@ -273,8 +275,10 @@ export function pendingTaskNotifications(warn: (line: string) => void = () => {}
         if (!Array.isArray(value.notification_events)) throw new Error('invalid notification events');
         // Only typed task events are delivered. Unsupported entries are never sent or converted,
         // and they do not block later lifecycle events.
-        const events = value.notification_events.filter(event => typedTaskNotification(event, id));
-        if (events.length) result.push({ taskId: id, events });
+        const typed = value.notification_events.filter(event => typedTaskNotification(event, id));
+        const upgraded = typed.filter(event => event.delivery === undefined).map(event => event.eventId);
+        const events = typed.map(event => event.delivery ? event : { ...event, delivery: 'push-only' as const });
+        if (events.length) result.push({ taskId: id, events, upgraded });
       } catch (error) {
         if (!isNotFoundError(error)) warn('Task notification record unavailable; other task deliveries continue');
       }
@@ -716,6 +720,18 @@ export function recordNotificationRooms(id: string, cids: string[]): TaskNotific
     const next = withManifestRooms(t.notification_manifest, cids);
     if (next !== t.notification_manifest) { t.notification_manifest = next; writeTask(t); }
     return next;
+  });
+}
+
+/** After a refused registration (409), move the manifest revision past the refused one; rooms are unchanged. A retry
+ * then registers the full union under a newer revision. Nothing happens if the manifest already moved on. */
+export function advanceNotificationRevision(id: string, refused: number): void {
+  assertCanonicalTaskId(id);
+  withTaskLock(id, () => {
+    const t = readTask(id);
+    if (t.deletion?.status === 'pending' || t.notification_manifest?.revision !== refused) return;
+    t.notification_manifest = { ...t.notification_manifest, revision: refused + 1 };
+    writeTask(t);
   });
 }
 
