@@ -98,6 +98,48 @@ it('an unavailable sidecar holds a completion instead of emitting it unowned; re
   expect(accepted[0]).toMatchObject({ eventId: `member:g:${done.seq}`, taskId: TASK });
 });
 
+/** Loopback agent-completion receiver for observer fixtures. */
+async function receiver() {
+  const accepted: any[] = [];
+  const server = createServer(async (req, res) => { let raw = ''; for await (const chunk of req) raw += chunk; accepted.push(JSON.parse(raw)); res.end('{}'); });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  cleanup.push(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); });
+  return { accepted, config: { origin: `http://127.0.0.1:${(server.address() as any).port}`, token: 't'.repeat(40) } };
+}
+
+it('an existing role whose sidecar is unavailable at startup gets no checkpoint and emits nothing; repair resumes from the boundary', async () => {
+  const dir = mkdtempSync(join('.test-artifacts', 'sidecar-startup-')), { accepted, config: live } = await receiver();
+  const root = join(dir, 'agents'), roleDir = join(root, 'member'), state = join(dir, 'outboxes'); mkdirSync(root);
+  const store = new ConversationEventStore(join(roleDir, '.conversation'), { roleId: 'member' }); cleanup.push(() => store.close());
+  // History before startup: the generation's binding lies here, so only the sidecar can supply it after the boundary.
+  store.append({ kind: 'session.ownership', sessionGeneration: 'g', payload: { launchId: 'l', taskId: TASK } });
+  writeFileSync(join(roleDir, SESSION_OWNERSHIP_FILE), '{"schema":1,"generations":');
+  vi.useFakeTimers({ toFake: ['Date'] }); cleanup.push(() => vi.useRealTimers());
+  const producer = new FleetNotificationProducer([root], state, live); cleanup.push(() => producer.close());
+  store.append({ kind: 'prompt.admitted', promptId: 'p', source: 'browser', sessionGeneration: 'g', payload: {} });
+  const done = store.append({ kind: 'turn.completed', promptId: 'p', sessionGeneration: 'g', payload: { outcome: 'completed' } });
+  producer.poll(); await producer.drain(); producer.poll(); await producer.drain();
+  expect(accepted).toEqual([]);
+  expect(existsSync(state) ? readdirSync(state) : []).toEqual([]);               // no checkpoint was created
+  writeFileSync(join(roleDir, SESSION_OWNERSHIP_FILE), JSON.stringify({ schema: 1, generations: { g: { launchId: 'l', taskId: TASK } } }));
+  vi.setSystemTime(Date.now() + 31_000);                                         // past the 30 s re-check
+  await vi.waitFor(async () => { producer.poll(); await producer.drain(); expect(accepted).toHaveLength(1); });
+  expect(accepted[0]).toMatchObject({ eventId: `member:g:${done.seq}`, taskId: TASK });
+});
+
+it('a binding already in the checkpoint needs no sidecar: an unavailable sidecar does not hold that completion', async () => {
+  const dir = mkdtempSync(join('.test-artifacts', 'sidecar-trusted-')), { accepted, config: live } = await receiver();
+  const root = join(dir, 'agents'), roleDir = join(root, 'member'); mkdirSync(root);
+  const producer = new FleetNotificationProducer([root], join(dir, 'outboxes'), live); cleanup.push(() => producer.close());
+  const store = new ConversationEventStore(join(roleDir, '.conversation'), { roleId: 'member' }); cleanup.push(() => store.close());
+  mkdirSync(join(roleDir, SESSION_OWNERSHIP_FILE));                               // unreadable (EISDIR)
+  store.append({ kind: 'session.ownership', sessionGeneration: 'g', payload: { launchId: 'l', taskId: TASK } });
+  store.append({ kind: 'prompt.admitted', promptId: 'p', source: 'browser', sessionGeneration: 'g', payload: {} });
+  store.append({ kind: 'turn.completed', promptId: 'p', sessionGeneration: 'g', payload: { outcome: 'completed' } });
+  await vi.waitFor(async () => { producer.poll(); await producer.drain(); expect(accepted).toHaveLength(1); });
+  expect(accepted[0].taskId).toBe(TASK);
+});
+
 // #3 bootstrap generation
 it('bootstrap generation: only a missing file starts at 1; corrupt, invalid or exhausted state is refused with its bytes kept', async () => {
   for (const contents of ['{', '7', '"1"', '[]', '{"generation":-1}', '{"generation":1.5}', '{"generation":"2"}', `{"generation":${Number.MAX_SAFE_INTEGER}}`]) {
@@ -108,6 +150,11 @@ it('bootstrap generation: only a missing file starts at 1; corrupt, invalid or e
     expect(readFileSync(bootstrapFile(), 'utf8')).toBe(contents);
   }
   rmSync(bootstrapFile());
+  mkdirSync(bootstrapFile());                                                    // unreadable existing state (EISDIR) is not absent
+  const blocked = service();
+  await expect(bootstrapMissionRooms(config, () => [], () => [], blocked.request)).rejects.toThrow(/unreadable/);
+  expect(blocked.calls).toEqual([]); expect(readdirSync(bootstrapFile())).toEqual([]);
+  rmSync(bootstrapFile(), { recursive: true });
   const fake = service();
   await bootstrapMissionRooms(config, () => [], () => [], fake.request);
   await bootstrapMissionRooms(config, () => [], () => [], fake.request);    // a restart never reuses a generation
@@ -143,6 +190,29 @@ it('bootstrap never completes on a refused or unconfirmed registration', async (
   const fake = service();
   await bootstrapMissionRooms(config, () => listTasks({ strict: true }), () => [], fake.request);
   expect(fake.calls.at(-1)?.body).toMatchObject({ complete: true });
+});
+
+it('a service holding another room set at the same or a newer revision converges through revision advances, never through a 409', async () => {
+  const task = create(); updateTaskRoom(task.task_id, 'room-1', OTHER);           // Fleet: revision 1 {B}
+  // Stateful fake following the Notifications Store association rules: older revision → 409 stale; same revision with a
+  // different set → 409 conflict; otherwise the union is stored and returned.
+  const stored = { revision: 3, contactIds: [ROOM.toUpperCase()] };               // service: revision 3 {A}
+  const fake = service((_path, body) => {
+    if (body.revision < stored.revision) return { status: 409, body: { error: { message: 'stale association' } } };
+    const union = [...new Set([...stored.contactIds, ...body.contactIds])];
+    if (body.revision === stored.revision && union.length !== stored.contactIds.length) return { status: 409, body: { error: { message: 'conflicting association' } } };
+    Object.assign(stored, { revision: body.revision, contactIds: union });
+    return { status: 200, body: { ...stored } };
+  });
+  const attempts: string[] = [];
+  for (let n = 0; n < 4; n++) {
+    try { await associateRoomNotifications(task.task_id, OTHER, { config, request: fake.request }); attempts.push('ok'); break; }
+    catch { attempts.push('refused'); }
+  }
+  // rev 1 stale, rev 2 stale, rev 3 conflict, rev 4 accepted with the union.
+  expect(attempts).toEqual(['refused', 'refused', 'refused', 'ok']);
+  expect(fake.calls.map(call => call.body.revision)).toEqual([1, 2, 3, 4]);
+  expect(stored).toEqual({ revision: 4, contactIds: [ROOM.toUpperCase(), OTHER.toUpperCase()] });
 });
 
 // #7 inventory
