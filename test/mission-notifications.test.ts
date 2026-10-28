@@ -7,7 +7,7 @@ import {
   updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import { appendTaskProgress, setTaskReviewMarkdown, taskContributionSummary } from '../src/rooms-tasks/task-review.js';
-import { pendingMissionCleanups } from '../src/rooms-tasks/notification-manifest.js';
+import { missionCleanupDir, pendingMissionCleanups } from '../src/rooms-tasks/notification-manifest.js';
 
 const ROOM = 'a'.repeat(64), LAYOUT = 'b'.repeat(64);
 const author = { kind: 'agent', role: 'dev-1', surface: 'mcp' } as const;
@@ -42,8 +42,12 @@ it('deletion acceptance drops queued transitions, produces no deleting/deleted e
   expect(getTask(task.task_id).notification_manifest?.room_cids).toEqual([ROOM.toUpperCase()]);
   expect(pendingMissionCleanups()).toEqual([{ schema: 1, taskId: task.task_id, contactIds: [ROOM.toUpperCase()] }]);
   // A retried acceptance heals a missing intent; unlink merges and emits nothing.
-  rmSync(join(process.env.OURS_FLEET_HOME!, 'notifications', 'mission-cleanup', `${task.task_id}.json`));
+  const cleanupFile = join(missionCleanupDir(), `${task.task_id}.json`);
+  expect(existsSync(cleanupFile)).toBe(true);
+  rmSync(cleanupFile);
+  expect(existsSync(cleanupFile)).toBe(false);
   beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
+  expect(existsSync(cleanupFile)).toBe(true);
   expect(pendingMissionCleanups()).toHaveLength(1);
   expect(unlinkDeletedTask(task.task_id)).toBe(true);
   expect(events(task.task_id)).toEqual([]);

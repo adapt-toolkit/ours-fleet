@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { readSessionOwnership, recordSessionOwnership, SESSION_OWNERSHIP_FILE } from '../src/session/session-ownership.js';
 import { TEMP_SUPERVISOR_FILE } from '../src/temp-lifecycle.js';
+import { stateRoot } from '../src/paths.js';
 import { FleetNotificationProducer } from '../src/notifications/fleet-producer.js';
 import { TaskNotificationProducer } from '../src/notifications/task-producer.js';
 import { associateRoomNotifications, bootstrapMissionRooms, drainMissionCleanup } from '../src/notifications/mission-ownership.js';
@@ -42,7 +43,7 @@ function service(answer: (path: string, body: any) => { status: number; body?: u
   }) as unknown as typeof fetch;
   return { calls, request };
 }
-const bootstrapFile = () => join(process.env.OURS_FLEET_HOME!, 'notifications', 'mission-bootstrap.json');
+const bootstrapFile = () => join(stateRoot(), 'notifications', 'mission-bootstrap.json');
 
 // #1 writer paths
 it('a corrupt or unreadable sidecar is never reset by a writer: an owned start fails, a standalone start keeps its bytes', () => {
@@ -152,7 +153,7 @@ it('a binding already persisted in the checkpoint needs no sidecar: after a rest
 // #3 bootstrap generation
 it('bootstrap generation: only a missing file starts at 1; corrupt, invalid or exhausted state is refused with its bytes kept', async () => {
   for (const contents of ['{', '7', '"1"', '[]', '{"generation":-1}', '{"generation":1.5}', '{"generation":"2"}', `{"generation":${Number.MAX_SAFE_INTEGER}}`]) {
-    mkdirSync(join(process.env.OURS_FLEET_HOME!, 'notifications'), { recursive: true }); writeFileSync(bootstrapFile(), contents);
+    mkdirSync(join(stateRoot(), 'notifications'), { recursive: true }); writeFileSync(bootstrapFile(), contents);
     const fake = service();
     await expect(bootstrapMissionRooms(config, () => [], () => [], fake.request)).rejects.toThrow();
     expect(fake.calls).toEqual([]);
