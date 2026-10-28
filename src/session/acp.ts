@@ -490,7 +490,9 @@ export class AcpSession implements AgentSession {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
-    recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir);
+    // Unavailable ownership refuses the start; release the ledger descriptor this constructor opened.
+    try { recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir); }
+    catch (error) { this.conversation.close(); throw error; }
     this.conversationStartCursor = this.conversation.lastCursor();
     // A durable append can precede its inventory mutation. Capture only after
     // the synchronous owner checkpoint, never the state at append notification.
@@ -572,7 +574,12 @@ export class AcpSession implements AgentSession {
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     const connection = app.connect(stream);
-    instance = new AcpSession(options, child, connection);
+    try { instance = new AcpSession(options, child, connection); }
+    catch (error) {
+      // A cleanup exception never replaces the ownership failure: both are kept.
+      throw await AcpSession.releaseFailedStart(child, connection, error)
+        .catch(cleanupError => new AggregateError([error, cleanupError], 'ACP start failed and its cleanup failed', { cause: error }));
+    }
     try {
       await instance.initialize();
       instance.startStallWatchdog();
@@ -583,6 +590,26 @@ export class AcpSession implements AgentSession {
       await instance.close();
       throw error;
     }
+  }
+
+  /** Construction failed after the child and connection exist: close the connection, stop the child (bounded TERM, then
+   * KILL), and check liveness at the end. Every cleanup failure is kept; a child not proven exited is named by pid. */
+  private static async releaseFailedStart(child: ChildProcessWithoutNullStreams, connection: acp.ClientConnection, error: unknown): Promise<unknown> {
+    const failures: unknown[] = [];
+    try { connection.close(); } catch (closeError) { failures.push(closeError); }
+    const exited = () => child.exitCode !== null || child.signalCode !== null;
+    const wait = (ms: number) => new Promise<void>(resolve => {
+      if (exited()) return resolve();
+      const settle = () => { clearTimeout(timer); child.off('exit', settle); resolve(); };
+      const timer = setTimeout(settle, ms); timer.unref();
+      child.on('exit', settle);
+    });
+    let killFailed = false;
+    const signal = (name: NodeJS.Signals) => { try { child.kill(name); } catch (killError) { killFailed = true; failures.push(killError); } };
+    if (!exited()) { signal('SIGTERM'); await wait(2_500); }
+    if (!exited()) { signal('SIGKILL'); await wait(2_500); }
+    if (!exited()) failures.push(new Error(`ACP child (pid ${child.pid}) ${killFailed ? 'exit unproven: a stop signal failed' : 'is still running'}`));
+    return failures.length ? new AggregateError([error, ...failures], 'ACP start failed and its release is unproven', { cause: error }) : error;
   }
 
   /**

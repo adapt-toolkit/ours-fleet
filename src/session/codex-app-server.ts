@@ -265,7 +265,9 @@ export class CodexAppServerSession implements AgentSession {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
-    recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir);
+    // Unavailable ownership refuses the start; release the ledger descriptor this constructor opened.
+    try { recordSessionOwnership(this.conversation, this.sessionGeneration, options.stateDir); }
+    catch (error) { this.conversation.close(); throw error; }
     this.conversationStartCursor = this.conversation.lastCursor();
     // A durable append can precede its inventory mutation. Capture only after
     // the synchronous owner checkpoint, never the state at append notification.
@@ -288,7 +290,14 @@ export class CodexAppServerSession implements AgentSession {
       onRequest: (method, id, params) => instance?.serverRequest(method, id, params),
       onExit: exit => instance?.transportExited(exit),
     });
-    instance = new CodexAppServerSession(options, transport);
+    try { instance = new CodexAppServerSession(options, transport); }
+    catch (error) {
+      // Existing bounded TERM→KILL; its waits are not proof, so liveness is checked after it returns.
+      const failures: unknown[] = [];
+      await transport.close().catch((closeError: unknown) => { failures.push(closeError); });
+      if (transport.isAlive()) failures.push(new Error(`Codex app-server transport (pid ${transport.pid}) is still running`));
+      throw failures.length ? new AggregateError([error, ...failures], 'Codex app-server start failed and its release is unproven', { cause: error }) : error;
+    }
     try {
       await instance.initialize();
       instance.recoverOpenPrompts();
