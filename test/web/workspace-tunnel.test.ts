@@ -97,42 +97,31 @@ it('closes a real missing-executable spawn promptly without leaving retry work',
   expect(JSON.parse(output).elapsed).toBeLessThan(2000);
 }, 15000);
 
-it('refuses a real missing connector before starting or scheduling retries', () => {
-  const module = pathToFileURL(resolve('dist/web/workspace-tunnel.js')).href;
-  const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
-    import { startWorkspaceTunnel } from ${JSON.stringify(module)};
-    try { await startWorkspaceTunnel(${JSON.stringify(origin)}); process.exitCode=2; }
-    catch(error) { console.log(error.message); }
-  `], { env: { ...process.env, PATH: dir }, encoding:'utf8',timeout:10000 });
-  expect(output).toMatch(/cloudflared could not be verified \(not found\).*2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/);
-},15000);
-
-it('refuses a real unsafe connector on PATH and never spawns it', () => {
+it.each([
+  ['missing', null, /cloudflared could not be verified \(not found\).*2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/],
+  ['unsafe', 'cloudflared version 2026.7.2 (built 2026-07-15-1200 UTC)', /cloudflared version 2026\.7\.2 is not permitted/],
+])('refuses a real %s connector on PATH before starting it or scheduling retries', (_, version, refusal) => {
   const bin = join(dir, 'bin');
   mkdirSync(bin);
-  writeFileSync(join(bin, 'cloudflared'), '#!/bin/sh\nif [ "$1" = --version ]; then echo "cloudflared version 2026.7.2 (built 2026-07-15-1200 UTC)"; else touch "$0.ran"; fi\n', { mode: 0o700 });
+  if (version) writeFileSync(join(bin, 'cloudflared'), `#!/bin/sh\nif [ "$1" = --version ]; then echo "${version}"; else touch "$0.ran"; fi\n`, { mode: 0o700 });
   const module = pathToFileURL(resolve('dist/web/workspace-tunnel.js')).href;
   const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
     import { startWorkspaceTunnel } from ${JSON.stringify(module)};
     try { await startWorkspaceTunnel(${JSON.stringify(origin)}); process.exitCode=2; }
     catch(error) { console.log(error.message); }
   `], { env: { ...process.env, PATH: bin }, encoding:'utf8',timeout:10000 });
-  expect(output).toMatch(/cloudflared version 2026\.7\.2 is not permitted/);
+  expect(output).toMatch(refusal);
   expect(existsSync(join(bin, 'cloudflared.ran'))).toBe(false);
 },15000);
 
 it.each([
-  ['cloudflared version 2026.7.2', /cloudflared version 2026\.7\.2 is not permitted/],
-  ['cloudflared version 2026.10.2-rc.1', /cloudflared with an unrecognized version is not permitted/],
-])('rejects an installed unsafe connector %j without spawning a tunnel', async (stdout, found) => {
-  const refusal = startWorkspaceTunnel(origin, async () => ({ code: 0, stdout, stderr: '' }));
+  [{ code: 0, stdout: 'cloudflared version 2026.7.2' }, /cloudflared version 2026\.7\.2 is not permitted/],
+  [{ code: 0, stdout: 'cloudflared version 2026.10.2-rc.1' }, /cloudflared with an unrecognized version is not permitted/],
+  [{ code: 1, stdout: '' }, /cloudflared could not be verified \(version check failed\)/],
+])('rejects an installed unsafe or unverifiable connector %j without spawning a tunnel', async (result, found) => {
+  const refusal = startWorkspaceTunnel(origin, async () => ({ ...result, stderr: '' }));
   await expect(refusal).rejects.toThrow(found);
   await expect(refusal).rejects.toThrow(/2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared/);
-  expect(launch).not.toHaveBeenCalled();
-});
-
-it('rejects a failing version check without spawning a tunnel', async () => {
-  await expect(startWorkspaceTunnel(origin, async () => ({ code: 1, stdout: '', stderr: 'timed out' }))).rejects.toThrow(/cloudflared could not be verified \(version check failed\)/);
   expect(launch).not.toHaveBeenCalled();
 });
 
