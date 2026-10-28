@@ -97,10 +97,14 @@ describe('task-scoped layout snapshots', () => {
   });
 });
 
+// These tests isolate snapshot/provenance and operation admission; native startup is exercised
+// through the real engine in empty-task-layout.test.ts.
+class SnapshotLayouts extends TaskLayouts { override async initializeRooms(): Promise<void> {} }
+
 describe('layout tasks', () => {
   const launches: string[][] = [];
   const service = () => new TaskRoomApplicationService(config, {
-    taskLayouts: new TaskLayouts(config, { launch: async args => { launches.push(args); } }),
+    taskLayouts: new SnapshotLayouts(config, { launch: async args => { launches.push(args); } }),
   });
   const actor = { kind: 'local_control' as const, surface: 'web' as const };
   beforeEach(() => { launches.length = 0; writeLayout('work'); });
@@ -123,7 +127,7 @@ describe('layout tasks', () => {
       { key: 'delivery:qa', participant: 'qa', room: 'delivery', agent_template: 'Agent', owned: true, retired: false },
     ]);
     // Rechecking the original task/run provenance must not require an expanded definition.
-    await new TaskLayouts(config).ensureRun(task);
+    await new SnapshotLayouts(config).ensureRun(task);
     const source = new RoomLayoutService(config).definition('work');
     expect(task.layout!.definition_hash).toBe(layoutDefinitionHash(source));
     const changed = structuredClone(source); changed.participants.qa.instance_scope = 'layout';
@@ -195,7 +199,7 @@ describe('layout tasks', () => {
     await expect(app.launchTaskLayoutOperation({ actor, taskId: backlog.task_id, operation: 'open', room: 'design' }))
       .rejects.toThrow(/start the task before opening rooms/);
     const failing = new TaskRoomApplicationService(config, {
-      taskLayouts: new TaskLayouts(config, { launch: async () => { throw Error('no systemd'); } }) });
+      taskLayouts: new SnapshotLayouts(config, { launch: async () => { throw Error('no systemd'); } }) });
     const other = await failing.createTask({ actor, title: 'Fail', layout: 'work', origin: { type: 'web' } });
     await expect(failing.launchTaskLayoutOperation({ actor, taskId: other.task_id, operation: 'open', room: 'design' })).rejects.toThrow(/no systemd/);
     expect(failing.taskLayout(other.task_id).operation).toMatchObject({ status: 'failed', error: expect.stringMatching(/worker failed to start/) });
@@ -245,7 +249,7 @@ describe('layout tasks', () => {
 
 it('summarizes layout rooms for task listings without exposing run internals', async () => {
   writeLayout('work');
-  const app = new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+  const app = new TaskRoomApplicationService(config, { taskLayouts: new SnapshotLayouts(config, { launch: async () => {} }) });
   const task = await app.createTask({ actor: { kind: 'local_control', surface: 'web' }, title: 'Ship', layout: 'work', origin: { type: 'web' } });
   expect(app.withLayoutRooms(task).layout_rooms).toEqual([{ key: 'design', state: 'declared' }, { key: 'delivery', state: 'declared' }]);
   expect(app.getTask(task.task_id).task.layout_rooms).toHaveLength(2);
@@ -258,7 +262,7 @@ it('summarizes layout rooms for task listings without exposing run internals', a
 describe('layout task races and worker boundaries', () => {
   const actor = { kind: 'local_control' as const, surface: 'web' as const };
   const worker = { kind: 'internal_worker' as const, surface: 'cli' as const };
-  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new SnapshotLayouts(config, { launch: async () => {} }) });
   beforeEach(() => writeLayout('work'));
 
   it('refuses a run file that does not carry this task\'s provenance', async () => {
@@ -306,7 +310,7 @@ describe('layout task races and worker boundaries', () => {
   });
 
   it('does not recreate a run removed by deletion when a stale open worker proceeds', async () => {
-    const layouts = new TaskLayouts(config, { launch: async () => {} });
+    const layouts = new SnapshotLayouts(config, { launch: async () => {} });
     const a = new TaskRoomApplicationService(config, { taskLayouts: layouts });
     const task = await a.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
     await layouts.closeAndForget(task);           // deletion cleanup wins the race
@@ -330,7 +334,7 @@ describe('operation status ownership', () => {
 
   it('never lets a superseded open worker overwrite the terminal close status', async () => {
     const launches: string[][] = [];
-    const layouts = new TaskLayouts(config, { launch: async args => { launches.push(args); } });
+    const layouts = new SnapshotLayouts(config, { launch: async args => { launches.push(args); } });
     const app = new TaskRoomApplicationService(config, { taskLayouts: layouts });
     const task = await app.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
     const open = await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
@@ -345,7 +349,7 @@ describe('operation status ownership', () => {
   });
 
   it('does not resurrect an operation record removed by deletion', async () => {
-    const layouts = new TaskLayouts(config, { launch: async () => {} });
+    const layouts = new SnapshotLayouts(config, { launch: async () => {} });
     const app = new TaskRoomApplicationService(config, { taskLayouts: layouts });
     const task = await app.createTask({ actor, title: 'Ship', layout: 'work', origin: { type: 'web' } });
     const open = await app.launchTaskLayoutOperation({ actor, taskId: task.task_id, operation: 'open', room: 'design' });
@@ -365,7 +369,7 @@ describe('choosing a Backlog task\'s room layout', () => {
       room_templates: { solo: { version: 1, description: 'one agent', members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] } } } as any);
     writeLayout('work'); writeLayout('other', { ...LAYOUT, description: 'Other' });
   });
-  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new TaskLayouts(config, { launch: async () => {} }) });
+  const app = () => new TaskRoomApplicationService(config, { taskLayouts: new SnapshotLayouts(config, { launch: async () => {} }) });
 
   it('replaces a sealed one-room plan with a layout, releases its snapshot, and starts with the chosen layout', async () => {
     const a = app();

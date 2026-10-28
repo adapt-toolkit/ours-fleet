@@ -19,6 +19,7 @@ import { RoomLayout, type LayoutInstance, type LayoutSupervisor } from '../src/r
 import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import { stateRoot } from '../src/paths.js';
 import { layoutOwnedMemberName } from '../src/rooms-tasks/layout-member-retirement.js';
+import { activateTask, startTask } from '../src/rooms-tasks/task-state.js';
 
 const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
 let root: string, previousHome: string | undefined, previousUmask: number;
@@ -55,7 +56,7 @@ function fakes() {
   return { rooms, running, events, supervisor, cowork, setRunId: (id: string) => { runId = id; } };
 }
 
-it('authors a layout, runs a multi-room task through its lifecycle over HTTP, and cleans up on finish and deletion', async () => {
+it('authors a layout and preserves manual room recovery for a retained pre-autostart task, including cleanup', async () => {
   const config = join(root, 'fleet.yaml');
   writeV2Fixture(config, { roles: {}, rooms: { owner: { expected_cid: '0'.repeat(64) }, defaults: { attach_owner: false } } });
   mkdirSync(join(root, 'fleet', 'room_layouts'), { mode: 0o700 });
@@ -97,11 +98,13 @@ it('authors a layout, runs a multi-room task through its lifecycle over HTTP, an
     expect((await call('PUT', '/api/v1/room-layouts/delivery', { revision: 'absent', definition })).status).toBe(200);
     expect((await call('GET', '/api/v1/room-layouts')).body.layouts[0]).toMatchObject({ name: 'delivery', issues: [] });
 
-    // Create a started layout task: no legacy room, task-scoped snapshot, both rooms declared.
-    const created = await call('POST', '/api/v1/tasks', { title: 'Ship', brief: 'Original brief', layout: 'delivery' });
+    // Seed the retained state used by the previous version: active task, declared rooms.
+    // New automatic startup is covered separately through HTTP and the real engine.
+    const created = await call('POST', '/api/v1/tasks', { title: 'Ship', brief: 'Original brief', layout: 'delivery', backlog: true });
     expect(created.status).toBe(201);
     const task = created.body.task; const id = task.task_id as string;
-    expect(task).toMatchObject({ state: 'active', layout: { name: 'delivery', run_id: `task-${id}` } });
+    expect(task).toMatchObject({ state: 'backlog', layout: { name: 'delivery', run_id: `task-${id}` } });
+    startTask(id); await layouts.ensureRun(app.getTask(id).task); activateTask(id);
     expect(task.room_id).toBeUndefined(); expect(created.body.provisioning).toBeUndefined();
     expect((await layoutOf(id)).rooms.map((r: any) => [r.key, r.state])).toEqual([['design', 'declared'], ['delivery', 'declared']]);
 

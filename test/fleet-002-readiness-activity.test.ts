@@ -85,9 +85,11 @@ describe('FLEET-002 — a steered wake turn produces no turn evidence', () => {
     expect(await session.submitPrompt('hello')).toMatchObject({ outcome: 'completed' });
     expect(session.snapshot().readiness).toBe('idle');
 
-    const wake = await session.submitPromptAfterTool(
-      '[fleet-monitor] 1 new message — steer tool', { origin: { kind: 'fleet-monitor' }, steer: true },
-    );
+    // An idle wake is now admitted as a turn Fleet owns; a turn only the
+    // adapter knows about remains possible when steering races the end of an
+    // owned turn. Drive that steering request directly.
+    const wake = await (session as unknown as { steerPrompt(text: string): Promise<unknown> })
+      .steerPrompt('[fleet-monitor] 1 new message — steer tool');
     expect(wake).toMatchObject({ accepted: true, detail: 'startedNewTurn' });
     for (let i = 0; i < 50 && (session.snapshot().activity?.activeToolCalls ?? 0) === 0; i++)
       await new Promise(resolve => setTimeout(resolve, 10));

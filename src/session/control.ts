@@ -232,6 +232,8 @@ export class RoleControlServer {
   private readonly sockets = new Set<Socket>();
   /** Interrupt idempotency: same command id returns the first receipt. */
   private readonly interruptCommands = new Map<string, unknown>();
+  /** A Stop retried while its first attempt is settling joins that attempt instead of cancelling the next turn. */
+  private readonly interruptsInFlight = new Map<string, Promise<unknown>>();
   private correspondence?: SupervisorCorrespondence;
   setCorrespondence(value: SupervisorCorrespondence):void { this.correspondence=value; }
   private ownerChannel?: OwnerChannelHandle;
@@ -367,6 +369,7 @@ export class RoleControlServer {
             version: 1, id: request.id, ok: true,
             result: {
               ...this.session.snapshot(),
+              ownerChannelCid: this.ownerChannel?.ownerChannelCid?.(),
               protocolVersion: this.session.conversationPage ? 3 : 2,
               features: [
                 'events_since', 'observer_follow', 'retained_range',
@@ -684,17 +687,21 @@ export class RoleControlServer {
             this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
             return;
           }
-          const outcome = await interruptSession(this.session, 'local-console');
-          const receipt = {
-            accepted: true, commandId: request.commandId, at: new Date().toISOString(),
-            ...outcome,
-          };
-          this.interruptCommands.set(request.commandId, receipt);
-          if (this.interruptCommands.size > 200) {
-            const oldest = this.interruptCommands.keys().next().value as string;
-            this.interruptCommands.delete(oldest);
+          const commandId = request.commandId;
+          let attempt = this.interruptsInFlight.get(commandId);
+          if (!attempt) {
+            attempt = interruptSession(this.session, 'local-console').then(outcome => {
+              const receipt = { accepted: true, commandId, at: new Date().toISOString(), ...outcome };
+              this.interruptCommands.set(commandId, receipt);
+              if (this.interruptCommands.size > 200) {
+                const oldest = this.interruptCommands.keys().next().value as string;
+                this.interruptCommands.delete(oldest);
+              }
+              return receipt;
+            }).finally(() => this.interruptsInFlight.delete(commandId));
+            this.interruptsInFlight.set(commandId, attempt);
           }
-          this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
+          this.write(socket, { version: 1, id: request.id, ok: true, result: await attempt });
           return;
         }
         case 'respond_permission_v2': {
@@ -776,14 +783,23 @@ export async function controlRequest(
   const socket = createConnection(controlSocketPath(stateDir));
   socket.setEncoding('utf8');
   return new Promise<ControlResponse>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let settled = false, expiry: ReturnType<typeof setImmediate> | undefined;
+    const settle = () => { settled = true; clearTimeout(timer); if (expiry) clearImmediate(expiry); };
+    // Timers run before pending I/O. When this process was busy past the deadline, a reply
+    // already waiting on the socket is still unread: give it the next poll phase before
+    // declaring the supervisor silent. That is one event-loop turn, not added time; a reply
+    // arriving within that turn is accepted, and a silent supervisor fails in the same turn.
+    const timer = setTimeout(() => { expiry = setImmediate(() => {
+      if (settled) return;
+      settle();
       socket.destroy();
       reject(new SessionControlError('timeout',
         `the role control plane did not answer '${request.command}' within ${timeoutMs}ms`));
-    }, timeoutMs);
+    }); }, timeoutMs);
     let buffer = '';
     socket.once('error', error => {
-      clearTimeout(timer);
+      if (settled) return;
+      settle();
       const code = (error as NodeJS.ErrnoException).code;
       const permissionHint = code === 'EPERM' || code === 'EACCES'
         ? `; the operating system denied access before '${request.command}' reached the supervisor. `
@@ -798,8 +814,8 @@ export async function controlRequest(
     socket.on('data', chunk => {
       buffer += chunk;
       const newline = buffer.indexOf('\n');
-      if (newline < 0) return;
-      clearTimeout(timer);
+      if (newline < 0 || settled) return;
+      settle();
       try { resolve(JSON.parse(buffer.slice(0, newline)) as ControlResponse); }
       catch (error) {
         reject(new SessionControlError('backend',

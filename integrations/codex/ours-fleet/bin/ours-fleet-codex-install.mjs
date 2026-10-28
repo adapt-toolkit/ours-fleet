@@ -11,6 +11,14 @@ const run = (command, args, { optional = false } = {}) => {
   return true;
 };
 
+// Floors match src/security-versions.ts; refuse before any command, network access or write.
+const floors = { 22: [23, 4], 24: [22, 1], 26: [12, 1] };
+const node = process.versions.node, parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(node)?.slice(1).map(Number), floor = parsed && floors[parsed[0]];
+if (!floor || parsed[1] < floor[0] || (parsed[1] === floor[0] && parsed[2] < floor[1])) {
+  console.error(`ours-fleet-codex-install: Node.js ${/^[0-9A-Za-z.+-]{1,64}$/.test(node) ? node : 'unrecognized'} is not permitted. Ours requires a patched supported Node.js release: 22.23.4+, 24.22.1+, 26.12.1+ within those release lines; prerelease, end-of-life and unreviewed release lines are refused. Earlier patch levels are affected by CVE-2026-111497 (Brotli decompression out-of-bounds write): https://nodejs.org/en/blog/vulnerability/october-2026-security-releases Update Node.js from https://nodejs.org/en/download or your package manager, then retry.`);
+  process.exit(1);
+}
+
 try {
   if (!run('codex', ['--version'], { optional: true }))
     throw new Error('Codex CLI is not installed or not on PATH');

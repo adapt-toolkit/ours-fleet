@@ -20,6 +20,8 @@ it.each(['https://app.ours.network','https://app.ours-tunnel.com'].flatMap(appOr
  const reservation=createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');const port=(reservation.address() as {port:number}).port;if(!occupied)await new Promise<void>(r=>reservation.close(()=>r()));
  try{
   for(const key of ['OURS_PORT','OURS_STATE_DIR','OURS_API_TOKEN','OURS_DAEMON_ID','OURS_DAEMON_URL','OURS_DAEMON_CREDENTIAL_PATH'])delete process.env[key];
+  // A patched fixture connector, never the host's cloudflared with a fixture token.
+  const bin=join(dir,'bin');mkdirSync(bin);writeFileSync(join(bin,'cloudflared'),'#!/bin/sh\n[ "$1" = --version ] && { echo "cloudflared version 2026.10.2 (built fixture)"; exit 0; }\nexec /bin/sleep 600\n',{mode:0o700});process.env.PATH=bin+':'+process.env.PATH;
   process.env.OURS_FLEET_HOME=dir;const profile=join(dir,'profile.json'),credential=join(dir,'server-credential');writeFileSync(credential,'fixture-server-credential-32-characters\n',{mode:0o600});writeFileSync(profile,JSON.stringify({serverUrl:providerOrigin,endpoint:providerOrigin+'/daemon',expectedInstanceId:'12345678-1234-1234-1234-123456789abc',credentialPath:credential}),{mode:0o600});process.env.OURS_CONFIG=profile;
   const config=join(dir,'fleet.yaml');await ensureMinimalSetup(config);
   const access=new WebAccessStore();access.write({version:1,mode:'none'});

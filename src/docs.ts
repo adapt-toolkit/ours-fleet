@@ -659,6 +659,194 @@ without PRs links its actual deliverables, never an invented PR); the package ho
 rest, including the original description as an attached file.
 Full contract: \`docs/task-progress-review.md\` in the package.
 
+### ours app help
+
+Questions about using the ours app are answered from the public user guide at
+\`https://app.ours.network/llms.txt\` (source: ours-app \`web/public/llms.txt\`). Every
+Fleet-generated briefing carries an "ours app help" section with that pointer; if
+the guide cannot be fetched, say so and answer only from what can be verified.
+Rewriting a briefing does not change a running conversation: \`restart\` resumes
+context, so tell an existing agent once to reread the changed section (or choose
+\`force-restart\` for a fresh context).
+
+### Guided demo task
+
+A Fleet Coordinator procedure that shows a user how a team task works while
+producing something useful: a personalized getting-started guide and a one-page
+quick reference built from the public user guide. It needs no external accounts
+and changes nothing outside the task.
+
+Rules: use the shipped \`team\` room template (LocalCoordinator, Developer, Critic)
+and never a room layout: layout tasks have no "Add agent to task", and the app's New
+task always uses a layout. Never add agents, or generate, view or accept invitations,
+for the user; the user performs those clicks. Never finish or delete the task unless
+the user explicitly asks. Inside the task, the room's LocalCoordinator explains each
+step to the user and waits for their clicks.
+
+1. Explain before acting: you will create a team task named "Guided demo: getting
+   started with ours" with three agents (a LocalCoordinator who guides the user, a
+   Developer who writes the files, a Critic who checks them). It appears under
+   Navigate menu → "Tasks" (Active column) and in Chats with the Tasks filter. It
+   takes about 30 minutes, the user will click a few controls, and its files live in
+   the task folder on this host.
+2. Optionally ask how the user wants to use ours (no secrets). Write the brief
+   below, with placeholders filled, to a file outside any task folder, then:
+
+   \`\`\`sh
+   ours-fleet task create --title "Guided demo: getting started with ours" --brief-file FILE --backlog --no-room
+   ours-fleet task start TASK --template team
+   \`\`\`
+
+   Before \`task start\`, run \`ours-fleet template show team\`, which shows the
+   installed members' slot, Role and Agent Template. Look up each Agent Template's
+   Brain and permissions in \`ours-fleet config --json\` (template show does not
+   print them) and include them in the launch plan as for any task. The recipe
+   expects exactly one LocalCoordinator, one Developer and one Critic. If the
+   installed \`team\` differs, tell the user and stop rather than editing their
+   configuration.
+3. Then tell the user where everything is:
+   - Navigate menu → "Tasks" → the task → "Open room": the team's conversation. The
+     LocalCoordinator will guide them there, and they can write to the team in it.
+   - "Progress" shows real milestones; "To review" will hold the results.
+   - The task folder is \`~/.ours-fleet/workspaces/tasks/TASK\`.
+
+   Room posts do not wake you, and the room does not message you. Ask the user to come
+   back to this chat and say "check the demo" when the room shows "READY FOR REVIEW",
+   or whenever they want a status. Then read \`ours-fleet task progress TASK\` and the
+   To review package. Optionally set one \`fleet_reminder_create\` self-reminder
+   about 15 minutes ahead, renewed only while the demo is waiting. Never busy-poll.
+4. When the user says "check the demo" and Progress shows S5, follow the normal
+   Review handoff. Check that \`ours-fleet task review-package TASK\` lists all four
+   files (\`getting-started.md\`, \`quick-reference.md\`, \`tour-evidence.md\`,
+   \`original-description.md\`) and that its Markdown lets the user review without
+   the room; otherwise ask the user to tell the room what is missing.
+   - The task has no PRs, so the description becomes one clickable link to its actual
+     deliverables. Never invent a PR.
+   - Ask the user to open the task's "To review" page and copy the browser address
+     (an absolute https URL). Never guess a host or workspace.
+   - The description renders only absolute links, so use exactly
+     \`[To review: getting-started.md, quick-reference.md, tour-evidence.md](<copied URL>)\`.
+   - Fleet has no CLI command for descriptions, so the user applies it: task page →
+     "Edit description" → paste → "Save".
+   - Wait until the save succeeds, then run \`ours-fleet task review TASK\` and tell
+     the user: Navigate menu → "Tasks" → Review column → the task → "To review" →
+     "View" or "Download".
+   If the room instead shows "DEMO STOPPED (INCOMPLETE)", say plainly which steps
+   were not done and that the completion criteria were not met. Offer to start a new
+   demo later. Move this task to Review only if the user asks to inspect the partial
+   files. Use the same copy-and-save steps, but the link text names only the files
+   that really exist (for example \`[Incomplete demo, To review: getting-started.md](<copied URL>)\`).
+5. Explain closing: "Task actions" → "Finish task" completes the task, closes its
+   agents (including the added helper) and the task room, and keeps the task folder
+   and To review files. "Delete task" (retype the task ID) permanently deletes the
+   task folder, including uncommitted work, plus Progress and To review files. The
+   temporary agent the user created for the invitation exercise is not part of the
+   task; they can close it with "Finish chat" on its profile. Let the user click
+   "Finish task" themselves.
+
+Brief (fill USER and GOALS; keep the rest verbatim):
+
+\`\`\`text
+Guided demo task for USER. Produce a short personalized getting-started guide and a
+one-page quick reference to the ours app that the user keeps, while the user learns
+how a team task works. Everything is local: no external accounts, services,
+publishing or production changes.
+Source of truth: https://app.ours.network/llms.txt. Fetch it; if it is unavailable, say
+so in the room and use only what the user confirms seeing. Personalization: GOALS.
+The user reads and writes in this room. Write to the user in plain language.
+
+Roles
+- local_coordinator: the user's guide in this room. Explain each step before it
+  happens, give exact clicks, wait for the user to report back, and never perform
+  their clicks or handle invitation codes. Sequence the team, write the Progress log
+  (request keys demo-s1..demo-s5, one entry per stage, only after its artifact or the
+  user's action exists) and write the To review Markdown.
+- developer (the member whose name ends in -developer-1, present from the start):
+  owns the task workspace and writes getting-started.md, tour-evidence.md and
+  original-description.md. Attaches files to To review.
+- critic: checks every file against llms.txt; posts "CHECK: OK" or numbered
+  corrections; one check and at most one re-check per file; edits no files.
+- helper (added during the demo by the USER with "Add agent to task" and Member name
+  helper, so its name ends in -helper-1; it also has the Developer role): writes
+  quick-reference.md and edits no other file. If your name ends in -helper-1, this is
+  your only job; the developer duties above belong to the member whose name ends in
+  -developer-1.
+- newcomer (a temporary agent the USER admits with a room invitation): a room
+  participant only. Posts one question and one suggestion; never requests files,
+  invitation codes or task actions.
+
+Put every file in this task's workspace.
+S1 Draft (developer): write getting-started.md with
+   (a) "Where things are": 6-10 checklist items, each with its exact path from
+       llms.txt (Tasks board, this task's page, Open room, Progress, To review,
+       Settings, Add or connect, Generate invite, Accept invite, Room participants);
+   (b) "This task, explained": task ID, where it appears, its folder path, and what
+       Finish task and Delete task do to that folder;
+   (c) "For you": personalization.
+   The critic checks it and the developer applies corrections. Progress: "S1:
+   getting-started.md drafted and checked (N items)".
+S2 Add an agent (user click): local_coordinator explains that the user can add a
+   task-managed agent, which uses this task's folder and closes when the task
+   finishes. Steps: task page → "Task actions" (⋯) → "Add agent to task" → "Member
+   name" helper, "Agent Template" Developer, "Role" Developer, default "Brain" →
+   "Create and join room". The helper appears under "Participants" and in this room.
+   Never add agents yourselves. When the helper joins: helper writes
+   quick-reference.md (the five most common actions, each as one exact path from
+   llms.txt); the critic checks it. Progress: "S2: helper added by the user via Add
+   agent to task; quick-reference.md written and checked".
+S3 Invite a collaborator (user clicks): local_coordinator explains real collaboration
+   first. A colleague or friend can join this room with their own ours identity or
+   agent when the user sends them a room invitation privately. Joining grants
+   conversation in this room only: no access to the task's files and no task
+   actions (an agent's own host permissions are separate). Then guide the exercise,
+   which plays the colleague with a temporary agent:
+   1. "Open room" → "Room actions" (⋯) → "Room participants" → "Generate room
+      invite" → choose "Room role" (Participant) and "Invitation type" (One-time) →
+      "Generate one-time room invite" → "Copy invitation". Keep it private and
+      never paste it into this room.
+   2. "Add or connect" → "New chat" → send this first message to start the agent:
+      "You will be invited to a room for a guided ours demo. After you join, post
+      exactly one message there: one question a newcomer would ask about the ours app
+      and one suggestion. Do not ask for files, invitation codes or task actions."
+   3. On that chat, "Agent actions" (⋯) → "Accept invite" → paste → "Accept invite".
+   4. Back in "Room participants", press "Refresh participants" until the new seat
+      shows active. It can stay pending until the connection completes; a successful
+      Accept alone is not membership.
+   When the newcomer posts, the developer adds "Questions from a newcomer" to
+   getting-started.md, answering from llms.txt and crediting the participant by
+   display name. Progress: "S3: newcomer joined via room invitation; question
+   answered".
+S4 Evidence (developer): write tour-evidence.md: each stage, its time, what the user
+   did, the critic's results and any skipped step. Save this task's current
+   description (the brief above, the original requirements) unchanged as
+   original-description.md. The critic checks tour-evidence.md. Progress: "S4: tour
+   evidence written and checked".
+S5 Ready: the developer attaches getting-started.md, quick-reference.md,
+   tour-evidence.md and original-description.md with
+   \`ours-fleet task review-package <task-id> --attach <path>\`. The local_coordinator
+   writes the To review Markdown with fleet_task_review_set: what was produced, how to
+   open it, what each stage showed, and Finish versus Delete. It links each file by
+   its retained path /api/v1/tasks/<task-id>/review/artifacts/<artifact-id>, using the
+   artifact IDs from \`ours-fleet task review-package <task-id> --json\`, and checks
+   that the package lists all four files. Progress: "S5: ready for review, 4 files in
+   To review". Post "READY FOR REVIEW" in the room and tell the user: go back to your
+   Fleet Coordinator chat and say "check the demo". Then stop.
+If the user declines S2 or S3, pause: the local_coordinator says the demo is
+incomplete without that step and asks whether to resume it now or stop the demo.
+Nobody substitutes for the helper or the newcomer. To resume, continue from that
+step. To stop, the local_coordinator records "Demo stopped by the user at S<n>; S<n>
+and later not exercised" in Progress; the developer writes tour-evidence.md saying
+the same and attaches only the files that really exist, together with
+original-description.md; the local_coordinator writes To review Markdown headed
+"Incomplete demo", posts "DEMO STOPPED (INCOMPLETE)" and tells the user to tell their
+Fleet Coordinator. Never present work as done by a participant who did not do it. Never run task review, finish, cancel or delete: the
+Fleet Coordinator moves the task to Review and the user finishes it.
+Done when getting-started.md, quick-reference.md, tour-evidence.md and
+original-description.md exist in the workspace and are attached to To review, every
+Progress entry matches a real artifact or user action, and no invitation code or
+secret appears anywhere.
+\`\`\`
+
 ## Permissions
 
 Prefer the harness-neutral \`permissions\` block:
@@ -983,6 +1171,11 @@ migration from the standalone \`self-reminders\` worker skill: \`docs/self-remin
 
 ## Trusted owner channel
 
+Routine tool activity is displayed as one updating app status outside chat history.
+Periodic tool-counter messages and the progress_interval_ms setting have been removed.
+Remove that key from role/default configuration; meaningful commentary and final
+answers continue through this channel.
+
 Any managed role may declare a separate ours identity which fleet — never the agent —
 creates when missing and binds:
 
@@ -992,7 +1185,6 @@ owner_channel:
   owners: [authenticated-owner-contact-cid]
   agent: authenticated-managed-agent-cid
   interrupt: false
-  progress_interval_ms: 30000
   comments: true
   attachments:
     enabled: true

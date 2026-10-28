@@ -143,7 +143,7 @@ try {
   await attached.at(-1).createTemporaryIdentity(identity('FleetOwnerTempA'));
   await attached.at(-1).createTemporaryIdentity(identity('FleetOwnerTempB'));
   await adapter.bindIdentity('RecoveryRoot');
-  const channelConfig={identity:'RecoveryRoot',owners:[created.cid],interrupt:false,progress_interval_ms:0};
+  const channelConfig={identity:'RecoveryRoot',owners:[created.cid],interrupt:false};
   channel=new OwnerChannel({
     role:'RecoveryRole',harness:'codex',
     config:channelConfig,

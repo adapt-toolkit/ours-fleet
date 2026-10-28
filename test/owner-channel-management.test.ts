@@ -149,7 +149,7 @@ function setup(options: {
   const channel = new OwnerChannel({
     role: 'Role', harness: 'claude-code', config: {
       identity: 'Role-owner', owners: options.owners ?? [OWNER],
-      interrupt: false, progress_interval_ms: 0,
+      interrupt: false,
       ...(options.agent ? { agent: options.agent } : {}),
     }, session, stateDir: dir, client, log: line => logs.push(line),
   });
@@ -250,7 +250,7 @@ describe('OwnerChannel live management', () => {
     const logs: string[] = [];
     const channel = new OwnerChannel({
       role: 'Role', harness: 'claude-code',
-      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false },
       session, stateDir: dir, client,
       log: line => logs.push(line),
       binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
@@ -1120,8 +1120,7 @@ describe('OwnerChannel live management', () => {
 
     const restartedClient = new ManagementClient();
     const restarted = new OwnerChannel({
-      role: 'Role', harness: 'claude-code', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
-        progress_interval_ms: 0 },
+      role: 'Role', harness: 'claude-code', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false },
       session: { backend: 'acp', pid: 2, isAlive: () => true,
         snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
         queuePrompt: vi.fn(), interrupt: vi.fn(), eventsSince: () => [] } as unknown as SessionHandle,

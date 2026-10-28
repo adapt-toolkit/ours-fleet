@@ -47,6 +47,8 @@ export const RESOURCE_ASSEMBLY_BYTES = 16 * 1024 * 1024;
 const CHUNK_BYTES = 256 * 1024;
 /** Minimum spacing of activity-only follow-up captures of one view. */
 export const ACTIVITY_CAPTURE_INTERVAL_MS = 1000;
+/** Sparse health: a current view is qualified at most this often without data. */
+const COVERAGE_INTERVAL_MS = 15000;
 
 /** Lazily yield byte chunks so backpressure never queues an entire large record.
  * Base64 prevents splitting a Unicode scalar from corrupting JSON/SSE parsing. */
@@ -270,7 +272,7 @@ export class FleetResourceViews {
         if (!authorized()) { close(); return; }
         this.coverage(connection!).catch(close);
         if (!connection!.views.size) response.write(': keepalive\n\n');
-      }, 15000); healthTimer.unref();
+      }, COVERAGE_INTERVAL_MS); healthTimer.unref();
     }
     return { connectionId:id, close };
   }
@@ -327,7 +329,11 @@ export class FleetResourceViews {
   // complete batch behind any active chunk assembly and earlier data records.
   private coverage(connection:Connection) {
     const now=Date.now();
-    const eligible=[...connection.views.values()].filter(view=>this.current(connection,view)&&!view.failed&&!view.running&&!view.dirty&&view.payload!==undefined&&view.covered&&view.covered.health==='healthy'&&view.covered.position===view.source.snapshot().position&&now-(view.qualifiedAt??0)>=15000);
+    return this.cover(connection,[...connection.views.values()].filter(view=>!view.running&&!view.dirty&&view.covered?.position===view.source.snapshot().position&&now-(view.qualifiedAt??0)>=COVERAGE_INTERVAL_MS),now);
+  }
+  /** Certify each view's last projected source; never a position its capture did not read. */
+  private cover(connection:Connection,candidates:View[],now:number) {
+    const eligible=candidates.filter(view=>this.current(connection,view)&&!view.failed&&view.payload!==undefined&&view.covered&&view.covered.health==='healthy');
     if(!eligible.length)return Promise.resolve();
     const views=eligible.map(view=>({protocolVersion:1 as const,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,source:view.covered!}));
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
@@ -445,6 +451,9 @@ export class FleetResourceViews {
       const first=view.payload===undefined,changed=first||JSON.stringify(payload, (key,value)=>key==='observedAt'?undefined:value)!==JSON.stringify(view.payload, (key,value)=>key==='observedAt'?undefined:value);
       view.covered=source;
       if(changed) {view.revision++;await this.emit(connection,view,'snapshot',payload,source);if(!this.current(connection,view))return;view.payload=payload;}
+      // Sustained activity can keep a view dirty at every health tick while its payload is
+      // unchanged; the completed capture still qualifies the source it read.
+      else if(Date.now()-(view.qualifiedAt??0)>=COVERAGE_INTERVAL_MS)await this.cover(connection,[view],Date.now());
       if(first) {
         await this.emit(connection,view,'ready',{baselineId:view.baselineId,source});
         if(this.current(connection,view))view.resolveInitial({payload,source,producerGeneration:this.producerGeneration,revision:view.revision,baselineId:view.baselineId,descriptor:view.descriptor});

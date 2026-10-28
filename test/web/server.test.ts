@@ -139,10 +139,13 @@ describe('secure local web host', () => {
       expect(created.statusCode).toBe(201);expect(created.json()).toEqual({task:{...task,progress_count:0,progress_unread:0,review_unread:false,review:{has_markdown:false,artifact_count:0,revision:0}}});
       expect(taskRooms.createTask).toHaveBeenCalledWith(expect.objectContaining({layout:'work',title:'Ship'}));
       expect(taskRooms.launchTaskProvisioning).not.toHaveBeenCalled();
-      // Every task needs a saved layout; room templates and inline room plans are refused before the service.
-      for (const payload of [{title:'Ship'},{title:'Ship',layout:''},{title:'Ship',layout:'work',template:'pair'},{title:'Ship',layout:'work',noRoom:true}])
+      const empty=await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload:{title:'Empty'}});
+      expect(empty.statusCode).toBe(201);
+      expect(taskRooms.createTask).toHaveBeenLastCalledWith(expect.objectContaining({layout:'builtin-empty',title:'Empty'}));
+      // Malformed explicit layouts and legacy task modes remain rejected.
+      for (const payload of [{title:'Ship',layout:null},{title:'Ship',layout:''},{title:'Ship',layout:'work',template:'pair'},{title:'Ship',layout:'work',noRoom:true}])
         expect((await server.app.inject({method:'POST',url:'/api/v1/tasks',headers,payload})).statusCode).toBe(400);
-      expect(taskRooms.createTask).toHaveBeenCalledTimes(1);
+      expect(taskRooms.createTask).toHaveBeenCalledTimes(2);
       expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/layout',headers})).json()).toEqual({layout:{name:'work',rooms:[{key:'design',state:'declared'}]}});
       const open=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/layout/rooms/design/open',headers});
       expect(open.statusCode).toBe(202);

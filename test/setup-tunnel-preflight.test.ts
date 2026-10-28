@@ -11,7 +11,7 @@ const answers = (overrides: Record<string, { code: number; stdout?: string; stde
   const calls: string[] = [];
   const exec: Exec = async (command, args) => {
     calls.push([command, ...args].join(' '));
-    const answer = overrides[command] ?? (command === 'cloudflared' ? { code: 0, stdout: 'OPTIONS:\n   --token-file value\n' } : { code: 0 });
+    const answer = overrides[[command, ...args].join(' ')] ?? overrides[command] ?? (command === 'cloudflared' ? { code: 0, stdout: args[0] === '--version' ? 'cloudflared version 2026.10.2 (built fixture)' : 'OPTIONS:\n   --token-file value\n' } : { code: 0 });
     return { code: answer.code, stdout: answer.stdout ?? '', stderr: answer.stderr ?? '' };
   };
   return { exec, calls };
@@ -20,28 +20,52 @@ const answers = (overrides: Record<string, { code: number; stdout?: string; stde
 describe('tunnel setup preflight', () => {
   it('accepts a host with a reachable user service manager and a current cloudflared', async () => {
     const { exec, calls } = answers();
-    await setupTunnelPreflight({ exec, platform: 'linux', node: '22.13.0' });
-    expect(calls).toEqual(['systemctl --user show-environment', 'cloudflared tunnel run --help']);
+    await setupTunnelPreflight({ exec, platform: 'linux', node: '22.23.4' });
+    expect(calls).toEqual(['systemctl --user show-environment', 'cloudflared --version', 'cloudflared tunnel run --help']);
   });
   it('refuses an old Node.js before asking the host anything', async () => {
     const { exec, calls } = answers();
-    await expect(setupTunnelPreflight({ exec, platform: 'linux', node: '22.12.0' })).rejects.toThrow(/Node\.js 22\.13 or newer; this is 22\.12\.0.*not bound/);
+    await expect(setupTunnelPreflight({ exec, platform: 'linux', node: '22.12.0' })).rejects.toThrow(/Node\.js 22\.12\.0 is not permitted.*not bound/);
     expect(calls).toEqual([]);
   });
   it('explains an unreachable user service manager', async () => {
     const { exec } = answers({ systemctl: { code: 1, stderr: 'Failed to connect to bus: No medium found\n' } });
-    await expect(setupTunnelPreflight({ exec, platform: 'linux', node: '24.1.0' })).rejects.toThrow(/user service manager is not reachable.*Failed to connect to bus: No medium found.*enable-linger.*not bound/s);
+    await expect(setupTunnelPreflight({ exec, platform: 'linux', node: '24.22.1' })).rejects.toThrow(/user service manager is not reachable.*Failed to connect to bus: No medium found.*enable-linger.*not bound/s);
   });
   it('does not require systemd on macOS', async () => {
     const { exec, calls } = answers({ systemctl: { code: 127 } });
-    await setupTunnelPreflight({ exec, platform: 'darwin', node: '22.13.1' });
-    expect(calls).toEqual(['cloudflared tunnel run --help']);
+    await setupTunnelPreflight({ exec, platform: 'darwin', node: '22.23.4' });
+    expect(calls).toEqual(['cloudflared --version', 'cloudflared tunnel run --help']);
   });
   it('refuses a missing or too old cloudflared', async () => {
-    await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 127 } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/cloudflared is not installed/);
-    await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 0, stdout: 'OPTIONS:\n   --token value\n' } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/too old.*--token-file/);
-    await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 1, stderr: 'unknown command; see --token-file' } }), platform: 'darwin', node: '22.13.0' })).rejects.toThrow(/too old/);
+    await expect(setupTunnelPreflight({ ...answers({ cloudflared: { code: 127 } }), platform: 'darwin', node: '22.23.4' })).rejects.toThrow(/cloudflared could not be verified \(not found\).*2026\.10\.2 or later.*emudhra-certificate-compromise.*update-cloudflared.*not bound/);
+    await expect(setupTunnelPreflight({ ...answers({ 'cloudflared tunnel run --help': { code: 0, stdout: 'OPTIONS:\n   --token value\n' } }), platform: 'darwin', node: '22.23.4' })).rejects.toThrow(/too old.*--token-file/);
+    await expect(setupTunnelPreflight({ ...answers({ 'cloudflared tunnel run --help': { code: 1, stderr: 'unknown command; see --token-file' } }), platform: 'darwin', node: '22.23.4' })).rejects.toThrow(/too old/);
   });
+  it.each([
+    ['cloudflared version 2026.10.1', /cloudflared version 2026\.10\.1 is not permitted/],
+    ['cloudflared version 2026.7.2 (built 2026-07-15-1200 UTC)\n', /cloudflared version 2026\.7\.2 is not permitted/],
+    ['cloudflared version 2026.9.10', /cloudflared version 2026\.9\.10 is not permitted/],
+    ['cloudflared version 2026.10.2-rc.1', /cloudflared with an unrecognized version is not permitted/],
+    ['garbage', /cloudflared with an unrecognized version is not permitted/],
+  ])('refuses unsafe or unverified connector %j before checking features', async (stdout, found) => {
+    const {exec,calls}=answers({'cloudflared --version':{code:0,stdout}});
+    const refusal = setupTunnelPreflight({exec,platform:'darwin',node:'22.23.4'});
+    await expect(refusal).rejects.toThrow(found);
+    await expect(refusal).rejects.toThrow(/2026\.10\.2 or later.*cloudflare\.com\/emudhra-certificate-compromise.*update-cloudflared.*not bound/);
+    expect(calls).toEqual(['cloudflared --version']);
+  });
+  it('refuses a failing or timed-out version check before checking features', async () => {
+    const {exec,calls}=answers({'cloudflared --version':{code:1,stderr:'killed'}});
+    await expect(setupTunnelPreflight({exec,platform:'darwin',node:'22.23.4'})).rejects.toThrow(/cloudflared could not be verified \(version check failed\).*not bound/);
+    expect(calls).toEqual(['cloudflared --version']);
+  });
+  it.each(['22.23.3', '24.22.0', '26.12.0', '25.9.0', '27.0.0-pre'])('refuses unpatched or unsupported Node.js %s before asking the host anything', async node => {
+    const { exec, calls } = answers();
+    await expect(setupTunnelPreflight({ exec, platform: 'linux', node })).rejects.toThrow(new RegExp(`Node\\.js ${node.replace(/\./g, '\\.')} is not permitted.*CVE-2026-111497.*not bound`));
+    expect(calls).toEqual([]);
+  });
+
 });
 
 describe('unfinished tunnel setup record', () => {

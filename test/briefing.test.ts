@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateBriefing } from '../src/briefing.js';
+import { APP_GUIDE_URL, generateBriefing } from '../src/briefing.js';
 import { livenessNote, oversightTaxonomy, oversightTaxonomyLines } from '../src/session/control.js';
 import { fakeAdapter } from './registry.test.js';
 import type { ResolvedRole } from '../src/config.js';
@@ -49,6 +49,27 @@ describe('generateBriefing', () => {
     expect(task).not.toContain('fleet_task_progress_append');
     const standalone = generateBriefing({ ...base, session: 'acp', roomMemberStartup: startup } as ResolvedRole, vocab, opts);
     expect(standalone).not.toContain('To review');
+  });
+
+  it('points every briefing branch at the public app guide; only standalone roles get the demo recipe', () => {
+    const startup = {
+      room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: 'r', invite_id: 'i',
+      invite: 'x', role: 'Developer', task: 'Build.', owner_seat_cid: null, task_id: '0mvggdtxfab05d11b',
+    };
+    const branches = {
+      standalone: generateBriefing(base, vocab, opts),
+      managed: generateBriefing({ ...base, session: 'acp' }, vocab, opts),
+      curated: generateBriefing(base, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' }),
+      roomMember: generateBriefing({ ...base, session: 'acp', roomMemberStartup: startup } as ResolvedRole, vocab, opts),
+    };
+    for (const [branch, text] of Object.entries(branches)) {
+      expect(text.match(/## ours app help/g), branch).toHaveLength(1);
+      expect(text, branch).toContain(`first fetch ${APP_GUIDE_URL}`);
+      expect(text, branch).toMatch(/never invent controls/);
+    }
+    expect(APP_GUIDE_URL).toBe('https://app.ours.network/llms.txt');
+    expect(branches.standalone).toContain('"Guided demo task" section of `ours-fleet docs`');
+    expect(branches.roomMember).not.toContain('Guided demo task');
   });
 
   it('renders identity boot steps from the vocabulary', () => {
@@ -294,7 +315,6 @@ describe('generateBriefing', () => {
       owner_channel: {
         identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
         agent: 'A'.repeat(64),
-        progress_interval_ms: 30_000,
       },
     }, vocab, opts);
     expect(b).toContain('separate **Alice-owner** owner-channel identity');
@@ -322,7 +342,6 @@ describe('generateBriefing', () => {
       session: 'codex-app-server',
       owner_channel: {
         identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
-        progress_interval_ms: 30_000,
       },
     }, vocab, opts);
     expect(b).toContain('source=owner_admin_console');

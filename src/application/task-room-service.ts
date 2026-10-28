@@ -1,5 +1,6 @@
 import type { AddMemberRequest } from '../rooms-tasks/add-member.js';
 import { TaskLayouts, assertLayoutOpenable, writeTaskBrief } from './task-layouts.js';
+import { EMPTY_TASK_LAYOUT } from '../rooms-tasks/empty-layout.js';
 import { FleetError } from './errors.js';
 import { readFileSync } from 'node:fs';
 import { taskLiveReadiness, type LiveReadinessDeps, type TaskReadinessIssue } from '../rooms-tasks/live-readiness.js';
@@ -136,6 +137,8 @@ export interface CreateTaskRequest {
   anonymous?: boolean;
   /** Room Layout name: the task's rooms and participants come from a layout run. */
   layout?: string;
+  /** HTTP acceptance returns while a detached worker initializes the layout. */
+  deferLayoutStart?: boolean;
 }
 export interface CreateRoomRequest {
   actor: TaskRoomActor;
@@ -181,7 +184,7 @@ export class TaskRoomApplicationService {
     const {requestMemberAddition}=await import('../rooms-tasks/add-member.js');
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return requestMemberAddition({taskId,request,cfg,configPath:this.configurationPath,
-      cowork:(this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers});
+      cowork:readTask(taskId).layout ? undefined : (this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers,layouts:this.layouts()});
   }
   async memberAddition(taskId:string,requestId:string) { const {memberAddition}=await import('../rooms-tasks/add-member.js');return memberAddition(taskId,requestId); }
 
@@ -204,11 +207,11 @@ export class TaskRoomApplicationService {
     recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
       title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
       list: task.list_name ?? 'default', roomId: undefined, template: `layout:${layout.name}`, agents: [] });
-    return task.state === 'provisioning' ? (await this.ensureLayoutWork(task)).task : task;
+    return task.state === 'provisioning' ? (await this.ensureLayoutWork(task, request.deferLayoutStart)).task : task;
   }
 
   /** Layout tasks never provision the legacy single room; their run is a local snapshot. */
-  private async ensureLayoutWork(task: TaskRecord): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' }> {
+  private async ensureLayoutWork(task: TaskRecord, defer = false): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' | 'in_progress' }> {
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: task.task_id, state: task.state });
     if (task.state === 'active' || task.state === 'review') return { task, status: 'already_active' };
@@ -218,7 +221,14 @@ export class TaskRoomApplicationService {
         throw new FleetError('conflict', `room layout ${task.layout!.name} changed after it was chosen for this task; choose it again on the task page to use the edited version`);
       task = transitionTask(task.task_id);
     }
-    try { await this.layouts().ensureRun(task); }
+    try {
+      await this.layouts().ensureRun(task);
+      if (defer) {
+        await this.layouts().launch(task, 'start');
+        return { task: readTask(task.task_id), status: 'in_progress' };
+      }
+      await this.layouts().initializeRooms(task);
+    }
     catch (error) {
       const reason = `layout run could not be created: ${(error as Error).message}`;
       persistBlockTask(task.task_id, reason);
@@ -274,7 +284,7 @@ export class TaskRoomApplicationService {
   }
 
   /** Worker entry for detached layout operations. */
-  async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'open' | 'close-room' | 'close'; room?: string; operationId?: string }) {
+  async runTaskLayoutOperation(input: { actor: TaskRoomActor; taskId: string; operation: 'start' | 'open' | 'close-room' | 'close'; room?: string; operationId?: string }) {
     const task = readTask(input.taskId);
     // Preconditions are enforced inside the worker before side effects; the worker is directly callable.
     if (input.operation === 'open') assertLayoutOpenable(task);
@@ -382,7 +392,7 @@ export class TaskRoomApplicationService {
   }
 
   async startTask(input: {
-    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
+    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean; deferLayoutStart?: boolean;
   }): Promise<TaskRecord> {
     const result = await this.ensureTaskWork(input);
     if (result.status !== 'already_active')
@@ -474,10 +484,11 @@ export class TaskRoomApplicationService {
       const blocker = task.outcome?.summary ?? task.blocked?.reason;
       return {
         kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room: undefined,
-        launch: { template: `layout:${task.layout.name}`, anonymous: false, owner_attached: false },
+        launch: { template: `layout:${task.layout.name}`, anonymous: false,
+          owner_attached: task.layout.name === EMPTY_TASK_LAYOUT && this.layouts().view(task)?.rooms.some(room => room.state === 'active') === true },
         members: { expected: 0, active: 0, launched: 0 },
         ...(blocker ? { blocker } : {}),
-        ...(!ready && !failed ? { next_action: `Correct the blocker, then run ours-fleet task start ${task.task_id}.` } : {}),
+        ...(!ready && !failed && blocker ? { next_action: `Correct the blocker, then run ours-fleet task start ${task.task_id}.` } : {}),
       };
     }
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
@@ -713,6 +724,7 @@ export class TaskRoomApplicationService {
 
   async launchTaskProvisioning(taskId: string): Promise<TaskProvisioningOutcome> {
     const outcome = this.taskProvisioningOutcome(taskId);
+    if (outcome.task.layout) return outcome; // layout startup already has its own durable operation/worker
     if (outcome.kind === 'in_progress' && !outcome.next_action) {
       await launchFleetWorker(['task', '_provision', taskId], `task-provision-${taskId}`,
         this.configurationPath, this.deps.binPath?.());
@@ -1030,14 +1042,14 @@ export class TaskRoomApplicationService {
   }
 
   async ensureTaskWork(input: {
-    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
+    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean; deferLayoutStart?: boolean;
   }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' | 'in_progress' }> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
     if (task.layout) {
       if (input.template || input.members || input.anonymous !== undefined)
         throw new FleetError('invalid_request', 'a layout task cannot take a room template or member overrides');
-      return this.ensureLayoutWork(task);
+      return this.ensureLayoutWork(task, input.deferLayoutStart);
     }
     const recordedRoom = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const recordedPolicy = storedRoomLaunchPolicy(

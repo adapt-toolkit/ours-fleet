@@ -46,7 +46,7 @@ describe('loadConfig', () => {
       // CIDs resolve to their canonical (lowercase) hex form.
       identity: 'Coordinator-owner', owners: [ownerOne.toLowerCase(), ownerTwo.toLowerCase()],
       agent: agent.toLowerCase(),
-      interrupt: false, progress_interval_ms: 30_000, comments: true,
+      interrupt: false, comments: true,
       attachments: {
         enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
         max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
@@ -54,6 +54,13 @@ describe('loadConfig', () => {
     });
     base('roles:\n  A:\n    session: tmux\n');
     expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
+  });
+
+  it('rejects the removed periodic chat progress setting', () => {
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], progress_interval_ms: 30000 }\n');
+    expect(() => loadConfig()).toThrow(/owner_channel\.progress_interval_ms has been removed; delete it/);
+    base('defaults:\n  owner_channel: { progress_interval_ms: 0 }\nroles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(() => loadConfig()).toThrow(/progress_interval_ms has been removed/);
   });
 
   it('requires an exact managed-agent CID distinct from owner authority', () => {

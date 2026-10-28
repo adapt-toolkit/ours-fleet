@@ -48,6 +48,23 @@ async function started(client: ReturnType<typeof fakeSdkClient>): Promise<OursSd
 }
 
 describe('OursSdkClient send verdicts', () => {
+  it('exposes only the successfully bound mailbox CID and clears it on failed rebind and close', async () => {
+    let fail = false;
+    const sdk = await started(fakeSdkClient({ chooseIdentity: async () => {
+      if (fail) throw new Error('bind unavailable');
+      return { name: 'Role-owner', cid: 'A'.repeat(64), switchedFrom: null };
+    } }));
+    expect(sdk.boundIdentityCid?.()).toBeUndefined();
+    await sdk.bindIdentity('Role-owner');
+    expect(sdk.boundIdentityCid?.()).toBe('a'.repeat(64));
+    fail = true;
+    await expect(sdk.bindIdentity('Other-owner')).rejects.toThrow('bind unavailable');
+    expect(sdk.boundIdentityCid?.()).toBeUndefined();
+    fail = false;
+    await sdk.bindIdentity('Role-owner');
+    await sdk.close();
+    expect(sdk.boundIdentityCid?.()).toBeUndefined();
+  });
   it('attaches the owner through the complete explicit client profile only', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-fleet-owner-profile-'));
     try {
