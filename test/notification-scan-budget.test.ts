@@ -92,11 +92,14 @@ it('keeps full-role backoff despite same-role wakes while ready roles progress, 
   expect(f.opens().filter(path=>path.includes('/Role0/'))).toEqual([]);
   expect(blocked.entries).toHaveLength(2000);expect(blocked.checkpoint.offset).toBe(retained);
   expect(f.queues().get(join(f.root,'Role1')).entries.map((entry:any)=>entry.id)).toEqual(['Role1:g:3']);
+  expect(vi.mocked(fetch).mock.calls.map(([,init])=>JSON.parse(String(init?.body)).eventId)).toEqual(['Role1:g:3']);
   blocked.entries=[];await vi.advanceTimersByTimeAsync(550);
   expect(blocked.entries.map((entry:any)=>entry.id)).toEqual(['Role0:g:2']);
   f.producer.poll();await vi.advanceTimersByTimeAsync(20);
   expect(blocked.entries.map((entry:any)=>entry.id)).toEqual(['Role0:g:2']);
-  expect(fetch).not.toHaveBeenCalled();
+  // Each newly admitted completion prompts one send. Failed sends remain
+  // durable, and same-role wakes or an explicit poll add no retry attempts.
+  expect(vi.mocked(fetch).mock.calls.map(([,init])=>JSON.parse(String(init?.body)).eventId)).toEqual(['Role1:g:3','Role0:g:2']);
 });
 it('retains conservative unknown discovery, rotation and observation recovery',async()=>{
   const f=fixture(1);await vi.advanceTimersByTimeAsync(50);

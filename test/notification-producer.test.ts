@@ -210,8 +210,14 @@ it('retries transient ledger admission without a new mutation after the final co
     expect(warnings.some(line=>line.includes('admission pending'))).toBe(true);expect(accepted).toHaveLength(0);
     failing=false;
     const queueFile=join(dir,'outboxes',readdirSync(join(dir,'outboxes'))[0]);
-    await expect.poll(()=>JSON.parse(readFileSync(queueFile,'utf8')).entries.some((entry:any)=>entry.id===`agent:g:${completed.seq}`),{timeout:1800}).toBe(true);
+    // Admission now prompts delivery immediately, so a persisted pending entry
+    // can be delivered before this observer reads it. Require the actual send
+    // and durable checkpoint instead of waiting for that transient state.
+    await expect.poll(()=>accepted.length,{timeout:1800}).toBe(1);
     await producer.drain();expect(accepted).toHaveLength(1);
     expect(accepted[0].eventId).toBe(`agent:g:${completed.seq}`);
+    const saved=JSON.parse(readFileSync(queueFile,'utf8'));
+    expect(saved.entries).toEqual([]);
+    expect(saved.checkpoint.offset).toBe(Buffer.byteLength(readFileSync(join(root,'agent','.conversation','events-000001.jsonl'),'utf8')));
   }finally{spy.mockRestore();}
 });

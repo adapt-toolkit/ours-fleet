@@ -2,7 +2,7 @@ import { FleetResourceViews, ResourceBindingError, canonicalResourceDescriptor, 
 import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import { stateRoot, defaultConfigPath } from '../paths.js';
 import type { FleetResourceScope } from '../application/resource-observer.js';
-import { conversationPreview } from '../application/conversation-history.js';
+import { conversationActivity, conversationPreview } from '../application/conversation-history.js';
 import { registerConversationStream } from './conversation-stream.js';
 import type { ConversationRoleObservation, ConversationRoleState } from '../application/conversation-role-observer.js';
 import { conversationHasAttachment } from '../application/conversation-history.js';
@@ -476,13 +476,14 @@ export async function buildWebServer(
           signal.throwIfAborted(); const role=selected.get(id),dir=role && services.repository.stateDir(role);
           if(!role)continue;
           try {
-            previews[id]=dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
+            previews[id]=descriptor.activityOnly ? (dir ? await conversationActivity(dir,signal) : {at:''})
+              : dir ? await conversationPreview(dir,signal) : {text:'No recent agent output',at:''};
           } catch {
             signal.throwIfAborted();
             // A damaged/unreadable ledger is unavailable, not empty or removed.
             // Keep this selected row observable so a repair can refresh it,
             // without retiring previews for the other selected roles.
-            previews[id]={text:'Preview unavailable',at:'',unavailable:true};
+            previews[id]=descriptor.activityOnly ? {at:'',unavailable:true} : {text:'Preview unavailable',at:'',unavailable:true};
           }
         }
         return {previews};
@@ -530,7 +531,7 @@ export async function buildWebServer(
   });
   for(const resource of ['task-layout','creation-action','action','member-addition','login','onboarding-health'] as const) app.get('/api/v1/'+resource,async()=>{throw new ResourceBindingError(409,'resource binding required');});
   app.get('/api/v1/directory',async request=>{auth.authenticate(request);return project({viewId:'read',resource:'directory'},new AbortController().signal);});
-  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const ids=String((request.query as any).ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids}),new AbortController().signal);});
+  app.get('/api/v1/previews',async request=>{auth.authenticate(request);const query=request.query as any,ids=String(query.ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids,...(query.activityOnly==='true'?{activityOnly:true}:{})}),new AbortController().signal);});
   app.get('/api/v1/task-lists', async request => {
     auth.authenticate(request);
     return project({viewId:'read',resource:'task-lists'},new AbortController().signal);

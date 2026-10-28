@@ -182,6 +182,8 @@ export async function conversationHasAttachment(stateDir: string, attachment: im
 /** Passive, bounded last assistant text for directory previews. Never opens the
  * ledger writer/recovery path or acquires a session/controller. An incomplete
  * newest append is not committed yet; completed malformed records still fail. */
+/** The assistant message events a preview is made of. */
+const previewAssistant=(event:ConversationEventV1)=>['message.chunk','message.replace'].includes(event.kind) && (event.payload as any)?.role==='assistant' && typeof (event.payload as any)?.content?.type==='string';
 /** Bytes of a segment's tail a preview may consider, and the newest events it reads. */
 const PREVIEW_WINDOW_BYTES = 2 * 1024 * 1024;
 const PREVIEW_EVENTS = 200;
@@ -192,7 +194,7 @@ const PREVIEW_EVENTS = 200;
  * cut by the window start is not complete and is skipped. Only the newest
  * segment can have an in-flight append; elsewhere a partial record fails.
  */
-async function previewSegmentEvents(path:string,newest:boolean,need:number,signal:AbortSignal):Promise<ConversationEventV1[]> {
+async function previewSegmentEvents(path:string,newest:boolean,need:number,signal:AbortSignal,until?:(event:ConversationEventV1)=>boolean):Promise<ConversationEventV1[]> {
   const events:ConversationEventV1[]=[];
   const file=await open(path,'r');
   try {
@@ -202,6 +204,7 @@ async function previewSegmentEvents(path:string,newest:boolean,need:number,signa
       const event=JSON.parse(line) as ConversationEventV1;
       if(event.schemaVersion!==1 || !Number.isSafeInteger(event.seq))throw Error('preview ledger invalid');
       events.push(event);
+      if(until?.(event))need=events.length;
     };
     while(position>floor && events.length<need){
       signal.throwIfAborted();
@@ -225,6 +228,30 @@ async function previewSegmentEvents(path:string,newest:boolean,need:number,signa
   return events;
 }
 
+/**
+ * The newest assistant message's time alone: the same event the text preview ends with,
+ * found by reading backwards only until it, within the same event and byte bounds.
+ * Records older than it are not read, so they are not validated either.
+ */
+export async function conversationActivity(stateDir: string, signal: AbortSignal): Promise<{at:string}> {
+  signal.throwIfAborted();
+  const dir=join(stateDir,'.conversation');
+  let files:string[];
+  try {files=(await readdir(dir)).filter(name=>/^events-\d{6}\.jsonl$/.test(name)).sort().reverse();}
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return {at:''};throw error;}
+  let read=0;
+  for(const name of files){
+    signal.throwIfAborted();
+    const events=await previewSegmentEvents(join(dir,name),name===files[0],PREVIEW_EVENTS-read,signal,previewAssistant);
+    const found=events.find(previewAssistant);
+    if(found)return {at:found.at??''};
+    read+=events.length;
+    if(read>=PREVIEW_EVENTS)break;
+  }
+  signal.throwIfAborted();
+  return {at:''};
+}
+
 export async function conversationPreview(stateDir: string, signal: AbortSignal): Promise<{text:string;at:string}> {
   signal.throwIfAborted();
   const dir=join(stateDir,'.conversation');
@@ -238,7 +265,7 @@ export async function conversationPreview(stateDir: string, signal: AbortSignal)
     if(events.length>=PREVIEW_EVENTS)break;
   }
   signal.throwIfAborted();
-  const assistant=(event:ConversationEventV1)=>['message.chunk','message.replace'].includes(event.kind) && (event.payload as any)?.role==='assistant' && typeof (event.payload as any)?.content?.type==='string';
+  const assistant=previewAssistant;
   const end=events.findIndex(assistant);if(end<0)return {text:'No recent agent output',at:''};
   const last=events[end],parts:string[]=[];
   for(let i=end;i<events.length;i++){

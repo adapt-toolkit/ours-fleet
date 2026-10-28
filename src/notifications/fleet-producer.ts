@@ -186,7 +186,7 @@ export class FleetNotificationProducer {
         const fd = openSync(join(dir, current.segment), 'r'), buffer = Buffer.alloc(Math.min(BATCH_BYTES, remaining));
         let count: number;
         try { count = readSync(fd, buffer, 0, buffer.length, current.offset); } finally { closeSync(fd); }
-        let position = 0, blocked = false, unavailable = false, sidecar: Record<string, string | null> | undefined;
+        let position = 0, blocked = false, admitted = false, unavailable = false, sidecar: Record<string, string | null> | undefined;
         while (position < count) {
           const end = buffer.indexOf(10, position);
           if (end < 0 || end >= count) {
@@ -221,12 +221,15 @@ export class FleetNotificationProducer {
             }
             const binding = Object.hasOwn(current.bindings, event.sessionGeneration) ? { taskId: current.bindings[event.sessionGeneration] } : {};
             if (!outbox.enqueue(`${roleId}:${event.sessionGeneration}:${event.seq}`, { ...binding, anchor: { kind: 'fleet-message', messageId: current.messages[prompt] ?? event.promptId } })) {blocked=true;break;}
+            admitted = true;
             current.prompts = current.prompts.filter(p => p !== prompt); delete current.messages[prompt];
           }
           current.offset += end - position + 1; position = end + 1;
           if (performance.now() >= deadline) break;
         }
         if (current.segment !== saved.segment || current.offset !== saved.offset) outbox.saveCheckpoint(current);
+        // Prompt only after both completion and checkpoint have been durably recorded.
+        if (admitted) outbox.prompt();
         if (unavailable) this.warn('Notification ownership evidence unavailable; ledger admission held');
         if (blocked || unavailable) {
           // Corrupt evidence needs an operator repair: re-check it slowly rather than spin.

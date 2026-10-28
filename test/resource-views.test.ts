@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FleetResourceViews, canonicalResourceDescriptor, resourceFrames } from '../src/web/resource-views.js';
 import { publishFleetResourceCommit } from '../src/application/resource-observer.js';
-import { conversationPreview } from '../src/application/conversation-history.js';
+import { conversationActivity, conversationPreview } from '../src/application/conversation-history.js';
 import { stateRoot } from '../src/paths.js';
 import { open } from 'node:fs/promises';
 const clean:Array<()=>void>=[];
@@ -94,6 +94,45 @@ it('reads a preview backwards only until its newest two hundred events',async()=
     expect(preview.at).toBe('280');expect(preview.text.startsWith('w51 w53 ')).toBe(true);
     expect(bytes).toBeLessThanOrEqual(64*1024);
   } finally {spy.mockRestore();}
+});
+it('reads activity only back to the newest assistant message, with the time its text preview has',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'preview-'));clean.push(()=>rmSync(root,{recursive:true,force:true}));mkdirSync(join(root,'.conversation'));
+  const event=(seq:number,extra:object)=>JSON.stringify({schemaVersion:1,seq,at:String(seq),...extra});
+  const path=join(root,'.conversation','events-000001.jsonl');
+  expect(await conversationActivity(join(root,'missing'),new AbortController().signal)).toEqual({at:''});
+  // Large older tool output, an assistant message, then large newer tool output.
+  const lines=[...Array.from({length:10},(_,i)=>event(i+1,{kind:'tool.upsert',pad:'x'.repeat(100*1024)})),
+    event(11,{kind:'message.chunk',messageId:'m',payload:{role:'assistant',content:{type:'text',text:'done'}}}),
+    ...Array.from({length:8},(_,i)=>event(i+12,{kind:'tool.upsert',pad:'y'.repeat(100*1024)}))];
+  writeFileSync(path,lines.join('\n')+'\n');
+  const probe=await open(path,'r'),proto=Object.getPrototypeOf(probe);await probe.close();
+  let bytes=0;const read=proto.read;
+  const spy=vi.spyOn(proto,'read').mockImplementation(async function(this:unknown,...args:unknown[]){const result=await read.apply(this,args);bytes+=result.bytesRead;return result;});
+  try {
+    expect(await conversationActivity(root,new AbortController().signal)).toEqual({at:'11'});
+    const activityBytes=bytes;bytes=0;
+    expect((await conversationPreview(root,new AbortController().signal)).at).toBe('11');
+    expect(activityBytes).toBeLessThan(900*1024);
+    expect(bytes).toBeGreaterThanOrEqual(1800*1024);
+  } finally {spy.mockRestore();}
+  // No assistant message within the newest events: no time, as for the text preview.
+  writeFileSync(path,Array.from({length:250},(_,i)=>event(i+1,{kind:'thought.chunk'})).join('\n')+'\n');
+  expect(await conversationActivity(root,new AbortController().signal)).toEqual({at:''});
+  expect((await conversationPreview(root,new AbortController().signal)).at).toBe('');
+  // An assistant message older than the newest two hundred events is not activity, for either.
+  writeFileSync(path,[event(1,{kind:'message.chunk',payload:{role:'assistant',content:{type:'text',text:'old'}}}),...Array.from({length:200},(_,i)=>event(i+2,{kind:'thought.chunk'}))].join('\n')+'\n');
+  expect(await conversationActivity(root,new AbortController().signal)).toEqual({at:''});
+  expect((await conversationPreview(root,new AbortController().signal)).at).toBe('');
+  // Trade-off: records older than the found message are not read, so a damaged one there no
+  // longer makes the agent unavailable; a damaged record newer than it still does.
+  writeFileSync(path,['{"schemaVersion":7}',event(2,{kind:'message.chunk',payload:{role:'assistant',content:{type:'text',text:'hi'}}})].join('\n')+'\n');
+  expect(await conversationActivity(root,new AbortController().signal)).toEqual({at:'2'});
+  await expect(conversationPreview(root,new AbortController().signal)).rejects.toThrow('preview ledger invalid');
+  writeFileSync(path,[event(1,{kind:'message.chunk',payload:{role:'assistant',content:{type:'text',text:'hi'}}}),'{"schemaVersion":7}'].join('\n')+'\n');
+  await expect(conversationActivity(root,new AbortController().signal)).rejects.toThrow('preview ledger invalid');
+  expect(canonicalResourceDescriptor({viewId:'v',resource:'previews',ids:['a'],activityOnly:true})).toMatchObject({activityOnly:true});
+  expect(()=>canonicalResourceDescriptor({viewId:'v',resource:'directory',activityOnly:true})).toThrow();
+  expect(()=>canonicalResourceDescriptor({viewId:'v',resource:'previews',activityOnly:'yes'})).toThrow();
 });
 it('serves one authenticated canonical capture over SSE and bound HTTP, reuses redacted config serialization and retires on revocation',async()=>{
   const {buildWebServer}=await import('../src/web/server.js');
