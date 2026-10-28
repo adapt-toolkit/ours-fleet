@@ -3,7 +3,8 @@ import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
-import { controlRequest, controlSocketPath, controlTokenPath, SessionControlError } from '../src/session/control.js';
+import { controlRequest, controlSocketPath, controlTokenPath } from '../src/session/control.js';
+import { SessionControlError } from '../src/session/types.js';
 
 const clean: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const fn of clean.splice(0).reverse()) await fn(); });
