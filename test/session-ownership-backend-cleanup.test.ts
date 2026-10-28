@@ -3,8 +3,16 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ChildProcess } from 'node:child_process';
 import { afterEach, expect, it, vi } from 'vitest';
+// Parent-side capture of every child the ACP start spawns: the test owns exactly these and tears down only them.
+const spawned = vi.hoisted(() => [] as ChildProcess[]);
+vi.mock('node:child_process', async original => {
+  const actual = await original<typeof import('node:child_process')>();
+  return { ...actual, spawn: ((...args: Parameters<typeof actual.spawn>) => { const child = actual.spawn(...args); spawned.push(child); return child; }) as typeof actual.spawn };
+});
 import { AcpSession } from '../src/session/acp.js';
+import { ConversationEventStore } from '../src/session/conversation-store.js';
 import { CodexAppServerSession } from '../src/session/codex-app-server.js';
 import type { CodexAppServerTransportFactory } from '../src/session/codex-app-server-transport.js';
 import { SESSION_OWNERSHIP_FILE } from '../src/session/session-ownership.js';
@@ -15,13 +23,22 @@ import { FakeAppServer } from './fixtures/codex-app-server.js';
 // is the one OS-level exit proof; fd checks read this process's real descriptors; fake children/transports prove call
 // order and error shape only.
 const dirs: string[] = [];
-afterEach(() => { vi.useRealTimers(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-function stateDir(failure: 'metadata' | 'sidecar'): string {
+afterEach(() => {
+  vi.useRealTimers(); vi.restoreAllMocks();
+  // Only children this file spawned, and only if an assertion left one running.
+  for (const child of spawned.splice(0)) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+const OWNED = JSON.stringify({ version: 1, role: 'member', launchId: 'l', taskOwner: { taskId: '0mvrpv4kt1f567911', creationActionId: 'a' } });
+type Failure = 'metadata' | 'sidecar' | 'append';
+/** `append`: a valid owned role whose durable ledger append fails AFTER the ledger descriptor was opened (see failAppend). */
+function stateDir(failure: Failure): string {
   const dir = mkdtempSync(join(tmpdir(), 'fleet-ownership-start-')); dirs.push(dir);
   if (failure === 'metadata') writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), '{');                  // unreadable metadata
+  else if (failure === 'append') writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), OWNED);
   else {
     // Owned role whose sidecar is corrupt: the writer refuses rather than reset it.
-    writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), JSON.stringify({ version: 1, role: 'member', launchId: 'l', taskOwner: { taskId: '0mvrpv4kt1f567911', creationActionId: 'a' } }));
+    writeFileSync(join(dir, TEMP_SUPERVISOR_FILE), OWNED);
     writeFileSync(join(dir, SESSION_OWNERSHIP_FILE), '{"schema":1');
   }
   return dir;
@@ -31,18 +48,32 @@ const ledgerFds = (dir: string) => readdirSync('/proc/self/fd').flatMap(fd => {
   try { const target = readlinkSync(`/proc/self/fd/${fd}`); return target.startsWith(join(dir, '.conversation')) ? [target] : []; } catch { return []; }
 });
 const aggregate = (error: unknown) => error instanceof AggregateError ? error.errors : [error];
+const expected: Record<Failure, RegExp> = { metadata: /session ownership unavailable/, sidecar: /JSON/, append: /durable append failed/ };
+/** The real append runs (opening the ledger descriptor and writing), then fails as a lost durable write would. Records the
+ * descriptors held at that moment, so a test can prove one was acquired before asserting it was released. */
+function failAppend(dir: string): { held: string[] } {
+  const seen = { held: [] as string[] }, real = ConversationEventStore.prototype.append;
+  vi.spyOn(ConversationEventStore.prototype, 'append').mockImplementation(function (this: ConversationEventStore, draft) {
+    real.call(this, draft); seen.held = ledgerFds(dir); throw new Error('durable append failed');
+  });
+  return seen;
+}
 
-it.each(['metadata', 'sidecar'] as const)('ACP: a real child is stopped and the ledger fd closed when ownership fails (%s)', async failure => {
-  const dir = stateDir(failure), pidFile = join(dir, 'child.pid');
+it.each(['metadata', 'sidecar', 'append'] as const)('ACP: the real spawned child is stopped and the ledger fd closed when ownership fails (%s)', async failure => {
+  const dir = stateDir(failure), append = failure === 'append' ? failAppend(dir) : undefined;
   const start = AcpSession.start({
-    name: 'A', argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdin.resume();`],
+    name: 'A', argv: [process.execPath, '-e', 'process.stdin.resume();'],
     cwd: dir, stateDir: dir, mode: 'fresh', permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, env: {}, log: () => {},
   } as Parameters<typeof AcpSession.start>[0]);
-  await expect(start).rejects.toThrow(failure === 'metadata' ? /session ownership unavailable/ : /ownership evidence|JSON|invalid/);
-  const pid = Number(readFileSync(pidFile, 'utf8'));
-  expect(existsSync(`/proc/${pid}`)).toBe(false);                                   // real OS exit, reaped
-  expect(ledgerFds(dir)).toEqual([]);
-  // No prompt was ever admitted: the ledger holds no ownership binding or prompt.
+  await expect(start).rejects.toThrow(expected[failure]);
+  // The pid comes from the parent's own ChildProcess, captured at spawn: no race with the child writing anything.
+  expect(spawned).toHaveLength(1);
+  const [child] = spawned;
+  expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+  expect(existsSync(`/proc/${child.pid}`)).toBe(false);                             // real OS exit, reaped
+  if (append) expect(append.held.length).toBeGreaterThan(0);                       // a descriptor was acquired…
+  expect(ledgerFds(dir)).toEqual([]);                                               // …and released
+  // No prompt was ever admitted (an `append` failure may leave the ownership event itself; never a prompt).
   expect(existsSync(join(dir, '.conversation')) ? readdirSync(join(dir, '.conversation')).filter(name => name.endsWith('.jsonl'))
     .flatMap(name => readFileSync(join(dir, '.conversation', name), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line).kind)) : [])
     .not.toContain('prompt.admitted');
@@ -124,17 +155,20 @@ const codexStart = (dir: string, factory: CodexAppServerTransportFactory) => Cod
 it.each([
   [false, false, 0], [false, true, 1], [true, false, 1], [true, true, 2],
 ] as const)('Codex: close rejects=%s, alive after close=%s → original plus %i cleanup failure(s); no initialize; fd closed', async (closeRejects, alive, extra) => {
-  for (const failure of ['metadata', 'sidecar'] as const) {
+  for (const failure of ['metadata', 'sidecar', 'append'] as const) {
     const dir = stateDir(failure), transport = codexTransport(closeRejects, alive);
+    const append = failure === 'append' ? failAppend(dir) : undefined;
     const error = await codexStart(dir, transport.factory).then(() => { throw new Error('started'); }, (reason: unknown) => reason);
     const errors = aggregate(error);
     expect(errors).toHaveLength(1 + extra);
-    expect(String(errors[0])).toMatch(failure === 'metadata' ? /session ownership unavailable/ : /ownership evidence|JSON|invalid/);
+    expect(String(errors[0])).toMatch(expected[failure]);
     if (extra) expect((error as AggregateError).cause).toBe(errors[0]);
     if (closeRejects) expect(errors.map(String)).toContain('Error: close failed');
     if (alive) expect(String(errors.at(-1))).toMatch(/pid 4242\) is still running/);
     expect(transport.calls).toEqual(['close']);                                         // never initialized, closed once
+    if (append) expect(append.held.length).toBeGreaterThan(0);
     expect(ledgerFds(dir)).toEqual([]);
+    vi.restoreAllMocks();
   }
 });
 

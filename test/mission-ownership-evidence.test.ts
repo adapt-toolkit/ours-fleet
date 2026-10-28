@@ -127,14 +127,23 @@ it('an existing role whose sidecar is unavailable at startup gets no checkpoint 
   expect(accepted[0]).toMatchObject({ eventId: `member:g:${done.seq}`, taskId: TASK });
 });
 
-it('a binding already in the checkpoint needs no sidecar: an unavailable sidecar does not hold that completion', async () => {
+it('a binding already persisted in the checkpoint needs no sidecar: after a restart with an unavailable sidecar the completion is labelled', async () => {
   const dir = mkdtempSync(join('.test-artifacts', 'sidecar-trusted-')), { accepted, config: live } = await receiver();
-  const root = join(dir, 'agents'), roleDir = join(root, 'member'); mkdirSync(root);
-  const producer = new FleetNotificationProducer([root], join(dir, 'outboxes'), live); cleanup.push(() => producer.close());
+  const root = join(dir, 'agents'), roleDir = join(root, 'member'), state = join(dir, 'outboxes'); mkdirSync(root);
+  let producer = new FleetNotificationProducer([root], state, live); cleanup.push(() => producer.close());
   const store = new ConversationEventStore(join(roleDir, '.conversation'), { roleId: 'member' }); cleanup.push(() => store.close());
-  mkdirSync(join(roleDir, SESSION_OWNERSHIP_FILE));                               // unreadable (EISDIR)
   store.append({ kind: 'session.ownership', sessionGeneration: 'g', payload: { launchId: 'l', taskId: TASK } });
   store.append({ kind: 'prompt.admitted', promptId: 'p', source: 'browser', sessionGeneration: 'g', payload: {} });
+  // The binding and the open prompt are persisted in the checkpoint before any completion exists.
+  await vi.waitFor(async () => {
+    producer.poll(); await producer.drain();
+    const files = existsSync(state) ? readdirSync(state) : [];
+    expect(files).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(state, files[0]), 'utf8')).checkpoint?.bindings).toEqual({ g: TASK });
+  });
+  await producer.close();
+  mkdirSync(join(roleDir, SESSION_OWNERSHIP_FILE));                                // the sidecar is now unreadable (EISDIR)
+  producer = new FleetNotificationProducer([root], state, live);
   store.append({ kind: 'turn.completed', promptId: 'p', sessionGeneration: 'g', payload: { outcome: 'completed' } });
   await vi.waitFor(async () => { producer.poll(); await producer.drain(); expect(accepted).toHaveLength(1); });
   expect(accepted[0].taskId).toBe(TASK);
