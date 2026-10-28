@@ -258,7 +258,9 @@ function typedTaskNotification(value: TaskNotificationEvent, id: string): boolea
 
 /** Atomic snapshots contain the events, including intermediate states between polls. */
 /** `upgraded`: IDs of events queued by an earlier release without a delivery policy. They are sent push-only under the
- * same event ID (state transitions never count as unread); the queued record itself is not rewritten. */
+ * same event ID (state transitions never count as unread); the queued record itself is not rewritten. A service that
+ * already admitted one as an inbox row repairs that row to push-only itself, so the retry matches; any refusal keeps the
+ * event queued. */
 export function pendingTaskNotifications(warn: (line: string) => void = () => {}): Array<{ taskId: string; events: TaskNotificationEvent[]; upgraded: string[] }> {
   const result: Array<{ taskId: string; events: TaskNotificationEvent[]; upgraded: string[] }> = [];
   for (const dir of [tasksDir()]) {

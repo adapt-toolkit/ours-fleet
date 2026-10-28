@@ -161,7 +161,7 @@ it('unavailable task or layout inventory leaves the bootstrap run unstarted; rep
 });
 
 // #6 legacy queued lifecycle events
-it('a queued lifecycle event from an earlier release is sent push-only under its own ID; a reused-ID refusal acknowledges it', async () => {
+it('a queued lifecycle event from an earlier release is sent push-only under its own ID; a refusal keeps it queued', async () => {
   for (const status of [200, 409]) {
     const task = create(), path = join(tasksDir(), `${task.task_id}.json`);
     const record = JSON.parse(readFileSync(path, 'utf8'));
@@ -173,8 +173,12 @@ it('a queued lifecycle event from an earlier release is sent push-only under its
     const sent: any[] = [];
     const request = (async (_url: string, init: RequestInit) => { sent.push(JSON.parse(init.body as string)); return new Response('{}', { status }); }) as unknown as typeof fetch;
     const producer = new TaskNotificationProducer(config, undefined, request); await producer.drain(); await producer.close();
-    expect(sent.map(event => [event.eventId, event.delivery])).toEqual(record.notification_events.map((event: any) => [event.eventId, 'push-only']));
-    expect(pendingTaskNotifications().find(t => t.taskId === task.task_id)).toBeUndefined();
+    expect(sent[0]).toMatchObject({ eventId: record.notification_events[0].eventId, delivery: 'push-only' });
+    // Accepted: acknowledged. Refused (409): never treated as delivered; the event stays queued unchanged.
+    const left = pendingTaskNotifications().find(t => t.taskId === task.task_id);
+    if (status === 200) expect(left).toBeUndefined();
+    else expect(left?.events.map(event => event.eventId)).toEqual(record.notification_events.map((event: any) => event.eventId));
+    if (status === 409) rmSync(path);                                            // keep later iterations independent
   }
 });
 

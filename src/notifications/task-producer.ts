@@ -81,13 +81,6 @@ export class TaskNotificationProducer {
               body: JSON.stringify(event),
             });
             await response.body?.cancel();
-            // An upgraded legacy event refused as a reused ID: the service already holds this event ID, admitted by the
-            // earlier release in its original form (IDs are unique per event). Acknowledge; never resend it as inbox.
-            if (response.status === 409 && task.upgraded.includes(event.eventId)) {
-              this.warn('Legacy task event already admitted by the notification service; acknowledged');
-              acknowledgeTaskNotification(task.taskId, event.eventId);
-              continue;
-            }
             if (!response.ok) {
               this.warn(response.status === 400 && event.delivery
                 ? 'Notification service does not support push-only task events; committed events retained'
