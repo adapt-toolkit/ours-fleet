@@ -658,7 +658,8 @@ it('does not qualify an unchanged capture that was replaced while it ran',async(
   // The obsolete capture completes unchanged after its qualification interval.
   release({rows:['same']});await new Promise(setImmediate);await new Promise(setImmediate);
   expect(coverage().filter((v:any)=>v.subscriptionEpoch===1)).toEqual([]);
-  await vi.advanceTimersByTimeAsync(15_000);
+  // The replacement was qualified by its ready at about 16s; the first tick due for it is at 45s.
+  await vi.advanceTimersByTimeAsync(30_000);
   expect(coverage().length).toBeGreaterThan(0);
   expect(coverage().every((v:any)=>v.subscriptionEpoch===2)).toBe(true);
 });
