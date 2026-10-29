@@ -24,13 +24,13 @@ function fixture(changed:string, resource='previews', explicitConfig=false, role
  const frames=()=>response.write.mock.calls.map(([s])=>String(s)).filter(s=>s.startsWith('event: resource\n')).map(s=>JSON.parse(s.split('data: ')[1]));
  return {root,adopted,resources,connection,binding,bound,frames,callbacks,reads:()=>reads,update(){value='committed';publishFleetResourceCommit(join(roles,'selected','.conversation','events-000001.jsonl'));}};
 }
-for(const changed of ['history.jsonl','models_cache.json','state_5.sqlite','logs_2.sqlite-wal','thread_history_1.sqlite-shm','queue_1.sqlite-journal','goals_1.sqlite-wal'])it(`keeps previews ready through adopted Codex activity ${changed}`,async()=>{
- const f=fixture(changed);expect((await f.bound()).payload).toEqual({value:'initial'});expect(f.reads()).toBe(1);
+for(const resource of ['previews','directory','roles'])for(const changed of ['history.jsonl','models_cache.json','state_5.sqlite','logs_2.sqlite-wal','thread_history_1.sqlite-shm','queue_1.sqlite-journal','goals_1.sqlite-wal'])it(`keeps ${resource} ready through adopted Codex activity ${changed}`,async()=>{
+ const f=fixture(changed,resource);expect((await f.bound()).payload).toEqual({value:'initial'});expect(f.reads()).toBe(1);
  for(let n=0;n<5;n++)f.callbacks.get(f.adopted)!('change',changed);
  await new Promise(setImmediate);expect(f.reads()).toBe(1);
  f.update();await expect.poll(()=>f.frames().filter(frame=>frame.kind==='snapshot').at(-1).payload).toEqual({value:'committed'});expect(f.reads()).toBe(2);expect(f.frames().some(frame=>['resync','health'].includes(frame.kind))).toBe(false);
 });
-for(const [resource,changed,explicit]of [['previews','auth.json',false],['previews','config.toml',false],['previews','unknown.sqlite-wal',false],['previews','nested/state_5.sqlite-wal',false],['previews','history.jsonl',true],['subscriptions','state_5.sqlite-wal',false],['directory','logs_2.sqlite-wal',false]]as const)it(`retains three-attempt capture fence for ${resource} ${changed} explicit=${explicit}`,async()=>{
+for(const [resource,changed,explicit]of [['previews','auth.json',false],['previews','config.toml',false],['previews','unknown.sqlite-wal',false],['previews','nested/state_5.sqlite-wal',false],['previews','history.jsonl',true],['subscriptions','state_5.sqlite-wal',false]]as const)it(`retains three-attempt capture fence for ${resource} ${changed} explicit=${explicit}`,async()=>{
  const f=fixture(changed,resource,explicit);await expect(f.bound()).rejects.toThrow('projection unstable');expect(f.reads()).toBe(3);expect(f.frames().some(frame=>frame.kind==='snapshot')).toBe(false);
 });
 
@@ -39,4 +39,11 @@ it('retains capture fencing when an activity-shaped path belongs to a declared r
 });
 it('retains capture fencing for an unknown directory-level adopted-home wake',async()=>{
  const f=fixture('history.jsonl','previews',false,false,true);await expect(f.bound()).rejects.toThrow('projection unstable');expect(f.reads()).toBe(3);
+});
+
+for(const resource of ['directory','roles'])for(const changed of ['auth.json','config.toml','unknown.sqlite-wal','nested/state_5.sqlite-wal'])it(`retains ${resource} fencing for ${changed}`,async()=>{
+ const f=fixture(changed,resource);await expect(f.bound()).rejects.toThrow('projection unstable');expect(f.reads()).toBe(3);
+});
+for(const resource of ['directory','roles'])for(const boundary of ['explicit','root','ancestor'])it(`retains ${resource} ${boundary} capture fence`,async()=>{
+ const f=fixture('state_5.sqlite-wal',resource,boundary==='explicit',boundary==='root',boundary==='ancestor');await expect(f.bound()).rejects.toThrow('projection unstable');expect(f.reads()).toBe(3);
 });
