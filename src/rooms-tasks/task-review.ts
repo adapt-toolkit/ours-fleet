@@ -83,6 +83,17 @@ export function listTaskProgress(taskId: string): TaskProgressEntry[] {
   return getTask(taskId).progress ?? [];
 }
 
+/** Browser snapshot: entry bodies and their saved read state come from one task record. */
+export function taskProgressSnapshot(taskId: string): Array<Omit<TaskProgressEntry, 'request_key'> & { unread: boolean }> {
+  assertTaskId(taskId);
+  const task = getTask(taskId);
+  const reads = task.contribution_reads;
+  const seen = new Set(reads?.progress_read);
+  return (task.progress ?? []).map(entry => ({
+    ...publicProgressEntry(entry), unread: !!reads && !seen.has(entry.id),
+  }));
+}
+
 /**
  * Append one milestone. Text is kept exactly as written; whitespace-only text is
  * rejected. A retry with the same author-scoped request_key returns the original

@@ -50,7 +50,7 @@ import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, TaskStateError } from '../rooms-tasks/task-state.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import {
-  appendTaskProgress, getTaskReview, listTaskProgress, publicProgressEntry, publicReview, readTaskReviewArtifact,
+  appendTaskProgress, getTaskReview, taskProgressSnapshot, publicProgressEntry, publicReview, readTaskReviewArtifact,
   setTaskReviewMarkdown, taskContributionSummary, TaskReviewError,
 } from '../rooms-tasks/task-review.js';
 import { isProvider, type SubscriptionProvider } from '../subscriptions/store.js';
@@ -629,7 +629,7 @@ export async function buildWebServer(
   });
   app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async request => {
     auth.authenticate(request);
-    return { progress: (await reviewApi(() => listTaskProgress(request.params.id))).map(publicProgressEntry) };
+    return { progress: await reviewApi(() => taskProgressSnapshot(request.params.id)) };
   });
   app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async (request, reply) => {
     auth.authenticate(request, true);
