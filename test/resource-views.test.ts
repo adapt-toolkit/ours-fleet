@@ -420,7 +420,11 @@ it('keeps committed previews live through an incomplete append and publishes its
   await expect(conversationPreview(join(f.root, 'selected'), new AbortController().signal)).rejects.toThrow();
 });
 
-for (const resource of ['directory', 'roles']) it.each(['.conversation/events-000001.jsonl', '.notify-cursor', '.monitor-state.json', '.monitor-status'])(`keeps ${resource} ready and ordered through sustained independent agent status commits (%s)`, async activityPath => {
+for (const resource of ['directory', 'roles']) it.each(['.conversation/events-000001.jsonl', '.notify-cursor', '.monitor-state.json', '.monitor-status',
+  // Supervisor/session status and runner bookkeeping a starting member commits.
+  '.restart-ledger.json', '.exit-status', '.daemon-recovery.json', '.control-token', '.control.sock', '.monitor-owner',
+  '.booted', '.supervisor-run.json', '.subscription-pin.json', '.session-ownership.json', '.managed-recovery.json',
+  '.acp-session-id', '.self-reminders.json', 'supervisor.log', 'WORKLOG.md', '.ours-bridge/descriptor.json', '.task-supervisor/state.json'])(`keeps ${resource} ready and ordered through sustained independent agent status commits (%s)`, async activityPath => {
   vi.useFakeTimers({toFake:['setTimeout','clearTimeout','setInterval','clearInterval','Date','performance']});clean.push(()=>vi.useRealTimers());
   const status = { A: 0, B: 0 };
   let commits = 0, reads = 0, readyAt = -1;
@@ -499,9 +503,9 @@ it('fences an in-flight old agent row on structural removal and replacement whil
   expect(f.frames().filter(frame=>frame.kind==='snapshot').some(frame=>frame.payload.roles.some((row:any)=>row.status.sequence===99))).toBe(false);
 });
 
-it('still bounds continuously changing directory structure to three capture attempts', async()=>{
+it.each(['', 'role.yaml', '.temp-supervisor.json', 'creation.json', '.identity', '.cwd', 'unknown.json'])('still bounds continuously changing directory structure to three capture attempts (%s)', async member=>{
   let reads=0;
-  const f=fixture(async()=>{reads++;publishFleetResourceCommit(join(f.root,'A'));return {roles:[],tasks:[],lists:[]};});
+  const f=fixture(async()=>{reads++;publishFleetResourceCommit(join(f.root,'A',member));return {roles:[],tasks:[],lists:[]};});
   const binding=f.register();
   await expect(f.resources.bound('owner',f.connection.connectionId,'view',1,binding.baselineId)).rejects.toThrow('unstable');
   expect(reads).toBe(3);

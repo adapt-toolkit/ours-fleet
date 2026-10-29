@@ -387,6 +387,12 @@ export class FleetResourceViews {
       // Monitor cursor/state and its presented status are per-agent activity.
       // None changes role membership/configuration. Keep these as full wakes.
       if (structural && parts.length === 2 && ['.session-events.jsonl', '.session-events.jsonl.1', '.subscription-usage.json', '.notify-cursor', '.monitor-state.json', '.monitor-status'].includes(parts[1])) return false;
+      // A starting or running member also commits its supervisor/session status
+      // (restart ledger, exit, daemon recovery, control endpoint, monitor owner) and
+      // runner bookkeeping no projection reads. Neither changes membership; while
+      // members start, fencing on them left no stable directory capture.
+      if (structural && parts.length === 2 && ['.restart-ledger.json', '.exit-status', '.daemon-recovery.json', '.control-token', '.control.sock', '.monitor-owner', '.booted', '.supervisor-run.json', '.subscription-pin.json', '.session-ownership.json', '.managed-recovery.json', '.acp-session-id', '.self-reminders.json', 'supervisor.log', 'WORKLOG.md'].includes(parts[1])) return false;
+      if (structural && parts.length >= 2 && ['.ours-bridge', '.task-supervisor'].includes(parts[1])) return false;
       if (parts.length < 3 || parts[1] !== '.conversation') continue;
       if (structural && (descriptor.resource === 'directory' || descriptor.resource === 'roles')) return false;
       if (descriptor.resource === 'previews') {
