@@ -239,7 +239,7 @@ describe('HTTP API', () => {
       expect((await get(`/api/v1/tasks/${other.task_id}`)).json().task).toMatchObject({ progress_count: 0, review: { has_markdown: false, artifact_count: 0 } });
 
       expect((await get(`/api/v1/tasks/${task.task_id}/progress`, anonymous)).statusCode).toBe(401);
-      expect((await get(`/api/v1/tasks/${task.task_id}/progress`)).json().progress).toEqual([expect.objectContaining({ text: 'milestone', author: { kind: 'agent', role: 'dev-1', surface: 'mcp' } })]);
+      expect((await get(`/api/v1/tasks/${task.task_id}/progress`)).json().progress).toEqual([expect.objectContaining({ text: 'milestone', unread: true, author: { kind: 'agent', role: 'dev-1', surface: 'mcp' } })]);
       expect((await get(`/api/v1/tasks/${task.task_id}/review`)).json().review).toMatchObject({ markdown: '[Spec](https://example.test/spec)', artifacts: [{ id: artifact.id, name: 'my "data".bin' }] });
       expect((await get(`/api/v1/tasks/${other.task_id}/review`)).json()).toEqual({ review: null });
 

@@ -3,10 +3,10 @@ import { spawn } from 'node:child_process';
 import { utimesSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask } from '../src/rooms-tasks/task-state.js';
+import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask, acknowledgeTaskProgress } from '../src/rooms-tasks/task-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
 import {
-  appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress,
+  appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress, taskProgressSnapshot,
   openTaskWorkspaceFile, readTaskReviewArtifact, reviewStoreDirectory, reviewStoreFiles, setTaskReviewMarkdown,
   taskContributionSummary, PROGRESS_MAX_ENTRIES,
 } from '../src/rooms-tasks/task-review.js';
@@ -35,6 +35,29 @@ async function attachFile(taskId: string, path: string, author: typeof developer
 }
 
 describe('task progress', () => {
+  it('snapshots exact per-ID reads without mutation and preserves legacy read semantics', async () => {
+    const t = task();
+    const first = appendTaskProgress(t.task_id, { text: 'old', author: developer, requestKey: 'private-retry-key' }).entry;
+    const middle = appendTaskProgress(t.task_id, { text: 'middle', author: developer }).entry;
+    const last = appendTaskProgress(t.task_id, { text: 'last', author: developer }).entry;
+    await acknowledgeTaskProgress(t.task_id, [middle.id]);
+    const before = getTask(t.task_id);
+    const snapshot = taskProgressSnapshot(t.task_id);
+    expect(snapshot.map(entry => [entry.id, entry.unread])).toEqual([[first.id, true], [middle.id, false], [last.id, true]]);
+    expect(snapshot[0]).not.toHaveProperty('request_key');
+    expect(getTask(t.task_id)).toEqual(before);
+    // Old records predate tracking. Existing entries must not become new after upgrade.
+    const path = join(tasksDir(), `${t.task_id}.json`);
+    const legacy = { ...before };
+    delete legacy.contribution_reads;
+    writeFileSync(path, JSON.stringify(legacy));
+    expect(taskProgressSnapshot(t.task_id).map(entry => entry.unread)).toEqual([false, false, false]);
+    const fresh = appendTaskProgress(t.task_id, { text: 'after upgrade', author: developer }).entry;
+    expect(taskProgressSnapshot(t.task_id).map(entry => [entry.id, entry.unread])).toEqual([
+      [first.id, false], [middle.id, false], [last.id, false], [fresh.id, true],
+    ]);
+  });
+
   it('appends exact authored text in order with stable ids, authors and times', () => {
     const t = task();
     const first = appendTaskProgress(t.task_id, { text: '  Root cause found:\n\n    stale cache key\n', author: developer });

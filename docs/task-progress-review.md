@@ -4,7 +4,10 @@ Every task can carry two optional sections next to its description. Tasks create
 before this feature, or that never use it, have neither and behave as before.
 
 - **Progress** is an append-only, chronological milestone log: free-form text
-  entries, each with a stable ID, the time it was recorded and its author. It is
+  entries, each with a stable ID, the time it was recorded and its author. The
+  browser response also includes `unread` per entry from the same task snapshot,
+  based on persisted entry-ID acknowledgments. Legacy records without read state
+  report all existing entries as read; retry keys remain private. It is
   for significant verified milestones (root cause found, PR opened with its link,
   a measured result with its honest scope, final deliverable ready), not for room
   chat, routine status, handoffs or ordinary review rounds. Entries cannot be
@@ -99,7 +102,7 @@ workspace-device bearer. `GET /api/v1/meta` reports API minor version 1.
 | Route | Result |
 | --- | --- |
 | `GET /tasks`, `GET /tasks/:id` and other task payloads | `progress_count` and `review: {has_markdown, artifact_count, revision, updated_at?}`; `revision` grows with every package change (0 without a package). Bodies are not inlined. |
-| `GET /tasks/:id/progress` | `{progress: [{id, at, author, text}]}`, oldest first. |
+| `GET /tasks/:id/progress` | `{progress: [{id, at, author, text, unread}]}`, oldest first. |
 | `POST /tasks/:id/progress` | `{text, requestKey?}` (or an `Idempotency-Key` header): 201 new, 200 replay, 409 conflicting replay. |
 | `GET /tasks/:id/review` | `{review: {markdown, updated_at, updated_by, artifacts: [{id, name, mime, size, sha256, added_at, added_by}]}}` or `{review: null}`. |
 | `PUT /tasks/:id/review` | `{markdown, expectedMarkdown}`; 409 when the Markdown changed meanwhile. |
