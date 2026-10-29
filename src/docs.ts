@@ -644,16 +644,24 @@ deletion-pending tasks to operators).
 A task can carry an append-only **Progress** milestone log and a self-contained
 **To review** package (Markdown plus retained files). Agents launched for a task
 use \`fleet_task_progress_list\`, \`fleet_task_progress_append\`,
-\`fleet_task_review_show\`, \`fleet_task_review_set\` and
+\`fleet_task_review_show\`, \`fleet_task_review_set\`, \`fleet_task_review_clear\` and
 \`fleet_task_review_detach\`; files are attached from the task workspace with the CLI:
 
 \`\`\`sh
 ours-fleet task progress TASK [--text TEXT | --text-file FILE] [--request-key KEY] [--json]
 ours-fleet task review-package TASK [--markdown-file FILE] [--attach PATH] [--detach ID] [--json]
+ours-fleet task review-package TASK --clear --expected-revision N [--markdown-file FILE]
 \`\`\`
 
-By default only the LocalCoordinator writes Progress, and every task role prepares
-the To review package before a Review handoff without gaining lifecycle authority.
+A Progress entry is one significant verified fact for the Owner in at most 400
+Unicode code points; longer text is refused, never cut. Example: "Owner review
+required: choose the deployment option in To review." The LocalCoordinator is the
+only Progress writer when the room has one; otherwise the Developer writes it.
+To review holds one current request for human review or decision (final
+acceptance or one Owner decision), never an archive. After the Owner answers in
+the room, its writer clears it with \`fleet_task_review_clear\` and the revision it
+last read; a changed package is a conflict. Every task role prepares the final
+package before a Review handoff without gaining lifecycle authority.
 At Review the task description keeps only the clickable PR links, one per line (a task
 without PRs links its actual deliverables, never an invented PR); the package holds the
 rest, including the original description as an attached file.

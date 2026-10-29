@@ -132,7 +132,7 @@ describe('packaged default role contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('ships the self-contained To review handoff to every task role and Progress writing only to LocalCoordinator', () => {
+  it('ships the current-request To review lifecycle to every task role and one Progress writer per room', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-review-contracts-'));
     try {
       const config = join(root, 'fleet.yaml');
@@ -164,15 +164,33 @@ describe('packaged default role contract', () => {
         expect(persona('Critic')).toMatch(/must also attach the original task description, which at Review is replaced with only the clickable PR links, one per line \(or the actual deliverable links when there are no PRs\)/);
         expect(persona('LocalCoordinator')).toMatch(/the original task description as an attached file \(at Review the description keeps only the PR links, or the actual deliverable links when there are no PRs\)/);
         expect(persona('Critic')).toMatch(/Withhold sign-off while it is missing, stale or misleading/);
-        expect(persona('LocalCoordinator')).toMatch(/default writer of this task's Progress log/);
-        expect(persona('LocalCoordinator')).toMatch(/never poll, schedule turns or mirror messages/);
-        expect(persona('LocalCoordinator')).toMatch(/Do not record agent starts,\s+status checks, normal handoffs, ordinary review findings/);
-        for (const name of ['Developer', 'Engineer', 'Critic', 'Coordinator'])
+        const local = persona('LocalCoordinator');
+        expect(local).toMatch(/only writer of this task's Progress log/);
+        expect(local).toMatch(/never poll, schedule turns or mirror messages/);
+        expect(local).toMatch(/Skip agent starts, status checks, repeated status, handoffs, internal review back-and-forth, filler and unverified claims/);
+        expect(local).toMatch(/at most 400 characters \(Unicode code points; longer text is refused, never cut\)/);
+        expect(local).toMatch(/never split one sentence to fit/);
+        expect(local).toMatch(/`ours-fleet task progress <task-id> --text <text> --request-key <key>`/);
+        // To review is one current request; the Owner's answer, not opening it, resolves it, and a fenced clear removes it.
+        expect(local).toMatch(/holds one CURRENT request for human review or decision/);
+        expect(local).toMatch(/Owner review required: choose the deployment option in To review\./);
+        expect(local).toMatch(/Opening To review does not resolve a request; the Owner's answer in the room does/);
+        for (const name of ['LocalCoordinator', 'Developer', 'Engineer'])
+          expect(persona(name), `${source}:${name}`).toMatch(/`fleet_task_review_clear` with `expected_revision` \(or `ours-fleet task review-package <task-id> --clear --expected-revision <n>`/);
+        // Developers write Progress only in a room without a LocalCoordinator; Critic and Coordinator never.
+        for (const name of ['Developer', 'Engineer']) {
+          expect(persona(name), `${source}:${name}`).toMatch(/when the room has a LocalCoordinator, it alone writes Progress; post facts the Owner should know in the room instead\. Otherwise you write it/);
+          expect(persona(name), `${source}:${name}`).toMatch(/at most 400 characters/);
+        }
+        expect(persona('Critic')).toMatch(/You do not write Progress/);
+        expect(persona('Critic')).toMatch(/not your ongoing review/);
+        for (const name of ['Critic', 'Coordinator'])
           expect(persona(name), `${source}:${name}`).not.toMatch(/fleet_task_progress_append|task progress <task-id> --text/);
         const coordinator = persona('Coordinator');
         expect(coordinator).toMatch(/ours-fleet task review-package <task-id>/);
         expect(coordinator).toMatch(/do not write or judge it yourself/);
-        expect(coordinator).toMatch(/and that it attaches the original task description/);
+        expect(coordinator).toMatch(/one current acceptance request, not an archive of earlier requests/);
+        expect(coordinator).toMatch(/attach the original task description/);
         expect(coordinator).toMatch(/Then replace the task description with only the clickable Markdown PR links, one per line, with no status or evidence \(those stay in To review\); a task without PRs links its actual deliverables instead, never an invented PR. Then move the task to Review with `ours-fleet task review <task-id>`/);
         expect(coordinator).toMatch(/Only when the Owner accepts\s+the result or explicitly asks, run `ours-fleet task finish/);
         // The packaged continuity loop stays observation-only and never becomes a Progress pipeline;
@@ -182,7 +200,7 @@ describe('packaged default role contract', () => {
             .toMatch(/This pass never appends task Progress entries/);
         else expect(String(generated.get('agent_templates/LocalCoordinator.yaml'))).not.toMatch(/loops|Progress/);
       }
-      // Each generated room member task carries its charter's handoff; only a LocalCoordinator writes Progress.
+      // Each generated room member task carries its charter's handoff; a Developer writes Progress only without a LocalCoordinator.
       for (const template of listTemplates(cfg.roomTemplates ?? {})) {
         const roster = template.members.map(member => ({ role_name: `${template.name}-${member.slot}-1`, cowork_role: member.role }));
         for (const [index, member] of template.members.entries()) {
@@ -192,6 +210,8 @@ describe('packaged default role contract', () => {
           });
           expect(task, `${template.name}:${member.role}`).toMatch(/To\s+review\s+package/);
           if (member.role === 'LocalCoordinator') expect(task).toContain('fleet_task_progress_append');
+          else if (['Developer', 'Engineer'].includes(member.role))
+            expect(task.replace(/\s+/g, ' ')).toMatch(/when the room has a LocalCoordinator, it alone writes Progress/);
           else expect(task, `${template.name}:${member.role}`).not.toContain('fleet_task_progress_append');
         }
       }

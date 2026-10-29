@@ -3,12 +3,12 @@ import { spawn } from 'node:child_process';
 import { utimesSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync, ftruncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask, acknowledgeTaskProgress } from '../src/rooms-tasks/task-state.js';
+import { beginTaskDeletionIntent, createTask, getTask, tasksDir, activateTask, reviewTask, acknowledgeTaskProgress, acknowledgeTaskReview } from '../src/rooms-tasks/task-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
 import {
-  appendTaskProgress, attachTaskReviewArtifact, detachTaskReviewArtifact, getTaskReview, listTaskProgress, taskProgressSnapshot,
+  appendTaskProgress, attachTaskReviewArtifact, clearTaskReview, detachTaskReviewArtifact, getTaskReview, listTaskProgress, taskProgressSnapshot,
   openTaskWorkspaceFile, readTaskReviewArtifact, reviewStoreDirectory, reviewStoreFiles, setTaskReviewMarkdown,
-  taskContributionSummary, PROGRESS_MAX_ENTRIES,
+  taskContributionSummary, PROGRESS_MAX_ENTRIES, PROGRESS_TEXT_MAX,
 } from '../src/rooms-tasks/task-review.js';
 
 const developer = { kind: 'agent', role: 'dev-1', identity_cid: 'A'.repeat(64), surface: 'mcp' } as const;
@@ -82,11 +82,53 @@ describe('task progress', () => {
   it('rejects empty, oversized and malformed input without writing', () => {
     const t = task();
     expect(() => appendTaskProgress(t.task_id, { text: ' \n\t', author: developer })).toThrow(/required/);
-    expect(() => appendTaskProgress(t.task_id, { text: 'x'.repeat(4_001), author: developer })).toThrow(/maximum/);
+    expect(() => appendTaskProgress(t.task_id, { text: 'x'.repeat(401), author: developer })).toThrow(/maximum/);
     expect(() => appendTaskProgress(t.task_id, { text: 'ok', requestKey: 'bad key', author: developer })).toThrow(/request_key/);
     expect(() => appendTaskProgress('../escape', { text: 'ok', author: developer })).toThrow(/invalid task ID/);
     expect(listTaskProgress(t.task_id)).toEqual([]);
     expect(getTask(t.task_id).progress).toBeUndefined();
+  });
+
+  it('limits new entries to 400 code points of the exact text, writing nothing when refused', () => {
+    expect(PROGRESS_TEXT_MAX).toBe(400);
+    const t = task();
+    appendTaskProgress(t.task_id, { text: 'first', author: developer });
+    const before = readFileSync(join(tasksDir(), `${t.task_id}.json`), 'utf8');
+    const refused = [
+      'x'.repeat(401),
+      // Astral characters are two UTF-16 units but one code point each.
+      '😀'.repeat(401),
+      // A combining mark is its own code point: 399 + 'é' (e + U+0301) is 401.
+      'x'.repeat(399) + 'e\u0301',
+      // Whitespace counts as written; nothing is trimmed before counting.
+      ` ${'x'.repeat(400)}`,
+      'Готово. '.repeat(50) + 'x',
+    ];
+    for (const text of refused) {
+      expect(() => appendTaskProgress(t.task_id, { text, author: developer, requestKey: 'long' }))
+        .toThrow(/is 401 Unicode characters \(code points\); the maximum is 400\. Nothing was saved/);
+    }
+    // No entry, no retry key, no notification event and no read-state change.
+    expect(readFileSync(join(tasksDir(), `${t.task_id}.json`), 'utf8')).toBe(before);
+    const accepted = ['x'.repeat(400), '😀'.repeat(400), 'x'.repeat(398) + 'e\u0301', 'Готово. '.repeat(50), '👩‍💻'.repeat(133)];
+    for (const text of accepted) expect(appendTaskProgress(t.task_id, { text, author: developer }).entry.text).toBe(text);
+    // A joined emoji is several code points: 👩‍💻 is three, so 134 of them are 402.
+    expect(() => appendTaskProgress(t.task_id, { text: '👩‍💻'.repeat(134), author: developer })).toThrow(/is 402 Unicode/);
+    expect(listTaskProgress(t.task_id)).toHaveLength(1 + accepted.length);
+  });
+
+  it('keeps longer entries written before the limit readable and does not block new appends', () => {
+    const t = task();
+    appendTaskProgress(t.task_id, { text: 'seed', author: developer });
+    const path = join(tasksDir(), `${t.task_id}.json`);
+    const record = JSON.parse(readFileSync(path, 'utf8'));
+    const historical = 'h'.repeat(4_000);
+    record.progress[0].text = historical;
+    writeFileSync(path, JSON.stringify(record));
+    expect(listTaskProgress(t.task_id)[0]!.text).toBe(historical);
+    expect(taskProgressSnapshot(t.task_id)[0]!.text).toBe(historical);
+    appendTaskProgress(t.task_id, { text: 'next', author: developer });
+    expect(listTaskProgress(t.task_id).map(entry => entry.text)).toEqual([historical, 'next']);
   });
 
   it('replays author-scoped retry keys, refuses changed retries and checks replay before the cap', () => {
@@ -499,5 +541,91 @@ describe('review revision', () => {
     setTaskReviewMarkdown(t.task_id, { markdown: 'x', expectedMarkdown: '', author: developer });
     expect(taskContributionSummary(getTask(t.task_id)).review.revision).toBe(after.revision + 1);
     expect(getTaskReview(t.task_id)!.updated_by).toEqual(developer);
+  });
+});
+
+describe('review clear', () => {
+  const revisionOf = (taskId: string) => taskContributionSummary(getTask(taskId)).review.revision;
+
+  it('removes Markdown and every file in one fenced change that readers see as an update', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'a.md'), 'a'); writeFileSync(join(ws, 'b.md'), 'b');
+    setTaskReviewMarkdown(t.task_id, { markdown: 'Owner decision: choose A or B', expectedMarkdown: '', author: developer });
+    const a = await attachFile(t.task_id, join(ws, 'a.md')), b = await attachFile(t.task_id, join(ws, 'b.md'));
+    const revision = revisionOf(t.task_id);
+    acknowledgeTaskReview(t.task_id, revision);
+    const cleared = clearTaskReview(t.task_id, { expectedRevision: revision, author: critic });
+    expect(cleared.removed.map(item => item.id)).toEqual([a.artifact.id, b.artifact.id]);
+    expect(getTaskReview(t.task_id)).toMatchObject({ revision: revision + 1, markdown: '', artifacts: [], updated_by: critic });
+    expect(reviewStoreFiles(t.task_id)).toEqual([]);
+    await expect(readTaskReviewArtifact(t.task_id, a.artifact.id)).rejects.toThrow(/not found/);
+    // Existing read and push semantics: a new revision is unread until seen and pushes once.
+    expect(taskContributionSummary(getTask(t.task_id))).toMatchObject({ review_unread: true });
+    expect(getTask(t.task_id).notification_events!.map(event => event.eventId)).toContain(`task:${t.task_id}:review:${revision + 1}`);
+    // The next request writes from the empty package.
+    setTaskReviewMarkdown(t.task_id, { markdown: 'Final acceptance', expectedMarkdown: '', author: developer });
+    expect(getTaskReview(t.task_id)).toMatchObject({ revision: revision + 2, markdown: 'Final acceptance', artifacts: [] });
+  });
+
+  it('refuses a stale revision after any change, including an edit back to the same Markdown, and changes nothing', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'a.md'), 'a');
+    setTaskReviewMarkdown(t.task_id, { markdown: 'A', expectedMarkdown: '', author: developer });
+    const read = revisionOf(t.task_id);
+    // Re-sending the stored Markdown is a no-op, so the read revision still fences.
+    setTaskReviewMarkdown(t.task_id, { markdown: 'A', expectedMarkdown: 'A', author: developer });
+    expect(revisionOf(t.task_id)).toBe(read);
+    // An edit that ends at the same Markdown is still a change since the read.
+    setTaskReviewMarkdown(t.task_id, { markdown: 'B', expectedMarkdown: 'A', author: critic });
+    setTaskReviewMarkdown(t.task_id, { markdown: 'A', expectedMarkdown: 'B', author: critic });
+    const path = join(tasksDir(), `${t.task_id}.json`);
+    let before = readFileSync(path, 'utf8');
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: read, author: developer })).toThrow(/changed elsewhere/);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    // A concurrent attach or detach is a change too; its file survives the refused clear.
+    const current = revisionOf(t.task_id);
+    const attached = await attachFile(t.task_id, join(ws, 'a.md'), critic);
+    before = readFileSync(path, 'utf8');
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: current, author: developer })).toThrow(/changed elsewhere/);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(reviewStoreFiles(t.task_id)).toEqual([`${attached.artifact.id}.data`]);
+    const withFile = revisionOf(t.task_id);
+    detachTaskReviewArtifact(t.task_id, attached.artifact.id, { author: critic });
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: withFile, author: developer })).toThrow(/changed elsewhere/);
+    expect(getTaskReview(t.task_id)!.markdown).toBe('A');
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: -1, author: developer })).toThrow(/non-negative integer/);
+  });
+
+  it('keeps a file whose attach commits after the clear and refuses a stale retry after the next request', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'old.md'), 'old'); writeFileSync(join(ws, 'new.md'), 'new');
+    const old = await attachFile(t.task_id, join(ws, 'old.md'));
+    const read = revisionOf(t.task_id);
+    // The new file's bytes are already stored when the clear commits; only the cleared file is removed.
+    const source = await openTaskWorkspaceFile(getTask(t.task_id), join(ws, 'new.md'));
+    const late = await attachTaskReviewArtifact(t.task_id, { name: 'new.md', source, author: critic, beforeCommit: () => {
+      expect(clearTaskReview(t.task_id, { expectedRevision: read, author: developer }).removed.map(item => item.id)).toEqual([old.artifact.id]);
+    } });
+    expect(getTaskReview(t.task_id)!.artifacts.map(item => item.id)).toEqual([late.artifact.id]);
+    expect(reviewStoreFiles(t.task_id)).toEqual([`${late.artifact.id}.data`]);
+    expect((await readTaskReviewArtifact(t.task_id, late.artifact.id)).bytes.toString()).toBe('new');
+    // Retrying the old clear after the package was written again removes nothing.
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: read, author: developer })).toThrow(/changed elsewhere/);
+    expect(reviewStoreFiles(t.task_id)).toEqual([`${late.artifact.id}.data`]);
+  });
+
+  it('succeeds unchanged on an empty package at its revision and leaves other tasks alone', async () => {
+    const t = task(), other = task();
+    const path = join(tasksDir(), `${t.task_id}.json`), before = readFileSync(path, 'utf8');
+    expect(clearTaskReview(t.task_id, { expectedRevision: 0, author: developer })).toEqual({ review: undefined, removed: [] });
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: 1, author: developer })).toThrow(/changed elsewhere/);
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    writeFileSync(join(other.workspace!.path, 'keep.md'), 'keep');
+    await attachFile(other.task_id, join(other.workspace!.path, 'keep.md'));
+    setTaskReviewMarkdown(t.task_id, { markdown: 'x', expectedMarkdown: '', author: developer });
+    clearTaskReview(t.task_id, { expectedRevision: 1, author: developer });
+    expect(clearTaskReview(t.task_id, { expectedRevision: 2, author: developer }).removed).toEqual([]);
+    expect(revisionOf(t.task_id)).toBe(2);
+    expect(reviewStoreFiles(other.task_id)).toHaveLength(1);
   });
 });

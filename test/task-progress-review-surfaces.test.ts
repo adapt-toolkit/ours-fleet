@@ -93,7 +93,7 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
     try {
       const names = (await mcp.client.listTools()).tools.map(tool => tool.name);
       expect(names).toEqual(expect.arrayContaining(['fleet_task_progress_list', 'fleet_task_progress_append',
-        'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_detach']));
+        'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_clear', 'fleet_task_review_detach']));
       expect(error(await mcp.call('fleet_task_progress_append', { text: 'x' }))).toBe('task_unavailable');
 
       role = { name: 'dev-1', roomMemberStartup: { task_id: task.task_id } };
@@ -105,6 +105,9 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
       expect((await mcp.call('fleet_task_progress_append', { text: 'PR opened: https://example.test/pr/7', request_key: 'pr-7' })).structuredContent.replayed).toBe(true);
       expect(error(await mcp.call('fleet_task_progress_append', { text: 'changed', request_key: 'pr-7' }))).toBe('idempotency_conflict');
       expect(error(await mcp.call('fleet_task_progress_append', { text: '   ' }))).toBe('invalid_request');
+      const long = await mcp.call('fleet_task_progress_append', { text: 'é'.repeat(401), request_key: 'long' });
+      expect(error(long)).toBe('invalid_request');
+      expect(long.content[0].text).toMatch(/401 Unicode characters \(code points\); the maximum is 400\. Nothing was saved/);
       expect((await mcp.call('fleet_task_progress_list')).structuredContent.progress).toHaveLength(1);
       expect(getTask(other.task_id).progress).toBeUndefined();
 
@@ -112,6 +115,13 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
       expect(error(await mcp.call('fleet_task_review_set', { markdown: 'stale', expected_markdown: '' }))).toBe('conflict');
       expect((await mcp.call('fleet_task_review_show')).structuredContent.review).toMatchObject({ markdown: '## Outcome', artifacts: [] });
       expect(error(await mcp.call('fleet_task_review_detach', { artifact_id: '00000000-0000-0000-0000-000000000000' }))).toBe('not_found');
+      const revision = (await mcp.call('fleet_task_review_show')).structuredContent.review.revision;
+      expect(error(await mcp.call('fleet_task_review_clear', { expected_revision: revision - 1 }))).toBe('conflict');
+      expect((await mcp.call('fleet_task_review_show')).structuredContent.review.markdown).toBe('## Outcome');
+      expect((await mcp.call('fleet_task_review_clear', { expected_revision: revision })).structuredContent)
+        .toMatchObject({ task_id: task.task_id, removed: [], review: { revision: revision + 1, markdown: '', artifacts: [],
+          updated_by: { kind: 'agent', role: 'dev-1', identity_cid: CID, surface: 'mcp' } } });
+      expect(getTask(other.task_id).review).toBeUndefined();
 
       // A listed member with another identity, or an unlisted non-task launch, is refused.
       withMembers(task.task_id, [{ name: 'dev-1', identity_cid: 'E'.repeat(64) }]);
@@ -137,9 +147,9 @@ describe('agent MCP progress paging', { timeout: 60_000 }, () => {
     withMembers(task.task_id, [{ name: 'dev-1', identity_cid: CID }]);
     const { appendTaskProgress, PROGRESS_MAX_ENTRIES, PROGRESS_TEXT_MAX } = await import('../src/rooms-tasks/task-review.js');
     // Worst cases for serialized size: astral characters and control characters that JSON escapes.
-    const texts = Array.from({ length: PROGRESS_MAX_ENTRIES }, (_, index) => (index % 2
-      ? '😀'.repeat(PROGRESS_TEXT_MAX / 2)
-      : `${index}\u0001`.padEnd(PROGRESS_TEXT_MAX, '\u0001')).slice(0, PROGRESS_TEXT_MAX));
+    const texts = Array.from({ length: PROGRESS_MAX_ENTRIES }, (_, index) => index % 2
+      ? '😀'.repeat(PROGRESS_TEXT_MAX)
+      : `${index}\u0001`.padEnd(PROGRESS_TEXT_MAX, '\u0001'));
     for (const text of texts) appendTaskProgress(task.task_id, { text, author: { kind: 'local_control', surface: 'cli' } });
     const mcp = await bridge(() => ({ taskId: task.task_id, role: 'dev-1', identityCid: CID, taskOwned: false }));
     try {
@@ -154,7 +164,7 @@ describe('agent MCP progress paging', { timeout: 60_000 }, () => {
         after = page.structuredContent.next_after; pages++;
       } while (after);
       expect(read).toEqual(texts);
-      expect(pages).toBeGreaterThan(4);
+      expect(pages).toBeGreaterThanOrEqual(4);
       expect(error(await mcp.call('fleet_task_progress_list', { after: 'missing' }))).toBe('invalid_request');
       expect(error(await mcp.call('fleet_task_progress_list', { limit: 0 }))).toBe('invalid_request');
       const two = await mcp.call('fleet_task_progress_list', { limit: 2 });
@@ -191,6 +201,11 @@ describe('task CLI', { timeout: 120_000 }, () => {
       expect(JSON.parse(operator.stdout).entry.author).toEqual({ kind: 'local_control', surface: 'cli' });
       const listed = await runCli(['task', 'progress', task.task_id, '--json']);
       expect(JSON.parse(listed.stdout).progress.map((entry: any) => entry.text)).toEqual(['Root cause found\n  in cache', 'Operator note']);
+      writeFileSync(join(root, 'long.txt'), `${'x'.repeat(400)}\n`);
+      const long = await runCli(['task', 'progress', task.task_id, '--text-file', join(root, 'long.txt')], managed);
+      expect(long.status).not.toBe(0);
+      expect(long.stderr).toMatch(/401 Unicode characters \(code points\); the maximum is 400\. Nothing was saved/);
+      expect(getTask(task.task_id).progress).toHaveLength(2);
 
       writeFileSync(join(task.workspace!.path, 'spec.md'), '# Spec');
       writeFileSync(join(root, 'review.md'), '## Outcome\n\n[PR](https://example.test/pr/9)');
@@ -204,6 +219,21 @@ describe('task CLI', { timeout: 120_000 }, () => {
       expect(outside.status).not.toBe(0);
       expect(outside.stderr).toMatch(/inside the task workspace/);
       expect(getTask(task.task_id).review!.artifacts).toHaveLength(1);
+
+      // Clear the resolved request and write the next one in a single fenced call.
+      const shown = await runCli(['task', 'review-package', task.task_id]);
+      const revision = Number(/\(revision (\d+)\)/.exec(shown.stdout)![1]);
+      expect(revision).toBe(getTask(task.task_id).review!.revision);
+      const stale = await runCli(['task', 'review-package', task.task_id, '--clear', '--expected-revision', String(revision - 1)], managed);
+      expect(stale.status).not.toBe(0);
+      expect(stale.stderr).toMatch(/changed elsewhere/);
+      expect(getTask(task.task_id).review!.artifacts).toHaveLength(1);
+      expect((await runCli(['task', 'review-package', task.task_id, '--clear'], managed)).stderr).toMatch(/go together/);
+      writeFileSync(join(root, 'next.md'), 'Owner decision: choose the rollout window.');
+      const replaced = await runCli(['task', 'review-package', task.task_id, '--clear', '--expected-revision', String(revision),
+        '--markdown-file', join(root, 'next.md'), '--json'], managed);
+      expect(replaced.stderr).toBe('');
+      expect(JSON.parse(replaced.stdout).review).toMatchObject({ revision: revision + 2, markdown: 'Owner decision: choose the rollout window.', artifacts: [] });
     } finally { await control.close(); }
   });
 });
@@ -258,6 +288,10 @@ describe('HTTP API', () => {
       const post = (payload: unknown, h: Record<string, string> = headers) => server.app.inject({ method: 'POST', url: `/api/v1/tasks/${task.task_id}/progress`, headers: h, payload: payload as any });
       expect((await post({ text: 'no csrf' }, { host: boundary.host, origin: boundary.origin, cookie })).statusCode).toBe(403);
       expect((await post({ text: 3 })).statusCode).toBe(400);
+      const long = await post({ text: '😀'.repeat(401) });
+      expect(long.statusCode).toBe(400);
+      expect(long.body).toMatch(/401 Unicode characters/);
+      expect((await post({ text: '😀'.repeat(400) })).statusCode).toBe(201);
       const created = await post({ text: 'web milestone', requestKey: 'w1' });
       expect(created.statusCode).toBe(201);
       expect(created.json().entry.author).toEqual({ kind: 'local_control', surface: 'web' });

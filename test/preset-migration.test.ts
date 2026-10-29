@@ -278,6 +278,32 @@ describe('packaged role-default adoption', () => {
     expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'review-package-11-again' }).replacements).toEqual([]);
   });
 
+  it('adopts untouched revision-12 charters, which predate the Progress limit and the To review clear lifecycle', () => {
+    const config = join(dir, 'current-request-12.yaml');
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    const roles = ['Developer', 'Critic', 'Engineer', 'LocalCoordinator', 'Coordinator'];
+    for (const role of roles) {
+      const previous = readFileSync(new URL(`./fixtures/presets/${role}.revision-12.yaml`, import.meta.url), 'utf8');
+      expect(previous).not.toContain('fleet_task_review_clear');
+      writeFileSync(join(root, 'roles', `${role}.yaml`), previous, { mode: 0o600 });
+    }
+    // An edited copy among them stays byte-for-byte.
+    const edited = readFileSync(new URL('./fixtures/presets/Critic.revision-12.yaml', import.meta.url), 'utf8')
+      .replace('Audit assumptions', 'Audit every assumption');
+    writeFileSync(join(root, 'roles', 'Critic.yaml'), edited, { mode: 0o600 });
+    const changed = roles.filter(role => role !== 'Critic').map(role => join(root, 'roles', `${role}.yaml`)).sort();
+    expect(migratePackagedRoleDefaults(config).replacements).toEqual(changed);
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: 'current-request-12' });
+    for (const role of roles.filter(role => role !== 'Critic')) {
+      const current = readFileSync(join(root, 'roles', `${role}.yaml`), 'utf8');
+      expect(current).toBe(readFileSync(join(packagedPresetRoot(), 'fleet', 'roles', `${role}.yaml`), 'utf8'));
+    }
+    expect(readFileSync(join(root, 'roles', 'LocalCoordinator.yaml'), 'utf8')).toContain('fleet_task_review_clear');
+    expect(readFileSync(join(root, 'roles', 'Critic.yaml'), 'utf8')).toBe(edited);
+    expect(migratePackagedRoleDefaults(config, { write: true }, { nonce: 'current-request-12-again' }).replacements).toEqual([]);
+  });
+
   it('preserves an edited revision-11 Developer charter byte-for-byte', () => {
     const config = join(dir, 'developer-custom-11.yaml');
     bootstrapPresets(config);

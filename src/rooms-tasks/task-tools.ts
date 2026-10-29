@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import {
   appendTaskProgress, detachTaskReviewArtifact, getTaskReview, listTaskProgress, publicProgressEntry, publicReview,
-  setTaskReviewMarkdown, TaskReviewError, PROGRESS_TEXT_MAX, REVIEW_MARKDOWN_MAX,
+  setTaskReviewMarkdown, clearTaskReview, TaskReviewError, PROGRESS_TEXT_MAX, REVIEW_MARKDOWN_MAX,
 } from './task-review.js';
 import { getTask, TaskStateError } from './task-state.js';
 import type { TaskContributionAuthor, TaskProgressEntry } from './types.js';
@@ -110,11 +110,13 @@ export function registerTaskTools(
   }, async args => run(bound => ({ task_id: bound.taskId, ...progressPage(listTaskProgress(bound.taskId), args) })));
 
   server.registerTool('fleet_task_progress_append', {
-    description: 'Append ONE significant, verified milestone to your task\'s Progress log (e.g. root cause found, PR opened with link, '
-      + 'measured result with its scope, final deliverable ready). Not for routine status, handoffs or review chatter. '
+    description: 'Append ONE significant, verified fact the Owner should know to your task\'s Progress log: delivered behavior, root cause, '
+      + 'measured result with a valid comparison, PR or publication, important blocker, changed scope, or a required Owner decision '
+      + '(e.g. "Owner review required: choose the deployment option in To review."). Lead with the result and name the actor; '
+      + 'one fact per entry, in the task\'s language. Not for routine status, handoffs or review chatter. '
       + 'Entries are permanent and shown to the Owner as written. Repeating a call with the same request_key and text returns the original entry.',
     inputSchema: {
-      text: z.string().describe(`Free-form milestone text, kept exactly as written (max ${PROGRESS_TEXT_MAX} characters).`),
+      text: z.string().describe(`Entry text, kept exactly as written: at most ${PROGRESS_TEXT_MAX} Unicode characters (code points); longer text is refused, not cut.`),
       request_key: z.string().optional().describe('Stable key for this milestone so a retried call cannot add it twice (e.g. "pr-opened-123").'),
     },
   }, async args => run((bound, author) => {
@@ -131,8 +133,9 @@ export function registerTaskTools(
   }));
 
   server.registerTool('fleet_task_review_set', {
-    description: 'Replace the Markdown of your task\'s To review package: the self-contained material the Owner reviews without reading the room or task description '
-      + '(outcome, clickable PR/spec links, validation and CI, independent verdict, limits, decisions needed). '
+    description: 'Replace the Markdown of your task\'s To review package: the one current request the Owner reviews without reading the room or task description '
+      + '(final acceptance: outcome, clickable PR/spec links, validation and CI, independent verdict, limits; or one Owner decision with its options). '
+      + 'Not an archive: clear a resolved request with fleet_task_review_clear. Attached files are kept. '
       + 'Pass the Markdown you last read as expected_markdown ("" when empty); a concurrent change is refused instead of overwritten.',
     inputSchema: {
       markdown: z.string().describe(`Review Markdown (max ${REVIEW_MARKDOWN_MAX} characters). Links use the same safe rules as task descriptions.`),
@@ -142,6 +145,19 @@ export function registerTaskTools(
     task_id: bound.taskId,
     review: publicReview(setTaskReviewMarkdown(bound.taskId, { markdown: args.markdown, expectedMarkdown: args.expected_markdown, author })),
   })));
+
+  server.registerTool('fleet_task_review_clear', {
+    description: 'Clear your task\'s resolved To review request after the Owner answered it in the room: removes the Markdown and every attached file in one change. '
+      + 'Pass the revision from your last fleet_task_review_show; if the package changed since, nothing is removed and you get a conflict. '
+      + 'Record the Owner\'s decision in Progress or the room first; then write the next request, if any, with fleet_task_review_set.',
+    inputSchema: {
+      expected_revision: z.number().int().describe('review.revision as you last read it with fleet_task_review_show.'),
+    },
+  }, async args => run((bound, author) => {
+    const cleared = clearTaskReview(bound.taskId, { expectedRevision: args.expected_revision, author });
+    return { task_id: bound.taskId, review: cleared.review ? publicReview(cleared.review) : null,
+      removed: cleared.removed.map(({ request_key: _key, ...artifact }) => artifact) };
+  }));
 
   server.registerTool('fleet_task_review_detach', {
     description: 'Remove one file from your task\'s To review package by artifact_id (from fleet_task_review_show).',

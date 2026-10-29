@@ -103,8 +103,14 @@ function taskReviewGuidance(taskId: string | undefined): string[] {
     'files, and never add status logs to the description.',
     'Preparing it grants no lifecycle authority: move the task to Review only when your instructions grant',
     'that; otherwise hand the complete package to your authorized coordinator.',
-    'The task **Progress** log (`fleet_task_progress_list`) holds significant verified milestones. Append to it',
-    'only when your role instructions make you its writer.',
+    'To review holds one current request for human review or decision: that final package, or one specific',
+    'Owner decision that blocks the work. It is not agent review or an evidence archive. After the Owner',
+    'answers in the room, its writer clears it: read `revision` with `fleet_task_review_show`, then call',
+    '`fleet_task_review_clear` with `expected_revision` (or',
+    `\`ours-fleet task review-package ${taskId} --clear --expected-revision <n>\`); a conflict means newer content.`,
+    'The task **Progress** log (`fleet_task_progress_list`) holds significant verified facts for the Owner, at',
+    'most 400 characters each. Append to it only when your role instructions make you its writer; otherwise',
+    'post such facts in the room.',
   ];
 }
 

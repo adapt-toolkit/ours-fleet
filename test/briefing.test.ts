@@ -46,6 +46,8 @@ describe('generateBriefing', () => {
     expect(task.replace(/\s+/g, ' ')).toMatch(/task description is replaced with only the clickable PR links, one per line \(a task without PRs links its actual deliverables instead; never invent a PR\): first save the current description \(the original requirements\) to a task-workspace file and attach it to the package, keep fuller evidence in task files, and never add status logs/);
     expect(task).toMatch(/hand the complete package to your authorized coordinator/);
     expect(task).toMatch(/only when your role instructions make you its writer/);
+    expect(task).toContain('`ours-fleet task review-package 0mvggdtxfab05d11b --clear --expected-revision <n>`');
+    expect(task.replace(/\s+/g, ' ')).toMatch(/one current request for human review or decision.*not agent review or an evidence archive/);
     expect(task).not.toContain('fleet_task_progress_append');
     const standalone = generateBriefing({ ...base, session: 'acp', roomMemberStartup: startup } as ResolvedRole, vocab, opts);
     expect(standalone).not.toContain('To review');
