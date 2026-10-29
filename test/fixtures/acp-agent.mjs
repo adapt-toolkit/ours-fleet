@@ -427,7 +427,11 @@ createInterface({ input: process.stdin }).on('line', line => {
           sessionUpdate: 'tool_call', toolCallId: 'wait-tool', title: 'Wait fixture tool',
           kind: 'execute', status: 'in_progress',
         });
-        setTimeout(() => {
+        const finishTool = () => {
+          // The owning test releases this gate only after observing deferral.
+          // Timed toolwait behavior stays unchanged for every other fixture user.
+          const hold = process.env.ACP_FIXTURE_TOOLWAIT_HOLD_FILE;
+          if (hold && existsSync(hold)) { setTimeout(finishTool, 10); return; }
           update({ sessionUpdate: 'tool_call_update', toolCallId: 'wait-tool', status: 'completed' });
           const answer = () => answerPrompt(message.id, stopReasonFor(text));
           pendingToolwaitAnswer = answer;
@@ -437,7 +441,8 @@ createInterface({ input: process.stdin }).on('line', line => {
               answer();
             }
           }, 5000);
-        }, delay);
+        };
+        setTimeout(finishTool, delay);
       } else if (/\blate\b/i.test(text)) {
         // Start a tool, then wait: only session/cancel releases this prompt,
         // and the cancel path emits the late updates first.

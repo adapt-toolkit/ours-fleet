@@ -850,36 +850,52 @@ describe('AcpSession', () => {
   });
 
   it('defers an after_tool wake until terminal ACP tool evidence, then steers without cancellation', async () => {
-    const session = await start();
-    const active = session.submitPrompt('toolwait 120');
-    for (let i = 0; i < 50 && !session.eventsSince(0)
-      .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
-      await new Promise(resolve => setTimeout(resolve, 5));
+    const gateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-tool-gate-')); dirs.push(gateDir);
+    const gate = join(gateDir, 'held'); writeFileSync(gate, 'held');
+    const session = await start('allow', { env: { ACP_FIXTURE_TOOLWAIT_HOLD_FILE: gate } });
+    let active: ReturnType<AcpSession['submitPrompt']> | undefined;
+    let pending: ReturnType<AcpSession['submitPromptAfterTool']> | undefined;
+    try {
+      active = session.submitPrompt('toolwait 120');
+      await vi.waitFor(() => expect(session.eventsSince(0).some(event =>
+        event.kind === 'tool_call' && event.toolCallId === 'wait-tool' && event.status === 'in_progress')).toBe(true));
+      expect(session.eventsSince(0).some(event =>
+        event.kind === 'tool_call' && event.toolCallId === 'wait-tool' && event.status === 'completed')).toBe(false);
+      pending = session.submitPromptAfterTool('safe wake', {
+        origin: { kind: 'fleet-monitor' }, steer: true,
+      });
+      await vi.waitFor(() => expect(session.eventsSince(0).filter(event => event.kind === 'monitor_delivery')
+        .map(event => event.status)).toEqual(['deferred']));
+      expect(session.eventsSince(0).some(event =>
+        event.kind === 'tool_call' && event.toolCallId === 'wait-tool' && event.status === 'completed')).toBe(false);
+      rmSync(gate);
+      const delivered = await pending;
+      expect(delivered).toMatchObject({
+        accepted: true, detail: 'injected',
+        safeBoundary: { state: 'after_tool', activeToolCount: 0 },
+      });
+      expect(session.eventsSince(0).filter(event => event.kind === 'monitor_delivery')
+        .map(event => event.status)).toEqual(['deferred', 'after_tool']);
+      expect(session.eventsSince(0).some(event =>
+        event.kind === 'turn_stop' && event.cancellationSource === 'fleet-monitor')).toBe(false);
+      expect(await active).toMatchObject({ outcome: 'completed' });
 
-    const delivered = await session.submitPromptAfterTool('safe wake', {
-      origin: { kind: 'fleet-monitor' }, steer: true,
-    });
-    expect(delivered).toMatchObject({
-      accepted: true, detail: 'injected',
-      safeBoundary: { state: 'after_tool', activeToolCount: 0 },
-    });
-    expect(session.eventsSince(0).filter(event => event.kind === 'monitor_delivery')
-      .map(event => event.status)).toEqual(['deferred', 'after_tool']);
-    expect(session.eventsSince(0).some(event =>
-      event.kind === 'turn_stop' && event.cancellationSource === 'fleet-monitor')).toBe(false);
-    expect(await active).toMatchObject({ outcome: 'completed' });
-
-    const ledger = readFileSync(join(dirs.at(-1)!, '.conversation', 'events-000001.jsonl'), 'utf8')
-      .trim().split('\n').map(line => JSON.parse(line));
-    const toolCompleted = ledger.findIndex(event =>
-      event.kind === 'tool.upsert' && event.payload?.status === 'completed');
-    const boundary = ledger.findIndex(event =>
-      event.kind === 'monitor.delivery' && event.payload?.state === 'after_tool');
-    expect(toolCompleted).toBeGreaterThanOrEqual(0);
-    expect(boundary).toBeGreaterThan(toolCompleted);
-    expect(JSON.stringify(ledger.filter(event => event.kind === 'monitor.delivery')))
-      .not.toContain('safe wake');
-    await session.close();
+      const ledger = readFileSync(join(dirs.at(-1)!, '.conversation', 'events-000001.jsonl'), 'utf8')
+        .trim().split('\n').map(line => JSON.parse(line));
+      const toolCompleted = ledger.findIndex(event =>
+        event.kind === 'tool.upsert' && event.payload?.status === 'completed');
+      const boundary = ledger.findIndex(event =>
+        event.kind === 'monitor.delivery' && event.payload?.state === 'after_tool');
+      expect(toolCompleted).toBeGreaterThanOrEqual(0);
+      expect(boundary).toBeGreaterThan(toolCompleted);
+      expect(JSON.stringify(ledger.filter(event => event.kind === 'monitor.delivery')))
+        .not.toContain('safe wake');
+    } finally {
+      rmSync(gate, { force: true });
+      await session.close();
+      await active?.catch(() => {});
+      await pending?.catch(() => {});
+    }
   });
 
   it('steers an after_tool wake directly when no tool or permission is active', async () => {
