@@ -12,28 +12,104 @@ export function conversationEventVisible(event:ConversationEventV1,sessionGenera
   return event.source!=='agent_replay' && (event.sessionGeneration===sessionGeneration || (!!resumedSessionId&&HISTORICAL_KINDS.includes(event.kind)&&event.acpSessionId===resumedSessionId));
 }
 
-/** Newest-first lines of a file, read in chunks from its end; `visit` returns false to stop. */
-async function readLinesBackward(path:string,visit:(line:string)=>boolean,signal?:AbortSignal):Promise<boolean> {
+// A seek attempt is transactional: its caller discards all collected rows and
+// performs one ordinary scan if a probe or the file identity is no longer safe.
+class SeekFallback extends Error {}
+type SegmentStamp = {dev:number;ino:number;size:number;mtimeMs:number;ctimeMs:number};
+const stamp=(info:SegmentStamp)=>`${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+type TailSeek = {before:number;checked:Array<{path:string;key:string}>};
+
+/** Strict lower bound in an admitted monotonic writer segment, on this FD only. */
+async function seekBefore(file:Awaited<ReturnType<typeof open>>,size:number,before:number,signal?:AbortSignal):Promise<number> {
+  const read=async(position:number,length:number)=>{
+    signal?.throwIfAborted();
+    const bytes=Buffer.alloc(length);
+    const {bytesRead}=await file.read(bytes,0,length,position);
+    signal?.throwIfAborted();
+    if(bytesRead!==length)throw new SeekFallback('segment changed during seek');
+    return bytes;
+  };
+  if(!size)return 0;
+  // An active partial append is not a safe boundary, even if the first event
+  // would let us skip this whole segment.
+  if((await read(size-1,1))[0]!==10)throw new SeekFallback('partial segment');
+  const record=async(position:number)=>{
+    let start=position,end=position;const left:Buffer[]=[],right:Buffer[]=[];
+    while(start>0){
+      const length=Math.min(4096,start),chunk=await read(start-length,length);
+      const newline=chunk.lastIndexOf(10);
+      left.push(chunk.subarray(newline+1));start-=length;
+      if(newline>=0){start+=newline+1;break;}
+    }
+    while(end<size){
+      const chunk=await read(end,Math.min(4096,size-end)),newline=chunk.indexOf(10);
+      right.push(newline<0?chunk:chunk.subarray(0,newline));end+=newline<0?chunk.length:newline+1;
+      if(newline>=0)break;
+    }
+    let event:ConversationEventV1;
+    try{event=JSON.parse(Buffer.concat([...left.reverse(),...right]).toString('utf8'));}
+    catch{throw new SeekFallback('unreadable seek record');}
+    if(!event||event.schemaVersion!==1||!Number.isSafeInteger(event.seq)||event.seq<=0)throw new SeekFallback('legacy seek record');
+    return {start,end,seq:event.seq};
+  };
+  const first=await record(0);
+  if(first.seq>=before)return 0;
+  let low=first.end,high=size,lower=first.seq,upper=Infinity;
+  while(low<high){
+    const found=await record(Math.floor((low+high)/2));
+    if(found.start<low||found.end>high||found.seq<=lower||found.seq>=upper)throw new SeekFallback('non-monotonic seek record');
+    if(found.seq<before){low=found.end;lower=found.seq;}
+    else{high=found.start;upper=found.seq;}
+  }
+  return low;
+}
+
+/** Newest-first lines; optional finite-before seek is only for a healthy writer. */
+async function readLinesBackward(path:string,visit:(line:string)=>boolean,signal?:AbortSignal,seek?:TailSeek):Promise<boolean> {
   signal?.throwIfAborted();
-  const file=await open(path,'r');
+  let file:Awaited<ReturnType<typeof open>>;
+  try{file=await open(path,'r');}catch(error){signal?.throwIfAborted();if(seek)throw new SeekFallback('segment disappeared');throw error;}
   try {
-    let position=(await file.stat()).size;let carry=Buffer.alloc(0);
-    while(position>0){
+    const initial=await file.stat(),key=stamp(initial);
+    let position=seek?await seekBefore(file,initial.size,seek.before,signal):initial.size;
+    let carry=Buffer.alloc(0),more=true;
+    scan: while(position>0){
       signal?.throwIfAborted();
       const size=Math.min(256*1024,position);position-=size;
-      const chunk=Buffer.alloc(size);await file.read(chunk,0,size,position);
+      const chunk=Buffer.alloc(size);const {bytesRead}=await file.read(chunk,0,size,position);
       signal?.throwIfAborted();
-      let buffer=Buffer.concat([chunk,carry]);let end=buffer.length;
+      if(seek&&bytesRead!==size)throw new SeekFallback('short segment read');
+      const buffer=Buffer.concat([chunk.subarray(0,bytesRead),carry]);let end=buffer.length;
       for(let i=buffer.length-1;i>=0;i--){
         if(buffer[i]!==10)continue;
-        if(end>i+1&&!visit(buffer.toString('utf8',i+1,end)))return false;
+        if(end>i+1&&!visit(buffer.toString('utf8',i+1,end))){more=false;break scan;}
         end=i;
       }
       carry=buffer.subarray(0,end);
     }
-    if(carry.length&&!visit(carry.toString('utf8')))return false;
-    return true;
-  } finally {await file.close();}
+    if(more&&carry.length&&!visit(carry.toString('utf8')))more=false;
+    if(seek){
+      signal?.throwIfAborted();
+      const current=await stat(path).catch(()=>undefined);
+      if(stamp(await file.stat())!==key||!current||stamp(current)!==key)throw new SeekFallback('segment changed during read');
+      seek.checked.push({path,key});
+    }
+    return more;
+  } catch(error){signal?.throwIfAborted();if(seek&&!(error instanceof SeekFallback))throw new SeekFallback('seek read unavailable');throw error;}
+  finally {await file.close();}
+}
+
+/** Existing writer provenance, never a substitute for the captured barrier. */
+async function seekManifest(dir:string,files:string[],signal?:AbortSignal):Promise<string|undefined> {
+  try{
+    signal?.throwIfAborted();
+    const raw=await readFile(join(dir,'manifest.json'),{encoding:'utf8',signal}),value=JSON.parse(raw);
+    if(value.schemaVersion!==1||!Number.isSafeInteger(value.nextSeq)||value.nextSeq<1
+      ||!Array.isArray(value.segments)||value.segments.length!==files.length
+      ||value.segments.some((name:unknown,i:number)=>name!==files[files.length-1-i])
+      ||(value.failedGenerations!==undefined&&(!Array.isArray(value.failedGenerations)||value.failedGenerations.length>0)))return;
+    return raw;
+  }catch{signal?.throwIfAborted();return;}
 }
 
 // Rotated segments never change, so their last cursor is reused until the file itself changes.
@@ -68,6 +144,15 @@ export interface ConversationTailPage extends ConversationPageView {
  * `nextCursor` is the newest ledger position seen, for forward `after` paging.
  */
 export async function conversationTailPage(stateDir:string,request:{before?:string;limit?:number},snapshot:ConversationPageView['snapshot'],resumedSessionId?:string,signal?:AbortSignal):Promise<ConversationTailPage> {
+  try{return await tailPage(stateDir,request,snapshot,resumedSessionId,signal,true);}
+  catch(error){
+    signal?.throwIfAborted();
+    if(!(error instanceof SeekFallback))throw error;
+    return tailPage(stateDir,request,snapshot,resumedSessionId,signal,false);
+  }
+}
+
+async function tailPage(stateDir:string,request:{before?:string;limit?:number},snapshot:ConversationPageView['snapshot'],resumedSessionId:string|undefined,signal:AbortSignal|undefined,allowSeek:boolean):Promise<ConversationTailPage> {
   signal?.throwIfAborted();
   const before=request.before===undefined?Infinity:Number(request.before);
   if(before!==Infinity&&(!Number.isSafeInteger(before)||before<0))throw new Error('before must be a ledger cursor');
@@ -83,6 +168,11 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
   // generation on every open. Legacy/incomplete snapshots still need context.
   const complete = !snapshot.observationFailure && Number.isSafeInteger(barrier) && barrier! >= 0
     && Number.isSafeInteger(observation.stateRevision) && observation.stateRevision! >= 0;
+  const dir=join(stateDir,'.conversation');
+  const manifest=allowSeek&&before!==Infinity&&complete&&!snapshot.historyDegraded
+    ?await seekManifest(dir,files,signal):undefined;
+  const seek:TailSeek|undefined=manifest===undefined?undefined:{before,checked:[]};
+  let previousSeq=Infinity;
   const needsCapabilities = !complete || !Array.isArray(observation.commands);
   const pending=new Set(complete && Array.isArray(observation.pendingPermissions)
     && snapshot.pendingPermissionIds.every(id=>observation.pendingPermissions!.some(permission=>permission.permissionId===id))
@@ -99,8 +189,13 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
         if(!line.includes(generation))return !line.includes('"sessionGeneration":')&&wantsContext();
         if(!line.includes('"capabilities.updated"')&&!line.includes('"permission.requested"'))return wantsContext();
       }
-      let event:ConversationEventV1;try{event=JSON.parse(line);}catch{return true;}
-      const seq=Number(event.seq);if(!Number.isSafeInteger(seq))return true;
+      let event:ConversationEventV1;try{event=JSON.parse(line);}catch{if(seek)throw new SeekFallback('unreadable page record');return true;}
+      const seq=Number(event.seq);
+      if(seek){
+        if(event.schemaVersion!==1||!Number.isSafeInteger(seq)||seq<=0||seq>=previousSeq)throw new SeekFallback('non-monotonic page record');
+        previousSeq=seq;
+      }
+      if(!Number.isSafeInteger(seq))return true;
       if(barrier!==undefined&&seq>barrier)return true;
       newest??=seq;
       if(seq<before&&conversationEventVisible(event,snapshot.sessionGeneration,resumedSessionId)){
@@ -112,8 +207,18 @@ export async function conversationTailPage(stateDir:string,request:{before?:stri
         if(inPage)events.push(event);else hasOlder=true;
       }
       return !hasOlder||wantsContext();
-    },signal);
+    },signal,seek);
     if(!more)break;
+  }
+  if(seek){
+    signal?.throwIfAborted();
+    const currentFiles=(await readdir(dir).catch(()=>{throw new SeekFallback('ledger disappeared');})).filter(n=>/^events-\d{6}\.jsonl$/.test(n)).sort().reverse();
+    if(await seekManifest(dir,currentFiles,signal)!==manifest||currentFiles.join()!==files.join())throw new SeekFallback('segments rotated during page');
+    for(const checked of seek.checked){
+      signal?.throwIfAborted();
+      const current=await stat(checked.path).catch(()=>undefined);
+      if(!current||stamp(current)!==checked.key)throw new SeekFallback('segment replaced during page');
+    }
   }
   events.reverse();context.reverse();
   return {events,snapshot,hasOlder,context,hasMore:false,

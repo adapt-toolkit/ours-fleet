@@ -1,5 +1,5 @@
 import {describe,it,expect} from 'vitest';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,renameSync,statSync,utimesSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,rmSync,renameSync,statSync,utimesSync,appendFileSync,fstatSync} from 'node:fs';
 import {open} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -226,4 +226,151 @@ it('closes a private follow handle that arrives after cancellation exactly once'
  const pending=adapter.followConversation({expectedGeneration:'g',after:0,controller:false,signal:abort.signal,onReplay:()=>{},onReady:()=>{},onEvent:()=>{},onState:()=>{},onClose:()=>{finished++;}});
  abort.abort();release();const handle=await pending;handle.close();handle.close();
  expect(options).toMatchObject({expectedGeneration:'g',after:0,controller:false});expect(closes).toBe(1);expect(finished).toBe(1);
+});
+
+// Structural I/O regression: an older page must not reparse all newer records.
+it('seeks repeated healthy older pages without rereading the newer rotated prefix',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'fleet-tail-seek-'));
+ const handle=await open(dir,'r');const proto=Object.getPrototypeOf(handle);await handle.close();
+ const read=proto.read,parse=JSON.parse;let bytes=0,parses=0;
+ try{
+  mkdirSync(join(dir,'.conversation'));
+  const names=Array.from({length:4},(_,i)=>`events-${String(i+1).padStart(6,'0')}.jsonl`);
+  for(let segment=0;segment<4;segment++)writeFileSync(join(dir,'.conversation',names[segment]),Array.from({length:2000},(_,i)=>JSON.stringify({schemaVersion:1,seq:segment*2000+i+1,eventId:`seek-${segment*2000+i+1}`,kind:'message.chunk',sessionGeneration:'g',source:'agent',payload:{text:'界'.repeat(340)}})).join('\n')+'\n');
+  writeFileSync(join(dir,'.conversation/manifest.json'),JSON.stringify({schemaVersion:1,nextSeq:8001,segments:names,failedGenerations:[]}));
+  const snapshot={sessionGeneration:'g',readiness:'idle' as const,queueDepth:0,pendingPermissionIds:[],ledgerBarrier:8000,stateRevision:1,commands:[],pendingPermissions:[]};
+  proto.read=async function(this:unknown,...args:unknown[]){const result=await read.apply(this,args);bytes+=result.bytesRead;return result;};
+  JSON.parse=((...args:Parameters<typeof JSON.parse>)=>{const value=parse(...args);if(value?.eventId?.startsWith('seek-'))parses++;return value;}) as typeof JSON.parse;
+  let before='2201';const seen:number[]=[];
+  for(let i=0;i<3;i++){
+   const page=await conversationTailPage(dir,{before,limit:200},snapshot);
+   expect(page.events.map(e=>e.seq)).toEqual(Array.from({length:200},(_,j)=>Number(before)-200+j));
+   expect(page.hasOlder).toBe(true);expect(page.nextCursor).toBeUndefined();expect(page.context).toEqual([]);
+   before=page.olderCursor!;seen.unshift(...page.events.map(e=>e.seq));
+  }
+  expect(seen).toEqual(Array.from({length:600},(_,i)=>1601+i));
+  console.info('healthy older page structural counters',JSON.stringify({bytes,parses}));
+  expect(bytes).toBeLessThan(2*1024*1024);
+  expect(parses).toBeLessThan(800);
+ }finally{proto.read=read;JSON.parse=parse;rmSync(dir,{recursive:true,force:true});}
+});
+
+
+describe('healthy older seek safety',()=>{
+ const event=(seq:number,extra:Record<string,unknown>={})=>({schemaVersion:1,seq,eventId:`safety-${seq}`,kind:'message.chunk',sessionGeneration:'g',acpSessionId:'s',source:'agent',payload:{text:`界 ${seq}`},...extra});
+ const snapshot={sessionGeneration:'g',readiness:'idle' as const,queueDepth:0,pendingPermissionIds:[],ledgerBarrier:1000,stateRevision:1,commands:[],pendingPermissions:[]};
+ const fixture=async(run:(dir:string,write:(name:string,rows:unknown[],newline?:boolean)=>void,manifest:(names:string[],extra?:Record<string,unknown>)=>void)=>Promise<void>)=>{
+  const dir=mkdtempSync(join(tmpdir(),'fleet-tail-seek-safety-'));mkdirSync(join(dir,'.conversation'));
+  const write=(name:string,rows:unknown[],newline=true)=>writeFileSync(join(dir,'.conversation',name),rows.map(x=>JSON.stringify(x)).join('\n')+(newline?'\n':''));
+  const manifest=(names:string[],extra:Record<string,unknown>={})=>writeFileSync(join(dir,'.conversation/manifest.json'),JSON.stringify({schemaVersion:1,nextSeq:1,segments:names,failedGenerations:[],...extra}));
+  try{await run(dir,write,manifest);}finally{rmSync(dir,{recursive:true,force:true});}
+ };
+ const one='events-000001.jsonl',two='events-000002.jsonl';
+ it('preserves numeric boundaries, visibility, resumed history and the captured barrier across rotations',async()=>{
+  await fixture(async(dir,write,manifest)=>{
+   const rows=Array.from({length:240},(_,i)=>event(i*2+1,i%7===0?{source:'agent_replay'}:i%5===0?{sessionGeneration:'old'}:i%3===0?{sessionGeneration:'foreign',acpSessionId:'foreign'}:{}));
+   write(one,rows.slice(0,100));write(two,rows.slice(100));manifest([one,two]);
+   // A recovery-time nextSeq can legitimately trail subsequent appends.
+   const captured={...snapshot,ledgerBarrier:451};
+   for(const resumed of [undefined,'s'])for(const before of ['0','1','199','201','202','305','481','2000']){
+    const expected=await conversationTailPage(dir,{before,limit:17},{...captured,historyDegraded:true},resumed);
+    expect(await conversationTailPage(dir,{before,limit:17},captured,resumed)).toEqual({...expected,snapshot:captured});
+   }
+   let before='481';const seen:number[]=[];
+   for(;;){const page=await conversationTailPage(dir,{before,limit:17},captured,'s');seen.unshift(...page.events.map(x=>x.seq));if(!page.hasOlder)break;before=page.olderCursor!;}
+   expect(seen).toEqual(rows.filter(x=>x.seq<=451&&x.source!=='agent_replay'&&(x.sessionGeneration==='g'||x.acpSessionId==='s')).map(x=>x.seq));
+  });
+ });
+ it('keeps legacy, degraded and unproven manifests on the original non-monotonic scan',async()=>{
+  await fixture(async(dir,write,manifest)=>{
+   const rows=[event(1),event(40),event(2),{bad:'malformed schema'},event(100),event(3),event(4)];write(one,rows);
+   const expected=[1,40,2,3,4];
+   const cases=[
+    {snapshot:{...snapshot,historyDegraded:true},manifest:{}},
+    {snapshot,manifest:{failedGenerations:['g']}},
+    {snapshot,manifest:{schemaVersion:2}},
+    {snapshot,manifest:{nextSeq:0}},
+    {snapshot,manifest:{segments:[one,one]}},
+    {snapshot,manifest:{segments:[two]}},
+    {snapshot:{...snapshot,observationFailure:'capture_failed' as const},manifest:{}},
+    {snapshot:{...snapshot,stateRevision:undefined},manifest:{}},
+    {snapshot:{...snapshot,ledgerBarrier:undefined},manifest:{}},
+   ];
+   const handle=await open(dir,'r'),proto=Object.getPrototypeOf(handle);await handle.close();const read=proto.read;
+   try{
+    for(const item of cases){
+     manifest([one],item.manifest);const lengths:number[]=[];
+     proto.read=function(this:unknown,...args:any[]){lengths.push(args[2]);return read.apply(this,args);};
+     expect((await conversationTailPage(dir,{before:'50',limit:100},item.snapshot)).events.map(x=>x.seq)).toEqual(expected);
+     expect(lengths).toEqual([statSync(join(dir,'.conversation',one)).size]);
+    }
+    proto.read=read;rmSync(join(dir,'.conversation/manifest.json'));
+    expect((await conversationTailPage(dir,{before:'50',limit:100},snapshot)).events.map(x=>x.seq)).toEqual(expected);
+    manifest([one]);write(two,[event(101)]); // discovered extra omitted by manifest
+    expect((await conversationTailPage(dir,{before:'50',limit:100},snapshot)).events.map(x=>x.seq)).toEqual(expected);
+    manifest([two,one]); // inverted manifest order is unproven too
+    expect((await conversationTailPage(dir,{before:'50',limit:100},snapshot)).events.map(x=>x.seq)).toEqual(expected);
+   }finally{proto.read=read;}
+  });
+ });
+ it('reads complete huge UTF8 records and conservatively scans partial or legacy records',async()=>{
+  await fixture(async(dir,write,manifest)=>{
+   const huge=event(2,{payload:{text:'界🙂'.repeat(80000)}});const rows=[event(1),huge,event(3),event(4),event(5)];
+   manifest([one]);
+   for(const newline of [true,false]){
+    write(one,rows,newline);
+    const handle=await open(dir,'r'),proto=Object.getPrototypeOf(handle);await handle.close();const read=proto.read;let bytes=0;
+    try{
+     proto.read=async function(this:unknown,...args:any[]){const result=await read.apply(this,args);bytes+=result.bytesRead;return result;};
+     const page=await conversationTailPage(dir,{before:'4',limit:2},snapshot);
+     expect(page.events).toEqual([huge,event(3)]);expect(page.olderCursor).toBe('2');expect(page.hasOlder).toBe(true);
+     // A midpoint inside a huge record discards that entire probe interval:
+     // it must not read the same long line again at every binary-search step.
+     expect(bytes).toBeLessThan(3*statSync(join(dir,'.conversation',one)).size);
+     console.info('huge older record structural bytes',JSON.stringify({newline,bytes}));
+    }finally{proto.read=read;}
+   }
+   write(one,[{...event(1),schemaVersion:undefined},huge,event(3)]);
+   expect((await conversationTailPage(dir,{before:'4',limit:10},snapshot)).events.map(x=>x.seq)).toEqual([1,2,3]);
+   writeFileSync(join(dir,'.conversation',one),JSON.stringify(event(1))+'\n{torn\n'+JSON.stringify(event(2))+'\n');
+   expect((await conversationTailPage(dir,{before:'3',limit:10},snapshot)).events.map(x=>x.seq)).toEqual([1,2]);
+  });
+ });
+ it('discards the whole seek attempt on append, rotation, truncation, replacement or short read',async()=>{
+  for(const change of ['append','rotation','truncate','replace','short','during-page'])await fixture(async(dir,write,manifest)=>{
+   const original=Array.from({length:40},(_,i)=>event(i+1));write(one,original);manifest([one]);
+   const handle=await open(dir,'r'),proto=Object.getPrototypeOf(handle);await handle.close();const read=proto.read;
+   let changed=false,calls=0;let expected=[25,26,27,28,29];
+   try{
+    proto.read=async function(this:unknown,...args:any[]){
+     const result=await read.apply(this,args);calls++;
+     if(!changed&&(change!=='during-page'||args[2]>4096)){
+      changed=true;
+      if(change==='append'||change==='during-page')appendFileSync(join(dir,'.conversation',one),JSON.stringify(event(41))+'\n');
+      if(change==='rotation'){write(two,[event(41)]);manifest([one,two]);}
+      if(change==='truncate'){write(one,original.slice(0,20));expected=[16,17,18,19,20];}
+      if(change==='replace'){
+       write('replacement',Array.from({length:40},(_,i)=>event((i+1)*3)));const before=statSync(join(dir,'.conversation',one));utimesSync(join(dir,'.conversation/replacement'),before.atime,before.mtime);renameSync(join(dir,'.conversation/replacement'),join(dir,'.conversation',one));expected=[15,18,21,24,27];
+      }
+      if(change==='short')return {...result,bytesRead:0};
+     }
+     return result;
+    };
+    const page=await conversationTailPage(dir,{before:'30',limit:5},{...snapshot,ledgerBarrier:40});
+    expect(changed,change).toBe(true);expect(page.events.map(x=>x.seq),change).toEqual(expected);expect(new Set(page.events.map(x=>x.seq)).size).toBe(5);expect(page.hasOlder).toBe(true);expect(calls).toBeLessThan(40);
+   }finally{proto.read=read;}
+  });
+ });
+ it('cancels seek probes at different positions and closes the owned file',async()=>{
+  for(const stopAfter of [1,2,4])await fixture(async(dir,write,manifest)=>{
+   write(one,Array.from({length:50},(_,i)=>event(i+1)));manifest([one]);
+   const handle=await open(dir,'r'),proto=Object.getPrototypeOf(handle);await handle.close();const read=proto.read;
+   const owner=new AbortController();let fd=-1,reads=0;
+   try{
+    proto.read=async function(this:{fd:number},...args:any[]){const result=await read.apply(this,args);fd=this.fd;if(++reads===stopAfter)owner.abort();return result;};
+    await expect(conversationTailPage(dir,{before:'30',limit:5},snapshot,undefined,owner.signal)).rejects.toMatchObject({name:'AbortError'});
+    expect(reads).toBe(stopAfter);expect(()=>fstatSync(fd)).toThrow(expect.objectContaining({code:'EBADF'}));
+   }finally{proto.read=read;}
+  });
+ });
 });
