@@ -191,20 +191,27 @@ export function setTaskReviewMarkdown(taskId: string, input: {
  * unchanged; after a successful clear, read the package again before retrying.
  * Like any change, a clear gets the next revision, so read markers, unread and
  * push behave as for any update. Only the files this change removed are
- * deleted; a file attached after it stays.
+ * deleted; a file attached after it stays. With `markdown`, the same change
+ * writes the next request, so no other writer can slip in between.
  */
 export function clearTaskReview(taskId: string, input: {
-  expectedRevision: number; author: TaskContributionAuthor;
+  expectedRevision: number; author: TaskContributionAuthor; markdown?: string;
 }): { review: TaskReview | undefined; removed: TaskReviewArtifact[] } {
   const dir = reviewStoreDirectory(taskId);
   if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0)
     throw new TaskReviewError('invalid_request', 'expected revision must be a non-negative integer');
+  const markdown = input.markdown ?? '';
+  if (typeof markdown !== 'string')
+    throw new TaskReviewError('invalid_request', 'markdown must be a string');
+  if (markdown.length > REVIEW_MARKDOWN_MAX)
+    throw new TaskReviewError('invalid_request', `review markdown maximum is ${REVIEW_MARKDOWN_MAX} characters`);
   const result = updateTaskContribution<{ review: TaskReview | undefined; removed: TaskReviewArtifact[] }>(taskId, task => {
     if (reviewRevision(task.review) !== input.expectedRevision)
       throw new TaskReviewError('conflict', 'The review package changed elsewhere. Read it again before clearing it.');
-    if (!task.review || (!task.review.markdown && !task.review.artifacts.length)) return { value: { review: task.review, removed: [] }, changed: false };
-    const removed = task.review.artifacts;
-    task.review = { revision: nextRevision(task.review), markdown: '', updated_at: new Date().toISOString(),
+    const empty = !task.review || (!task.review.markdown && !task.review.artifacts.length);
+    if (empty && !markdown) return { value: { review: task.review, removed: [] }, changed: false };
+    const removed = task.review?.artifacts ?? [];
+    task.review = { revision: nextRevision(task.review), markdown, updated_at: new Date().toISOString(),
       updated_by: input.author, artifacts: [] };
     return { value: { review: task.review, removed }, changed: true };
   });

@@ -20,6 +20,7 @@ import { createTask, getTask, tasksDir } from '../src/rooms-tasks/task-state.js'
 import { FleetCommandAuditStore } from '../src/fleet-command-audit.js';
 import { RoleControlServer } from '../src/session/control.js';
 import { buildWebServer } from '../src/web/server.js';
+import { TASK_TOOL_NAMES } from '../src/rooms-tasks/task-tools.js';
 import { WebAuth } from '../src/web/auth.js';
 import { TrustedDeviceStore } from '../src/web/device-store.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
@@ -92,8 +93,8 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
     const mcp = await bridge(() => taskToolBinding(role, stateDir, CID), fenced);
     try {
       const names = (await mcp.client.listTools()).tools.map(tool => tool.name);
-      expect(names).toEqual(expect.arrayContaining(['fleet_task_progress_list', 'fleet_task_progress_append',
-        'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_clear', 'fleet_task_review_detach']));
+      expect(names).toEqual(expect.arrayContaining([...TASK_TOOL_NAMES]));
+      expect(TASK_TOOL_NAMES).toContain('fleet_task_review_clear');
       expect(error(await mcp.call('fleet_task_progress_append', { text: 'x' }))).toBe('task_unavailable');
 
       role = { name: 'dev-1', roomMemberStartup: { task_id: task.task_id } };
@@ -122,6 +123,8 @@ describe('agent MCP tools', { timeout: 60_000 }, () => {
         .toMatchObject({ task_id: task.task_id, removed: [], review: { revision: revision + 1, markdown: '', artifacts: [],
           updated_by: { kind: 'agent', role: 'dev-1', identity_cid: CID, surface: 'mcp' } } });
       expect(getTask(other.task_id).review).toBeUndefined();
+      expect((await mcp.call('fleet_task_review_clear', { expected_revision: revision + 1, markdown: 'Next request' })).structuredContent.review)
+        .toMatchObject({ revision: revision + 2, markdown: 'Next request', artifacts: [] });
 
       // A listed member with another identity, or an unlisted non-task launch, is refused.
       withMembers(task.task_id, [{ name: 'dev-1', identity_cid: 'E'.repeat(64) }]);
@@ -233,7 +236,19 @@ describe('task CLI', { timeout: 120_000 }, () => {
       const replaced = await runCli(['task', 'review-package', task.task_id, '--clear', '--expected-revision', String(revision),
         '--markdown-file', join(root, 'next.md'), '--json'], managed);
       expect(replaced.stderr).toBe('');
-      expect(JSON.parse(replaced.stdout).review).toMatchObject({ revision: revision + 2, markdown: 'Owner decision: choose the rollout window.', artifacts: [] });
+      // One change: the clear and the next request share a single new revision.
+      expect(JSON.parse(replaced.stdout).review).toMatchObject({ revision: revision + 1, markdown: 'Owner decision: choose the rollout window.', artifacts: [] });
+      // Another writer's request published after that read is never overwritten by a stale replace.
+      const { setTaskReviewMarkdown } = await import('../src/rooms-tasks/task-review.js');
+      setTaskReviewMarkdown(task.task_id, { markdown: 'B', expectedMarkdown: 'Owner decision: choose the rollout window.', author: { kind: 'local_control', surface: 'cli' } });
+      const stale2 = await runCli(['task', 'review-package', task.task_id, '--clear', '--expected-revision', String(revision + 1),
+        '--markdown-file', join(root, 'next.md')], managed);
+      expect(stale2.stderr).toMatch(/changed elsewhere/);
+      expect(getTask(task.task_id).review).toMatchObject({ revision: revision + 2, markdown: 'B' });
+      const combined = await runCli(['task', 'review-package', task.task_id, '--clear', '--expected-revision', String(revision + 2),
+        '--attach', join(task.workspace!.path, 'spec.md')], managed);
+      expect(combined.stderr).toMatch(/cannot attach in the same call/);
+      expect(getTask(task.task_id).review).toMatchObject({ revision: revision + 2, markdown: 'B' });
     } finally { await control.close(); }
   });
 });

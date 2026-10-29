@@ -614,6 +614,32 @@ describe('review clear', () => {
     expect(reviewStoreFiles(t.task_id)).toEqual([`${late.artifact.id}.data`]);
   });
 
+  it('replaces the request in the same fenced change when given Markdown', async () => {
+    const t = task(), ws = t.workspace!.path;
+    writeFileSync(join(ws, 'old.md'), 'old');
+    setTaskReviewMarkdown(t.task_id, { markdown: 'Decision A', expectedMarkdown: '', author: developer });
+    await attachFile(t.task_id, join(ws, 'old.md'));
+    const read = revisionOf(t.task_id);
+    // Another writer publishes its request after our read: our replace is refused and theirs stays.
+    setTaskReviewMarkdown(t.task_id, { markdown: 'Decision B', expectedMarkdown: 'Decision A', author: critic });
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: read, author: developer, markdown: 'Decision C' })).toThrow(/changed elsewhere/);
+    expect(getTaskReview(t.task_id)).toMatchObject({ markdown: 'Decision B', revision: read + 1 });
+    expect(getTaskReview(t.task_id)!.artifacts).toHaveLength(1);
+    const replaced = clearTaskReview(t.task_id, { expectedRevision: read + 1, author: developer, markdown: 'Decision C' });
+    expect(replaced.review).toMatchObject({ revision: read + 2, markdown: 'Decision C', artifacts: [], updated_by: developer });
+    expect(reviewStoreFiles(t.task_id)).toEqual([]);
+    // A peer that read the new request may replace it and attach right away; the clear's cleanup touched only its own files.
+    writeFileSync(join(ws, 'peer.md'), 'peer');
+    setTaskReviewMarkdown(t.task_id, { markdown: 'Decision D', expectedMarkdown: 'Decision C', author: critic });
+    const peer = await attachFile(t.task_id, join(ws, 'peer.md'), critic);
+    expect(getTaskReview(t.task_id)).toMatchObject({ markdown: 'Decision D', revision: read + 4 });
+    expect(reviewStoreFiles(t.task_id)).toEqual([`${peer.artifact.id}.data`]);
+    expect(() => clearTaskReview(t.task_id, { expectedRevision: read + 2, author: developer, markdown: 'x'.repeat(50_001) })).toThrow(/maximum/);
+    // A first request can be written through the same call on a task without a package.
+    const fresh = task();
+    expect(clearTaskReview(fresh.task_id, { expectedRevision: 0, author: developer, markdown: 'First' }).review).toMatchObject({ revision: 1, markdown: 'First' });
+  });
+
   it('succeeds unchanged on an empty package at its revision and leaves other tasks alone', async () => {
     const t = task(), other = task();
     const path = join(tasksDir(), `${t.task_id}.json`), before = readFileSync(path, 'utf8');

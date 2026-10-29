@@ -1085,7 +1085,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--attach <path>', 'retain a file from the task workspace in the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
     .option('--detach <artifact-id>', 'remove a file from the package (repeatable)', (value: string, all: string[]) => [...all, value], [] as string[])
     .option('--request-key <key>', 'retry key for a single --attach: repeating it with the same file returns the original artifact')
-    .option('--clear', 'first remove the resolved request: all Markdown and files (needs --expected-revision)')
+    .option('--clear', 'remove the resolved request: all Markdown and files, replaced by --markdown[-file] if given (needs --expected-revision)')
     .option('--expected-revision <n>', 'package revision you last read; --clear is refused if it changed since')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { markdown?: string; markdownFile?: string; attach: string[]; detach: string[]; requestKey?: string; clear?: boolean; expectedRevision?: string; json?: boolean }) => {
@@ -1094,14 +1094,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.requestKey !== undefined && opts.attach.length !== 1) throw new Error('--request-key needs exactly one --attach');
         if (!!opts.clear !== (opts.expectedRevision !== undefined)) throw new TaskReviewError('invalid_request', '--clear and --expected-revision go together');
         if (opts.clear && opts.detach.length) throw new TaskReviewError('invalid_request', '--clear already removes every file; drop --detach');
+        if (opts.clear && opts.attach.length)
+          throw new TaskReviewError('invalid_request', '--clear cannot attach in the same call; attach the next request\'s files after reading the package again');
         const expectedRevision = opts.expectedRevision !== undefined ? Number(opts.expectedRevision) : undefined;
         if (expectedRevision !== undefined && (!/^\d+$/.test(opts.expectedRevision!) || !Number.isSafeInteger(expectedRevision)))
           throw new TaskReviewError('invalid_request', '--expected-revision must be a non-negative integer');
         const markdown = opts.markdownFile !== undefined ? readFileSync(opts.markdownFile, 'utf8') : opts.markdown;
         const author = markdown !== undefined || opts.attach.length || opts.detach.length || opts.clear ? cliContributionAuthor(id) : undefined;
         const attached = [];
-        if (opts.clear) clearTaskReview(id, { expectedRevision: expectedRevision!, author: author! });
-        if (markdown !== undefined)
+        // A clear with Markdown replaces the request in one fenced change; nothing can land in between.
+        if (opts.clear) clearTaskReview(id, { expectedRevision: expectedRevision!, author: author!, markdown });
+        else if (markdown !== undefined)
           setTaskReviewMarkdown(id, { markdown, expectedMarkdown: getTaskReview(id)?.markdown ?? '', author: author! });
         for (const artifactId of opts.detach) detachTaskReviewArtifact(id, artifactId, { author: author! });
         for (const path of opts.attach) {

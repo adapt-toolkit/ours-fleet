@@ -19,7 +19,7 @@ export interface TaskToolBinding {
 
 export const TASK_TOOL_NAMES = Object.freeze([
   'fleet_task_progress_list', 'fleet_task_progress_append',
-  'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_detach',
+  'fleet_task_review_show', 'fleet_task_review_set', 'fleet_task_review_clear', 'fleet_task_review_detach',
 ] as const);
 
 /** Compact JSON: a result is carried twice (text and structured) inside one bounded bridge frame. */
@@ -149,12 +149,13 @@ export function registerTaskTools(
   server.registerTool('fleet_task_review_clear', {
     description: 'Clear your task\'s resolved To review request after the Owner answered it in the room: removes the Markdown and every attached file in one change. '
       + 'Pass the revision from your last fleet_task_review_show; if the package changed since, nothing is removed and you get a conflict. '
-      + 'Record the Owner\'s decision in Progress or the room first; then write the next request, if any, with fleet_task_review_set.',
+      + 'Record the Owner\'s decision in Progress or the room first. Pass markdown to write the next request in the same fenced change.',
     inputSchema: {
       expected_revision: z.number().int().describe('review.revision as you last read it with fleet_task_review_show.'),
+      markdown: z.string().optional().describe(`Optional Markdown of the next request (max ${REVIEW_MARKDOWN_MAX} characters), written in the same change.`),
     },
   }, async args => run((bound, author) => {
-    const cleared = clearTaskReview(bound.taskId, { expectedRevision: args.expected_revision, author });
+    const cleared = clearTaskReview(bound.taskId, { expectedRevision: args.expected_revision, author, markdown: args.markdown });
     return { task_id: bound.taskId, review: cleared.review ? publicReview(cleared.review) : null,
       removed: cleared.removed.map(({ request_key: _key, ...artifact }) => artifact) };
   }));

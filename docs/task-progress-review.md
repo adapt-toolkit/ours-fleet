@@ -50,7 +50,8 @@ before this feature, or that never use it, have neither and behave as before.
    the room, reads the package `revision` with `fleet_task_review_show`, and
    calls `fleet_task_review_clear` with that `expected_revision` (CLI:
    `ours-fleet task review-package TASK --clear --expected-revision N`). The next
-   request replaces the cleared one; requests do not accumulate.
+   request replaces the cleared one, in the same change when `markdown` (CLI:
+   `--markdown-file`) is given; requests do not accumulate.
 
 A clear removes the Markdown and every attached file in one change and only when
 the package revision is still the one the writer read. Any Markdown edit, attach
@@ -111,7 +112,7 @@ agent that is a listed task member must match that member's identity CID.
 | `fleet_task_progress_append` | Append one entry (`text`, optional `request_key`). |
 | `fleet_task_review_show` | Read the package Markdown and file list. |
 | `fleet_task_review_set` | Replace the Markdown; pass the Markdown you last read as `expected_markdown` (`""` when empty). Attached files are kept. |
-| `fleet_task_review_clear` | Clear the resolved request: Markdown and every file, only if `expected_revision` is still current. Returns the package and the removed files. |
+| `fleet_task_review_clear` | Clear the resolved request: Markdown and every file, only if `expected_revision` is still current. Optional `markdown` writes the next request in the same change. Returns the package and the removed files. |
 | `fleet_task_review_detach` | Remove one file by `artifact_id`. |
 
 Files are attached with the CLI below. It runs in the agent's own process, so the
@@ -136,8 +137,10 @@ author (with its identity CID); otherwise the author is the local operator.
 redacted from the supervisor's command ledger. `--markdown-file` replaces the
 Markdown current at the time of the call; use `fleet_task_review_set` when a
 concurrent change must be refused. The text output shows the package revision.
-`--clear` runs first and is fenced by `--expected-revision`; with
-`--markdown-file` or `--attach` the same call then writes the next request.
+`--clear` is fenced by `--expected-revision`; with `--markdown` or
+`--markdown-file` the same locked change writes the next request, so no other
+writer can land in between. `--clear` cannot be combined with `--attach`: attach
+the next request's files afterwards.
 
 ## HTTP API
 
