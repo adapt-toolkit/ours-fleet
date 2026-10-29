@@ -80,7 +80,7 @@ export class RoomLayout {
   private coworkAdapter?: CoworkAdapter;
   private readonly coworkFactory: () => CoworkAdapter;
   constructor(private file: string, cowork: CoworkAdapter | (() => CoworkAdapter), private supervisor: LayoutSupervisor, private owner?: LayoutOwner,
-    /** Runs before the Owner may join each room; a failure stops here and the next pass retries it. */
+    /** Best-effort notification registration before the Owner joins each room. */
     private beforeOwner?: (roomCid: string) => Promise<void>) {
     this.coworkFactory = typeof cowork === 'function' ? cowork : () => cowork;
   }
@@ -179,7 +179,10 @@ export class RoomLayout {
       activation_requirements: !spec.members.length && s.owner ? [{ role: s.owner.role, count: 1 }]
         : [...new Set(spec.members.map(roleFor))].map(role => ({ role, count: spec.members.filter(m => roleFor(m) === role).length })),
     }), native => { room.native = native; s.order.push(key); });
-    if (s.owner && !room.owner_ready && this.beforeOwner) await this.beforeOwner(room.native!.identity_cid);
+    if (s.owner && !room.owner_ready && this.beforeOwner) {
+      try { await this.beforeOwner(room.native!.identity_cid); }
+      catch { console.warn('Mission room notification registration failed; continuing room admission with ordinary notifications'); }
+    }
     if (s.owner && !room.owner_ready) await this.mutation(s, `owner:${key}`, async () => {
       await this.cowork.acceptInvite(room.native!.room_id, this.owner!.invite, { role: s.owner!.role, expected_cid: s.owner!.cid });
       await this.cowork.setRoleCommands(room.native!.room_id, { role: s.owner!.role, commands: ['*'] });

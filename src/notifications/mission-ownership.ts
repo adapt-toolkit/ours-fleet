@@ -45,10 +45,9 @@ async function registerMission(config: ProducerConfig, taskId: string, manifest:
 }
 
 /**
- * Register a room as this task's before the Owner can join it: with own-room messages off, the service must know
- * the room before the room can message the Owner. Unreachable service or unconfirmed coverage → throws, so room
- * activation waits and retries. No producer configured → nothing to gate. An older service without the route →
- * admitted with a warning (it cannot suppress own-room messages either).
+ * Attempt to register the task room before the Owner joins, so preferences apply from its first message when confirmed.
+ * Unreachable service or unconfirmed coverage throws to the caller, which continues admission with ordinary notifications.
+ * No producer configured → nothing to register. An older service without the route returns with a warning.
  */
 export async function associateRoomNotifications(taskId: string, roomCid: string, options: {
   config?: ProducerConfig | undefined; warn?: (line: string) => void; request?: typeof fetch;
@@ -59,7 +58,7 @@ export async function associateRoomNotifications(taskId: string, roomCid: string
   try { await registerMission(config, taskId, manifest, options.request); }
   catch (error) {
     if (error instanceof MissionOwnershipUnsupported) { options.warn?.('Notification service does not support mission rooms; own-room message preferences are unavailable'); return; }
-    if (error instanceof MissionOwnershipUnavailable) throw new Error('Waiting for notification service to register the mission room');
+    if (error instanceof MissionOwnershipUnavailable) throw new Error('Notification service did not register the mission room');
     throw error;
   }
 }

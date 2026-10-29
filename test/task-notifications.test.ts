@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   createTask, startTask, activateTask, blockTask, unblockTask, reviewTask, completeTask,
   cancelTask, failTask, updateTaskBrief, getTask, beginTaskTerminalIntent, finishTaskTerminalIntent,
@@ -106,6 +106,30 @@ it('continues admitted task deliveries when another task record is corrupt', asy
   expect(warnings.some(line => line.includes('other task deliveries continue'))).toBe(true);
 });
 
+it.each([403, 503, 'unreachable'] as const)('attempts startup registration once after %s, while task event delivery continues without registration retries', async status => {
+  const task = create(), warnings: string[] = [], calls: string[] = [];
+  const request = (async (url) => {
+    const path = new URL(String(url)).pathname; calls.push(path);
+    if (path.endsWith('/bootstrap') && status === 'unreachable') throw Error('unreachable');
+    return new Response('{}', { status: path.endsWith('/bootstrap') && typeof status === 'number' ? status : 200 });
+  }) as typeof fetch;
+  vi.useFakeTimers();
+  const producer = new TaskNotificationProducer({ origin: 'http://127.0.0.1:1', token: 'x'.repeat(40) },
+    line => warnings.push(line), request, { tasks: () => [getTask(task.task_id)], layoutRooms: () => [] });
+  try {
+    await producer.drain();
+    expect(events(task.task_id)).toEqual([]);
+    expect(calls.filter(path => path.endsWith('/bootstrap'))).toHaveLength(1);
+    expect(calls).toContain('/api/v1/send');
+    expect(warnings).toContain('Mission room registration failed; own-room message preference may be unavailable');
+    // Existing task delivery timers and fresh task commits must not retry association.
+    await vi.advanceTimersByTimeAsync(60_000);
+    create(); await producer.drain();
+    expect(calls.filter(path => path.endsWith('/bootstrap'))).toHaveLength(1);
+    expect(calls.filter(path => path.endsWith('/send'))).toHaveLength(2);
+  } finally { await producer.close(); vi.useRealTimers(); }
+});
+
 it('retains unsupported task journal entries across typed delivery and acknowledgement, and deletion retires them',async()=>{
  const task=create(),file=join(tasksDir(),task.task_id+'.json'),stored=JSON.parse(readFileSync(file,'utf8'));
  const legacy=Array.from({length:40},(_,i)=>({eventId:`task:${task.task_id}:old-${i}`,title:'Old',body:'Retain',taskId:task.task_id,url:`/fleet/tasks/${task.task_id}`}));
@@ -119,4 +143,3 @@ it('retains unsupported task journal entries across typed delivery and acknowled
  expect(existsSync(join(tasksDir(),'.notification-retired',task.task_id+'.json'))).toBe(false);
  expect(pendingTaskNotifications()).toEqual([]);
 });
-

@@ -833,16 +833,14 @@ export class TaskRoomApplicationService {
   }
 
   /**
-   * Before the Owner can join, register the room as this task's with the notification service, so own-room message
-   * preferences apply to its first message. An unreachable service stops here and the saga retries from this step.
+   * Attempt registration before the Owner joins. A notification failure must not become a room saga error:
+   * admission continues and unassociated room messages may arrive as ordinary notifications.
    */
   private async associateRoomNotifications(room: RoomOrchestrationRecord): Promise<void> {
     if (!room.task_id || !room.room_identity_cid) return;
     try { await (this.deps.associateRoomNotifications ?? associateRoomNotifications)(room.task_id, room.room_identity_cid); }
-    catch (error) {
-      setSagaError(room.room_id, error instanceof Error ? error.message : String(error),
-        `Start or repair the notification service, then run ours-fleet task start ${room.task_id}.`, 'waiting_cowork');
-      throw error;
+    catch {
+      console.warn('Mission room notification registration failed; continuing room admission with ordinary notifications');
     }
   }
 

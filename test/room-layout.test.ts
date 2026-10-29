@@ -267,6 +267,30 @@ describe('experimental local layout', () => {
   });
 });
 
+it.each(['accepted', 'refused'])('waits for one notification registration attempt (%s), then admits Owner and agents without a room error or replay', async outcome => {
+  const f = fixture();
+  f.cowork.acceptInvite = vi.fn(async (id, _invite, opts) => { f.rooms.get(id).seats.push({ identity_cid: opts.expected_cid, role: opts.role, seat_state: 'active' }); return {} as any; });
+  f.cowork.setRoleCommands = vi.fn(async () => {});
+  const owner = { cid: 'owner-cid', role: 'Owner', invite: 'private-owner-invite' };
+  let settle!: () => void;
+  const register = vi.fn(() => new Promise<void>((resolve, reject) => { settle = () => outcome === 'accepted' ? resolve() : reject(Error('notification service unavailable')); }));
+  const engine = () => new RoomLayout(f.file, f.cowork, f.supervisor, owner, register);
+  await engine().create(definition(), 'operator');
+  const activation = engine().activate('operator', 'product');
+  await vi.waitFor(() => { expect(register).toHaveBeenCalledOnce(); expect(register).toHaveBeenCalledWith('room-1'); });
+  expect(f.cowork.acceptInvite).not.toHaveBeenCalled();
+  expect(f.supervisor.assign).not.toHaveBeenCalled();
+  settle(); await activation;
+  expect(engine().snapshot()).toMatchObject({ rooms: { product: { state: 'active', owner_ready: true, ready: ['architect', 'doctor'] } } });
+  expect(engine().snapshot().uncertain).toBeUndefined();
+  expect(f.cowork.acceptInvite).toHaveBeenCalledOnce();
+  expect(f.supervisor.assign).toHaveBeenCalledTimes(2);
+  await engine().activate('operator', 'product');
+  expect(register).toHaveBeenCalledOnce();
+  expect(f.cowork.acceptInvite).toHaveBeenCalledOnce();
+  expect(f.supervisor.assign).toHaveBeenCalledTimes(2);
+});
+
 it('pins room owner attachment and preserves the invite only in memory', async () => {
   const f = fixture();
   f.cowork.acceptInvite = vi.fn(async (id, _invite, opts) => { f.rooms.get(id).seats.push({ identity_cid: opts.expected_cid, role: opts.role, seat_state: 'active' }); return {} as any; });

@@ -15,8 +15,7 @@ export class TaskNotificationProducer {
   private offset = 0;
   private stopped = false;
   private readonly shutdown = new AbortController();
-  private bootstrapped = false;
-  private bootstrapAt = 0;
+  private bootstrapAttempted = false;
   constructor(private readonly config: ProducerConfig, private readonly warn: (line: string) => void = () => {},
     private readonly request: typeof fetch = fetch,
     /** Existing tasks and their layout room CIDs, registered once per start before own-room OFF can be chosen. */
@@ -51,14 +50,11 @@ export class TaskNotificationProducer {
     if (this.stopped) return;
     // Deletion first: a retired task's notifications go before any other delivery work in this pass.
     if (convertRetiredTaskNotifications() || await drainMissionCleanup(this.config, this.warn, this.request)) this.retry();
-    if (this.missions && !this.bootstrapped && !this.stopped) {
-      // A failed run waits 30s: unavailable inventory or a refused registration needs repair, not a tight loop.
-      const wait = this.bootstrapAt - Date.now();
-      if (wait > 0) this.retry(wait);
-      else {
-        try { await bootstrapMissionRooms(this.config, this.missions.tasks, this.missions.layoutRooms, this.request); this.bootstrapped = true; }
-        catch { this.warn('Mission room registration pending; own-room message preference stays unavailable'); this.bootstrapAt = Date.now() + 30_000; this.retry(30_000); }
-      }
+    if (this.missions && !this.bootstrapAttempted && !this.stopped) {
+      // One startup attempt. Association failure neither blocks task events nor schedules another registration.
+      this.bootstrapAttempted = true;
+      try { await bootstrapMissionRooms(this.config, this.missions.tasks, this.missions.layoutRooms, this.request); }
+      catch { this.warn('Mission room registration failed; own-room message preference may be unavailable'); }
     }
     const pending = pendingTaskNotifications(this.warn);
     if (!pending.length) return;
