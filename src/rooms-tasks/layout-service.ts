@@ -137,7 +137,7 @@ export class RoomLayoutService {
     const path = layoutRunPath(id); if (existsSync(path)) assertLayoutFile(path);
     return new RoomLayout(path, () => createCoworkAdapter(), this.supervisor(id), cleanup ? undefined : this.owner(), this.beforeOwner(id));
   }
-  /** A task's layout rooms are registered with the notification service before the Owner can join them. */
+  /** A task's layout rooms attempt notification registration before Owner admission. */
   private beforeOwner(id: string): ((roomCid: string) => Promise<void>) | undefined {
     const taskId = /^task-([0-9a-z]{9}[0-9a-f]{8})$/.exec(id)?.[1];
     return taskId ? async roomCid => (await import('../notifications/mission-ownership.js')).associateRoomNotifications(taskId, roomCid) : undefined;

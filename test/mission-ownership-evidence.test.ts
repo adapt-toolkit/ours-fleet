@@ -175,13 +175,13 @@ it('bootstrap generation: only a missing file starts at 1; corrupt, invalid or e
 });
 
 // #4 association proof
-it('a 409 (deleted, stale or conflicting) or an unconfirmed 2xx never admits a room; a retry under a newer revision does', async () => {
+it('a 409 (deleted, stale or conflicting) or an unconfirmed 2xx never proves registration; an explicit newer attempt can confirm it', async () => {
   const task = create();
   for (const reply of [{ status: 409, body: { error: { message: 'conflicting association' } } }, { status: 409, body: { error: { message: 'stale association' } } },
     { status: 409, body: { error: { message: 'mission deleted' } } }, { status: 200, body: { contactIds: [OTHER.toUpperCase()], revision: 1 } }, { status: 200, body: {} }]) {
     const before = getTask(task.task_id).notification_manifest?.revision ?? 0;
     const fake = service(() => reply);
-    await expect(associateRoomNotifications(task.task_id, ROOM, { config, request: fake.request })).rejects.toThrow(/Waiting for notification service/);
+    await expect(associateRoomNotifications(task.task_id, ROOM, { config, request: fake.request })).rejects.toThrow(/did not register the mission room/);
     // Only a 409 moves the revision past the refused one; the room set never shrinks.
     expect(getTask(task.task_id).notification_manifest).toEqual({ revision: Math.max(before, 1) + (reply.status === 409 ? 1 : 0), room_cids: [ROOM.toUpperCase()] });
   }
