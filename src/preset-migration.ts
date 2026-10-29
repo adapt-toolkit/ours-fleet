@@ -115,6 +115,17 @@ const REVIEW_PACKAGE_FINGERPRINTS: Readonly<Record<string, readonly string[]>> =
   'agent_templates/LocalCoordinator.yaml': ['931908da43df7c85dd2b106c99c765a3aeb4a97361fa00ce110e3ac93221ce32'],
 });
 
+// The packaged revision-12 charters before the 400-character Progress rules, the single Progress
+// writer and the current-request To review lifecycle with clear. Untouched copies adopt the current
+// text; edited ones stay.
+const CURRENT_REQUEST_FINGERPRINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'roles/Developer.yaml': ['684b4cb278b92746ba3abe29523adb9ab585e0831f8519b17bc17f41a3e992a4'],
+  'roles/Critic.yaml': ['b5b1d00074e6540160b14da256609b42600fa7d94ba776f8d5e7b42771669c41'],
+  'roles/Engineer.yaml': ['79991291c354229a71cdbd7191ad132ea91499b5326b1386c7abe8ce1444f714'],
+  'roles/LocalCoordinator.yaml': ['0fdbb9b56fedcf1897ad8044d6d88eaefcd5ccc48176860da3f7a1efe22da51d'],
+  'roles/Coordinator.yaml': ['c9038f3e33068058884e2ae52f6d569c22c4d56fcdb345e9381866c6de38d9a9'],
+});
+
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'roles/Engineer.yaml',
@@ -272,6 +283,7 @@ export function migratePackagedRoleDefaults(
       ...Object.keys(REREADING_CONTINUITY_LOOP_FINGERPRINTS),
       ...Object.keys(PEER_WAIT_REMINDER_FINGERPRINTS),
       ...Object.keys(REVIEW_PACKAGE_FINGERPRINTS),
+      ...Object.keys(CURRENT_REQUEST_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -287,6 +299,7 @@ export function migratePackagedRoleDefaults(
         ...(REREADING_CONTINUITY_LOOP_FINGERPRINTS[relative] ?? []),
         ...(PEER_WAIT_REMINDER_FINGERPRINTS[relative] ?? []),
         ...(REVIEW_PACKAGE_FINGERPRINTS[relative] ?? []),
+        ...(CURRENT_REQUEST_FINGERPRINTS[relative] ?? []),
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
         (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);

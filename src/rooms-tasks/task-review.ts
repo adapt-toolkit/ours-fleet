@@ -18,7 +18,13 @@ import type {
   TaskContributionAuthor, TaskProgressEntry, TaskRecord, TaskReview, TaskReviewArtifact,
 } from './types.js';
 
-export const PROGRESS_TEXT_MAX = 4_000;
+/**
+ * Maximum length of a new Progress entry, in Unicode code points of the exact
+ * submitted text (no normalization or trimming). A combining sequence or a
+ * joined emoji counts as each of its code points. Stored entries are not
+ * re-checked, so older, longer entries still read and display.
+ */
+export const PROGRESS_TEXT_MAX = 400;
 export const PROGRESS_MAX_ENTRIES = 200;
 export const REVIEW_MARKDOWN_MAX = 50_000;
 export const REVIEW_MAX_ARTIFACTS = 20;
@@ -94,6 +100,13 @@ export function taskProgressSnapshot(taskId: string): Array<Omit<TaskProgressEnt
   }));
 }
 
+/** Progress length in Unicode code points: a character outside the BMP counts once, not as two UTF-16 units. */
+export function progressTextLength(text: string): number {
+  let length = 0;
+  for (const _ of text) length++;
+  return length;
+}
+
 /**
  * Append one milestone. Text is kept exactly as written; whitespace-only text is
  * rejected. A retry with the same author-scoped request_key returns the original
@@ -105,8 +118,10 @@ export function appendTaskProgress(taskId: string, input: {
   assertTaskId(taskId);
   if (typeof input.text !== 'string' || !input.text.trim())
     throw new TaskReviewError('invalid_request', 'progress text is required');
-  if (input.text.length > PROGRESS_TEXT_MAX)
-    throw new TaskReviewError('invalid_request', `progress text maximum is ${PROGRESS_TEXT_MAX} characters`);
+  const length = progressTextLength(input.text);
+  if (length > PROGRESS_TEXT_MAX)
+    throw new TaskReviewError('invalid_request', `progress text is ${length} Unicode characters (code points); the maximum is ${PROGRESS_TEXT_MAX}. `
+      + 'Nothing was saved. Keep one fact per entry and shorten it, or record distinct facts as separate entries.');
   checkRequestKey(input.requestKey);
   return updateTaskContribution<{ entry: TaskProgressEntry; replayed: boolean }>(taskId, task => {
     const progress = task.progress ?? [];
@@ -166,6 +181,43 @@ export function setTaskReviewMarkdown(taskId: string, input: {
     };
     return { value: task.review, changed: true };
   });
+}
+
+/**
+ * Clear the resolved To review request: Markdown and every attached file, in
+ * one change fenced by the whole package revision the writer last read. Any
+ * Markdown edit, attach or detach since then is a conflict and nothing is
+ * removed. Clearing an already empty package at the expected revision succeeds
+ * unchanged; after a successful clear, read the package again before retrying.
+ * Like any change, a clear gets the next revision, so read markers, unread and
+ * push behave as for any update. Only the files this change removed are
+ * deleted; a file attached after it stays. With `markdown`, the same change
+ * writes the next request, so no other writer can slip in between.
+ */
+export function clearTaskReview(taskId: string, input: {
+  expectedRevision: number; author: TaskContributionAuthor; markdown?: string;
+}): { review: TaskReview | undefined; removed: TaskReviewArtifact[] } {
+  const dir = reviewStoreDirectory(taskId);
+  if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0)
+    throw new TaskReviewError('invalid_request', 'expected revision must be a non-negative integer');
+  const markdown = input.markdown ?? '';
+  if (typeof markdown !== 'string')
+    throw new TaskReviewError('invalid_request', 'markdown must be a string');
+  if (markdown.length > REVIEW_MARKDOWN_MAX)
+    throw new TaskReviewError('invalid_request', `review markdown maximum is ${REVIEW_MARKDOWN_MAX} characters`);
+  const result = updateTaskContribution<{ review: TaskReview | undefined; removed: TaskReviewArtifact[] }>(taskId, task => {
+    if (reviewRevision(task.review) !== input.expectedRevision)
+      throw new TaskReviewError('conflict', 'The review package changed elsewhere. Read it again before clearing it.');
+    const empty = !task.review || (!task.review.markdown && !task.review.artifacts.length);
+    if (empty && !markdown) return { value: { review: task.review, removed: [] }, changed: false };
+    const removed = task.review?.artifacts ?? [];
+    task.review = { revision: nextRevision(task.review), markdown, updated_at: new Date().toISOString(),
+      updated_by: input.author, artifacts: [] };
+    return { value: { review: task.review, removed }, changed: true };
+  });
+  for (const artifact of result.removed)
+    try { removeStoredFile(dir, artifact.id); } catch { /* an unreferenced copy is swept later */ }
+  return result;
 }
 
 // ── Review artifact store ──────────────────────────────────────────────
