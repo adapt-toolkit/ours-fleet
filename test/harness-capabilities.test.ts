@@ -8,6 +8,11 @@ import { bootstrapPresets } from '../src/preset-bootstrap.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { prepareExecutionPlan } from '../src/rooms-tasks/member-overrides.js';
 import { getAdapter } from '../src/harness/registry.js';
+import { makeClaudeCodeAdapter } from '../src/harness/claude-code.js';
+import { makeCodexAdapter } from '../src/harness/codex.js';
+import type { AcpSessionTransport } from '../src/harness/acp-session-transport.js';
+import type { AgentSession } from '../src/session/types.js';
+import { vi } from 'vitest';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 import '../src/harness/hermes.js';
@@ -131,5 +136,36 @@ describe('manual harness/model/effort for one member', () => {
     expect(unchanged.launchDefinitions['helper:Developer'].brain).toEqual(cfg.agentTemplates!.Developer.brain);
     expect(readdirSync(brains).sort()).toEqual(before);
     expect(existsSync(join(brains, 'gpt-6-luna-xhigh.yaml'))).toBe(false);
+  });
+
+  it.each([
+    ['codex', 'gpt-6-luna', 'xhigh'],
+    ['claude-code', 'claude-opus-5-5', 'max'],
+  ] as const)('starts a %s session with exactly the manual model and effort', async (harness, model, effort) => {
+    const configPath = join(root, 'fleet.yaml');
+    bootstrapPresets(configPath);
+    const cfg = loadConfig(configPath);
+    const plan = prepareExecutionPlan(template, cfg, { helper: { role: 'Developer',
+      overrides: { brain: { inline: { harness, session: 'acp', model, effort } } } } });
+    const role = cfg.resolveAgentDefinition!('RoomMember_helper',
+      { ...plan.launchDefinitions['helper:Developer'], identity: 'RoomMember_helper' });
+    // A recording transport stands in for the ACP child; it receives what the session would be started with.
+    const transport = vi.fn(async () => ({ backend: 'acp', pid: 1 }) as AgentSession) as unknown as AcpSessionTransport;
+    const exec = async () => ({ code: 0, stdout: '', stderr: '' });
+    const adapter = harness === 'codex' ? makeCodexAdapter(exec, transport) : makeClaudeCodeAdapter(exec, transport);
+    const prep = { env: { ...(role.env ?? {}) } };
+    const prepared = adapter.agentSession.prepareLaunch(role, prep);
+    await adapter.agentSession.start({ role, prep, launch: prepared, cwd: root, stateDir: root, mode: 'fresh',
+      permissions: role.permissions, permissionMode: { fleetMode: 'allow', nativeMode: 'native' }, log: () => {} });
+    const started = (transport as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    if (harness === 'codex') {
+      expect(started.configSelections).toEqual([
+        { configId: 'model', value: model }, { configId: 'reasoning_effort', value: effort },
+      ]);
+    } else {
+      // Claude Code runs the model pinned in its environment; effort is an ACP session option.
+      expect(started.env.ANTHROPIC_MODEL).toBe(model);
+      expect(started.configSelections).toEqual([{ configId: 'effort', value: effort }]);
+    }
   });
 });

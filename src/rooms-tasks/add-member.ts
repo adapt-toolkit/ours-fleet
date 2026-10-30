@@ -53,7 +53,9 @@ export function memberAddition(taskId:string,requestId:string) {
   const {hash,...view}=receipt;
   return receipt.state==='running'&&!running.has(path) ? {...view,state:'attention',error:'The server stopped observing this launch. Inspect the existing agent before any recovery.'} : view;
 }
-export async function requestMemberAddition(input:{taskId:string;request:AddMemberRequest;cfg:FleetConfig;cowork?:CoworkAdapter;configPath?:string;binPath:string;provision?:typeof provisionMembers;layouts?:TaskLayouts}) {
+export async function requestMemberAddition(input:{taskId:string;request:AddMemberRequest;cfg:FleetConfig;cowork?:CoworkAdapter;configPath?:string;binPath:string;provision?:typeof provisionMembers;layouts?:TaskLayouts;
+  /** Checks a new request only; a retry of an accepted request returns its receipt. */
+  checkNewRequest?:(request:AddMemberRequest)=>Promise<void>}) {
   const {request:r,taskId}=input;
   if(!r || typeof r.slot!=='string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(r.slot)
       || ![r.role,r.agentTemplate].every(v=>text(v)) || !validMemberBrain(r.brain))
@@ -68,6 +70,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
       if(old.hash!==hash)throw new TaskStateError('Request ID was already used with different settings');
       return memberAddition(taskId,r.requestId);
     }
+    await input.checkNewRequest?.(r);
     const task=getTask(taskId);const room=task.room_id&&getRoomRecord(task.room_id);
     if (task.layout?.name === EMPTY_TASK_LAYOUT && input.layouts) {
       if (!validLayoutKey(r.slot)) throw new MemberAdditionRejected('Invalid member name');

@@ -360,14 +360,16 @@ export async function buildWebServer(
   });
 
   // A new agent's own harness/model/effort must be one its adapter supports; saved Brains are used as they are.
-  const checkInlineBrain=async(creation:CreateRoleSessionRequest|undefined)=>{
-    const brain=(creation as {brain?:{inline?:Record<string,unknown>}}|undefined)?.brain?.inline;
+  const checkBrainChoice=async(brain:object|undefined)=>{
     if(!brain || typeof brain!=='object')return;
+    const value=brain as Record<string,unknown>;
     const check=validateBrainChoice(await harnessCapabilities({codexModels:services.codexModels,checkReadiness:false}),{
-      harness:String(brain.harness),session:brain.session as string|undefined,
-      model:brain.model as string|null|undefined,effort:brain.effort as string|undefined});
+      harness:String(value.harness),session:value.session as string|undefined,
+      model:value.model as string|null|undefined,effort:value.effort as string|undefined});
     if(!check.ok)throw new FleetError('invalid_request',`Brain: ${check.message}`);
   };
+  const checkInlineBrain=(creation:CreateRoleSessionRequest|undefined)=>
+    checkBrainChoice((creation as {brain?:{inline?:object}}|undefined)?.brain?.inline);
 
   app.post('/api/v1/roles/preview', async request => {
     auth.authenticate(request, true);
@@ -381,9 +383,8 @@ export async function buildWebServer(
     const idempotencyKey = String(request.headers['idempotency-key'] ?? '');
     if (!body?.request || !body.previewHash)
       throw new FleetError('invalid_request', 'request and previewHash are required');
-    await checkInlineBrain(body.request);
     const action = await services.creation.create(
-      body.request, body.previewHash, idempotencyKey, session.id);
+      body.request, body.previewHash, idempotencyKey, session.id, checkInlineBrain);
     events.publish('creation.changed', action, action.roleId);
     reply.header('Location', `/api/v1/creation-actions/${encodeURIComponent(action.actionId)}`);
     reply.code(202);
@@ -713,15 +714,12 @@ export async function buildWebServer(
   app.post('/api/v1/tasks/:id/members', async (request, reply) => {
     auth.authenticate(request, true);
     const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
-    // A manual harness/model/effort must be one the adapter supports; nothing is substituted.
-    const manual=body && typeof body.brain==='object' && body.brain ? (body.brain as unknown as {inline?:Record<string,unknown>}).inline : undefined;
-    if(manual && typeof manual==='object'){
-      const check=validateBrainChoice(await harnessCapabilities({codexModels:services.codexModels,checkReadiness:false}),
-        {harness:String(manual.harness),session:manual.session as string|undefined,model:manual.model as string|undefined,effort:manual.effort as string|undefined});
-      if(!check.ok)throw new FleetError('invalid_request',`Brain: ${check.message}`);
-    }
     try {
-      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+      // A new manual harness/model/effort must be one the adapter supports; nothing is substituted.
+      // A retry of an accepted request returns its receipt even if the account's models changed since.
+      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body,async member=>{
+        if(typeof member.brain==='object')await checkBrainChoice(member.brain.inline);
+      }));
       reply.code(result.state==='running'?202:200);return result;
     } catch(error) {
       if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});

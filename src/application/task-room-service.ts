@@ -180,11 +180,11 @@ export class TaskRoomApplicationService {
     private readonly deps: TaskRoomServiceDeps = {},
   ) {}
 
-  async addMember(taskId: string, request: AddMemberRequest) {
+  async addMember(taskId: string, request: AddMemberRequest, checkNewRequest?: (request: AddMemberRequest) => Promise<void>) {
     const {requestMemberAddition}=await import('../rooms-tasks/add-member.js');
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return requestMemberAddition({taskId,request,cfg,configPath:this.configurationPath,
-      cowork:readTask(taskId).layout ? undefined : (this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers,layouts:this.layouts()});
+      cowork:readTask(taskId).layout ? undefined : (this.deps.cowork ?? createCoworkAdapter)(cfg),binPath:(this.deps.binPath ?? getBinPath)(),provision:this.deps.provisionMembers,layouts:this.layouts(),checkNewRequest});
   }
   async memberAddition(taskId:string,requestId:string) { const {memberAddition}=await import('../rooms-tasks/add-member.js');return memberAddition(taskId,requestId); }
 
