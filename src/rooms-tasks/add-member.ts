@@ -20,12 +20,13 @@ import { validLayoutKey } from './layout-config.js';
 export class MemberAdditionRejected extends TaskStateError { readonly accepted=false; }
 /** A one-off harness/model/effort for this member only; no Brain is saved. Omitted model/effort keep the harness default. */
 export interface ManualBrain { harness: string; session?: string; model?: string; effort?: string }
-export interface AddMemberRequest { requestId: string; slot: string; role: string; brain: string | { inline: ManualBrain }; agentTemplate: string }
+/** `brain` omitted: the member uses its Agent Template's own Brain, unchanged. */
+export interface AddMemberRequest { requestId: string; slot: string; role: string; brain?: string | { inline: ManualBrain }; agentTemplate: string }
 const MANUAL_KEYS = ['harness', 'session', 'model', 'effort'];
 const text = (v: unknown, max = 128): v is string => typeof v === 'string' && v.length > 0 && v.length <= max;
-/** A saved Brain name, or exactly one manual harness/model/effort. */
+/** No Brain, a saved Brain name, or exactly one manual harness/model/effort. */
 export function validMemberBrain(brain: unknown): brain is AddMemberRequest['brain'] {
-  if (text(brain)) return true;
+  if (brain === undefined || text(brain)) return true;
   const inline = (brain as { inline?: unknown } | null)?.inline as Record<string, unknown> | undefined;
   return Boolean(brain) && typeof brain === 'object' && Object.keys(brain as object).join() === 'inline'
     && Boolean(inline) && typeof inline === 'object' && !Array.isArray(inline)
@@ -34,6 +35,7 @@ export function validMemberBrain(brain: unknown): brain is AddMemberRequest['bra
 }
 /** The member override: a saved Brain by name, or the manual triple as this member's own inline Brain. */
 function brainOverride(brain: AddMemberRequest['brain']) {
+  if (brain === undefined) return {};
   if (typeof brain === 'string') return { brain };
   const { harness, session, model, effort } = brain.inline;
   return { overrides: { brain: { inline: { harness, session: session ?? 'acp',
@@ -60,7 +62,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
   if(!r || typeof r.slot!=='string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(r.slot)
       || ![r.role,r.agentTemplate].every(v=>text(v)) || !validMemberBrain(r.brain))
     // No receipt lookup has happened yet: this request ID may already be accepted.
-    throw new TaskStateError('Slot, Role, Brain and Agent Template are required');
+    throw new TaskStateError('Slot, Role and Agent Template are required; Brain must be a saved Brain or a harness, model and effort');
   const path=pathFor(taskId,r.requestId);
   const hash=createHash('sha256').update(canonicalJson(r)).digest('hex');
   mkdirSync(join(stateRoot(),'member-additions',taskId),{recursive:true,mode:0o700});

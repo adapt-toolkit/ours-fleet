@@ -317,6 +317,11 @@ describe('simple Cowork room member startup', () => {
       .rejects.toThrow('does not offer this model');
     expect(existsSync(join(stateRoot(),'member-additions',task.task_id,'manual-request-456.json'))).toBe(false);
     expect(mocks.spawnTemp.mock.calls.length).toBe(launches);
+    // No Brain in the request: the member keeps its Agent Template's own Brain.
+    const {brain:_omitted,...templateDefault}=request;
+    await requestMemberAddition({...input,request:{...templateDefault,requestId:'template-brain-789',slot:'Third'},checkNewRequest:accept});
+    await expect.poll(()=>memberAddition(task.task_id,'template-brain-789').state).toBe('succeeded');
+    expect(mocks.spawnTemp.mock.calls.length).toBe(launches+1);
   });
 
   it.each([['room',false],['task',false],['room',true],['task',true]] as const)('rechecks terminal ownership after waiting for %s lock (append=%s)', async (boundary,append) => {
