@@ -480,6 +480,8 @@ export async function buildWebServer(
   };
   const project = async (descriptor: ResourceDescriptor, signal: AbortSignal, owner = ''): Promise<unknown> => {
     signal.throwIfAborted(); services.invalidateResourceCaches?.();
+    // Role projections load the configuration: fence this capture on its external inputs too.
+    if(['directory','roles','previews'].includes(descriptor.resource))services.configuration?.observeValidationInputs();
     switch(descriptor.resource) {
       case 'task-layout':
         try {return {layout:await taskApi(()=>requireTaskRooms().taskLayout(descriptor.entityId!))};}
