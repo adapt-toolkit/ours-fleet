@@ -13,7 +13,10 @@ import { createCoworkAdapter } from './cowork-adapter.js';
 import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-binding-client.js';
 import { readClientProfile } from '../client-profile.js';
 import { tempSupervisorLiveness } from '../temp-lifecycle.js';
-import { layoutOwnedMemberName, retireOwnedLayoutMember } from './layout-member-retirement.js';
+import {
+  allocateLayoutMemberName, retireOwnedLayoutMember,
+} from './layout-member-retirement.js';
+import type { LabelCandidate } from './member-naming.js';
 import { EMPTY_TASK_LAYOUT, emptyTaskLayout } from './empty-layout.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
@@ -38,10 +41,13 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     return this.request(i.agent, i.temporary, { ...request, instance: i });
   }
   async verify(i: LayoutInstance): Promise<void> { await this.call(i, { action: 'verify' }); }
-  async spawn(key: string, template: string, snapshot?: AgentTemplateDefinition): Promise<LayoutInstance> {
+  async spawn(key: string, template: string, snapshot?: AgentTemplateDefinition,
+    labels: LabelCandidate[] = []): Promise<LayoutInstance> {
     const definition = snapshot ?? this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
-    const name = layoutOwnedMemberName(this.runId, key);
+    // The first allocation is durable on the task; recovery reuses it once its durability is confirmed.
+    // Labels come from the run snapshot only.
+    const name = allocateLayoutMemberName(this.runId, key, labels);
     const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
     const task = taskId ? (await import('./task-state.js')).getTask(taskId) : undefined;
     if (task && task.layout?.run_id !== this.runId) throw Error('TASK_LAYOUT_OWNER_MISMATCH');
@@ -155,14 +161,17 @@ export class RoomLayoutService {
     const source = scope.source ?? this.definition(name);
     const definition = scope.definition ? scope.definition(structuredClone(source)) : source;
     const templates: Record<string, AgentTemplateDefinition> = {};
+    const roleLabels: Record<string, string> = {};
     for (const [key, participant] of Object.entries(definition.participants)) {
       if (bindings[key] || !participant.agent_template) continue;
       const template = cfg.agentTemplates?.[participant.agent_template];
       if (!template) throw Error(`agent template not found: ${participant.agent_template}`);
       templates[participant.agent_template] = { ...structuredClone(template), ...(scope.cwd ? { cwd: scope.cwd } : {}) };
+      const roleRef = cfg.agentTemplateRoleRefs?.[participant.agent_template];
+      if (roleRef) roleLabels[participant.agent_template] = roleRef;
     }
     const engine = this.engine(id);
-    await engine.create(definition, layoutSupervisorId(), bindings, templates);
+    await engine.create(definition, layoutSupervisorId(), bindings, templates, roleLabels);
     return { id, state: engine.snapshot() };
   }
 }

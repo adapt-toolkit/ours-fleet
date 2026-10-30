@@ -8,7 +8,17 @@ import type {
 } from '../rooms-tasks/types.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import { RoomStateError } from '../rooms-tasks/room-state.js';
-import { TaskStateError } from '../rooms-tasks/task-state.js';
+import { resolveTaskRef, TaskStateError } from '../rooms-tasks/task-state.js';
+import { MissionKeyError } from '../rooms-tasks/mission-keys.js';
+
+/** Canonical ID for an authenticated Owner's task argument (ID or mission key). */
+function ownerTaskRef(value: string, allowDeleted = false): string {
+  try { return resolveTaskRef(value, { allowDeleted }); }
+  catch (error) {
+    if (error instanceof MissionKeyError) throw new TaskStateError(error.message);
+    throw error;
+  }
+}
 import {
   markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
   renderMarkdownResult, roomStatus, taskStatus,
@@ -138,7 +148,7 @@ const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REPLY_MAX_CHARS = 3_500;
 
 const taskListRecord = (task: TaskRecord): string =>
-  `${taskStatus(task.state)} ${markdownCode(task.task_id)} — ${markdownProse(task.title)}`
+  `${taskStatus(task.state)} ${task.key ? `${markdownCode(task.key)} ` : ''}${markdownCode(task.task_id)} — ${markdownProse(task.title)}`
   + ` — List ${markdownCode(task.list_name ?? 'default')}`
   + (task.blocked ? ` — 🚧 Blocked: ${markdownProse(task.blocked.reason)}` : '');
 
@@ -230,6 +240,7 @@ const taskAction = (
 ): string => renderMarkdownResult({
   icon: '📋', title,
   fields: [
+    ...(task.key ? [{ label: 'Key', value: task.key, kind: 'code' as const }] : []),
     { label: 'ID', value: task.task_id, kind: 'code' },
     { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
     ...fields,
@@ -566,18 +577,18 @@ export const ownerCommands: OwnerCommand[] = [
           case 'move': {
             const destination = trailingLines ?? rest.find(r => r.startsWith('--list='))?.slice('--list='.length);
             if (!rest[0] || !destination) throw new OwnerCommandUsageError('usage: /task move <id> --list=<name>');
-            await showTask((await ctx.moveTask(rest[0], destination)).task_id);
+            await showTask((await ctx.moveTask(ownerTaskRef(rest[0]), destination)).task_id);
             break;
           }
           case 'show': {
             if (rest.length !== 1 || rest[0].startsWith('--'))
               throw new OwnerCommandUsageError('usage: /task show <id>');
-            await showTask(rest[0]);
+            await showTask(ownerTaskRef(rest[0]));
             break;
           }
           case 'start': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task start <id>');
-            const started = await ctx.startTask(rest[0]);
+            const started = await ctx.startTask(ownerTaskRef(rest[0]));
             await ctx.reply('kind' in started
               ? taskProvisioningAction(started) : taskAction('Task started', started));
             break;
@@ -585,45 +596,45 @@ export const ownerCommands: OwnerCommand[] = [
           case 'block': {
             if (!rest[0] || !rest[1]) throw new OwnerCommandUsageError('usage: /task block <id> <reason>');
             const reason = rest.slice(1).join(' ');
-            const t = ctx.blockTask(rest[0], reason);
+            const t = ctx.blockTask(ownerTaskRef(rest[0]), reason);
             await ctx.reply(taskAction('Task blocked', t, [{ label: 'Reason', value: reason }]));
             break;
           }
           case 'unblock': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task unblock <id>');
-            const t = ctx.unblockTask(rest[0]);
+            const t = ctx.unblockTask(ownerTaskRef(rest[0]));
             await ctx.reply(taskAction('Task unblocked', t));
             break;
           }
           case 'review': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task review <id>');
-            const t = ctx.reviewTask(rest[0]);
+            const t = ctx.reviewTask(ownerTaskRef(rest[0]));
             await ctx.reply(taskAction('Task ready for review', t));
             break;
           }
           case 'done': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task done <id> [summary]');
             const summary = rest.slice(1).join(' ') || undefined;
-            await ctx.terminalTask(rest[0], 'done', summary ? { summary } : undefined);
+            await ctx.terminalTask(ownerTaskRef(rest[0]), 'done', summary ? { summary } : undefined);
             break;
           }
           case 'cancel': {
             if (rest.length < 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task cancel <id> <id> — provide the task ID twice');
-            await ctx.terminalTask(rest[0], 'cancelled');
+            await ctx.terminalTask(ownerTaskRef(rest[0]), 'cancelled');
             break;
           }
           case 'delete': {
             if (rest.length !== 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task delete <id> <id> — provide the task ID twice');
-            await ctx.deleteTask(rest[0]);
+            await ctx.deleteTask(ownerTaskRef(rest[0], true));
             break;
           }
           default:
             // bare /task <id> → show
             if (sub === 'recover' || sub === 'await' || rest.length)
               throw new OwnerCommandUsageError(`unknown task subcommand: ${sub}`);
-            await showTask(sub);
+            await showTask(ownerTaskRef(sub));
         }
       } catch (e) {
         if (e instanceof OwnerCommandUsageError) throw e;

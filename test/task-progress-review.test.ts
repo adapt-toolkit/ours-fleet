@@ -73,7 +73,7 @@ describe('task progress', () => {
       ...t, progress: listed, contribution_reads: { progress_read: [], review_revision: 0 },
       notification_events: [...t.notification_events!, ...listed.map(entry => ({
         eventId: `task:${t.task_id}:progress:${entry.id}`, taskId: t.task_id,
-        title: 'Progress: work', body: entry.text.trim(),
+        title: `Progress: ${t.key} · work`, body: entry.text.trim(),
         target: { kind: 'task', taskId: t.task_id }, delivery: 'push-only',
       }))],
     });

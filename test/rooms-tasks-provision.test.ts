@@ -33,7 +33,7 @@ import { withFileLock } from '../src/atomic-file.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
 import { activateRoom, beginRoomClose, createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
-import { beginTaskTerminalIntent, blockTask, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
+import { allocateTaskMemberNames, beginTaskTerminalIntent, blockTask, createTask, getTask, updateTaskRoom } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
 } from '../src/rooms-tasks/cowork-adapter.js';
@@ -237,6 +237,25 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
+  it('names keyed task members KEY-Role[-n] from the selected Role and keeps them across re-provisioning', async () => {
+    const task=createTask({title:'Team',origin:{type:'cli'}});
+    const team:TemplateSnapshot={...template(1),members:[
+      {slot:'local_coordinator',role:'LocalCoordinator',count:1,agent_template:'Developer',role_label:'LocalCoordinator'},
+      {slot:'developer',role:'Developer',count:2,agent_template:'Developer',role_label:'Developer'},
+      {slot:'reviewer',role:'Developer',count:1,agent_template:'Developer',role_preset:{id:'Critic',hash:'h'}}]};
+    createRoomRecord({room_id:'room-team',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:team});
+    updateTaskRoom(task.task_id,'room-team','room-cid');const h=coworkHarness();
+    const input={cfg:cfg(),cowork:h.cowork,roomId:'room-team',taskId:task.task_id,template:team,binPath:'/fleet'};
+    await provisionMembers(input);
+    const names=getRoomRecord('room-team')!.member_seats.map(seat=>seat.role_name);
+    expect(names).toEqual(['MSN-1-LocalCoordinator','MSN-1-Developer','MSN-1-Developer-2','MSN-1-Critic']);
+    // The invite role stays the room label; the explicitly selected Role names the agent.
+    expect(getRoomRecord('room-team')!.member_seats.find(seat=>seat.role_name==='MSN-1-Critic')?.cowork_role).toBe('Developer');
+    // Recovery re-expands the same allocation keys and gets the same names, never new ordinals.
+    expect(allocateTaskMemberNames(task.task_id,[['local_coordinator',1],['developer',1],['developer',2],['reviewer',1]]
+      .map(([slot,i])=>({allocationKey:`initial:${slot}:${i}`,candidates:[{label:'ignored',source:'room_role' as const}]})))).toEqual(names);
+    expect(getTask(task.task_id).member_naming?.counters).toEqual({localcoordinator:1,developer:2,critic:1});
+  });
   it('appends a member without replacing or relaunching existing task members', async () => {
     const task=createTask({title:'Append',origin:{type:'cli'}});
     createRoomRecord({room_id:'room-add',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:template(1)});
@@ -270,9 +289,13 @@ describe('simple Cowork room member startup', () => {
     expect(results[0].status).toBe('fulfilled');
     await requestMemberAddition(input);
     await expect.poll(()=>memberAddition(task.task_id,input.request.requestId).state).toBe('succeeded');
-    if(results[1].status==='fulfilled')await expect.poll(()=>memberAddition(task.task_id,'second-request-123').state).toBe('failed');
+    // A second request for the same role is a second agent with the next durable role ordinal.
+    expect(results[1].status).toBe('fulfilled');
+    await expect.poll(()=>memberAddition(task.task_id,'second-request-123').state).toBe('succeeded');
+    expect([memberAddition(task.task_id,input.request.requestId).roleId,memberAddition(task.task_id,'second-request-123').roleId].sort())
+      .toEqual([`${task.key}-Critic`,`${task.key}-Critic-2`]);
     expect(getTask(task.task_id).blocked).toEqual(blocker);
-    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(3);
     await expect(requestMemberAddition({...input,request:{...input.request,slot:'Other'}})).rejects.toThrow('different settings');
     for(const changed of [{role:''},{slot:'invalid slot'}]) {
       const error=await requestMemberAddition({...input,request:{...input.request,...changed}}).catch(error=>error);
@@ -280,16 +303,38 @@ describe('simple Cowork room member startup', () => {
       expect(error).not.toHaveProperty('accepted');
       expect(memberAddition(task.task_id,input.request.requestId).state).toBe('succeeded');
     }
-    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(3);
     // A receipt left running by a terminated server is observed, never relaunched.
     const path=join(stateRoot(),'member-additions',task.task_id,input.request.requestId+'.json');
     const stored=JSON.parse(readFileSync(path,'utf8'));stored.state='running';writeFileSync(path,JSON.stringify(stored));
     expect((await requestMemberAddition(input)).state).toBe('attention');
-    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
-    await expect(requestMemberAddition({...input,request:{...input.request,requestId:'duplicate-slot-123'}})).rejects.toThrow('slot already exists');
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(3);
+    // Another request for the same role consumes the next ordinal; removed or failed ordinals are never reused.
+    expect((await requestMemberAddition({...input,request:{...input.request,requestId:'duplicate-slot-123'}})).roleId).toBe(`${task.key}-Critic-3`);
+    await expect.poll(()=>memberAddition(task.task_id,'duplicate-slot-123').state).toBe('succeeded');
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(4);
     beginRoomClose('room-receipt');
     await expect(requestMemberAddition({...input,request:{...input.request,requestId:'closing-room-123',slot:'Another'}})).rejects.toThrow('active task room');
-    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(4);
+  });
+
+  it('names added Constructor, ToString and ValueOf roles from their own counters, never Object.prototype', async () => {
+    const {requestMemberAddition,memberAddition}=await import('../src/rooms-tasks/add-member.js');
+    const task=createTask({title:'Prototype roles',origin:{type:'cli'}});
+    createRoomRecord({room_id:'room-proto',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:template(1)});
+    updateTaskRoom(task.task_id,'room-proto','room-cid');const h=coworkHarness();
+    await provisionMembers({cfg:cfg(),cowork:h.cowork,roomId:'room-proto',taskId:task.task_id,template:template(1),binPath:'/fleet'});
+    const roles=['Constructor','ToString','ValueOf'];
+    const configuration=cfg({rolePresets:Object.fromEntries(roles.map(role=>[role,{mission:'Review'}])),brainPresets:{test:{harness:'codex'}},resolveAgentDefinition:()=>caller});
+    const names:string[]=[];
+    for(const [i,role] of [...roles,'Constructor'].entries()){
+      const requestId=`proto-request-${i}00`;
+      const accepted=await requestMemberAddition({taskId:task.task_id,request:{requestId,slot:`Slot${i}`,role,brain:'test',agentTemplate:'Critic'},cfg:configuration,cowork:h.cowork,binPath:'/fleet'});
+      await expect.poll(()=>memberAddition(task.task_id,requestId).state).toBe('succeeded');
+      names.push(accepted.roleId);
+    }
+    expect(names).toEqual([`${task.key}-Constructor`,`${task.key}-ToString`,`${task.key}-ValueOf`,`${task.key}-Constructor-2`]);
+    expect(getTask(task.task_id).member_naming?.counters).toMatchObject({constructor:2,tostring:1,valueof:1});
   });
 
   it.each([['room',false],['task',false],['room',true],['task',true]] as const)('rechecks terminal ownership after waiting for %s lock (append=%s)', async (boundary,append) => {

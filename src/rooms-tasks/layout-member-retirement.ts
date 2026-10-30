@@ -9,6 +9,9 @@ import { agentDir, stateRoot } from '../paths.js';
 import { readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempArchiveForCreationAction, type TempLifecycleDeps } from '../temp-lifecycle.js';
 import { assertMemberIdentityAbsent, removeExactMemberIdentity, waitForLivenessAbsent } from './close.js';
 import { assertMemberNotPermanent } from './member-ownership.js';
+import { allocateTaskMemberNames, recordedMemberName } from './task-state.js';
+import { assertMemberNameAvailable } from './provision.js';
+import type { LabelCandidate } from './member-naming.js';
 import { retireTaskMemberService } from './task-service-retirement.js';
 import type { LayoutInstance, RoomLayoutState } from './layout.js';
 import type { RoomMemberSeat } from './types.js';
@@ -18,8 +21,35 @@ function proof(path: string): string {
   return readFileSync(path, 'utf8');
 }
 
-export function layoutOwnedMemberName(runId: string, key: string): string {
+/** Name a pre-mission-key layout run derived for every participant; still the recovery fallback. */
+export function legacyLayoutMemberName(runId: string, key: string): string {
   return `layout-${createHash('sha256').update(runId + ':' + key).digest('hex').slice(0, 16)}`;
+}
+
+const taskOfRun = (runId: string): string | undefined =>
+  runId.startsWith('task-') && /^task-[0-9a-z]{9}[0-9a-f]{8}$/.test(runId) ? runId.slice(5) : undefined;
+
+/**
+ * The owned name for a layout participant: the durable allocation recorded on
+ * its task (fresh or frozen), else the legacy hash. This is the ownership
+ * proof retirement checks before its launch, CID and provenance fences.
+ */
+export function layoutOwnedMemberName(runId: string, key: string): string {
+  const taskId = taskOfRun(runId);
+  return (taskId && recordedMemberName(taskId, `layout:${runId}:${key}`)) || legacyLayoutMemberName(runId, key);
+}
+
+/**
+ * Allocate (or reuse) the participant's durable role-scoped name before it is
+ * spawned. Every launch goes through the task allocator, which confirms a
+ * reused allocation is durable before returning it; retirement uses the
+ * side-effect-free layoutOwnedMemberName instead.
+ */
+export function allocateLayoutMemberName(runId: string, key: string, candidates: LabelCandidate[]): string {
+  const taskId = taskOfRun(runId);
+  if (!taskId) return legacyLayoutMemberName(runId, key);
+  return allocateTaskMemberNames(taskId, [{ allocationKey: `layout:${runId}:${key}`, candidates }],
+    assertMemberNameAvailable)?.[0] ?? legacyLayoutMemberName(runId, key);
 }
 function assertOwned(instance: LayoutInstance, runId: string, key: string): asserts instance is LayoutInstance & { agent: string } {
   if (instance.remote || !instance.agent || instance.temporary !== true
