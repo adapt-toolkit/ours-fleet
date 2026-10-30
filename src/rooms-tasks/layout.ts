@@ -48,6 +48,8 @@ type RoomState = {
 };
 export interface RoomLayoutState {
   version: 1; owner?: ReturnType<typeof ownerReference>; agent_templates?: Record<string, import('../config.js').AgentTemplateDefinition>; definition: LayoutDefinition; controller: string;
+  /** Named Role of each source Agent Template, sealed at run creation; later config edits never rename members. */
+  role_labels?: Record<string, string>;
   participants: Record<string, ParticipantState>; rooms: Record<string, RoomState>;
   /** Runtime additions leave the pinned source definition unchanged. */
   additional_members?: Record<string, { room: string; role: string; template: string; request_id: string; hash: string }>;
@@ -64,13 +66,15 @@ function instanceKey(definition: LayoutDefinition, participant: string, room: st
  * the supervisor): a runtime-added member's room role, else its room role when
  * every room it joins agrees (or its own room when room-scoped), else its key.
  */
-function participantLabels(s: RoomLayoutState, participant: string, room?: string): import('./member-naming.js').LabelCandidate[] {
+function participantLabels(s: RoomLayoutState, participant: string, template: string, room?: string): import('./member-naming.js').LabelCandidate[] {
   const added = s.additional_members?.[participant];
+  // Runs created before sealing have no role_labels: fall back to room roles, never to current config.
+  const sealed = s.role_labels && own(s.role_labels, template) ? s.role_labels[template] : undefined;
   const roles = Object.entries(s.definition.rooms)
     .filter(([key, spec]) => spec.members.includes(participant) && (!room || room === key))
     .map(([, spec]) => spec.roles?.[participant] ?? participant);
   const agreed = added?.role ?? (new Set(roles).size === 1 ? roles[0] : undefined);
-  return [{ label: agreed, source: 'room_role' }, { label: participant, source: 'participant_key' }];
+  return [{ label: sealed, source: 'template_ref' }, { label: agreed, source: 'room_role' }, { label: participant, source: 'participant_key' }];
 }
 
 export function validateLayout(def: LayoutDefinition): void {
@@ -107,7 +111,8 @@ export class RoomLayout {
     need(i.launch && i.cid && i.session, 'incomplete instance reference');
     await this.supervisor.verify(i);
   }
-  async create(definition: LayoutDefinition, controller: string, bindings: Record<string, LayoutInstance> = {}, agentTemplates?: RoomLayoutState['agent_templates']): Promise<void> {
+  async create(definition: LayoutDefinition, controller: string, bindings: Record<string, LayoutInstance> = {}, agentTemplates?: RoomLayoutState['agent_templates'],
+    roleLabels?: RoomLayoutState['role_labels']): Promise<void> {
     validateLayout(definition); need(controller, 'controller required');
     this.checkOwnerRoles(definition);
     await withFileLock(this.file + '.lock', async () => {
@@ -133,7 +138,8 @@ export class RoomLayout {
         } else participants[key] = { owned: !bindings[key], ...(bindings[key] ? { instance: bindings[key] } : {}) };
       }
       this.save({ version: 1, definition, controller, ...(this.owner ? { owner: ownerReference(this.owner) } : {}),
-        agent_templates: agentTemplates, participants, rooms: {}, order: [], closed: false });
+        agent_templates: agentTemplates, ...(roleLabels && Object.keys(roleLabels).length ? { role_labels: roleLabels } : {}),
+        participants, rooms: {}, order: [], closed: false });
     });
   }
   private checkOwnerRoles(definition: LayoutDefinition): void {
@@ -180,7 +186,7 @@ export class RoomLayout {
         const template = s.definition.participants[member]?.agent_template ?? s.additional_members?.[member]?.template;
         need(template, `no factory for ${member}`);
         if (this.supervisor.taskSupervised) p.task_supervised = true;
-        const labels = participantLabels(s, member, p.room);
+        const labels = participantLabels(s, member, template, p.room);
         await this.mutation(s, `spawn:${resolvedKey}`, () => s.additional_members?.[member]
           ? this.supervisor.spawn(resolvedKey, template, s.agent_templates?.[template], labels)
           : this.supervisor.spawn(resolvedKey, template, undefined, labels), i => { p.instance = i; });

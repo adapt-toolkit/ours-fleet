@@ -1,5 +1,5 @@
 import { it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 vi.mock('../src/client-profile.js', () => ({ readClientProfile: () => ({ expectedInstanceId: 'shared-daemon' }) }));
@@ -12,7 +12,7 @@ import { spawnTemp } from '../src/spawn.js';
 import { NativeLayoutSupervisor, RoomLayoutService } from '../src/rooms-tasks/layout-service.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import { stringify } from 'yaml';
-import { agentDir } from '../src/paths.js';
+import { agentDir, stateRoot } from '../src/paths.js';
 let root: string, previous: string | undefined;
 beforeEach(() => {
   vi.resetAllMocks(); previous = process.env.OURS_FLEET_HOME;
@@ -114,4 +114,46 @@ it('routes a borrowed instance through the owner HTTP port without opening forei
   expect(JSON.parse(fetcher.mock.calls[1][1].body)).not.toHaveProperty('invite');
   await expect(f.supervisor.retire(instance)).rejects.toThrow('cannot retire a borrowed');
   expect(fetcher).toHaveBeenCalledTimes(2); expect(tempSupervisorLiveness).not.toHaveBeenCalled();
+});
+it('seals template Role labels at run creation; a later first launch ignores edited or removed config', async () => {
+  const config = join(root, 'fleet.yaml');
+  writeV2Fixture(config, { roles: {}, rooms: { owner: { expected_cid: '0'.repeat(64) }, defaults: { attach_owner: false } } });
+  const fleetDir = join(root, 'fleet');
+  mkdirSync(join(fleetDir, 'roles'), { mode: 0o700 });
+  writeFileSync(join(fleetDir, 'roles', 'Architect.yaml'), 'mission: Shape the design\n', { mode: 0o600 });
+  const templatePath = join(fleetDir, 'agent_templates', 'Agent.yaml');
+  writeFileSync(templatePath, stringify({ role: { ref: 'Architect' }, brain: { inline: { harness: 'claude-code' } },
+    permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' } }), { mode: 0o600 });
+  const layouts = join(fleetDir, 'room_layouts'); mkdirSync(layouts, { mode: 0o700 });
+  writeFileSync(join(layouts, 'work.yaml'), stringify({ version: 1, participants: { worker: { agent_template: 'Agent' } },
+    rooms: { design: { goal: 'Design', members: ['worker'] } } }), { mode: 0o600 });
+  const { createTask } = await import('../src/rooms-tasks/task-state.js');
+  const task = createTask({ title: 'Layout names', origin: { type: 'cli' }, start: false });
+  const runId = `task-${task.task_id}`;
+  const taskPath = join(stateRoot(), 'tasks', `${task.task_id}.json`);
+  const row = JSON.parse(readFileSync(taskPath, 'utf8'));
+  row.layout = { name: 'work', run_id: runId, definition_hash: 'h' }; writeFileSync(taskPath, JSON.stringify(row));
+  const created = await new RoomLayoutService(config).create('work', {}, runId);
+  expect(created.state.role_labels).toEqual({ Agent: 'Architect' });
+  vi.mocked(controlRequest).mockImplementation(async (_dir, request: any) => ({
+    ok: true, result: { supervisor: 'local', agent: request.layout.agent, launch: 'launch', cid: 'cid', session: 'session' },
+  } as any));
+  const launch = async (key: string) => {
+    const snapshot = new RoomLayoutService(config).open(runId, true).snapshot();
+    const supervisor = new NativeLayoutSupervisor(config, runId, snapshot.agent_templates ?? {});
+    // The engine passes the sealed label first; the supervisor must not consult config for it.
+    await supervisor.spawn(key, 'Agent', undefined, [{ label: snapshot.role_labels?.Agent, source: 'template_ref' },
+      { label: key, source: 'participant_key' }]);
+    return vi.mocked(spawnTemp).mock.calls.at(-1)![0].name;
+  };
+  // Edited: the template now names another Role.
+  writeFileSync(join(fleetDir, 'roles', 'Reviewer.yaml'), 'mission: Review\n', { mode: 0o600 });
+  writeFileSync(templatePath, stringify({ role: { ref: 'Reviewer' }, brain: { inline: { harness: 'claude-code' } },
+    permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' } }), { mode: 0o600 });
+  expect(await launch('worker')).toBe(`${task.key}-Architect`);
+  // Removed: the Role and even a readable manifest are gone before another participant's first launch.
+  rmSync(join(fleetDir, 'roles'), { recursive: true });
+  writeFileSync(config, 'invalid: [');
+  expect(await launch('second')).toBe(`${task.key}-Architect-2`);
+  expect(new RoomLayoutService(config).open(runId, true).snapshot().role_labels).toEqual({ Agent: 'Architect' });
 });

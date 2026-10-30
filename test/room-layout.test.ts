@@ -423,3 +423,30 @@ it.each(['missing', 'closed', 'member', 'role', 'identity'])('rejects native %s 
   expect(f.supervisor.assign).toHaveBeenCalledTimes(2); expect(f.supervisor.spawn).toHaveBeenCalledTimes(2);
   expect(f.cowork.createRoom).toHaveBeenCalledTimes(1); expect(f.supervisor.join).toHaveBeenCalledTimes(2);
 });
+
+describe('sealed Role labels for agent names', () => {
+  const firstLabel = (spawn: ReturnType<typeof fixture>['supervisor']['spawn'], key: string) =>
+    (spawn.mock.calls.find(call => call[0] === key) as unknown[] | undefined)?.[3] as Array<{ label?: string; source: string }>;
+  it('names a participant first launched in a later room from the run snapshot, also after reload', async () => {
+    const f = fixture();
+    await f.layout.create(definition(), 'operator', {}, undefined, { architect: 'Architect', developer: 'Builder' });
+    expect(f.reload().snapshot().role_labels).toEqual({ architect: 'Architect', developer: 'Builder' });
+    await f.layout.activate('operator', 'product');
+    expect(firstLabel(f.supervisor.spawn, 'architect')[0]).toEqual({ label: 'Architect', source: 'template_ref' });
+    expect(firstLabel(f.supervisor.spawn, 'doctor')[0]).toEqual({ label: undefined, source: 'template_ref' });
+    // The developer is first launched in the later design room, by a fresh engine reading only the snapshot.
+    await f.reload().activate('operator', 'design');
+    expect(firstLabel(f.supervisor.spawn, 'developer')[0]).toEqual({ label: 'Builder', source: 'template_ref' });
+    expect(firstLabel(f.supervisor.spawn, 'developer').slice(1)).toEqual([
+      { label: 'developer', source: 'room_role' }, { label: 'developer', source: 'participant_key' }]);
+  });
+  it('falls back to room roles for runs created before labels were sealed', async () => {
+    const f = fixture();
+    await f.layout.create(definition(), 'operator');
+    expect(f.layout.snapshot()).not.toHaveProperty('role_labels');
+    await f.layout.activate('operator', 'product');
+    expect(firstLabel(f.supervisor.spawn, 'architect')).toEqual([
+      { label: undefined, source: 'template_ref' }, { label: 'architect', source: 'room_role' },
+      { label: 'architect', source: 'participant_key' }]);
+  });
+});

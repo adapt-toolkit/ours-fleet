@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   beginTaskDeletionIntent, createTask, getTask, migrateMissionKeysLocked, resolveTaskRef,
-  allocateTaskMemberNames,
+  allocateTaskMemberNames, recordedMemberName,
 } from '../src/rooms-tasks/task-state.js';
 import {
   ensureMissionKeyRegistry, normalizeMissionPrefix, readCreationReceipt, readKeyLedger,
@@ -116,6 +116,30 @@ describe('mission number allocation', () => {
     expect([...keys].sort((x, y) => Number(x.split('-')[1]) - Number(y.split('-')[1])))
       .toEqual(['MSN-1', 'MSN-2', 'MSN-3', 'MSN-4', 'MSN-5', 'MSN-6']);
     expect(readMissionKeyRegistry()!.prefixes.MSN.last_issued).toBe(6);
+  }, 60_000);
+
+  it('resolves keys in CLI block, unblock, progress and review, and shows the key in list and show', async () => {
+    const env = { ...process.env, OURS_FLEET_HOME: root };
+    const run = (...args: string[]) => promisify(execFile)(process.execPath, [resolve('dist/cli.js'), 'task', ...args], { env });
+    const created = JSON.parse((await run('create', '--title', 'Keyed CLI', '--no-room', '--json')).stdout).task;
+    expect(created.key).toBe('MSN-1');
+    expect(JSON.parse((await run('block', 'msn-1', '--reason', 'waiting', '--json')).stdout).task)
+      .toMatchObject({ task_id: created.task_id, blocked: { reason: 'waiting' } });
+    expect(JSON.parse((await run('unblock', 'MSN-1', '--json')).stdout).task.blocked).toBeUndefined();
+    expect(JSON.parse((await run('progress', 'MSN-1', '--text', 'Milestone', '--json')).stdout))
+      .toMatchObject({ task_id: created.task_id, entry: { text: 'Milestone' } });
+    expect(JSON.parse((await run('progress', 'MSN-1', '--json')).stdout))
+      .toMatchObject({ task_id: created.task_id, progress: [{ text: 'Milestone' }] });
+    // Review needs an active task; the fixture skips provisioning.
+    writeRow(created.task_id, { ...readRow(created.task_id), state: 'active' });
+    expect(JSON.parse((await run('review', 'MSN-1', '--json')).stdout).task).toMatchObject({ task_id: created.task_id, state: 'review' });
+    const list = (await run('list', '--state', 'all')).stdout;
+    expect(list).toContain('`MSN-1` `' + created.task_id + '` — Keyed CLI');
+    const show = (await run('show', 'MSN-1')).stdout;
+    expect(show).toMatch(/Key[^\n]*`MSN-1`/);
+    expect(show).toContain(created.task_id);
+    // An unknown key is a typed failure, never a canonical-ID error.
+    await expect(run('block', 'MSN-9', '--reason', 'x', '--json')).rejects.toMatchObject({ code: 1 });
   }, 60_000);
 
   it('replays the original request: first write wins, a different plan conflicts', () => {
@@ -316,6 +340,32 @@ describe('one-time migration', () => {
     expect(readKeyLedger('MSN-1')?.state).toBe('deleted');
   });
 
+  it('derives frozen role buckets from the reserved key, so a later same-role add is ordinal 2', () => {
+    createTaskListLocked('Long Keys', 'ABCDEF');
+    const registryPath = join(fleet(), 'mission-keys', 'registry.json');
+    const registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+    registry.prefixes.ABCDEF.last_issued = 123456788; writeFileSync(registryPath, JSON.stringify(registry));
+    const task = createTask({ title: 'Old', origin, idempotency_key: 'long-key', list: 'Long Keys', start: false });
+    expect(task.key).toBe('ABCDEF-123456789');
+    // As an earlier release wrote it: no key or naming on the row, one launched 60-character role.
+    const role = 'A'.repeat(60);
+    const row = readRow(task.task_id);
+    delete row.key; delete row.member_naming; delete row.key_from_migration;
+    row.execution_plan = { snapshot: { name: 'solo', version: 1, content_hash: 'h', members: [{ slot: 'worker', role, count: 1, agent_template: 'Agent' }] } };
+    writeRow(task.task_id, row);
+    const pending = JSON.parse(readFileSync(registryPath, 'utf8')); delete pending.keys_migrated;
+    writeFileSync(registryPath, JSON.stringify(pending));
+    migrateMissionKeysLocked();
+    const migrated = readRow(task.task_id);
+    expect(migrated.key).toBe('ABCDEF-123456789');
+    // 64 - len(key) - 1 - len('-999') characters, not the 54 a placeholder MSN-1 would allow.
+    const bucket = 'a'.repeat(64 - 'ABCDEF-123456789'.length - 1 - 4);
+    expect(migrated.member_naming.allocations['initial:worker:1'])
+      .toMatchObject({ name: `${task.task_id.slice(0, 8)}-worker-1`, frozen: true, bucket });
+    expect(allocateTaskMemberNames(task.task_id, [{ allocationKey: 'add:same', candidates: [{ label: role, source: 'room_role' }] }]))
+      .toEqual([`ABCDEF-123456789-${'A'.repeat(bucket.length)}-2`]);
+  });
+
   it('preserves progress appended by another process while the migration runs', async () => {
     const tasks = Array.from({ length: 8 }, (_, i) => createTask({ title: `T${i}`, origin, start: false }));
     downgrade(tasks.map(task => task.task_id));
@@ -405,6 +455,21 @@ describe('agent names', () => {
     expect(again).toBe(naming);
     const next = allocateName(naming, 'MSN-1', 'add:new', [{ label: 'Critic', source: 'role_override' }]);
     expect(next.allocation.name).toBe('MSN-1-Critic-3');
+  });
+
+  it('counts Object.prototype-named roles in their own buckets and never reads inherited allocations', () => {
+    const task = createTask({ title: 'Prototype', origin, start: false });
+    const role = (label: string) => [{ label, source: 'role_override' as const }];
+    expect(allocateTaskMemberNames(task.task_id, [
+      { allocationKey: 'add:a', candidates: role('Constructor') }, { allocationKey: 'add:b', candidates: role('ToString') },
+      { allocationKey: 'add:c', candidates: role('ValueOf') }, { allocationKey: 'add:d', candidates: role('HasOwnProperty') },
+      { allocationKey: 'add:e', candidates: role('constructor') },
+    ])).toEqual(['MSN-1-Constructor', 'MSN-1-ToString', 'MSN-1-ValueOf', 'MSN-1-HasOwnProperty', 'MSN-1-Constructor-2']);
+    expect(readRow(task.task_id).member_naming.counters).toEqual({ constructor: 2, tostring: 1, valueof: 1, hasownproperty: 1 });
+    for (const inherited of ['toString', 'constructor', 'valueOf', 'hasOwnProperty'])
+      expect(recordedMemberName(task.task_id, inherited)).toBeUndefined();
+    const legacy = createTask({ title: 'Prototype layout', origin, start: false });
+    expect(allocateLayoutMemberName(`task-${legacy.task_id}`, 'toString', role('ToString'))).toBe('MSN-2-ToString');
   });
 
   it('uses recorded layout allocations as the ownership name and keeps the legacy hash otherwise', () => {

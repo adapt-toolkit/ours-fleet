@@ -3,7 +3,7 @@ import type { ArchivedMemberAbsence } from './types.js';
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
+import { fsyncDirectory, replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
 import { incarnationEnded, processIncarnation, type ProcessIncarnation } from '../process-incarnation.js';
 import { stateRoot } from '../paths.js';
 import { planWorkspace, ensureWorkspace } from './workspace.js';
@@ -20,7 +20,7 @@ import {
   readMissionKeyRegistry, suggestMissionPrefix, unavailablePrefixes, withMissionKeysLock, writeCreationReceipt,
   writeMissionKeyRegistry, type CreationReceipt,
 } from './mission-keys.js';
-import { allocateName, freezeLegacyMemberNaming, type LabelCandidate } from './member-naming.js';
+import { allocateName, freezeLegacyMemberNaming, ownEntry, type LabelCandidate } from './member-naming.js';
 import { queueMissionCleanup, withManifestRooms, type TaskNotificationManifest } from './notification-manifest.js';
 
 export const tasksDir = () => join(stateRoot(), 'tasks');
@@ -150,7 +150,8 @@ function readTask(id: string): TaskRecord {
   return presentTask(JSON.parse(readFileSync(p, 'utf8')) as StoredTaskRecord);
 }
 
-function writeTask(record: TaskRecord | StoredTaskRecord): void {
+/** `durable` refuses unless the rename is known durable (agent names are reserved before launch). */
+function writeTask(record: TaskRecord | StoredTaskRecord, options: { durable?: boolean } = {}): void {
   mkdirSync(tasksDir(), { recursive: true });
   const persisted = { ...record } as Record<string, unknown>;
   delete persisted.list_name;
@@ -178,7 +179,8 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
     persisted.contribution_reads = { progress_read: (previous.progress ?? []).map(entry => entry.id), review_revision: reviewRevision(previous.review) };
   if (pending.length) persisted.notification_events = pending;
   else delete persisted.notification_events;
-  replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
+  replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n', 0o600, {},
+    { durable: options.durable });
   publishFleetResourceCommit(taskPath(record.task_id));
 }
 
@@ -552,7 +554,11 @@ export function allocateTaskMemberNames(
     if (fresh.length) {
       assertNoPendingDeletion(task);
       task.member_naming = naming;
-      writeTask(task);
+      // A counter that a host crash could roll back would hand the same name out twice.
+      writeTask(task, { durable: true });
+    } else if (names.length) {
+      // Reused names may come from a write whose directory sync failed: make it durable before any launch.
+      fsyncDirectory(tasksDir());
     }
     return names;
   });
@@ -563,7 +569,7 @@ export function recordedMemberName(id: string, allocationKey: string): string | 
   assertCanonicalTaskId(id);
   if (!existsSync(taskPath(id))) return undefined;
   const row = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
-  return row.member_naming?.allocations[allocationKey]?.name;
+  return ownEntry(row.member_naming?.allocations, allocationKey)?.name;
 }
 
 // ── One-time mission key migration ──────────────────────────────────────
@@ -642,11 +648,12 @@ export function migrateMissionKeysLocked(configuredDefault?: string): void {
           state: deleting ? 'deleted' : 'created',
         });
       ensureKeyLedger(missionKey, id, deleting ? 'deleted' : 'live');
-      const naming = freezeLegacyMemberNaming(row);
+      // Buckets depend on the key's length: derive them from the reserved key, not a placeholder.
+      const naming = freezeLegacyMemberNaming({ ...row, key: missionKey });
       if (row.key !== missionKey || naming !== row.member_naming) {
         if (row.key !== missionKey) { row.key = missionKey; row.key_from_migration = true; }
         if (naming) row.member_naming = naming;
-        writeTask(row);
+        writeTask(row, { durable: true });
       }
     }));
   }

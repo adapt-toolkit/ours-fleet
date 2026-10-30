@@ -57,6 +57,10 @@ export function chooseStem(key: string, candidates: readonly LabelCandidate[]): 
 
 export const bucketOf = (stem: string): string => stem.toLowerCase();
 
+/** Own-property read: buckets such as `constructor` must never hit Object.prototype. */
+export const ownEntry = <T>(record: Record<string, T> | undefined, key: string): T | undefined =>
+  record && Object.hasOwn(record, key) ? record[key] : undefined;
+
 export function formatMemberName(key: string, stem: string, ordinal: number): string {
   return ordinal === 1 ? `${key}-${stem}` : `${key}-${stem}-${ordinal}`;
 }
@@ -72,11 +76,11 @@ export function allocateName(
   const current: MemberNaming = naming
     ? { version: 2, counters: { ...naming.counters }, allocations: { ...naming.allocations } }
     : { version: 2, counters: {}, allocations: {} };
-  const existing = current.allocations[allocationKey];
+  const existing = ownEntry(current.allocations, allocationKey);
   if (existing) return { naming: naming ?? current, allocation: existing, created: false };
   const { stem, source } = chooseStem(key, candidates);
   const bucket = bucketOf(stem);
-  const ordinal = (current.counters[bucket] ?? 0) + 1;
+  const ordinal = (ownEntry(current.counters, bucket) ?? 0) + 1;
   if (ordinal > MAX_ROLE_ORDINAL)
     throw new MemberNameError('role_ordinal_exhausted', `mission ${key} has used every ${stem} ordinal`);
   const allocation: MemberNameAllocation = {
@@ -168,7 +172,7 @@ function legacyMembers(task: Pick<TaskRecord, 'task_id' | 'room_id' | 'layout' |
  * input object unchanged when there is nothing to add.
  */
 export function freezeLegacyMemberNaming(
-  task: Pick<TaskRecord, 'task_id' | 'room_id' | 'layout' | 'execution_plan' | 'member_naming' | 'key'>,
+  task: Pick<TaskRecord, 'task_id' | 'room_id' | 'layout' | 'execution_plan' | 'member_naming'> & { key: string },
 ): MemberNaming | undefined {
   const legacy = legacyMembers(task);
   if (!legacy.length) return task.member_naming;
@@ -180,17 +184,17 @@ export function freezeLegacyMemberNaming(
   let changed = !task.member_naming;
   for (const member of legacy) {
     if (known.has(member.name)) continue;
-    if (naming.allocations[member.allocationKey]) continue;
+    if (ownEntry(naming.allocations, member.allocationKey)) continue;
     known.add(member.name);
-    const { stem } = chooseStem(task.key ?? 'MSN-1', member.candidates);
+    const { stem } = chooseStem(task.key, member.candidates);
     const bucket = bucketOf(stem);
-    seeded[bucket] = (seeded[bucket] ?? 0) + 1;
+    seeded[bucket] = (ownEntry(seeded, bucket) ?? 0) + 1;
     naming.allocations[member.allocationKey] = { name: member.name, bucket, frozen: true };
     changed = true;
   }
   for (const [bucket, count] of Object.entries(seeded)) {
     const frozenInBucket = Object.values(naming.allocations).filter(a => a.frozen && a.bucket === bucket).length;
-    naming.counters[bucket] = Math.max(naming.counters[bucket] ?? 0, frozenInBucket, count);
+    naming.counters[bucket] = Math.max(ownEntry(naming.counters, bucket) ?? 0, frozenInBucket, count);
   }
   return changed ? naming : task.member_naming;
 }

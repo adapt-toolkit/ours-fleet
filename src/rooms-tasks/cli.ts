@@ -334,7 +334,7 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
   renderMarkdownList({
     icon: '📋', title, empty: 'No tasks found.',
     records: tasks.map(t =>
-      `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
+      `${taskStatus(t.state)} ${t.key ? `${markdownCode(t.key)} ` : ''}${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
       + ` — List ${markdownCode(t.list_name ?? 'default')}`
       + (t.deletion?.status === 'pending' ? ' — Deletion pending'
         + (t.deletion.error ? `: ${markdownProse(t.deletion.error)}` : '') : '')
@@ -350,6 +350,7 @@ const taskActionMarkdown = (
   return renderMarkdownResult({
   icon: '📋', title,
   fields: [
+    ...(task.key ? [{ label: 'Key', value: task.key, kind: 'code' as const }] : []),
     { label: 'ID', value: task.task_id, kind: 'code' },
     { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
     { label: 'List', value: task.list_name ?? 'default', kind: 'code' },
@@ -948,6 +949,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         console.log(renderMarkdownResult({
           icon: '📋', title: 'Task details',
           fields: [
+            ...(t.key ? [{ label: 'Key', value: t.key, kind: 'code' as const }] : []),
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
@@ -1047,6 +1049,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .requiredOption('--reason <reason>', 'blocking reason')
     .option('--json', 'JSON output')
     .action((id: string, opts: { reason: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         const t = taskRoomService().blockTask({
@@ -1062,6 +1065,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('unblock a task')
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const prior = getTask(id);
         const previous = prior.state;
@@ -1078,6 +1082,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('move a task to review')
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         const t = taskRoomService().reviewTask({
@@ -1096,6 +1101,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--request-key <key>', 'retry key: repeating the same key and text returns the original entry')
     .option('--json', 'JSON output')
     .action((id: string, opts: { text?: string; textFile?: string; requestKey?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         if (opts.text !== undefined && opts.textFile !== undefined) throw new Error('use --text or --text-file, not both');
         const text = opts.textFile !== undefined ? readFileSync(opts.textFile, 'utf8') : opts.text;

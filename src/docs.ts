@@ -613,21 +613,24 @@ only. Issued keys keep their prefix, earlier prefixes stay reserved to their
 list, and a deleted list's prefixes stay reserved with their counters.
 \`MSN\`, \`ROOM\`, \`LAYOUT\` and \`TASK\` are reserved.
 
-Keys are accepted wherever a task ID is: \`ours-fleet task show MSN-1\`, the
-owner channel \`/task show MSN-1\`, and \`/api/v1/tasks/MSN-1\` (after
-authentication). Keys are case-insensitive, except in the destructive
+Keys are accepted wherever a task ID is: \`ours-fleet task show MSN-1\`,
+\`task progress MSN-1\`, the owner channel \`/task show MSN-1\`, and
+\`/api/v1/tasks/MSN-1\` (after authentication). \`task list\`, \`task show\`
+and task reports show the key next to the title and task ID. Keys are case-insensitive, except in the destructive
 confirmation, which must repeat exactly what you typed (\`task delete MSN-1 MSN-1\`).
 The 17-character task ID remains the canonical identifier and keeps working.
 
 Agents in a task are named \`<KEY>-<Role>\` for the first agent of a Role and
 \`<KEY>-<Role>-2\`, \`-3\`, ... after it, for example \`MSN-1-Developer\` and
 \`MSN-1-Developer-2\`. The Role is the explicitly selected Role (a \`--role\`
-override, or the Agent Template's \`role: { ref }\`). Otherwise it is the
+override, or the Agent Template's \`role: { ref }\`, as it was when the task or
+layout run was created; later configuration edits do not rename members).
+Otherwise it is the
 member's room role, then its layout participant key or slot. It is written as
 PascalCase Latin letters and digits, and truncated so the name fits 64
 characters. Numbers are per mission and Role and never reused: recovering an
 agent keeps its name, while a replacement or an added agent takes the next
-number. The room still shows each member's invite role separately. Tasks and
+number. Each new number is saved durably before the agent launches. The room still shows each member's invite role separately. Tasks and
 agents that existed before mission keys keep their original names. They get a
 key on first use after the upgrade (stop older Fleet processes before
 upgrading). If a new name is already used on the shared ours daemon, the

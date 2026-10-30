@@ -32,7 +32,7 @@ const field = (label: string, value: ReportValue['value'], tone?: ReportValue['t
 
 interface SafeTaskList { list_id: string; name: string; built_in: boolean }
 interface SafeTask {
-  task_id: string; list_id: string; list_name: string; title: string; brief?: string;
+  task_id: string; key?: string; list_id: string; list_name: string; title: string; brief?: string;
   state: TaskState; blocked?: { reason: string }; room_id?: string;
   template?: { name: string; version: number }; member_roles: Array<{ name: string; slot: string; cowork_role: string }>;
   origin: { type: string }; created_at: string; started_at?: string; ended_at?: string;
@@ -42,7 +42,7 @@ const allowlistList = (list: TaskListRecord): SafeTaskList => ({
   list_id: list.list_id, name: bounded(list.name) ?? 'Unnamed list', built_in: list.built_in,
 });
 const allowlistTask = (task: TaskRecord): SafeTask => ({
-  task_id: task.task_id, list_id: task.list_id, list_name: bounded(task.list_name) ?? 'default',
+  task_id: task.task_id, ...(task.key ? { key: task.key } : {}), list_id: task.list_id, list_name: bounded(task.list_name) ?? 'default',
   title: bounded(task.title) ?? 'Untitled task', ...(task.brief === undefined ? {} : { brief: bounded(task.brief) ?? '' }),
   state: task.state, ...(task.blocked ? { blocked: { reason: bounded(task.blocked.reason) ?? 'Blocked' } } : {}),
   ...(task.room_id ? { room_id: bounded(task.room_id) ?? undefined } : {}),
@@ -55,11 +55,12 @@ const allowlistTask = (task: TaskRecord): SafeTask => ({
 
 function safeTask(task: SafeTask): ReportTaskNavigator['panels'][number]['tasks'][number] {
   const status = STATUS_LABEL[task.state];
-  const title = bounded(task.title) ?? 'Untitled task';
+  // The mission key leads the title so it is discoverable; the opaque ID stays as the record ID.
+  const title = `${task.key ? `${task.key} · ` : ''}${bounded(task.title) ?? 'Untitled task'}`;
   const brief = briefPreview(task.brief);
   const groups = [
     { title: '1. Identity and lifecycle', values: [
-      field('Task ID', task.task_id), field('Title', title),
+      ...(task.key ? [field('Mission key', task.key)] : []), field('Task ID', task.task_id), field('Title', bounded(task.title) ?? 'Untitled task'),
       field('Lifecycle status', status, STATUS_TONE[task.state]), field('List', task.list_name),
       field('Blocked indicator', task.blocked ? bounded(task.blocked.reason) : 'No — unblocked', task.blocked ? 'warning' : undefined),
     ] },

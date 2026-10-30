@@ -318,6 +318,25 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(4);
   });
 
+  it('names added Constructor, ToString and ValueOf roles from their own counters, never Object.prototype', async () => {
+    const {requestMemberAddition,memberAddition}=await import('../src/rooms-tasks/add-member.js');
+    const task=createTask({title:'Prototype roles',origin:{type:'cli'}});
+    createRoomRecord({room_id:'room-proto',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:template(1)});
+    updateTaskRoom(task.task_id,'room-proto','room-cid');const h=coworkHarness();
+    await provisionMembers({cfg:cfg(),cowork:h.cowork,roomId:'room-proto',taskId:task.task_id,template:template(1),binPath:'/fleet'});
+    const roles=['Constructor','ToString','ValueOf'];
+    const configuration=cfg({rolePresets:Object.fromEntries(roles.map(role=>[role,{mission:'Review'}])),brainPresets:{test:{harness:'codex'}},resolveAgentDefinition:()=>caller});
+    const names:string[]=[];
+    for(const [i,role] of [...roles,'Constructor'].entries()){
+      const requestId=`proto-request-${i}00`;
+      const accepted=await requestMemberAddition({taskId:task.task_id,request:{requestId,slot:`Slot${i}`,role,brain:'test',agentTemplate:'Critic'},cfg:configuration,cowork:h.cowork,binPath:'/fleet'});
+      await expect.poll(()=>memberAddition(task.task_id,requestId).state).toBe('succeeded');
+      names.push(accepted.roleId);
+    }
+    expect(names).toEqual([`${task.key}-Constructor`,`${task.key}-ToString`,`${task.key}-ValueOf`,`${task.key}-Constructor-2`]);
+    expect(getTask(task.task_id).member_naming?.counters).toMatchObject({constructor:2,tostring:1,valueof:1});
+  });
+
   it.each([['room',false],['task',false],['room',true],['task',true]] as const)('rechecks terminal ownership after waiting for %s lock (append=%s)', async (boundary,append) => {
     const task = createTask({ title: 'Waiting launch', origin: { type: 'cli' } });
     createRoomRecord({ room_id: 'room-lock-race', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id });
