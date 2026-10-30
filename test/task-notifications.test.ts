@@ -7,6 +7,7 @@ import {
   pendingTaskNotifications, acknowledgeTaskNotification, tasksDir, beginTaskDeletionIntent, unlinkDeletedTask,
 } from '../src/rooms-tasks/task-state.js';
 import { TaskNotificationProducer } from '../src/notifications/task-producer.js';
+import { setTaskReviewMarkdown } from '../src/rooms-tasks/task-review.js';
 
 let previous: string | undefined;
 beforeEach(() => {
@@ -35,6 +36,31 @@ it('commits creation and every effective state atomically, including block/unblo
   expect(new Set(pending.map(e => e.eventId)).size).toBe(pending.length);
   for (const e of pending) { expect(e.taskId).toBe(task.task_id); expect(e.target).toEqual({kind:'task',taskId:task.task_id});expect(e).not.toHaveProperty('url'); }
   expect(() => reviewTask(task.task_id)).toThrow(); expect(events(task.task_id)).toEqual(pending);
+});
+
+it('names the task by its mission key in notification bodies; the opaque ID stays in routing fields only', () => {
+  const task = create(); startTask(task.task_id);
+  setTaskReviewMarkdown(task.task_id, { markdown: 'Ready', expectedMarkdown: '',
+    author: { kind: 'agent', role: 'dev-1', identity_cid: 'A'.repeat(64), surface: 'mcp' } });
+  const pending = events(task.task_id);
+  expect(task.key).toMatch(/^MSN-\d+$/);
+  expect(pending.map(e => e.body)).toEqual([
+    `Task ${task.key}: created in backlog.`, `Task ${task.key}: backlog → provisioning.`,
+    `Task ${task.key}: the review package changed.`,
+  ]);
+  for (const e of pending) {
+    expect(e.title).toContain(task.key); expect(`${e.title} ${e.body}`).not.toContain(task.task_id);
+    expect(e.eventId).toContain(task.task_id); expect(e.taskId).toBe(task.task_id);
+    expect(e.target).toEqual({ kind: 'task', taskId: task.task_id });
+  }
+  // A row an earlier release wrote without a key: the body names no task rather than an opaque ID.
+  const legacy = create(), path = join(tasksDir(), `${legacy.task_id}.json`);
+  const row = JSON.parse(readFileSync(path, 'utf8')); delete row.key; writeFileSync(path, JSON.stringify(row));
+  startTask(legacy.task_id);
+  const changed = events(legacy.task_id).at(-1)!;
+  expect(changed.body).toBe('Backlog → provisioning.');
+  expect(changed.title).toBe('Task updated: Notification task');
+  expect(changed.target).toEqual({ kind: 'task', taskId: legacy.task_id });
 });
 
 it('covers failed, cancelled and idempotent terminal intent settlement without announcing pending intent', () => {
