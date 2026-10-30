@@ -373,6 +373,12 @@ export interface FleetConfig {
   agentDefinitions?: Record<string, AgentDefinition>;
   /** Canonical inert templates keyed by stable template ID. */
   agentTemplates?: Record<string, AgentTemplateDefinition>;
+  /**
+   * Named Role selected by each Agent Template (`role: { ref: X }`), captured
+   * before roles are flattened to `inline`. Naming provenance only: it is kept
+   * outside the definitions so launch fingerprints are unchanged.
+   */
+  agentTemplateRoleRefs?: Record<string, string>;
   rolePresets?: Record<string, Record<string, unknown>>;
   brainPresets?: Record<string, Record<string, unknown>>;
   /** Required launch-boundary resolver for effective temporary Agent definitions. */
@@ -733,6 +739,7 @@ function composeSplitRoles(
   templateSink: Record<string, AgentTemplateDefinition> = {},
   roleSink: Record<string, Record<string, unknown>> = {},
   brainSink: Record<string, Record<string, unknown>> = {},
+  roleRefSink: Record<string, string> = {},
 ): { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance>; agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>; agentDefinition?: AgentDefinition; agentTemplate?: { id: string; sourceFile: string; contentHash: string } }[] {
   if (baseDoc.api_version !== V2_API_VERSION)
     throw new ConfigError(`${base}: legacy fleet configuration is unsupported; run 'ours-fleet doctor' and rewrite it as ${V2_API_VERSION}`);
@@ -781,6 +788,7 @@ function composeSplitRoles(
       template.file, id,
     );
     canonicalTemplates.set(id, { file: template.file, value });
+    if (isPlainObject(value.role) && typeof value.role.ref === 'string') roleRefSink[id] = value.role.ref;
     const operational = deepSubStrict(
       Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'role' && key !== 'brain')),
       vars, template.file, `/agent_templates/${id}`,
@@ -935,6 +943,7 @@ export function loadConfig(
   const files: string[] = [];
   const diagnostics: ConfigDiagnostic[] = [];
   const agentTemplates: Record<string, AgentTemplateDefinition> = {};
+  const agentTemplateRoleRefs: Record<string, string> = {};
   const rolePresets: Record<string, Record<string, unknown>> = {};
   const brainPresets: Record<string, Record<string, unknown>> = {};
   let docs: { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance>; agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>; agentDefinition?: AgentDefinition; agentTemplate?: { id: string; sourceFile: string; contentHash: string } }[] = [];
@@ -955,7 +964,7 @@ export function loadConfig(
     throw new ConfigError(`${dd}: legacy fleet.d configuration is unsupported; run 'ours-fleet doctor' and move agents to ${splitRootFor(base)}/agents/`);
   docs = [{ file: base, doc: manifestDoc }, ...composeSplitRoles(
     base, manifestDoc, options.yamlMode ?? 'compat', diagnostics, files, options.additionalAgent,
-    agentTemplates, rolePresets, brainPresets,
+    agentTemplates, rolePresets, brainPresets, agentTemplateRoleRefs,
   )];
   const baseDoc = manifestDoc;
   const vars = (baseDoc.vars ?? {}) as Record<string, string>;
@@ -1154,7 +1163,7 @@ export function loadConfig(
   }
 
   const result: FleetConfig = {
-    roles, agentDefinitions, agentTemplates, rolePresets, brainPresets, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
+    roles, agentDefinitions, agentTemplates, agentTemplateRoleRefs, rolePresets, brainPresets, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
     rooms, roomTemplates, tasks, ownerInviteFingerprint,
     configMode: 'split-v2',

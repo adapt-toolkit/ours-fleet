@@ -38,10 +38,14 @@ exports[`owner-channel task subcommands > snapshots the Markdown task lifecycle 
 - **Created:** \`<ISO_DATE>\`",
   "## 📋 Task started
 
+- **Key:** \`MSN-1\`
+
 - **ID:** \`<TASK_ID>\`
 
 - **Status:** ⏳ Provisioning",
   "## 📋 Task blocked
+
+- **Key:** \`MSN-1\`
 
 - **ID:** \`<TASK_ID>\`
 
@@ -50,16 +54,20 @@ exports[`owner-channel task subcommands > snapshots the Markdown task lifecycle 
 - **Reason:** waiting on \\*dependency\\*",
   "## 📋 Task unblocked
 
+- **Key:** \`MSN-1\`
+
 - **ID:** \`<TASK_ID>\`
 
 - **Status:** 🟢 Active",
   "## 📋 Task ready for review
+
+- **Key:** \`MSN-1\`
 
 - **ID:** \`<TASK_ID>\`
 
 - **Status:** 🟡 Review",
   "## 📋 Tasks
 
-- 🟡 Review \`<TASK_ID>\` — test task — List \`default\`",
+- 🟡 Review \`MSN-1\` \`<TASK_ID>\` — test task — List \`default\`",
 ]
 `;

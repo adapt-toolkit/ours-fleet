@@ -6,15 +6,15 @@ import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { canonicalJson } from '../canonical-json.js';
 import type { FleetConfig } from '../config.js';
 import { stateRoot } from '../paths.js';
-import { getTask, TaskStateError } from './task-state.js';
+import { allocateTaskMemberNames, getTask, TaskStateError } from './task-state.js';
 import { getRoomRecord } from './room-state.js';
 import { prepareExecutionPlan } from './member-overrides.js';
 import { sealTemplateSnapshot } from './templates.js';
-import { provisionMembers } from './provision.js';
+import { assertMemberNameAvailable, provisionMembers } from './provision.js';
 import type { CoworkAdapter } from './cowork-adapter.js';
 import type { TaskLayouts } from '../application/task-layouts.js';
 import { EMPTY_TASK_LAYOUT, EMPTY_TASK_ROOM } from './empty-layout.js';
-import { layoutOwnedMemberName } from './layout-member-retirement.js';
+import { allocateLayoutMemberName } from './layout-member-retirement.js';
 import { validLayoutKey } from './layout-config.js';
 
 export class MemberAdditionRejected extends TaskStateError { readonly accepted=false; }
@@ -91,7 +91,10 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
         } catch (error) { throw new MemberAdditionRejected(error instanceof Error ? error.message : 'Invalid member configuration'); }
       })();
       const receipt: Receipt = { taskId, requestId: r.requestId,
-        roleId: layoutOwnedMemberName(task.layout.run_id, r.slot), hash, state: 'running' };
+        roleId: allocateLayoutMemberName(task.layout.run_id, r.slot, [
+          { label: r.role, source: 'role_override' },
+          { label: input.cfg.agentTemplateRoleRefs?.[r.agentTemplate], source: 'template_ref' },
+          { label: r.slot, source: 'participant_key' }]), hash, state: 'running' };
       const save = () => { replaceFileAtomically(path, JSON.stringify(receipt)+'\n', 0o600); publishFleetResourceCommit(path); };
       save(); running.add(path);
       void input.layouts.addMember(task, { key: r.slot, role: r.slot, requestId: r.requestId, hash, definition }).then(() => {
@@ -103,7 +106,13 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
     if(!room || !['active','review'].includes(task.state) || task.terminal_intent || room.state!=='active'
         || room.task_id!==taskId || room.room_identity_cid!==task.room_identity_cid)
       throw new MemberAdditionRejected('Adding an agent requires an active task room');
-    const roleId=`${taskId.slice(0,8)}-${r.slot}-1`;
+    // Keyed tasks take the next durable role ordinal; unkeyed tasks keep the legacy one-per-slot name.
+    const allocationKey=`add:${r.requestId}`;
+    const roleId=allocateTaskMemberNames(taskId,[{allocationKey,candidates:[
+      {label:r.role,source:'role_override'},
+      {label:input.cfg.agentTemplateRoleRefs?.[r.agentTemplate],source:'template_ref'},
+      {label:r.role,source:'room_role'},{label:r.slot,source:'slot'}]}],assertMemberNameAvailable)?.[0]
+      ??`${taskId.slice(0,8)}-${r.slot}-1`;
     if(room.member_seats.some(s=>s.role_name===roleId))throw new MemberAdditionRejected('This member slot already exists');
     const plan=(()=>{try{return prepareExecutionPlan({name:'additional-member',version:1,description:'Additional task participant',
       contract:room.template_snapshot?.contract,members:[{slot:r.slot,role:r.role,count:1,agent_template:r.agentTemplate}]},input.cfg,
@@ -113,7 +122,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
     const save=()=>{replaceFileAtomically(path,JSON.stringify(receipt)+'\n',0o600);publishFleetResourceCommit(path);};
     save();running.add(path);
     void (input.provision??provisionMembers)({cfg:input.cfg,cowork:input.cowork!,configPath:input.configPath,binPath:input.binPath,
-      taskId,roomId:room.room_id,template,goal:task.title,brief:task.brief,append:true}).then(result=>{
+      taskId,roomId:room.room_id,template,goal:task.title,brief:task.brief,append:true,allocationKey}).then(result=>{
         const seat=result.member_seats.find(s=>s.role_name===roleId);
         receipt.state=seat?.seat_state==='active'&&getTask(taskId).member_roles.some(m=>m.name===roleId)?'succeeded':'attention';
         if(receipt.state==='attention')receipt.error='Admission is not confirmed. Inspect the existing launch; no automatic retry was made.';

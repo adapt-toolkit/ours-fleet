@@ -186,6 +186,7 @@ export function prepareExecutionPlan(
       loop_source: input.loops !== undefined ? 'cli' : base.loops !== undefined ? 'agent-template' : 'omitted',
       agent_template_hash: hash,
       ...(input.role ? { role_preset: { id: input.role, hash: createHash('sha256').update(canonicalJson(rolePreset)).digest('hex') } } : {}),
+      ...(cfg.agentTemplateRoleRefs?.[source] ? { role_label: cfg.agentTemplateRoleRefs[source] } : {}),
       ...(input.brain ? { brain_preset: { id: input.brain, hash: createHash('sha256').update(canonicalJson(brainPreset)).digest('hex') } } : {}),
       agent_projection: redactLaunchDefinition(definition) as Record<string, unknown> };
   });

@@ -189,6 +189,15 @@ export interface TaskRecord {
   notification_manifest?: import('./notification-manifest.js').TaskNotificationManifest;
   workspace?: import('./workspace.js').OwnedWorkspace;
   task_id: string;
+  /**
+   * Immutable human mission key (`MSN-1`), issued once from a durable
+   * per-prefix high-water mark. Absent only before the one-time migration.
+   */
+  key?: string;
+  /** Set when the key was backfilled for a task that existed before mission keys. */
+  key_from_migration?: true;
+  /** Durable per-mission agent name allocations; absent until first allocation or migration. */
+  member_naming?: MemberNaming;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
   list_id: string;
   /** Derived presentation field; repositories must never persist it. */
@@ -227,9 +236,32 @@ export interface TaskRecord {
   deletion?: TaskDeletionIntent;
 }
 
+/**
+ * Role-scoped agent names: `<KEY>-<Stem>` for the first member of a stem,
+ * `<KEY>-<Stem>-<n>` (n >= 2) after it. Counters only grow; an allocation is
+ * reused by provisioning, recovery and restart, never by a replacement.
+ */
+export interface MemberNameAllocation {
+  name: string;
+  /** Counter bucket: the case-folded truncated stem. Absent on frozen legacy names. */
+  bucket?: string;
+  ordinal?: number;
+  label_source?: 'role_override' | 'template_ref' | 'room_role' | 'participant_key' | 'slot' | 'fallback';
+  /** A historical name kept exactly as launched before mission keys existed. */
+  frozen?: true;
+}
+
+export interface MemberNaming {
+  version: 2;
+  counters: Record<string, number>;
+  allocations: Record<string, MemberNameAllocation>;
+}
+
 export interface TaskListRecord {
   list_id: string;
   name: string;
+  /** Prefix for new mission keys; absent only before the one-time key migration. */
+  prefix?: string;
   built_in: boolean;
   created_at: string;
 }
@@ -432,6 +464,8 @@ export interface TemplateSnapshotMember extends TemplateMemberSlot {
   launch_definition_id?: string;
   role_preset?: { id: string; hash: string };
   brain_preset?: { id: string; hash: string };
+  /** Named Role of the member's Agent Template, sealed at plan time for agent naming. */
+  role_label?: string;
 }
 
 export interface TemplateSnapshot extends Omit<TemplateDefinition, 'members'> {
@@ -471,6 +505,8 @@ export interface TasksConfig {
   create_mode?: 'start' | 'backlog';
   close_room_on_done?: boolean;
   retain_completed_for?: string;
+  /** Default list prefix (default MSN); may change only before the first mission key. */
+  default_prefix?: string;
 }
 
 export type RoomTemplatesConfig = Record<string, TemplateDefinition>;
@@ -481,7 +517,7 @@ export const ROOMS_KEYS = ['cowork', 'owner', 'defaults'] as const;
 export const ROOMS_OWNER_KEYS = ['provider', 'public_invite', 'public_invite_file', 'expected_cid', 'role'] as const;
 export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;
-export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for'] as const;
+export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for', 'default_prefix'] as const;
 export const TEMPLATE_KEYS = ['version', 'description', 'room', 'contract', 'members', 'override_builtin'] as const;
 export const TEMPLATE_ROOM_KEYS = ['quiet_membership', 'anonymous'] as const;
 /** `agent` is accepted only so validation can emit its actionable migration error. */

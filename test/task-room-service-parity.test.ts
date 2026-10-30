@@ -532,7 +532,7 @@ describe('task create/start surface parity', () => {
       actor: { kind: 'local_control', surface: 'cli' }, title,
       template: 'empty-team', origin: { type: 'cli' },
     });
-    const expected = deriveTaskRoomName(title, task.task_id);
+    const expected = deriveTaskRoomName(title, task.task_id, task.key);
     expect(task.title).toBe(title);
     expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
     h.createRoom.mockClear();
@@ -578,7 +578,7 @@ describe('task create/start surface parity', () => {
     const continuation = await app.continueTaskProvisioning({
       actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
     });
-    const expected = deriveTaskRoomName(title, task.task_id);
+    const expected = deriveTaskRoomName(title, task.task_id, task.key);
     expect(continuation).toMatchObject({
       kind: 'provisioning_resumed', task: { title, room_id: 'room-shared' },
       room: { room_name: expected }, issues: [{ code: 'provisioning_resumed' }],

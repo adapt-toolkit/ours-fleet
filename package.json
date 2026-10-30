@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/fleet",
-  "version": "2.2.5",
+  "version": "2.3.0",
   "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, managed native/ACP sessions, supervision, and ours.network messaging.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
@@ -49,9 +49,9 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
     "@fastify/websocket": "^11.2.0",
-    "@ours.network/cli": "4.1.0",
-    "@ours.network/mcp": "2.0.2",
-    "@ours.network/sdk": "5.1.0",
+    "@ours.network/cli": "4.2.0",
+    "@ours.network/mcp": "2.0.3",
+    "@ours.network/sdk": "5.2.0",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
     "qrcode": "1.5.4",
@@ -65,7 +65,7 @@
     "@agentclientprotocol/codex-acp": "1.10.0"
   },
   "devDependencies": {
-    "@ours.network/daemon": "5.1.0",
+    "@ours.network/daemon": "5.2.0",
     "@types/node": "^22.20.4",
     "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.18.1",

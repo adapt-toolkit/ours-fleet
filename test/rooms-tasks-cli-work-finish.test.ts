@@ -721,7 +721,7 @@ describe('task title to Cowork room naming', () => {
   const unicodeTitle = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
 
   function expectCanonicalRoomName(taskId: string): void {
-    const roomName = deriveTaskRoomName(unicodeTitle, taskId);
+    const roomName = deriveTaskRoomName(unicodeTitle, taskId, getTask(taskId).key);
     expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
       room_name: roomName,
     }));
@@ -758,14 +758,14 @@ describe('task title to Cowork room naming', () => {
     await run('create', '--title', unicodeTitle, '--idempotency-key', 'same-request', '--json');
     const first = JSON.parse(out.join('\n')).task;
     const roomName = getRoomRecord(ROOM_ID)?.room_name;
-    expect(roomName).toBe(deriveTaskRoomName(unicodeTitle, first.task_id));
+    expect(roomName).toBe(deriveTaskRoomName(unicodeTitle, first.task_id, getTask(first.task_id).key));
     out = [];
     mocks.createRoom.mockClear();
     await run('create', '--title', unicodeTitle, '--idempotency-key', 'same-request', '--json');
     const replay = JSON.parse(out.join('\n')).task;
     expect(replay).toEqual(first);
     expect(replay.title).toBe(unicodeTitle);
-    expect(deriveTaskRoomName(replay.title, replay.task_id)).toBe(roomName);
+    expect(deriveTaskRoomName(replay.title, replay.task_id, getTask(replay.task_id).key)).toBe(roomName);
     expect(getRoomRecord(ROOM_ID)?.room_name).toBe(roomName);
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
@@ -774,7 +774,7 @@ describe('task title to Cowork room naming', () => {
     const overlong = 'Fix inconsistent local and UTC chat timestamps in messenger-server';
     await run('create', '--title', overlong, '--json');
     const task = JSON.parse(out.join('\n')).task;
-    const roomName = deriveTaskRoomName(overlong, task.task_id);
+    const roomName = deriveTaskRoomName(overlong, task.task_id, getTask(task.task_id).key);
     expect(task.title).toBe(overlong);
     expect(Array.from(roomName)).toHaveLength(52);
     expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({ room_name: roomName }));
@@ -787,7 +787,7 @@ describe('decomposed task title to Cowork room naming', () => {
 
   function expectCanonicalDecomposedRoomName(taskId: string): void {
     expect(decomposedTitle).not.toBe(decomposedTitle.normalize('NFC'));
-    const roomName = deriveTaskRoomName(decomposedTitle, taskId);
+    const roomName = deriveTaskRoomName(decomposedTitle, taskId, getTask(taskId).key);
     expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
       room_name: roomName,
     }));

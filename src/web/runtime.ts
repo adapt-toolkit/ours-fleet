@@ -207,13 +207,16 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const topologyPromote = new TopologyPromoteService({
     drafts: topologyDrafts, configuration, topology: readTopology,
   });
+  const taskRooms = new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath });
+  // One-time, lock-guarded mission key migration before serving; failure leaves it to the next mutation.
+  await taskRooms.prepareMissionKeys().catch(error => console.warn(`mission key migration deferred: ${(error as Error).message}`));
   let server: WebServer;
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration, observeRole,
     resourceScope:{configPath:configuration.path,subscribeMutations:listener=>events.subscribeResources(listener)},
     invalidateResourceCaches:()=>{watchdogConfigProvider.invalidate();watchdogFindings.invalidate();},
-    taskRooms: new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath }),
+    taskRooms,
     roomLayouts: new RoomLayoutDefinitions(options.configPath),
     layoutBindings: new LayoutBindingGrants(new RoomLayoutService(options.configPath).supervisor()),
     presetProvenance: new PresetProvenance(options.configPath),

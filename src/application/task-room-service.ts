@@ -16,14 +16,14 @@ import {
 import {
   activateTask, blockTask as persistBlockTask, createTask as persistTask,
   getDeletingTask, getTask as readTask, listTasks as readTasks, taskDeletionState,
-  moveTaskToList,
+  migrateMissionKeysLocked, moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
   updateTaskExecutionPlan, updateTaskBrief, updateTaskLayout,
 } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
-  renameTaskListLocked, resolveTaskList, TaskListError, withTaskListsLock,
+  renameTaskListLocked, resolveTaskList, setTaskListPrefixLocked, suggestTaskListPrefix, TaskListError, withTaskListsLock,
 } from '../rooms-tasks/task-lists.js';
 import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, snapshotTemplate } from '../rooms-tasks/templates.js';
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
@@ -202,7 +202,7 @@ export class TaskRoomApplicationService {
     const task = await withTaskListsLock(() => persistTask({
       title: request.title, brief, brief_file: request.briefFile, layout,
       origin: request.origin, idempotency_key: request.idempotencyKey,
-      start: !request.backlog, listId: resolveTaskList(request.list ?? 'default').list_id,
+      start: !request.backlog, list: request.list ?? 'default',
     }));
     recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
       title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
@@ -293,6 +293,7 @@ export class TaskRoomApplicationService {
   }
 
   async createTask(request: CreateTaskRequest): Promise<TaskRecord> {
+    await this.ensureMissionKeys();
     if (request.layout !== undefined) return this.createLayoutTask(request);
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let template = this.createTemplate(cfg, request.template, request.noRoom);
@@ -321,15 +322,12 @@ export class TaskRoomApplicationService {
           plan_hash: preparedPlan.planHash };
       }
       const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
-      task = await withTaskListsLock(() => {
-        const list = resolveTaskList(request.list ?? 'default');
-        return persistTask({
-          title: request.title, brief, brief_file: request.briefFile, template: ref,
-          execution_plan: executionPlan,
-          origin: request.origin, idempotency_key: request.idempotencyKey,
-          start: !request.backlog, no_room: request.noRoom, listId: list.list_id,
-        });
-      });
+      task = await withTaskListsLock(() => persistTask({
+        title: request.title, brief, brief_file: request.briefFile, template: ref,
+        execution_plan: executionPlan,
+        origin: request.origin, idempotency_key: request.idempotencyKey,
+        start: !request.backlog, no_room: request.noRoom, list: request.list ?? 'default',
+      }));
     } catch (error) {
       unlock?.();
       if (sealedHash) releaseLaunchSnapshot(sealedHash);
@@ -419,8 +417,31 @@ export class TaskRoomApplicationService {
     return lists.map(list => ({ list, tasks: tasks.filter(task => task.list_id === list.list_id) }));
   }
 
-  async createTaskList(input: { actor: TaskRoomActor; name: string }): Promise<TaskListRecord> {
-    return withTaskListsLock(() => createTaskListLocked(input.name));
+  /** Run the one-time mission key migration now (service start, `task migrate-keys`). */
+  prepareMissionKeys(): Promise<void> { return this.ensureMissionKeys(); }
+
+  /** One-time key migration under the list lock, honoring `tasks.default_prefix`. */
+  private ensureMissionKeys(): Promise<void> {
+    const configured = (() => {
+      try { return (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath).tasks?.default_prefix; }
+      catch { return undefined; }
+    })();
+    return withTaskListsLock(() => migrateMissionKeysLocked(configured));
+  }
+
+  async createTaskList(input: { actor: TaskRoomActor; name: string; prefix?: string }): Promise<TaskListRecord> {
+    await this.ensureMissionKeys();
+    return withTaskListsLock(() => createTaskListLocked(input.name, input.prefix));
+  }
+
+  async setTaskListPrefix(input: { actor: TaskRoomActor; name: string; prefix: string }): Promise<TaskListRecord> {
+    await this.ensureMissionKeys();
+    return withTaskListsLock(() => setTaskListPrefixLocked(input.name, input.prefix));
+  }
+
+  async suggestTaskListPrefix(name: string): Promise<string> {
+    await this.ensureMissionKeys();
+    return suggestTaskListPrefix(name);
   }
 
   async renameTaskList(input: {
@@ -1248,7 +1269,7 @@ export class TaskRoomApplicationService {
 
   private async provisionRoom(
     cfg: FleetConfig,
-    task: Pick<TaskRecord, 'title' | 'brief'> & { task_id?: string; goal?: string },
+    task: Pick<TaskRecord, 'title' | 'brief' | 'key' | 'key_from_migration'> & { task_id?: string; goal?: string },
     template: TemplateSnapshot | undefined,
     onCreated: (room: RoomOrchestrationRecord) => void,
     launchDefinitions?: Record<string, import('../config.js').AgentTemplateDefinition>,
@@ -1264,7 +1285,10 @@ export class TaskRoomApplicationService {
         throw new ConfigError('rooms: configuration is required before creating or querying rooms');
       return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
     })();
-    const roomName = task.task_id ? deriveTaskRoomName(task.title, task.task_id) : task.title;
+    // Only tasks keyed at creation lead with the key: a room create interrupted across the
+    // upgrade must keep the name its earlier attempt used.
+    const roomName = task.task_id ? deriveTaskRoomName(task.title, task.task_id,
+      task.key && !task.key_from_migration ? task.key : undefined) : task.title;
     const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
     let launchTemplate: TemplateSnapshot | undefined;
     let room: RoomOrchestrationRecord;

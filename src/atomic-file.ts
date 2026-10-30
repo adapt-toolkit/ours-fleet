@@ -64,7 +64,8 @@ export interface ReplaceOptions {
   durable?: boolean;
 }
 
-function fsyncDirectory(dir: string): void {
+/** Make completed renames in `dir` durable; throws where the platform cannot. */
+export function fsyncDirectory(dir: string): void {
   const dirFd = openSync(dir, 'r');
   try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
 }

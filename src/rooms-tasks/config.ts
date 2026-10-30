@@ -1,3 +1,4 @@
+import { normalizeMissionPrefix } from './mission-keys.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -150,7 +151,14 @@ export function validateTasksConfig(
   if (raw.retain_completed_for !== undefined && typeof raw.retain_completed_for !== 'string')
     throw new RoomsTasksConfigError(path, 'tasks.retain_completed_for: must be a duration string');
 
+  let defaultPrefix: string | undefined;
+  if (raw.default_prefix !== undefined) {
+    try { defaultPrefix = normalizeMissionPrefix(raw.default_prefix); }
+    catch (error) { throw new RoomsTasksConfigError(path, `tasks.default_prefix: ${(error as Error).message}`); }
+  }
+
   return {
+    ...(defaultPrefix ? { default_prefix: defaultPrefix } : {}),
     default_room_template: raw.default_room_template as string | undefined,
     create_mode: createMode as 'start' | 'backlog' | undefined,
     close_room_on_done: raw.close_room_on_done as boolean | undefined,

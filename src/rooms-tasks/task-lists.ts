@@ -4,6 +4,11 @@ import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import type { TaskListRecord } from './types.js';
+import {
+  claimPrefix, ensureMissionKeyRegistry, normalizeMissionPrefix, readMissionKeyRegistry,
+  suggestMissionPrefix, tombstoneListPrefixes, unavailablePrefixes, withMissionKeysLock,
+  writeMissionKeyRegistry,
+} from './mission-keys.js';
 
 export const DEFAULT_TASK_LIST_ID = 'default';
 export const TASK_LIST_NAME_MAX_CODE_POINTS = 64;
@@ -24,9 +29,11 @@ export const taskListsLockPath = () => join(stateRoot(), 'task-lists.lock');
 export const withTaskListsLock = <T>(fn: () => T | Promise<T>): Promise<T> =>
   withFileLock(taskListsLockPath(), fn);
 
-const defaultList = (): TaskListRecord => ({
-  list_id: DEFAULT_TASK_LIST_ID, name: 'default', built_in: true, created_at: CREATED_AT,
-});
+const defaultList = (): TaskListRecord => {
+  const prefix = readMissionKeyRegistry()?.default_prefix;
+  return { list_id: DEFAULT_TASK_LIST_ID, name: 'default', built_in: true, created_at: CREATED_AT,
+    ...(prefix ? { prefix } : {}) };
+};
 
 const compareNames = (a: TaskListRecord, b: TaskListRecord): number => {
   if (a.list_id === DEFAULT_TASK_LIST_ID) return b.list_id === DEFAULT_TASK_LIST_ID ? 0 : -1;
@@ -67,19 +74,60 @@ export function resolveTaskList(name: string, lists = readTaskLists()): TaskList
   return found;
 }
 
-/** Caller must hold withTaskListsLock. */
-export function createTaskListLocked(name: string): TaskListRecord {
+/**
+ * Server suggestion for a new list's prefix; convenience only, validated again
+ * on create.
+ */
+export function suggestTaskListPrefix(name: string): string {
+  const registry = readMissionKeyRegistry() ?? ensureMissionKeyRegistry();
+  return suggestMissionPrefix(typeof name === 'string' ? name : '', unavailablePrefixes(registry));
+}
+
+/**
+ * Caller must hold withTaskListsLock. The prefix registry is written before
+ * the list row, so a crash leaves at worst an orphan reservation that only an
+ * explicit reclaim can reuse; a key is never reissued.
+ */
+export function createTaskListLocked(name: string, prefix?: string): TaskListRecord {
   const normalized = normalizeTaskListName(name);
   if (normalized === 'default') throw new TaskListError('reserved_name', "'default' is a reserved built-in list");
   const lists = readTaskLists();
   if (lists.some(item => item.name === normalized))
     throw new TaskListError('duplicate_name', `task list already exists: ${normalized}`);
+  const explicit = prefix !== undefined && prefix !== '';
+  const requested = explicit ? normalizeMissionPrefix(prefix) : undefined;
   const record: TaskListRecord = {
     list_id: `list_${randomUUID().replace(/-/g, '')}`, name: normalized,
     built_in: false, created_at: new Date().toISOString(),
   };
+  withMissionKeysLock(() => {
+    const registry = ensureMissionKeyRegistry();
+    record.prefix = requested ?? suggestMissionPrefix(normalized, unavailablePrefixes(registry));
+    claimPrefix(registry, record.list_id, record.prefix, explicit);
+    writeMissionKeyRegistry(registry);
+  });
   writeTaskLists([...lists, record]);
   return record;
+}
+
+/**
+ * Caller must hold withTaskListsLock. Issued keys keep their old prefix; the
+ * previous prefix stays reserved to this list.
+ */
+export function setTaskListPrefixLocked(listName: string, prefix: string): TaskListRecord {
+  const lists = readTaskLists();
+  const current = resolveTaskList(listName, lists);
+  if (current.built_in)
+    throw new TaskListError('default_immutable', "the 'default' list prefix is set by tasks.default_prefix");
+  const next = normalizeMissionPrefix(prefix);
+  withMissionKeysLock(() => {
+    const registry = ensureMissionKeyRegistry();
+    claimPrefix(registry, current.list_id, next, true);
+    writeMissionKeyRegistry(registry);
+  });
+  const updated = { ...current, prefix: next };
+  writeTaskLists(lists.map(item => item.list_id === current.list_id ? updated : item));
+  return updated;
 }
 
 /** Caller must hold withTaskListsLock. */
@@ -98,5 +146,18 @@ export function renameTaskListLocked(currentName: string, nextName: string): Tas
 
 /** Caller must hold withTaskListsLock. */
 export function deleteTaskListRecordLocked(listId: string): void {
+  if (readMissionKeyRegistry()) withMissionKeysLock(() => {
+    const registry = readMissionKeyRegistry()!;
+    tombstoneListPrefixes(registry, listId);
+    writeMissionKeyRegistry(registry);
+  });
   writeTaskLists(readTaskLists().filter(item => item.list_id !== listId));
+}
+
+/** Caller holds withTaskListsLock; persists prefixes assigned by migration. */
+export function writeTaskListPrefixesLocked(prefixes: Map<string, string>): TaskListRecord[] {
+  const lists = readTaskLists().map(item => prefixes.has(item.list_id) && !item.built_in
+    ? { ...item, prefix: prefixes.get(item.list_id) } : item);
+  writeTaskLists(lists);
+  return readTaskLists();
 }

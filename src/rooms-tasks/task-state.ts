@@ -3,7 +3,7 @@ import type { ArchivedMemberAbsence } from './types.js';
 import { existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
+import { fsyncDirectory, replaceFileAtomically, withSynchronousFileLock } from '../atomic-file.js';
 import { incarnationEnded, processIncarnation, type ProcessIncarnation } from '../process-incarnation.js';
 import { stateRoot } from '../paths.js';
 import { planWorkspace, ensureWorkspace } from './workspace.js';
@@ -13,7 +13,14 @@ import type {
   TaskDeletionActor, TaskDeletionMemberPhase, TaskNotificationEvent,
 } from './types.js';
 import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
-import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
+import { DEFAULT_TASK_LIST_ID, readTaskLists, resolveTaskList, writeTaskListPrefixesLocked } from './task-lists.js';
+import {
+  activePrefixFor, canonicalFingerprint, claimPrefix, ensureKeyLedger, ensureMissionKeyRegistry, issueNextKey,
+  MissionKeyError, observeIssuedKey, parseMissionKeyRef, readCreationReceipt, readKeyLedger,
+  readMissionKeyRegistry, suggestMissionPrefix, unavailablePrefixes, withMissionKeysLock, writeCreationReceipt,
+  writeMissionKeyRegistry, type CreationReceipt,
+} from './mission-keys.js';
+import { allocateName, freezeLegacyMemberNaming, ownEntry, type LabelCandidate } from './member-naming.js';
 import { queueMissionCleanup, withManifestRooms, type TaskNotificationManifest } from './notification-manifest.js';
 
 export const tasksDir = () => join(stateRoot(), 'tasks');
@@ -143,7 +150,8 @@ function readTask(id: string): TaskRecord {
   return presentTask(JSON.parse(readFileSync(p, 'utf8')) as StoredTaskRecord);
 }
 
-function writeTask(record: TaskRecord | StoredTaskRecord): void {
+/** `durable` refuses unless the rename is known durable (agent names are reserved before launch). */
+function writeTask(record: TaskRecord | StoredTaskRecord, options: { durable?: boolean } = {}): void {
   mkdirSync(tasksDir(), { recursive: true });
   const persisted = { ...record } as Record<string, unknown>;
   delete persisted.list_name;
@@ -160,7 +168,7 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
     if (!previous || status(previous) !== status(record)) {
       const next = status(record), before = previous ? status(previous) : undefined;
       pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
-        title: `Task ${!previous ? 'created' : 'updated'}: ${record.title}`.slice(0, 160),
+        title: `Task ${!previous ? 'created' : 'updated'}: ${taskLabel(record)}`.slice(0, 160),
         body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
         target: { kind: 'task', taskId: record.task_id }, delivery: 'push-only' });
     }
@@ -171,9 +179,14 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
     persisted.contribution_reads = { progress_read: (previous.progress ?? []).map(entry => entry.id), review_revision: reviewRevision(previous.review) };
   if (pending.length) persisted.notification_events = pending;
   else delete persisted.notification_events;
-  replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
+  replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n', 0o600, {},
+    { durable: options.durable });
   publishFleetResourceCommit(taskPath(record.task_id));
 }
+
+/** Human label for notification titles: the mission key, when issued, precedes the title. */
+const taskLabel = (record: { key?: string; title: string }): string =>
+  record.key ? `${record.key} · ${record.title}` : record.title;
 
 /** Packages written before revisions existed count as revision 1; their next change becomes 2. No package is 0. */
 export const reviewRevision = (review: { revision?: number } | undefined): number => review ? review.revision ?? 1 : 0;
@@ -188,12 +201,12 @@ function contributionEvents(previous: StoredTaskRecord | undefined, record: Task
   const id = record.task_id, events: TaskNotificationEvent[] = [];
   for (const entry of record.progress ?? []) {
     if ((previous.progress ?? []).some(old => old.id === entry.id)) continue;
-    events.push({ eventId: `task:${id}:progress:${entry.id}`, taskId: id, title: `Progress: ${record.title}`.slice(0, 160),
+    events.push({ eventId: `task:${id}:progress:${entry.id}`, taskId: id, title: `Progress: ${taskLabel(record)}`.slice(0, 160),
       body: (entry.text.trim() || 'New progress entry').slice(0, 512), target: { kind: 'task', taskId: id }, delivery: 'push-only' });
   }
   const revision = reviewRevision(record.review);
   if (revision > reviewRevision(previous.review))
-    events.push({ eventId: `task:${id}:review:${revision}`, taskId: id, title: `To review updated: ${record.title}`.slice(0, 160),
+    events.push({ eventId: `task:${id}:review:${revision}`, taskId: id, title: `To review updated: ${taskLabel(record)}`.slice(0, 160),
       body: `Task ${id}: the review package changed.`, target: { kind: 'task', taskId: id }, delivery: 'push-only' });
   return events;
 }
@@ -381,6 +394,8 @@ export interface CreateTaskInput {
   layout?: { name: string; definition_hash: string };
   room_id?: string;
   listId?: string;
+  /** Submitted list name; resolved only after receipt replay, so a renamed or deleted list cannot reallocate. */
+  list?: string;
 }
 
 function creationPlan(plan: TaskRecord['execution_plan'], layout?: { name: string; definition_hash: string }): string {
@@ -388,49 +403,267 @@ function creationPlan(plan: TaskRecord['execution_plan'], layout?: { name: strin
     layout ? `${layout.name}@${layout.definition_hash}` : null]);
 }
 
+type CreateOutcome = { kind: 'existing'; taskId: string } | { kind: 'created'; taskId: string };
+
+/** Original creation input retained in the receipt; a resumed create uses only this. */
+interface StoredCreationInput {
+  title: string; brief?: string; brief_file?: string; template?: TaskTemplateRef;
+  execution_plan?: TaskRecord['execution_plan']; origin: TaskOrigin; start: boolean; no_room?: boolean;
+  layout?: { name: string; definition_hash: string }; room_id?: string; list: string; created_at: string;
+  /** Planned once at reservation, so a resumed create keeps the same owned workspace and marker. */
+  workspace?: TaskRecord['workspace'];
+}
+
+const creationFingerprint = (input: CreateTaskInput, plan: string): string => canonicalFingerprint({
+  title: input.title, brief: input.brief, brief_file: input.brief_file, template: input.template,
+  plan, origin: input.origin, start: input.start !== false, no_room: input.no_room || undefined,
+  room_id: input.room_id, list: input.list ?? input.listId ?? DEFAULT_TASK_LIST_ID,
+});
+
+function recordFromReceipt(receipt: CreationReceipt, idempotencyKey: string): StoredTaskRecord {
+  const input = receipt.input as unknown as StoredCreationInput;
+  const listId = readTaskLists().some(item => item.list_id === receipt.list_id) ? receipt.list_id : DEFAULT_TASK_LIST_ID;
+  const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
+  const record: StoredTaskRecord = {
+    task_id: receipt.task_id, key: receipt.mission_key, list_id: listId,
+    title: input.title, brief: input.brief, brief_file: input.brief_file, state,
+    template: input.template, execution_plan: input.execution_plan, no_room: input.no_room || undefined,
+    ...(input.layout ? { layout: { name: input.layout.name, run_id: `task-${receipt.task_id}`, definition_hash: input.layout.definition_hash } } : {}),
+    room_id: input.room_id, member_roles: [], origin: input.origin,
+    idempotency_key: idempotencyKey, creation_plan: receipt.creation_plan,
+    created_at: input.created_at, started_at: state === 'provisioning' ? input.created_at : undefined,
+  };
+  record.workspace = input.workspace ?? planWorkspace('task', record.task_id);
+  return record;
+}
+
+/**
+ * Create a task, or replay an earlier create with the same idempotency key.
+ * Production callers hold `task-lists.lock`; allocation itself is serialized
+ * by the innermost mission-keys lock. Ordering: high-water mark → reserved
+ * receipt → key ledger → task row → receipt `created`. Every crash cut leaves
+ * a gap or a resumable receipt, never a duplicate or a resurrected task.
+ */
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
-  const existing = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
   const requestedPlan = creationPlan(input.execution_plan, input.layout);
-  if (existing) {
-    // After a Backlog plan edit the current plan differs from the one created; retries compare the original request.
-    if ((existing.creation_plan ?? creationPlan(existing.execution_plan, existing.layout)) !== requestedPlan)
-      throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
-    return withTaskLock(existing.task_id, () => {
-      const fresh = readTask(existing.task_id);
-      assertNoPendingDeletion(fresh);
-      if (fresh.workspace) ensureWorkspace(fresh.workspace);
-      return fresh;
-    });
-  }
-
   if (input.layout && (input.execution_plan || input.no_room || input.room_id))
     throw new TaskStateError('a layout task cannot also use a room template, no-room mode or a room');
-  const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
-  const taskId = generateTaskId();
-  const record: StoredTaskRecord = {
-    task_id: taskId,
-    list_id: input.listId ?? DEFAULT_TASK_LIST_ID,
-    title: input.title,
-    brief: input.brief,
-    brief_file: input.brief_file,
-    state,
-    template: input.template,
-    execution_plan: input.execution_plan,
-    no_room: input.no_room || undefined,
-    ...(input.layout ? { layout: { name: input.layout.name, run_id: `task-${taskId}`, definition_hash: input.layout.definition_hash } } : {}),
-    room_id: input.room_id,
-    member_roles: [],
-    origin: input.origin,
-    idempotency_key: key,
-    creation_plan: requestedPlan,
-    created_at: new Date().toISOString(),
-    started_at: state === 'provisioning' ? new Date().toISOString() : undefined,
-  };
-  record.workspace = planWorkspace('task', record.task_id);
-  writeTask(record);
-  ensureWorkspace(record.workspace);
-  return readTask(record.task_id);
+  migrateMissionKeysLocked();
+  const fingerprint = creationFingerprint(input, requestedPlan);
+  const outcome = withMissionKeysLock((): CreateOutcome => {
+    const receipt = readCreationReceipt(key);
+    if (receipt) {
+      // Stable policy, unchanged from earlier releases: first write wins and only a different room
+      // plan conflicts. A resumed create uses the stored original input, never the retry's fields.
+      if (receipt.creation_plan !== undefined && receipt.creation_plan !== requestedPlan)
+        throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
+      const present = existsSync(taskPath(receipt.task_id));
+      if (receipt.mission_key && (present || receipt.state === 'reserved'))
+        ensureKeyLedger(receipt.mission_key, receipt.task_id);
+      if (present) {
+        if (receipt.state === 'reserved') writeCreationReceipt(key, { ...receipt, state: 'created' });
+        return { kind: 'existing', taskId: receipt.task_id };
+      }
+      if (receipt.state !== 'reserved' || readTaskDeletionReceipt(receipt.task_id) || !receipt.input)
+        throw new MissionKeyError('task_deleted',
+          `task ${receipt.mission_key ?? receipt.task_id} created with idempotency key '${key}' was deleted`);
+      writeTask(recordFromReceipt(receipt, key));
+      writeCreationReceipt(key, { ...receipt, state: 'created' });
+      return { kind: 'created', taskId: receipt.task_id };
+    }
+    // Rows written by an earlier release before migration completed.
+    const legacy = listTasks({ includeDeleting: true }).find(task => task.idempotency_key === key);
+    if (legacy) {
+      if ((legacy.creation_plan ?? creationPlan(legacy.execution_plan, legacy.layout)) !== requestedPlan)
+        throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
+      return { kind: 'existing', taskId: legacy.task_id };
+    }
+    const listId = input.listId ?? resolveTaskList(input.list ?? 'default').list_id;
+    const registry = ensureMissionKeyRegistry();
+    const missionKey = issueNextKey(registry, listId);
+    writeMissionKeyRegistry(registry);
+    const taskId = generateTaskId();
+    const stored: StoredCreationInput = {
+      title: input.title, brief: input.brief, brief_file: input.brief_file, template: input.template,
+      execution_plan: input.execution_plan, origin: input.origin, start: input.start !== false,
+      no_room: input.no_room || undefined, layout: input.layout, room_id: input.room_id,
+      list: input.list ?? listId, created_at: new Date().toISOString(),
+      workspace: planWorkspace('task', taskId),
+    };
+    const reserved: CreationReceipt = { version: 1, task_id: taskId, mission_key: missionKey, list_id: listId,
+      fingerprint, input: stored as unknown as Record<string, unknown>, creation_plan: requestedPlan, state: 'reserved' };
+    writeCreationReceipt(key, reserved);
+    ensureKeyLedger(missionKey, taskId);
+    writeTask(recordFromReceipt(reserved, key));
+    writeCreationReceipt(key, { ...reserved, state: 'created' });
+    return { kind: 'created', taskId };
+  });
+  return withTaskLock(outcome.taskId, () => {
+    const fresh = readTask(outcome.taskId);
+    if (outcome.kind === 'existing') assertNoPendingDeletion(fresh);
+    if (fresh.workspace) ensureWorkspace(fresh.workspace);
+    return fresh;
+  });
+}
+
+/**
+ * Resolve a canonical task ID or a mission key (any case) to the canonical
+ * ID. Callers authenticate before resolving. A deleted key resolves to its
+ * canonical ID only with `allowDeleted` (idempotent DELETE replay); every
+ * other use gets a stable `task_deleted` error and never another task.
+ */
+export function resolveTaskRef(ref: string, options: { allowDeleted?: boolean } = {}): string {
+  if (typeof ref !== 'string') throw new TaskStateError('invalid task reference');
+  if (TASK_ID_PATTERN.test(ref)) return ref;
+  const key = parseMissionKeyRef(ref);
+  // Not a key: hand the reference on unchanged so existing not-found/validation errors stay exact.
+  if (!key) return ref;
+  const entry = readKeyLedger(key);
+  if (!entry) throw new TaskStateError(`task not found: ${key}`);
+  if (!options.allowDeleted && entry.state === 'deleted' && !existsSync(taskPath(entry.task_id)))
+    throw new MissionKeyError('task_deleted', `task ${key} was deleted`);
+  return entry.task_id;
+}
+
+/**
+ * Durable role-scoped names for members of a keyed task. Returns undefined
+ * for a task without a mission key (legacy derivation applies). Existing
+ * allocations are returned unchanged; new ones are persisted under the task
+ * lock before the caller launches anything. `assertAvailable` runs for new
+ * names only; a conflict persists nothing and fails safely.
+ */
+export function allocateTaskMemberNames(
+  id: string, requests: Array<{ allocationKey: string; candidates: LabelCandidate[] }>,
+  assertAvailable: (name: string) => void = () => {},
+): string[] | undefined {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    if (!task.key) return undefined;
+    let naming = task.member_naming;
+    const names: string[] = [];
+    const fresh: string[] = [];
+    for (const request of requests) {
+      const result = allocateName(naming, task.key, request.allocationKey, request.candidates);
+      naming = result.naming;
+      names.push(result.allocation.name);
+      if (result.created) fresh.push(result.allocation.name);
+    }
+    for (const name of fresh) assertAvailable(name);
+    if (fresh.length) {
+      assertNoPendingDeletion(task);
+      task.member_naming = naming;
+      // A counter that a host crash could roll back would hand the same name out twice.
+      writeTask(task, { durable: true });
+    } else if (names.length) {
+      // Reused names may come from a write whose directory sync failed: make it durable before any launch.
+      fsyncDirectory(tasksDir());
+    }
+    return names;
+  });
+}
+
+/** Recorded allocation name for `allocationKey`, without allocating. */
+export function recordedMemberName(id: string, allocationKey: string): string | undefined {
+  assertCanonicalTaskId(id);
+  if (!existsSync(taskPath(id))) return undefined;
+  const row = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  return ownEntry(row.member_naming?.allocations, allocationKey)?.name;
+}
+
+// ── One-time mission key migration ──────────────────────────────────────
+
+function listLedgerKeys(): Set<string> {
+  const dir = join(stateRoot(), 'mission-keys', 'keys');
+  if (!existsSync(dir)) return new Set();
+  return new Set(readdirSync(dir).filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)));
+}
+
+/**
+ * Assign prefixes and keys to historical lists and tasks, then seed or repair
+ * receipts, ledger entries and frozen agent names for every row. Caller holds
+ * `task-lists.lock` (every production path does); per row the lock order is
+ * task lock → mission-keys lock, the same as deletion acceptance. Re-runnable:
+ * every step is idempotent, and `keys_migrated` is written only at the end.
+ */
+export function migrateMissionKeysLocked(configuredDefault?: string): void {
+  // Lock-free fast path: a completed migration with a matching default prefix needs no writes.
+  const current = readMissionKeyRegistry();
+  if (current?.keys_migrated && (configuredDefault === undefined || current.default_prefix === configuredDefault)) return;
+  const initial = ensureMissionKeyRegistry(configuredDefault);
+  if (initial.keys_migrated) return;
+  // 1. Prefixes for lists that predate mission keys.
+  const assigned = withMissionKeysLock(() => {
+    const registry = readMissionKeyRegistry()!;
+    const prefixes = new Map<string, string>();
+    for (const list of readTaskLists()) {
+      if (list.built_in) continue;
+      const existing = activePrefixFor(registry, list.list_id);
+      const prefix = list.prefix ?? existing ?? suggestMissionPrefix(list.name, unavailablePrefixes(registry));
+      if (!existing) claimPrefix(registry, list.list_id, prefix, false);
+      prefixes.set(list.list_id, prefix);
+    }
+    writeMissionKeyRegistry(registry);
+    return prefixes;
+  });
+  writeTaskListPrefixesLocked(assigned);
+  // 2. Reconcile every issued key before anything new is issued.
+  const rows = (existsSync(tasksDir()) ? readdirSync(tasksDir()) : [])
+    .filter(name => name.endsWith('.json')).map(name => name.slice(0, -5))
+    .filter(id => TASK_ID_PATTERN.test(id))
+    .map(id => ({ id, row: JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord }))
+    .sort((a, b) => (a.row.list_id ?? DEFAULT_TASK_LIST_ID).localeCompare(b.row.list_id ?? DEFAULT_TASK_LIST_ID)
+      || a.row.created_at.localeCompare(b.row.created_at) || a.id.localeCompare(b.id));
+  withMissionKeysLock(() => {
+    const registry = readMissionKeyRegistry()!;
+    for (const { row } of rows) {
+      if (row.key) observeIssuedKey(registry, row.key, row.list_id ?? DEFAULT_TASK_LIST_ID);
+      const receipt = readCreationReceipt(row.idempotency_key);
+      if (receipt?.mission_key) observeIssuedKey(registry, receipt.mission_key, receipt.list_id);
+    }
+    for (const key of listLedgerKeys()) observeIssuedKey(registry, key, DEFAULT_TASK_LIST_ID);
+    writeMissionKeyRegistry(registry);
+  });
+  // 3 + 4. Per row: reserve → receipt → ledger → keyed row, and repair every row.
+  for (const { id } of rows) {
+    withTaskLock(id, () => withMissionKeysLock(() => {
+      if (!existsSync(taskPath(id))) return;
+      const row = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+      const listId = row.list_id ?? DEFAULT_TASK_LIST_ID;
+      const deleting = row.deletion?.status === 'pending';
+      const prior = readCreationReceipt(row.idempotency_key);
+      let missionKey = row.key ?? prior?.mission_key;
+      if (!missionKey) {
+        const registry = readMissionKeyRegistry()!;
+        const effectiveList = activePrefixFor(registry, listId) ? listId : DEFAULT_TASK_LIST_ID;
+        missionKey = issueNextKey(registry, effectiveList);
+        writeMissionKeyRegistry(registry);
+      }
+      if (prior?.state !== 'deleted')
+        writeCreationReceipt(row.idempotency_key, {
+          version: 1, task_id: id, mission_key: missionKey, list_id: listId,
+          ...(prior?.fingerprint ? { fingerprint: prior.fingerprint, input: prior.input } : {}),
+          creation_plan: row.creation_plan ?? creationPlan(row.execution_plan, row.layout),
+          state: deleting ? 'deleted' : 'created',
+        });
+      ensureKeyLedger(missionKey, id, deleting ? 'deleted' : 'live');
+      // Buckets depend on the key's length: derive them from the reserved key, not a placeholder.
+      const naming = freezeLegacyMemberNaming({ ...row, key: missionKey });
+      if (row.key !== missionKey || naming !== row.member_naming) {
+        if (row.key !== missionKey) { row.key = missionKey; row.key_from_migration = true; }
+        if (naming) row.member_naming = naming;
+        writeTask(row, { durable: true });
+      }
+    }));
+  }
+  // Rows a crashed or sync-failed earlier pass already renamed are skipped above: confirm them before completion.
+  if (rows.length) fsyncDirectory(tasksDir());
+  withMissionKeysLock(() => {
+    const registry = readMissionKeyRegistry()!;
+    registry.keys_migrated = true;
+    writeMissionKeyRegistry(registry);
+  });
 }
 
 export function getTask(id: string): TaskRecord { return withTaskLock(id, () => readTask(id)); }
@@ -905,6 +1138,7 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
   }
   if (stored.deletion?.status === 'pending') {
     // Heal a crash between the intent write and the receipt write.
+    tombstoneCreation(stored);
     if (!readTaskDeletionReceipt(id)) writeDeletionReceiptForIntent(stored);
     queueMissionCleanup(id, notificationRoomCids(stored));
     return { status: 'pending', task: presentTaskLenient(stored) };
@@ -919,11 +1153,27 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
       name: member.name, identity_cid: member.identity_cid, phase: 'pending', updated_at: now,
     })),
   };
+  // Tombstone the create receipt and key first, so no create retry can resurrect this task.
+  tombstoneCreation(stored);
   // The task write drops queued transitions; the cleanup intent then retires everything already delivered.
   writeTask(stored);
   queueMissionCleanup(id, notificationRoomCids(stored));
   writeDeletionReceiptForIntent(stored);
   return { status: 'accepted', task: presentTaskLenient(stored) };
+  });
+}
+
+/** Terminal `deleted` receipt and ledger state; seeds a receipt for rows that predate receipts. */
+function tombstoneCreation(stored: StoredTaskRecord): void {
+  withMissionKeysLock(() => {
+    const receipt = readCreationReceipt(stored.idempotency_key);
+    const key = stored.key ?? receipt?.mission_key;
+    writeCreationReceipt(stored.idempotency_key, {
+      ...(receipt ?? { version: 1 as const, task_id: stored.task_id, list_id: stored.list_id ?? DEFAULT_TASK_LIST_ID,
+        creation_plan: stored.creation_plan ?? creationPlan(stored.execution_plan, stored.layout) }),
+      mission_key: key as string, state: 'deleted',
+    });
+    if (key) ensureKeyLedger(key, stored.task_id, 'deleted');
   });
 }
 

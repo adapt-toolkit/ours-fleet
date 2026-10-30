@@ -41,7 +41,7 @@ function cliAnonymousOverride(argv: readonly string[]): boolean | undefined {
   return enabled ? true : disabled ? false : undefined;
 }
 import {
-  createTask, getTask, getDeletingTask, listTasks, startTask, activateTask,
+  createTask, getTask, getDeletingTask, listTasks, startTask, activateTask, resolveTaskRef,
   blockTask, unblockTask, reviewTask,
   updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError, reviewRevision,
 } from './task-state.js';
@@ -255,6 +255,12 @@ function isKnownRoomStateMessage(message: string): boolean {
   ].some(pattern => pattern.test(message));
 }
 
+/** Canonical ID for a CLI task argument holding an ID or a mission key. */
+function cliTaskRef(ref: string, json?: boolean): string {
+  try { return resolveTaskRef(ref); }
+  catch (error) { if (json) die(error); dieTaskRoom(error); }
+}
+
 function dieTaskRoom(e: unknown): never {
   if (e instanceof TaskRoomApplicationError)
     e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);
@@ -328,7 +334,7 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
   renderMarkdownList({
     icon: '📋', title, empty: 'No tasks found.',
     records: tasks.map(t =>
-      `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
+      `${taskStatus(t.state)} ${t.key ? `${markdownCode(t.key)} ` : ''}${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
       + ` — List ${markdownCode(t.list_name ?? 'default')}`
       + (t.deletion?.status === 'pending' ? ' — Deletion pending'
         + (t.deletion.error ? `: ${markdownProse(t.deletion.error)}` : '') : '')
@@ -344,6 +350,7 @@ const taskActionMarkdown = (
   return renderMarkdownResult({
   icon: '📋', title,
   fields: [
+    ...(task.key ? [{ label: 'Key', value: task.key, kind: 'code' as const }] : []),
     { label: 'ID', value: task.task_id, kind: 'code' },
     { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
     { label: 'List', value: task.list_name ?? 'default', kind: 'code' },
@@ -851,13 +858,38 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     });
 
   taskCmd.command('list-create <name>')
-    .description('create a named task list')
+    .description('create a named task list; its mission keys read <PREFIX>-1, <PREFIX>-2, ...')
+    .option('--prefix <prefix>', 'mission key prefix: 1-6 Latin letters or digits starting with a letter (default: suggested from the name)')
     .option('--json', 'JSON output')
-    .action(async (name: string, opts: { json?: boolean }) => {
+    .action(async (name: string, opts: { json?: boolean; prefix?: string }) => {
       try {
-        const list = await taskRoomService().createTaskList({ actor: { kind: 'local_control', surface: 'cli' }, name });
+        const list = await taskRoomService().createTaskList({ actor: { kind: 'local_control', surface: 'cli' }, name, prefix: opts.prefix });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }
-        console.log(renderMarkdownResult({ icon: '📚', title: 'Task list created', fields: [{ label: 'Name', value: list.name }] }));
+        console.log(renderMarkdownResult({ icon: '📚', title: 'Task list created', fields: [{ label: 'Name', value: list.name },
+          { label: 'Prefix', value: list.prefix ?? '', kind: 'code' }] }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('migrate-keys')
+    .description('assign mission keys and frozen agent names to tasks created before mission keys (idempotent)')
+    .option('--json', 'JSON output')
+    .action(async (opts: { json?: boolean }) => {
+      try {
+        await taskRoomService().prepareMissionKeys();
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, migrated: true }, null, 2)); return; }
+        console.log(renderMarkdownResult({ icon: '🔑', title: 'Mission keys are up to date', fields: [] }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('list-prefix <name> <prefix>')
+    .description('change the prefix for new mission keys of a list; issued keys never change')
+    .option('--json', 'JSON output')
+    .action(async (name: string, prefix: string, opts: { json?: boolean }) => {
+      try {
+        const list = await taskRoomService().setTaskListPrefix({ actor: { kind: 'local_control', surface: 'cli' }, name, prefix });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }
+        console.log(renderMarkdownResult({ icon: '📚', title: 'Task list prefix changed', fields: [{ label: 'Name', value: list.name },
+          { label: 'Prefix', value: list.prefix ?? '', kind: 'code' }] }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
@@ -889,6 +921,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .requiredOption('--list <name>', 'destination task list')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { list: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const task = await taskRoomService().moveTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: id, list: opts.list });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task }, null, 2)); return; }
@@ -900,6 +933,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('show task details')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { json?: boolean; configuration?: string }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const service = taskRoomService(opts.configuration);
         const { task: t, orchestration: room } = service.getTask(id);
@@ -915,6 +949,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         console.log(renderMarkdownResult({
           icon: '📋', title: 'Task details',
           fields: [
+            ...(t.key ? [{ label: 'Key', value: t.key, kind: 'code' as const }] : []),
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
@@ -952,6 +987,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('resume proven stopped task members in-place; never create identities or replay invites')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const { recoverTaskMembers } = await import('./recovery.js');
         const task = getTask(id), cfg = loadConfig(opts.configuration);
@@ -982,6 +1018,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--no-loops', 'disable loops for current member')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean; template?: string; membersFile?: string }, command: Command) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const service = taskRoomService(opts.configuration);
         const t = await service.startTask({
@@ -1012,6 +1049,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .requiredOption('--reason <reason>', 'blocking reason')
     .option('--json', 'JSON output')
     .action((id: string, opts: { reason: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         const t = taskRoomService().blockTask({
@@ -1027,6 +1065,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('unblock a task')
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const prior = getTask(id);
         const previous = prior.state;
@@ -1043,6 +1082,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('move a task to review')
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         const t = taskRoomService().reviewTask({
@@ -1061,6 +1101,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--request-key <key>', 'retry key: repeating the same key and text returns the original entry')
     .option('--json', 'JSON output')
     .action((id: string, opts: { text?: string; textFile?: string; requestKey?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         if (opts.text !== undefined && opts.textFile !== undefined) throw new Error('use --text or --text-file, not both');
         const text = opts.textFile !== undefined ? readFileSync(opts.textFile, 'utf8') : opts.text;
@@ -1089,6 +1130,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--expected-revision <n>', 'package revision you last read; --clear is refused if it changed since')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { markdown?: string; markdownFile?: string; attach: string[]; detach: string[]; requestKey?: string; clear?: boolean; expectedRevision?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         if (opts.markdown !== undefined && opts.markdownFile !== undefined) throw new Error('use --markdown or --markdown-file, not both');
         if (opts.requestKey !== undefined && opts.attach.length !== 1) throw new Error('--request-key needs exactly one --attach');
@@ -1126,6 +1168,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--summary-file <path>', 'completion summary from file')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         let summary = opts.summary;
@@ -1162,6 +1205,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         if (id !== confirmId)
           throw taskRoomPublicError('task_confirmation_mismatch');
+        id = resolveTaskRef(id);
         const previous = getTask(id).state;
         const plan = await taskRoomService(opts.configuration).cancelTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
@@ -1192,6 +1236,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('task_confirmation_mismatch');
+        // A deleted key still maps to its canonical ID, so a repeated delete stays idempotent.
+        id = resolveTaskRef(id, { allowDeleted: true });
         const accepted = await taskRoomService(opts.configuration).requestTaskDeletion({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
@@ -1235,6 +1281,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('internal: settle a previously accepted task terminal intent')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const app = taskRoomService(opts.configuration);
         const t = await app.settleTask({
@@ -1259,6 +1306,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('internal: continue an accepted room-provisioning operation')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         await withFileLock(taskProvisioningWorkerLockPath(id), async () => {
           const app = taskRoomService(opts.configuration);
@@ -1288,6 +1336,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .option('--operation-id <id>', 'accepted operation ID; status updates apply only while it is current')
     .action(async (id: string, operation: string, room: string | undefined, opts: { configuration?: string; json?: boolean; operationId?: string }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         if (!['start', 'open', 'close-room', 'close'].includes(operation)) throw new Error(`unknown layout operation: ${operation}`);
         const view = await taskRoomService(opts.configuration).runTaskLayoutOperation({
@@ -1302,6 +1351,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('internal: settle a previously accepted task deletion')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const app = taskRoomService(opts.configuration);
         const result = await app.settleTaskDeletion({
@@ -1346,6 +1396,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--no-loops', 'disable loops for current member')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean; membersFile?: string }, command: Command) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         console.error('warning: `fleet task work` is deprecated; use `fleet task start`');
@@ -1393,6 +1444,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--summary-file <path>', 'completion summary from file')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const previous = getTask(id).state;
         let summary = opts.summary;
@@ -1510,6 +1562,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('show room details')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const { room: cowork, orchestration: r } =
           await taskRoomService(opts.configuration).getRoomDetail(id);
@@ -1547,6 +1600,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('open room in Cowork local console')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const { room, orchestration } = await taskRoomService(opts.configuration).getRoomDetail(id);
         const url = `http://localhost:4460/room/${id}`;
@@ -1569,6 +1623,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('show room members')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
       try {
         const { orchestration: r, members } =
           await taskRoomService(opts.configuration).getRoomMembers(id);
