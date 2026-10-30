@@ -9,25 +9,26 @@ import type { ReadStream, WriteStream } from 'node:tty';
 import { replaceFileAtomically, withFileLock } from './atomic-file.js';
 import { loadConfig, splitRootFor } from './config.js';
 import { packagedPresetRoot } from './preset-bootstrap.js';
+import { packagedModelCatalog, type PackagedModel } from './application/model-catalog.js';
+import { parse as parseYaml } from 'yaml';
 import { listTemplates } from './rooms-tasks/templates.js';
 
 export type Subscription = 'codex' | 'claude';
 export type WorkKind = 'development' | 'review' | 'coordination';
-export type ReasoningPreference = 'quick' | 'balanced' | 'thorough';
 export type AssignmentStrategy = 'one-model' | 'per-job';
 
-export interface CatalogModel {
+/** The exact harness, model and effort chosen for one purpose; `effort: null` only for a model without effort. */
+export interface PurposeChoice {
   harness: 'codex' | 'claude-code';
   session: 'acp';
   model: string;
-  efforts: string[];
+  effort: string | null;
 }
 
 export interface InitAnswers {
   subscriptions: Subscription[];
   assignmentStrategy: AssignmentStrategy;
-  models: Record<WorkKind, CatalogModel>;
-  reasoning: ReasoningPreference;
+  models: Record<WorkKind, PurposeChoice>;
 }
 
 export interface Choice<T> { label: string; value: T }
@@ -38,8 +39,6 @@ export interface InitPrompter {
   select<T>(message: string, choices: Choice<T>[], initial?: number): Promise<T | undefined>;
   note(message: string): void;
 }
-
-export interface BrainCatalog { schema_version: number; models: CatalogModel[] }
 
 export interface GeneratedSetup { files: Map<string, string>; answers: InitAnswers }
 
@@ -64,82 +63,64 @@ const ROLE_WORK: Record<string, WorkKind> = {
   Developer: 'development', Engineer: 'development', Critic: 'review',
   LocalCoordinator: 'coordination', Coordinator: 'coordination', FleetCoordinator: 'coordination',
 };
-const REASONING_EFFORT: Record<ReasoningPreference, 'low' | 'medium' | 'high'> = {
-  quick: 'low', balanced: 'medium', thorough: 'high',
+/** The three editable purpose Brains setup creates, by kind of work. */
+export const PURPOSE_BRAINS: Record<WorkKind, { id: string; label: string }> = {
+  development: { id: 'development', label: 'Development' },
+  review: { id: 'critic', label: 'Critic' },
+  coordination: { id: 'coordination', label: 'Coordination' },
 };
-const MODEL_LABELS: Record<string, string> = {
-  'gpt-6.1-sol': 'GPT-6.1 Sol',
-  'gpt-6-sol': 'GPT-6 Sol',
-  'gpt-6-luna': 'GPT-6 Luna',
-  'claude-fable-5-1': 'Claude Fable 5.1',
-  'claude-opus-5-5': 'Claude Opus 5.5',
-  'claude-haiku-4-5-20251001': 'Claude Haiku 4.5',
-  'gpt-6-astra': 'GPT-6 Astra',
-  'gpt-5.6-sol': 'GPT-5.6 Sol',
-  'gpt-5.6-terra': 'GPT-5.6 Terra',
-  'gpt-5.6-luna': 'GPT-5.6 Luna',
-  'gpt-5.5': 'GPT-5.5',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 Mini',
-  'gpt-5.3-codex-spark': 'GPT-5.3 Codex Spark',
-  'claude-fable-5': 'Claude Fable 5',
-  'claude-opus-5': 'Claude Opus 5',
-  'claude-sonnet-5': 'Claude Sonnet 5',
-};
+// Legacy --settings files chose one reasoning level for every purpose.
+const LEGACY_REASONING: Record<string, string> = { quick: 'low', balanced: 'medium', thorough: 'high' };
 
-export function validateCatalog(value: BrainCatalog, path = 'supported model catalog'): BrainCatalog {
-  if (value.schema_version !== 1 || !Array.isArray(value.models) || value.models.length === 0)
-    throw new Error(`invalid supported model catalog: ${path}`);
-  const tuples = new Set<string>();
-  for (const model of value.models) {
-    if (!['codex', 'claude-code'].includes(model.harness) || model.session !== 'acp'
-      || typeof model.model !== 'string' || !MODEL_LABELS[model.model]
-      || !Array.isArray(model.efforts)
-      || new Set(model.efforts).size !== model.efforts.length
-      || model.efforts.some(effort => !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort))
-      || (model.efforts.length > 0 && !['low', 'medium', 'high'].every(effort => model.efforts.includes(effort))))
-      throw new Error(`unsupported model state in ${path}`);
-    const tuple = `${model.harness}\0${model.session}\0${model.model}`;
-    if (tuples.has(tuple)) throw new Error(`duplicate supported model in ${path}: ${model.model}`);
-    tuples.add(tuple);
-  }
-  return value;
-}
-
-function catalog(): BrainCatalog {
-  const path = join(packagedPresetRoot(), 'brain-catalog.json');
-  return validateCatalog(JSON.parse(readFileSync(path, 'utf8')) as BrainCatalog, path);
-}
+const labelOf = (choice: Pick<PurposeChoice, 'harness' | 'model'>): string =>
+  packagedModelCatalog().find(model => model.harness === choice.harness && model.model === choice.model)?.label ?? choice.model;
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
 /** Read and validate the complete public InitAnswers JSON shape without side effects. */
 export function readInitSettings(path: string): InitAnswers {
   let value: unknown;
   try { value = JSON.parse(readFileSync(resolve(path), 'utf8')); }
   catch (error) { throw new Error(`cannot read valid Fleet init settings ${path}: ${(error as Error).message}`, { cause: error }); }
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || !hasExactKeys(value as Record<string, unknown>, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']))
-    throw new Error('Fleet init settings must contain exactly subscriptions, assignmentStrategy, models, and reasoning');
-  const candidate = value as Record<string, unknown>;
-  const models = candidate.models;
-  if (!models || typeof models !== 'object' || Array.isArray(models)
-    || !hasExactKeys(models as Record<string, unknown>, WORK_KINDS))
+  if (!isObject(value)) throw new Error('Fleet init settings must be a JSON object');
+  const legacy = hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']);
+  if (!legacy && !hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models']))
+    throw new Error('Fleet init settings must contain exactly subscriptions, assignmentStrategy, and models');
+  const models = value.models;
+  if (!isObject(models) || !hasExactKeys(models, WORK_KINDS))
     throw new Error('Fleet init settings models must contain exactly development, review, and coordination');
+  const chosen = {} as Record<WorkKind, PurposeChoice>;
   for (const work of WORK_KINDS) {
-    const model = (models as Record<string, unknown>)[work];
-    if (!model || typeof model !== 'object' || Array.isArray(model)
-      || !hasExactKeys(model as Record<string, unknown>, ['harness', 'session', 'model', 'efforts']))
-      throw new Error(`Fleet init settings ${work} model must contain exactly harness, session, model, and efforts`);
+    const model = models[work];
+    if (legacy) {
+      // The earlier shape: catalog entries plus one reasoning level; each purpose gets that exact effort.
+      if (!isObject(model) || !hasExactKeys(model, ['harness', 'session', 'model', 'efforts']))
+        throw new Error(`Fleet init settings ${work} model must contain exactly harness, session, model, and efforts`);
+      const effort = LEGACY_REASONING[String(value.reasoning)];
+      if (!effort) throw new Error(`unsupported reasoning preference: ${String(value.reasoning)}`);
+      chosen[work] = { harness: model.harness as PurposeChoice['harness'], session: model.session as 'acp',
+        model: model.model as string, effort };
+    } else {
+      if (!isObject(model) || !hasExactKeys(model, ['harness', 'session', 'model', 'effort']))
+        throw new Error(`Fleet init settings ${work} model must contain exactly harness, session, model, and effort`);
+      chosen[work] = model as unknown as PurposeChoice;
+    }
   }
-  const answers = value as InitAnswers;
+  const answers: InitAnswers = {
+    subscriptions: value.subscriptions as Subscription[],
+    assignmentStrategy: value.assignmentStrategy as AssignmentStrategy,
+    models: chosen,
+  };
   // Generation is the single semantic/catalog validator for wizard and file input.
   generateSetup(answers);
   return answers;
 }
 
-const subscriptionFor = (model: CatalogModel): Subscription =>
+const subscriptionFor = (model: Pick<PurposeChoice, 'harness'>): Subscription =>
   model.harness === 'codex' ? 'codex' : 'claude';
 
 export async function askInitQuestions(
@@ -160,9 +141,7 @@ export async function askInitQuestions(
   if (!subscriptions) return undefined;
   if (subscriptions.length === 0) throw new Error('Select at least one subscription.');
 
-  // The wizard assigns low/medium/high; no-effort models remain available as named presets.
-  const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model))
-    && model.efforts.length > 0);
+  const available = packagedModelCatalog().filter(model => subscriptions.includes(subscriptionFor(model)));
   if (!available.length) throw new Error('None of the selected subscriptions has a supported model.');
   prompter.note([
     'These are exact supported catalog IDs, not recommendations or entitlement claims.',
@@ -177,35 +156,39 @@ export async function askInitQuestions(
   );
   if (!assignmentStrategy) return undefined;
   const choices = available.map(model => ({
-    label: `${MODEL_LABELS[model.model]} (${subscriptionFor(model) === 'codex' ? 'Codex' : 'Claude'}) — ${model.model}; supported catalog ID, not a recommendation`,
+    label: `${model.label} (${subscriptionFor(model) === 'codex' ? 'Codex' : 'Claude'}) — ${model.model}; supported catalog ID, not a recommendation`,
     value: model,
   }));
-  const selected = {} as Record<WorkKind, CatalogModel>;
+  const askEffort = async (purpose: string, model: PackagedModel): Promise<string | null | undefined> => {
+    if (!model.efforts.length) {
+      prompter.note(`${model.label} has no effort setting; the ${purpose} Brain sets none.`);
+      return null;
+    }
+    const initial = Math.max(0, model.efforts.indexOf('medium'));
+    return prompter.select(`Which effort should the ${purpose} Brain use with ${model.label}?`,
+      model.efforts.map(effort => ({ label: effort, value: effort })), initial);
+  };
+  const selected = {} as Record<WorkKind, PurposeChoice>;
   if (assignmentStrategy === 'one-model') {
     const model = await prompter.select('Which model should handle every job?', choices, 0);
     if (!model) return undefined;
-    for (const work of WORK_KINDS) selected[work] = model;
+    for (const work of WORK_KINDS) {
+      const effort = await askEffort(PURPOSE_BRAINS[work].label, model);
+      if (effort === undefined) return undefined;
+      selected[work] = { harness: model.harness, session: model.session, model: model.model, effort };
+    }
   } else {
     for (const work of WORK_KINDS) {
       const model = await prompter.select(
-        `Which model should handle ${work}?`, choices, 0,
+        `Which model should the ${PURPOSE_BRAINS[work].label} Brain use?`, choices, 0,
       );
       if (!model) return undefined;
-      selected[work] = model;
+      const effort = await askEffort(PURPOSE_BRAINS[work].label, model);
+      if (effort === undefined) return undefined;
+      selected[work] = { harness: model.harness, session: model.session, model: model.model, effort };
     }
   }
-  const reasoning = await prompter.select<ReasoningPreference>(
-    'How much reasoning should Fleet use?',
-    [
-      { label: 'Quick — favor speed', value: 'quick' },
-      { label: 'Balanced — everyday work', value: 'balanced' },
-      { label: 'Thorough — harder work', value: 'thorough' },
-    ], 1,
-  );
-  if (!reasoning) return undefined;
-  const answers = {
-    subscriptions: [...subscriptions].sort(), assignmentStrategy, models: selected, reasoning,
-  };
+  const answers = { subscriptions: [...subscriptions].sort(), assignmentStrategy, models: selected };
   const summary = formatSetupSummary(answers, configuration);
   const finalized = await prompter.confirm(
     'Create this default Fleet setup?',
@@ -222,19 +205,18 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
   const existing = configExists && rootExists ? 'both targets exist'
     : configExists ? 'only the manifest exists'
       : rootExists ? 'only the split configuration directory exists' : 'neither target exists';
-  const friendly = (work: WorkKind) => `${MODEL_LABELS[answers.models[work].model]} (${
-    subscriptionFor(answers.models[work]) === 'codex' ? 'Codex' : 'Claude'}, ${answers.models[work].model})`;
-  const effort = REASONING_EFFORT[answers.reasoning];
+  const friendly = (work: WorkKind) => {
+    const choice = answers.models[work];
+    return `${PURPOSE_BRAINS[work].label} Brain (${PURPOSE_BRAINS[work].id}): ${labelOf(choice)} (${
+      subscriptionFor(choice) === 'codex' ? 'Codex' : 'Claude'}, ${choice.model}), effort ${choice.effort ?? 'none (model has no effort setting)'}`;
+  };
   return [
     'Your default Fleet setup:',
     `  Manifest: ${configPath}`,
     `  Split configuration: ${splitRoot}`,
     `  Existing state: ${existing}`,
     `  Model assignment: ${answers.assignmentStrategy === 'one-model' ? 'one model for every job' : 'different models by job'}`,
-    `  Development: ${friendly('development')}`,
-    `  Review: ${friendly('review')}`,
-    `  Coordination: ${friendly('coordination')}`,
-    `  Reasoning: ${answers.reasoning[0].toUpperCase()}${answers.reasoning.slice(1)} -> ${effort}`,
+    ...WORK_KINDS.map(work => `  ${friendly(work)}`),
     '  Availability: catalog support is not a recommendation or entitlement claim',
     '  Entitlement check: run ours-fleet doctor for Codex; Claude is validated when a role launches',
     '  Automatic model fallback: none (no model_chain is generated)',
@@ -242,8 +224,8 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     '  Reviewed pair: Developer + independent Critic',
     '  Team: LocalCoordinator + Developer + Critic',
     '  Gated engineering: Engineer (gate pipeline) + independent Critic',
-    '  FleetCoordinator: coordination model',
-    '  Brains: the packaged presets; each prepared agent references the preset of its chosen model',
+    '  FleetCoordinator: Coordination Brain',
+    '  Brains: three editable purpose Brains (development, critic, coordination); change them or add more in Settings > Brains',
     '',
     'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
     'A hard termination after that Yes can leave host integration or private stage/recovery evidence to inspect.',
@@ -254,23 +236,27 @@ function preset(relative: string): string {
   return readFileSync(join(packagedPresetRoot(), 'fleet', relative), 'utf8');
 }
 
-/** The packaged Brain preset for a catalog model at one effort; the same naming the presets are generated with. */
-export function brainPresetId(model: Pick<CatalogModel, 'harness' | 'model'>, effort: string): string {
-  return `${model.harness === 'claude-code' ? 'claude' : 'codex'}-${model.model
-    .replace(/^claude-/, '').replace(/\./g, '-').toLowerCase()}-${effort}`;
+/** The YAML of one purpose Brain holding exactly the chosen triple. */
+export function purposeBrainYaml(work: WorkKind, choice: PurposeChoice): string {
+  return [
+    `# ${PURPOSE_BRAINS[work].label} Brain created by Fleet setup. Edit it in Settings > Brains.`,
+    `harness: ${choice.harness}`,
+    `session: ${choice.session}`,
+    `model: ${choice.model}`,
+    ...(choice.effort === null ? [] : [`effort: ${choice.effort}`]),
+    '',
+  ].join('\n');
 }
 
 /** Build the exact, deterministic default experience without writing to disk. */
 export function generateSetup(answers: InitAnswers): GeneratedSetup {
-  const effort = REASONING_EFFORT[answers.reasoning];
-  if (!effort) throw new Error(`unsupported reasoning preference: ${String(answers.reasoning)}`);
   if (!['one-model', 'per-job'].includes(answers.assignmentStrategy))
     throw new Error(`unsupported model assignment strategy: ${String(answers.assignmentStrategy)}`);
   if (!Array.isArray(answers.subscriptions) || answers.subscriptions.length === 0
     || new Set(answers.subscriptions).size !== answers.subscriptions.length
     || answers.subscriptions.some(subscription => !['codex', 'claude'].includes(subscription)))
     throw new Error('subscriptions must be a non-empty unique selection of Codex and/or Claude');
-  const supported = catalog().models;
+  const supported = packagedModelCatalog();
   const files = new Map<string, string>();
   files.set('fleet.yaml', [
     'api_version: ours.network/fleet/v2',
@@ -279,26 +265,22 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     '  permissions: { approval: ask, filesystem: workspace, unattended: deny }',
     '',
   ].join('\n'));
-  const assigned = {} as Record<WorkKind, string>;
   for (const work of WORK_KINDS) {
-    const proposed = answers.models[work];
+    const proposed = answers.models?.[work];
     if (!proposed || !answers.subscriptions.includes(subscriptionFor(proposed)))
       throw new Error(`${work} uses a model outside the selected subscriptions`);
     const matches = supported.filter(model => model.harness === proposed.harness
       && model.session === proposed.session && model.model === proposed.model);
     if (matches.length !== 1) throw new Error(`${work} uses an unknown or ambiguous supported model`);
     const model = matches[0];
-    if (JSON.stringify(proposed.efforts) !== JSON.stringify(model.efforts))
-      throw new Error(`${work} contains tampered model capabilities`);
-    if (!model.efforts.includes(effort)) throw new Error(`${MODEL_LABELS[model.model]} does not support ${answers.reasoning} reasoning`);
-    // The chosen model is assigned by reference to its packaged Brain preset; setup defines no Brain of its own.
-    const id = brainPresetId(model, effort);
-    if (!existsSync(join(packagedPresetRoot(), 'fleet', 'brains', `${id}.yaml`)))
-      throw new Error(`no packaged Brain preset for ${MODEL_LABELS[model.model]} at ${effort} reasoning`);
-    assigned[work] = id;
+    // The chosen effort is kept exactly; nothing is substituted.
+    if (model.efforts.length === 0) {
+      if (proposed.effort !== null) throw new Error(`${model.label} has no effort setting; ${work} effort must be null`);
+    } else if (typeof proposed.effort !== 'string' || !model.efforts.includes(proposed.effort)) {
+      throw new Error(`${model.label} does not support effort '${String(proposed.effort)}' for ${work}; choose one of: ${model.efforts.join(', ')}`);
+    }
+    files.set(`brains/${PURPOSE_BRAINS[work].id}.yaml`, purposeBrainYaml(work, proposed));
   }
-  for (const name of readdirSync(join(packagedPresetRoot(), 'fleet', 'brains')).filter(name => name.endsWith('.yaml')).sort())
-    files.set(`brains/${name}`, preset(`brains/${name}`));
   if (answers.assignmentStrategy === 'one-model') {
     const tuples = new Set(WORK_KINDS.map(work => {
       const model = answers.models[work];
@@ -312,7 +294,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (role === 'Coordinator') continue;
     files.set(`agent_templates/${role}.yaml`, [
       `role: { ref: ${role} }`,
-      `brain: { ref: ${assigned[ROLE_WORK[role]]} }`,
+      `brain: { ref: ${PURPOSE_BRAINS[ROLE_WORK[role]].id} }`,
       'coordinator: FleetCoordinator',
       // Temporary default while the product is being tested: prepared agents work without asking.
       'permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
@@ -321,12 +303,35 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     ].join('\n'));
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
-    .replace('brain: { ref: claude-default }', `brain: { ref: ${assigned.coordination} }`));
+    .replace('brain: { ref: claude-default }', `brain: { ref: ${PURPOSE_BRAINS.coordination.id} }`));
   for (const name of ['single', 'pair', 'team', 'engineering']) {
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
     files.set(`room_layouts/${name}.yaml`, preset(`room_layouts/${name}.yaml`));
   }
   return { files, answers };
+}
+
+/** Setup stopped because an existing purpose Brain holds other settings than the chosen ones. */
+export class PurposeBrainConflictError extends Error {}
+
+/**
+ * Setup preserves existing files. A purpose Brain that already exists with a different
+ * harness, session, model or effort is never overwritten; setup stops and says so.
+ */
+export function purposeBrainConflicts(configuration: string, answers: InitAnswers): string[] {
+  const brains = join(splitRootFor(resolve(configuration)), 'brains');
+  return WORK_KINDS.flatMap(work => {
+    const { id } = PURPOSE_BRAINS[work];
+    const path = join(brains, `${id}.yaml`);
+    if (!existsSync(path)) return [];
+    let value: Record<string, unknown>;
+    try { value = (parseYaml(readFileSync(path, 'utf8')) ?? {}) as Record<string, unknown>; }
+    catch { return [`brains/${id}.yaml exists and cannot be read`]; }
+    const wanted = answers.models[work];
+    const same = value.harness === wanted.harness && (value.session ?? 'acp') === wanted.session
+      && value.model === wanted.model && (value.effort ?? null) === wanted.effort;
+    return same ? [] : [`brains/${id}.yaml already exists with different settings`];
+  });
 }
 
 /** Run the mutation boundary only after the complete questionnaire is accepted. */
@@ -349,6 +354,9 @@ export async function executeInitAnswers(
   // deterministically in tests.
   const setup = (deps.generate ?? generateSetup)(answers);
   (deps.preflight ?? preflightInitPaths)(configuration);
+  const conflicts = purposeBrainConflicts(configuration, answers);
+  if (conflicts.length) throw new PurposeBrainConflictError(`Setup would not use the chosen models: ${conflicts.join('; ')}. `
+    + 'Existing Brains are kept; change them in Settings > Brains or choose matching models.');
   try {
     await deps.hostSetup();
   } catch (error) {

@@ -15,6 +15,7 @@ import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
 import { hostClaude } from './claude-runtime.js';
 import { ClaudeCodeAgentSessionAdapter } from './claude-code-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
+import { packagedModelCatalog } from '../application/model-catalog.js';
 
 interface ClaudeOptions {
   plugins?: Record<string, boolean>;
@@ -230,6 +231,12 @@ export function makeClaudeCodeAdapter(
       },
     }, transport),
     supportsResume: true,
+    modelCapabilities: () => ({
+      sessions: ['acp'],
+      models: packagedModelCatalog('claude-code').map(model => ({ id: model.model, label: model.label, efforts: model.efforts })),
+      modelRequired: false,
+      customModels: true,
+    }),
 
     async checkPrereqs() {
       const r = await exec('claude', ['--version']);

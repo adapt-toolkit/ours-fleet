@@ -8,12 +8,13 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  askInitQuestions, brainPresetId, decodeKey, executeInitAnswers, executeInitWizard, formatSetupSummary, generateSetup,
-  isInteractiveTerminal, preflightInitPaths, publishSetup,
-  readInitSettings, TerminalPrompter, updateMultiSelect, validateCatalog,
-  type CatalogModel, type Choice, type InitAnswers, type InitPrompter, type ReasoningPreference,
+  askInitQuestions, decodeKey, executeInitAnswers, executeInitWizard, formatSetupSummary, generateSetup,
+  isInteractiveTerminal, preflightInitPaths, publishSetup, purposeBrainYaml,
+  readInitSettings, TerminalPrompter, updateMultiSelect,
+  type Choice, type InitAnswers, type InitPrompter, type PurposeChoice,
   type Subscription, type WorkKind,
 } from '../src/init-wizard.js';
+import { validatePackagedModelCatalog } from '../src/application/model-catalog.js';
 import { migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { validateRoomLayout } from '../src/rooms-tasks/layout-config.js';
@@ -45,14 +46,13 @@ class ScriptedPrompter implements InitPrompter {
   }
 }
 
-function model(harness: CatalogModel['harness'], name: string): CatalogModel {
-  const efforts = harness === 'claude-code'
-    ? ['low', 'medium', 'high', 'xhigh', 'max']
-    : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-  return { harness, session: 'acp', model: name, efforts };
+const WORK: WorkKind[] = ['development', 'review', 'coordination'];
+
+function model(harness: PurposeChoice['harness'], name: string, effort: string | null = 'medium'): PurposeChoice {
+  return { harness, session: 'acp', model: name, effort };
 }
 
-/** The packaged Brain preset a prepared agent of each kind of work references, and that preset's file. */
+/** The Brain a prepared agent of each kind of work references, and that Brain's file. */
 const BRAIN_HOLDER: Record<WorkKind, string> = {
   development: 'agent_templates/Developer.yaml', review: 'agent_templates/Critic.yaml', coordination: 'agents/FleetCoordinator.yaml',
 };
@@ -63,15 +63,14 @@ const brainOf = (generated: ReturnType<typeof generateSetup>, work: WorkKind): s
 
 function answers(
   subscriptions: Subscription[] = ['codex'],
-  reasoning: ReasoningPreference = 'balanced',
+  effort: string = 'medium',
 ): InitAnswers {
-  const selected = subscriptions[0] === 'codex'
-    ? model('codex', 'gpt-5.6-sol') : model('claude-code', 'claude-opus-5');
+  const selected = (): PurposeChoice => subscriptions[0] === 'codex'
+    ? model('codex', 'gpt-5.6-sol', effort) : model('claude-code', 'claude-opus-5', effort);
   return {
     subscriptions,
     assignmentStrategy: 'one-model',
-    reasoning,
-    models: { development: selected, review: selected, coordination: selected },
+    models: { development: selected(), review: selected(), coordination: selected() },
   };
 }
 
@@ -101,19 +100,73 @@ describe('interactive questionnaire', () => {
       JSON.stringify({ ...answers(), subscriptions: ['codex', 'invented'] }),
       JSON.stringify({ ...answers(), models: { ...answers().models,
         review: model('codex', 'invented-model') } }),
+      // The removed single reasoning field is not accepted alongside the new per-purpose shape.
+      JSON.stringify({ ...answers(), reasoning: 'balanced' }),
+      JSON.stringify({ ...answers(), models: { ...answers().models,
+        review: { ...model('codex', 'gpt-5.6-sol'), efforts: ['medium'] } } }),
+      JSON.stringify({ ...answers(), models: { ...answers().models,
+        review: model('codex', 'gpt-5.6-sol', 'impossible') } }),
+      JSON.stringify({ ...answers(), models: { development: answers().models.development,
+        review: answers().models.review } }),
     ]) {
       writeFileSync(path, value);
       expect(() => readInitSettings(path)).toThrow();
     }
   });
 
+  it.each([
+    ['quick', 'low'], ['balanced', 'medium'], ['thorough', 'high'],
+  ] as const)('converts legacy %s reasoning settings to per-purpose effort %s', (reasoning, effort) => {
+    const path = join(root, 'legacy.json');
+    const entry = (harness: string, name: string, efforts: string[]) => ({ harness, session: 'acp', model: name, efforts });
+    writeFileSync(path, JSON.stringify({
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job', reasoning,
+      models: {
+        development: entry('codex', 'gpt-5.6-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']),
+        review: entry('claude-code', 'claude-opus-5', ['low', 'medium', 'high', 'xhigh', 'max']),
+        coordination: entry('codex', 'gpt-5.6-terra', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']),
+      },
+    }));
+    const converted = readInitSettings(path);
+    expect(converted).toEqual({
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job',
+      models: {
+        development: model('codex', 'gpt-5.6-sol', effort),
+        review: model('claude-code', 'claude-opus-5', effort),
+        coordination: model('codex', 'gpt-5.6-terra', effort),
+      },
+    });
+    expect(converted).not.toHaveProperty('reasoning');
+    const generated = generateSetup(converted);
+    for (const work of WORK) expect(brainOf(generated, work)).toContain(`effort: ${effort}\n`);
+  });
+
+  it('rejects malformed legacy settings', () => {
+    const path = join(root, 'legacy.json');
+    const legacyModel = { harness: 'codex', session: 'acp', model: 'gpt-5.6-sol', efforts: ['low', 'medium', 'high'] };
+    const legacy = {
+      subscriptions: ['codex'], assignmentStrategy: 'one-model', reasoning: 'balanced',
+      models: { development: legacyModel, review: legacyModel, coordination: legacyModel },
+    };
+    writeFileSync(path, JSON.stringify({ ...legacy, reasoning: 'invented' }));
+    expect(() => readInitSettings(path)).toThrow(/unsupported reasoning preference/);
+    // Legacy shape requires legacy model entries (efforts arrays), not new per-purpose choices.
+    writeFileSync(path, JSON.stringify({ ...legacy, models: answers().models }));
+    expect(() => readInitSettings(path)).toThrow(/exactly harness, session, model, and efforts/);
+    // A legacy haiku entry has no effort setting, so a converted effort is rejected, not dropped.
+    const haiku = { harness: 'claude-code', session: 'acp', model: 'claude-haiku-4-5-20251001', efforts: [] };
+    writeFileSync(path, JSON.stringify({ ...legacy, subscriptions: ['claude'],
+      models: { development: haiku, review: haiku, coordination: haiku } }));
+    expect(() => readInitSettings(path)).toThrow(/has no effort setting/);
+  });
+
   it('validates supplied answers before host setup or publication and shares the mutation path', async () => {
     let hostCalls = 0; let publishCalls = 0;
     const config = join(root, 'fleet.yaml');
-    await expect(executeInitAnswers({ ...answers(), reasoning: 'invented' as ReasoningPreference }, config, {
+    await expect(executeInitAnswers(answers(['codex'], 'invented'), config, {
       async hostSetup() { hostCalls++; },
       async publish() { publishCalls++; throw new Error('must not publish'); },
-    })).rejects.toThrow(/unsupported reasoning/);
+    })).rejects.toThrow(/does not support effort 'invented'/);
     expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
 
     const result = await executeInitAnswers(answers(), config, {
@@ -135,31 +188,44 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 11 },
-    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 5 },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 16 },
-  ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
-    const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 11, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
+    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 6, first: 'Claude Fable 5', id: 'claude-fable-5' },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 17, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
+  ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize, first, id }) => {
+    // One model, then a distinct effort for each purpose: medium, high, xhigh.
+    const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, 2, 3, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
     expect(result?.subscriptions.sort()).toEqual(selected.map(index => index ? 'claude' : 'codex').sort());
     expect(result?.assignmentStrategy).toBe('one-model');
     expect(new Set(Object.values(result!.models).map(entry => entry.model)).size).toBe(1);
+    expect(result!.models).toEqual({
+      development: { harness: expect.any(String), session: 'acp', model: id, effort: 'medium' },
+      review: { harness: expect.any(String), session: 'acp', model: id, effort: 'high' },
+      coordination: { harness: expect.any(String), session: 'acp', model: id, effort: 'xhigh' },
+    });
+    expect(result).not.toHaveProperty('reasoning');
     const selects = prompt.calls.filter(call => call.kind === 'select');
     expect(selects.map(call => call.message)).toEqual([
       'How should models be assigned?',
       'Which model should handle every job?',
-      'How much reasoning should Fleet use?',
+      `Which effort should the Development Brain use with ${first}?`,
+      `Which effort should the Critic Brain use with ${first}?`,
+      `Which effort should the Coordination Brain use with ${first}?`,
     ]);
+    expect(prompt.calls.some(call => /How much reasoning/.test(call.message))).toBe(false);
+    for (const effortSelect of selects.slice(2))
+      expect(effortSelect.labels?.slice(0, 5)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
     expect(selects[1].labels?.every(label => models.test(label))).toBe(true);
     expect(selects[1].labels).toHaveLength(poolSize);
+    const generated = generateSetup(result!);
+    for (const work of WORK) expect(brainOf(generated, work)).toContain(`model: ${id}\n`);
+    expect(brainOf(generated, 'review')).toContain('effort: high\n');
     if (selected.includes(0)) {
       expect(selects[1].labels).toEqual(expect.arrayContaining([
         expect.stringContaining('GPT-6 Astra (Codex) — gpt-6-astra;'),
         expect.stringContaining('GPT-6.1 Sol (Codex) — gpt-6.1-sol;'),
       ]));
-      const generated = generateSetup(result!);
-      for (const work of ['development', 'review', 'coordination'] as WorkKind[])
-        expect(brainOf(generated, work)).toContain('model: gpt-6-astra');
+      expect(selects[2].labels).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     }
     expect(selects[1].labels?.every(label => /— (gpt-|claude-)/.test(label))).toBe(true);
     expect(prompt.calls.filter(call => call.kind === 'note').at(0)?.message).toMatch(/not recommendations.*entitlement/s);
@@ -177,35 +243,60 @@ describe('interactive questionnaire', () => {
     expect(final?.detail?.match(/Your default Fleet setup:/g)).toHaveLength(1);
   });
 
-  it('supports a deliberate both-provider per-job mix', async () => {
-    const prompt = new ScriptedPrompter([true, [0, 1], 1, 1, 9, 2, 2, true]);
+  it('supports a deliberate both-provider per-job mix with an effort per purpose', async () => {
+    // gpt-5.6-sol low, claude-opus-5 max, gpt-5.6-terra ultra.
+    const prompt = new ScriptedPrompter([true, [0, 1], 1, 1, 0, 9, 4, 2, 5, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
-    expect(result).toMatchObject({
-      assignmentStrategy: 'per-job', reasoning: 'thorough',
+    expect(result).toEqual({
+      subscriptions: ['claude', 'codex'], assignmentStrategy: 'per-job',
       models: {
-        development: { harness: 'codex', model: 'gpt-5.6-sol' },
-        review: { harness: 'claude-code', model: 'claude-opus-5' },
-        coordination: { harness: 'codex', model: 'gpt-5.6-terra' },
+        development: model('codex', 'gpt-5.6-sol', 'low'),
+        review: model('claude-code', 'claude-opus-5', 'max'),
+        coordination: model('codex', 'gpt-5.6-terra', 'ultra'),
       },
     });
     expect(prompt.calls.filter(call => call.kind === 'select').map(call => call.message)).toEqual([
       'How should models be assigned?',
-      'Which model should handle development?',
-      'Which model should handle review?',
-      'Which model should handle coordination?',
-      'How much reasoning should Fleet use?',
+      'Which model should the Development Brain use?',
+      'Which effort should the Development Brain use with GPT-5.6 Sol?',
+      'Which model should the Critic Brain use?',
+      'Which effort should the Critic Brain use with Claude Opus 5?',
+      'Which model should the Coordination Brain use?',
+      'Which effort should the Coordination Brain use with GPT-5.6 Terra?',
     ]);
   });
 
+  it('notes instead of asking an effort for a model without effort settings', async () => {
+    // Claude only; Claude Haiku 4.5 is the sixth Claude model and has efforts [].
+    const prompt = new ScriptedPrompter([true, [1], 0, 5, true]);
+    const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
+    const haiku = model('claude-code', 'claude-haiku-4-5-20251001', null);
+    expect(result?.models).toEqual({ development: haiku, review: haiku, coordination: haiku });
+    expect(prompt.calls.filter(call => call.kind === 'select').map(call => call.message)).toEqual([
+      'How should models be assigned?', 'Which model should handle every job?',
+    ]);
+    const notes = prompt.calls.filter(call => call.kind === 'note').map(call => call.message);
+    for (const purpose of ['Development', 'Critic', 'Coordination'])
+      expect(notes).toContain(`Claude Haiku 4.5 has no effort setting; the ${purpose} Brain sets none.`);
+    const final = prompt.calls.filter(call => call.kind === 'confirm').at(-1);
+    expect(final?.detail).toContain('effort none (model has no effort setting)');
+  });
+
   it('cancels at every stage without asking later questions', async () => {
-    for (const script of [[false], [true, undefined], [true, [0], undefined],
+    const scripts: unknown[][] = [[false], [true, undefined], [true, [0], undefined],
       [true, [0], 0, undefined], [true, [0], 0, 0, undefined],
-      [true, [0], 0, 0, 1, false],
+      [true, [0], 0, 0, 1, undefined], [true, [0], 0, 0, 1, 1, undefined],
+      [true, [0], 0, 0, 1, 1, 1, false],
       [true, [0], 1, undefined], [true, [0], 1, 0, undefined],
-      [true, [0], 1, 0, 0, undefined], [true, [0], 1, 0, 0, 0, undefined],
-      [true, [0], 1, 0, 0, 0, 1, false]]) {
+      [true, [0], 1, 0, 1, undefined], [true, [0], 1, 0, 1, 0, undefined],
+      [true, [0], 1, 0, 1, 0, 1, undefined], [true, [0], 1, 0, 1, 0, 1, 0, undefined],
+      [true, [0], 1, 0, 1, 0, 1, 0, 1, false]];
+    for (const script of scripts) {
+      const length = script.length;
       const prompt = new ScriptedPrompter(script);
       await expect(askInitQuestions(prompt, join(root, 'fleet.yaml'))).resolves.toBeUndefined();
+      // Every scripted answer was consumed and no later question was asked.
+      expect(prompt.calls.filter(call => call.kind !== 'note')).toHaveLength(length);
     }
   });
 
@@ -306,7 +397,7 @@ describe('interactive questionnaire', () => {
 
   it.each([
     { name: 'first confirmation', script: [false] },
-    { name: 'final confirmation', script: [true, [0], 0, 0, 1, false] },
+    { name: 'final confirmation', script: [true, [0], 0, 0, 1, 1, 1, false] },
   ])('does not cross the mutation boundary after cancellation at $name', async ({ script }) => {
     let hostCalls = 0; let publishCalls = 0;
     const result = await executeInitWizard(
@@ -322,7 +413,7 @@ describe('interactive questionnaire', () => {
   it('resolves the complete setup before host or publication mutation boundaries', async () => {
     let hostCalls = 0; let publishCalls = 0;
     await expect(executeInitWizard(
-      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+      new ScriptedPrompter([true, [0], 0, 0, 1, 1, 1, true]), join(root, 'fleet.yaml'), {
         generate() { throw new Error('catalog became invalid'); },
         async hostSetup() { hostCalls++; },
         async publish() { publishCalls++; throw new Error('must not publish'); },
@@ -334,7 +425,7 @@ describe('interactive questionnaire', () => {
   it('warns that host state may have changed when locked publication revalidation fails', async () => {
     let hostCalls = 0;
     await expect(executeInitWizard(
-      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+      new ScriptedPrompter([true, [0], 0, 0, 1, 1, 1, true]), join(root, 'fleet.yaml'), {
         async hostSetup() { hostCalls++; },
         async publish() { throw new Error('locked path revalidation refused a symlink'); },
       },
@@ -345,7 +436,7 @@ describe('interactive questionnaire', () => {
   it('warns about partial host state and skips publication when host setup fails', async () => {
     let publishCalls = 0;
     await expect(executeInitWizard(
-      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+      new ScriptedPrompter([true, [0], 0, 0, 1, 1, 1, true]), join(root, 'fleet.yaml'), {
         async hostSetup() { throw new Error('backend reload failed'); },
         async publish() { publishCalls++; throw new Error('must not publish'); },
       },
@@ -399,58 +490,131 @@ describe('interactive questionnaire', () => {
 });
 
 describe('deterministic default mapping', () => {
-  it('rejects duplicate model tuples, efforts, and unknown effort states', () => {
-    const valid = model('codex', 'gpt-5.6-sol');
-    expect(() => validateCatalog({ schema_version: 1, models: [valid, structuredClone(valid)] }))
+  it('validates the packaged model catalog: schema, labels, duplicate tuples, and effort states', () => {
+    const valid = { harness: 'codex', session: 'acp', model: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['low', 'medium'] };
+    const catalog = (models: unknown[], extra: Record<string, unknown> = {}) =>
+      ({ schema_version: 2, catalog_revision: 1, models, ...extra });
+    expect(validatePackagedModelCatalog(catalog([valid])).models).toEqual([valid]);
+    // Every effort level is a valid catalog state, and [] means the model has no effort setting.
+    expect(() => validatePackagedModelCatalog(catalog([
+      { ...valid, efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+      { ...valid, harness: 'claude-code', model: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', efforts: [] },
+    ]))).not.toThrow();
+    expect(() => validatePackagedModelCatalog(catalog([valid, structuredClone(valid)])))
       .toThrow(/duplicate supported model/);
-    expect(() => validateCatalog({ schema_version: 1, models: [
-      { ...valid, efforts: ['low', 'medium', 'high', 'high'] },
-    ] })).toThrow(/unsupported model state/);
-    expect(() => validateCatalog({ schema_version: 1, models: [
-      { ...valid, efforts: ['low', 'medium', 'high', 'impossible'] },
-    ] })).toThrow(/unsupported model state/);
+    expect(() => validatePackagedModelCatalog(catalog([{ ...valid, efforts: ['low', 'medium', 'high', 'high'] }])))
+      .toThrow(/unsupported model state/);
+    expect(() => validatePackagedModelCatalog(catalog([{ ...valid, efforts: ['low', 'impossible'] }])))
+      .toThrow(/unsupported model state/);
+    expect(() => validatePackagedModelCatalog(catalog([{ ...valid, label: '  ' }]))).toThrow(/unsupported model state/);
+    const { label: _label, ...unlabeled } = valid;
+    expect(() => validatePackagedModelCatalog(catalog([unlabeled]))).toThrow(/unsupported model state/);
+    expect(() => validatePackagedModelCatalog(catalog([valid], { schema_version: 1 }))).toThrow(/invalid/);
+    expect(() => validatePackagedModelCatalog(catalog([valid], { catalog_revision: 'x' }))).toThrow(/invalid/);
+    expect(() => validatePackagedModelCatalog(catalog([]))).toThrow(/invalid/);
+    // The shipped catalog itself is valid.
+    expect(() => validatePackagedModelCatalog(JSON.parse(readFileSync(
+      new URL('../presets/brain-catalog.json', import.meta.url), 'utf8')))).not.toThrow();
   });
 
-  it.each([
-    ['quick', 'low'], ['balanced', 'medium'], ['thorough', 'high'],
-  ] as const)('maps %s reasoning to %s for every outcome', (preference, effort) => {
-    const generated = generateSetup(answers(['codex'], preference));
-    for (const work of ['development', 'review', 'coordination'] as WorkKind[])
-      expect(brainOf(generated, work)).toContain(`effort: ${effort}`);
-  });
-
-  it('references packaged Brain presets and defines no Brain named after a kind of work', () => {
-    const generated = generateSetup(answers(['codex'], 'thorough'));
-    for (const work of ['development', 'review', 'coordination'] as WorkKind[]) {
-      expect(brainRef(generated, work)).toBe('codex-gpt-5-6-sol-high');
-      expect(generated.files.has(`brains/${work}.yaml`)).toBe(false);
-    }
-    expect(brainPresetId(model('claude-code', 'claude-opus-5'), 'medium')).toBe('claude-opus-5-medium');
-    expect(brainPresetId(model('codex', 'gpt-6.1-sol'), 'low')).toBe('codex-gpt-6-1-sol-low');
-    // Every packaged preset is installed unchanged, so any of them can be chosen later.
-    const packaged = readdirSync(new URL('../presets/fleet/brains', import.meta.url)).filter(name => name.endsWith('.yaml'));
-    expect(packaged.length).toBeGreaterThan(3);
-    for (const name of packaged)
-      expect(generated.files.get(`brains/${name}`)).toBe(readFileSync(new URL(`../presets/fleet/brains/${name}`, import.meta.url), 'utf8'));
-    expect([...generated.files.keys()].filter(name => name.startsWith('brains/')).sort()).toEqual(packaged.map(name => `brains/${name}`).sort());
-  });
-
-  it('maps default single/pair/team and coordinator roles to chosen outcomes', () => {
+  it('persists a distinct exact effort per purpose, including efforts beyond high', () => {
     const generated = generateSetup({
-      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job', reasoning: 'balanced',
+      subscriptions: ['codex'], assignmentStrategy: 'one-model',
+      models: {
+        development: model('codex', 'gpt-6-astra', 'ultra'),
+        review: model('codex', 'gpt-6-astra', 'xhigh'),
+        coordination: model('codex', 'gpt-6-astra', 'low'),
+      },
+    });
+    expect(brainOf(generated, 'development')).toBe(
+      '# Development Brain created by Fleet setup. Edit it in Settings > Brains.\n'
+      + 'harness: codex\nsession: acp\nmodel: gpt-6-astra\neffort: ultra\n');
+    expect(brainOf(generated, 'review')).toBe(
+      '# Critic Brain created by Fleet setup. Edit it in Settings > Brains.\n'
+      + 'harness: codex\nsession: acp\nmodel: gpt-6-astra\neffort: xhigh\n');
+    expect(brainOf(generated, 'coordination')).toBe(
+      '# Coordination Brain created by Fleet setup. Edit it in Settings > Brains.\n'
+      + 'harness: codex\nsession: acp\nmodel: gpt-6-astra\neffort: low\n');
+    const claude = generateSetup({
+      subscriptions: ['claude'], assignmentStrategy: 'per-job',
+      models: {
+        development: model('claude-code', 'claude-opus-5-5', 'max'),
+        review: model('claude-code', 'claude-fable-5-1', 'high'),
+        coordination: model('claude-code', 'claude-sonnet-5', 'medium'),
+      },
+    });
+    expect(parseYaml(brainOf(claude, 'development'))).toEqual({ harness: 'claude-code', session: 'acp', model: 'claude-opus-5-5', effort: 'max' });
+    expect(parseYaml(brainOf(claude, 'review'))).toEqual({ harness: 'claude-code', session: 'acp', model: 'claude-fable-5-1', effort: 'high' });
+    expect(parseYaml(brainOf(claude, 'coordination'))).toEqual({ harness: 'claude-code', session: 'acp', model: 'claude-sonnet-5', effort: 'medium' });
+  });
+
+  it('writes no effort line for a model without effort settings and rejects a non-null effort for it', () => {
+    const haiku = (effort: string | null) => model('claude-code', 'claude-haiku-4-5-20251001', effort);
+    const generated = generateSetup({
+      subscriptions: ['claude'], assignmentStrategy: 'one-model',
+      models: { development: haiku(null), review: haiku(null), coordination: haiku(null) },
+    });
+    for (const work of WORK) {
+      expect(brainOf(generated, work)).toContain('model: claude-haiku-4-5-20251001\n');
+      expect(brainOf(generated, work)).not.toMatch(/effort/);
+    }
+    expect(purposeBrainYaml('review', haiku(null))).not.toContain('effort');
+    expect(() => generateSetup({
+      subscriptions: ['claude'], assignmentStrategy: 'one-model',
+      models: { development: haiku(null), review: haiku('low'), coordination: haiku(null) },
+    })).toThrow(/Claude Haiku 4.5 has no effort setting; review effort must be null/);
+    // A null effort is equally rejected for a model that has efforts; nothing is substituted.
+    expect(() => generateSetup({ ...answers(), models: { ...answers().models,
+      coordination: model('codex', 'gpt-5.6-sol', null) } }))
+      .toThrow(/does not support effort 'null' for coordination/);
+  });
+
+  it('rejects an effort the chosen model does not support instead of substituting one', () => {
+    // gpt-5.5 supports up to xhigh; claude-opus-5 supports up to max (not ultra).
+    expect(() => generateSetup({ ...answers(), assignmentStrategy: 'per-job', models: { ...answers().models,
+      development: model('codex', 'gpt-5.5', 'max') } }))
+      .toThrow(/GPT-5.5 does not support effort 'max' for development; choose one of: low, medium, high, xhigh/);
+    expect(() => generateSetup(answers(['claude'], 'ultra')))
+      .toThrow(/Claude Opus 5 does not support effort 'ultra'/);
+    expect(() => generateSetup(answers(['codex'], 'invented'))).toThrow(/does not support effort 'invented'/);
+  });
+
+  it('generates exactly the three purpose Brains and no other Brain (no combinatorial catalog)', () => {
+    const generated = generateSetup(answers(['codex'], 'high'));
+    expect([...generated.files.keys()].filter(name => name.startsWith('brains/')).sort()).toEqual([
+      'brains/coordination.yaml', 'brains/critic.yaml', 'brains/development.yaml',
+    ]);
+    expect(generated.files.has('brains/claude-default.yaml')).toBe(false);
+    // Nothing generated references a Brain other than the three purpose Brains.
+    const refs = [...generated.files.values()].flatMap(text => [...text.matchAll(/brain: \{ ref: (\S+) \}/g)].map(match => match[1]));
+    expect(refs.length).toBeGreaterThan(0);
+    expect(new Set(refs)).toEqual(new Set(['development', 'critic', 'coordination']));
+    expect(brainRef(generated, 'development')).toBe('development');
+    expect(brainRef(generated, 'review')).toBe('critic');
+    expect(brainRef(generated, 'coordination')).toBe('coordination');
+    for (const work of WORK) expect(brainOf(generated, work)).toContain('model: gpt-5.6-sol\neffort: high\n');
+  });
+
+  it('maps default single/pair/team and coordinator roles to the purpose Brains', () => {
+    const generated = generateSetup({
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job',
       models: {
         development: model('codex', 'gpt-5.6-sol'),
         review: model('claude-code', 'claude-opus-5'),
         coordination: model('codex', 'gpt-5.6-terra'),
       },
     });
-    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
-    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: claude-opus-5-medium }');
-    expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: codex-gpt-5-6-terra-medium }');
+    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
+    expect(generated.files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: development }');
+    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: critic }');
+    expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: coordination }');
     for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
       expect(generated.files.get(`agent_templates/${role}.yaml`))
         .toContain('monitor: { mode: fleet, interrupt: after_tool }');
-    expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: codex-gpt-5-6-terra-medium }');
+    expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
+    expect(generated.files.get('agents/FleetCoordinator.yaml')).not.toContain('claude-default');
+    expect(brainOf(generated, 'review')).toContain('harness: claude-code\nsession: acp\nmodel: claude-opus-5\n');
+    expect(brainOf(generated, 'coordination')).toContain('model: gpt-5.6-terra\n');
     expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Critic');
@@ -474,8 +638,8 @@ describe('deterministic default mapping', () => {
   });
 
   it('generates a catalog-valid Claude setup without claiming or inventing entitlement fallback', () => {
-    const generated = generateSetup(answers(['claude'], 'thorough'));
-    for (const work of ['development', 'review', 'coordination'] as WorkKind[]) {
+    const generated = generateSetup(answers(['claude'], 'high'));
+    for (const work of WORK) {
       const brain = brainOf(generated, work);
       expect(brain).toContain('harness: claude-code');
       expect(brain).toContain('model: claude-opus-5');
@@ -484,35 +648,33 @@ describe('deterministic default mapping', () => {
     }
   });
 
-  it('is byte-deterministic and rejects subscription/model or effort mismatches', () => {
+  it('is byte-deterministic and rejects subscription/model mismatches', () => {
     const first = generateSetup(answers());
     const second = generateSetup(answers());
     expect([...first.files]).toEqual([...second.files]);
     expect(() => generateSetup({ ...answers(['claude']), models: answers(['codex']).models }))
       .toThrow(/outside the selected subscriptions/);
-    const unsupported = model('codex', 'gpt-5.6-sol'); unsupported.efforts = ['low'];
-    expect(() => generateSetup({ ...answers(['codex'], 'thorough'),
-      models: { development: unsupported, review: unsupported, coordination: unsupported } }))
-      .toThrow(/tampered model capabilities/);
     const unknown = model('codex', 'invented-model');
     expect(() => generateSetup({ ...answers(),
       models: { development: unknown, review: unknown, coordination: unknown } }))
+      .toThrow(/unknown or ambiguous supported model/);
+    const wrongSession = { ...model('codex', 'gpt-5.6-sol'), session: 'other' as 'acp' };
+    expect(() => generateSetup({ ...answers(),
+      models: { development: wrongSession, review: wrongSession, coordination: wrongSession } }))
       .toThrow(/unknown or ambiguous supported model/);
     expect(() => generateSetup({ ...answers(), subscriptions: ['codex', 'codex'] }))
       .toThrow(/non-empty unique selection/);
     expect(() => generateSetup({ ...answers(), subscriptions: ['codex', 'other' as Subscription] }))
       .toThrow(/non-empty unique selection/);
-    expect(() => generateSetup({ ...answers(), reasoning: 'impossible' as ReasoningPreference }))
-      .toThrow(/unsupported reasoning preference/);
     expect(() => generateSetup({ ...answers(), assignmentStrategy: 'impossible' as InitAnswers['assignmentStrategy'] }))
       .toThrow(/unsupported model assignment strategy/);
-    for (const work of ['development', 'review', 'coordination'] as WorkKind[])
+    for (const work of WORK)
       expect(brainOf(generateSetup(answers()), work).match(/^model:/gm)).toHaveLength(1);
   });
 
   it('blocks an inconsistent one-model answer and allows the same explicit per-job mix', () => {
     const mixed: InitAnswers = {
-      subscriptions: ['codex', 'claude'], assignmentStrategy: 'one-model', reasoning: 'balanced',
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'one-model',
       models: {
         development: model('codex', 'gpt-5.6-sol'),
         review: model('claude-code', 'claude-opus-5'),
@@ -521,6 +683,9 @@ describe('deterministic default mapping', () => {
     };
     expect(() => generateSetup(mixed)).toThrow(/one-model assignment requires the same exact model/);
     expect(() => generateSetup({ ...mixed, assignmentStrategy: 'per-job' })).not.toThrow();
+    // One model may still use a different effort for each purpose.
+    expect(() => generateSetup({ ...answers(), models: { ...answers().models,
+      review: model('codex', 'gpt-5.6-sol', 'max') } })).not.toThrow();
   });
 });
 
@@ -538,16 +703,67 @@ describe('review and preflight safety', () => {
     expect(summary).toContain(`Manifest: ${config}`);
     expect(summary).toContain(`Split configuration: ${splitRootFor(config)}`);
     expect(summary).toContain(phrase);
-    expect(summary).toContain('Balanced -> medium');
+    expect(summary).toContain('Development Brain (development): GPT-5.6 Sol (Codex, gpt-5.6-sol), effort medium');
+    expect(summary).toContain('Critic Brain (critic): GPT-5.6 Sol (Codex, gpt-5.6-sol), effort medium');
+    expect(summary).toContain('Coordination Brain (coordination): GPT-5.6 Sol (Codex, gpt-5.6-sol), effort medium');
+    expect(summary).toContain('FleetCoordinator: Coordination Brain');
+    expect(summary).toContain('three editable purpose Brains (development, critic, coordination)');
     expect(summary).toContain('catalog support is not a recommendation or entitlement claim');
     expect(summary).toContain('no model_chain is generated');
+  });
+
+  it('summarizes per-purpose models and efforts, including a model without effort', () => {
+    const summary = formatSetupSummary({
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job',
+      models: {
+        development: model('codex', 'gpt-6-astra', 'ultra'),
+        review: model('claude-code', 'claude-haiku-4-5-20251001', null),
+        coordination: model('claude-code', 'claude-opus-5-5', 'max'),
+      },
+    }, join(root, 'fleet.yaml'));
+    expect(summary).toContain('Model assignment: different models by job');
+    expect(summary).toContain('Development Brain (development): GPT-6 Astra (Codex, gpt-6-astra), effort ultra');
+    expect(summary).toContain('Critic Brain (critic): Claude Haiku 4.5 (Claude, claude-haiku-4-5-20251001), effort none (model has no effort setting)');
+    expect(summary).toContain('Coordination Brain (coordination): Claude Opus 5.5 (Claude, claude-opus-5-5), effort max');
+  });
+
+  it('refuses before host setup when an existing purpose Brain differs, keeping it byte-identical', async () => {
+    const config = join(root, 'fleet.yaml');
+    const brains = join(splitRootFor(config), 'brains');
+    mkdirSync(brains, { recursive: true, mode: 0o700 });
+    chmodSync(splitRootFor(config), 0o700);
+    const critic = join(brains, 'critic.yaml');
+    const existing = '# owner Critic\nharness: codex\nsession: acp\nmodel: gpt-5.6-sol\neffort: high\n';
+    writeFileSync(critic, existing, { mode: 0o600 });
+    let hostCalls = 0; let publishCalls = 0;
+    const deps = {
+      async hostSetup() { hostCalls++; },
+      async publish() { publishCalls++; throw new Error('must not publish'); },
+    };
+    // The chosen Critic effort (medium) differs from the existing Brain (high).
+    await expect(executeInitAnswers(answers(), config, deps))
+      .rejects.toThrow(/brains\/critic\.yaml already exists with different settings.*Existing Brains are kept/s);
+    expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
+    expect(readFileSync(critic, 'utf8')).toBe(existing);
+    // A different model is likewise refused.
+    await expect(executeInitAnswers({ ...answers(), assignmentStrategy: 'per-job', models: { ...answers().models,
+      review: model('codex', 'gpt-5.6-terra', 'high') } }, config, deps)).rejects.toThrow(/Existing Brains are kept/);
+    expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
+
+    // An identical existing Brain (same harness/session/model/effort) is accepted and kept as-is.
+    const matching = { ...answers(), models: { ...answers().models, review: model('codex', 'gpt-5.6-sol', 'high') } };
+    const result = await executeInitAnswers(matching, config, { async hostSetup() { hostCalls++; }, publish: publishSetup });
+    expect(result.configPath).toBe(config);
+    expect(hostCalls).toBe(1);
+    expect(readFileSync(critic, 'utf8')).toBe(existing);
+    expect(readFileSync(join(brains, 'development.yaml'), 'utf8')).toBe(purposeBrainYaml('development', matching.models.development));
   });
 
   it('rejects unsafe mode before host setup begins', async () => {
     chmodSync(root, 0o777);
     let hostCalls = 0;
     await expect(executeInitWizard(
-      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+      new ScriptedPrompter([true, [0], 0, 0, 1, 1, 1, true]), join(root, 'fleet.yaml'), {
         async hostSetup() { hostCalls++; },
         async publish() { throw new Error('must not publish'); },
       },
@@ -678,18 +894,24 @@ describe('locked replacement transaction', () => {
 
   it('reruns without overwriting customized role, agent-template, or room-template bytes', async () => {
     const config = join(root, 'fleet.yaml');
-    await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
+    await publishSetup(config, generateSetup(answers(['codex'], 'low')));
     const beforeManifest = readFileSync(config, 'utf8');
     const split = splitRootFor(config);
     writeFileSync(join(split, 'roles/Developer.yaml'), 'mission: custom developer\npersona: custom\nbio: custom\n');
     writeFileSync(join(split, 'agent_templates/Developer.yaml'),
-      'role: { ref: Developer }\nbrain: { ref: codex-gpt-5-6-sol-low }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
+      'role: { ref: Developer }\nbrain: { ref: development }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
     const single = join(split, 'room_templates/single.yaml');
     writeFileSync(single, readFileSync(single, 'utf8')
       .replace('Solo task: one Developer owns implementation and verification',
         'Customized solo task contract'));
+    // A claude-default Brain from an earlier install is no longer generated but is preserved byte-for-byte.
+    const legacyBrain = join(split, 'brains/claude-default.yaml');
+    expect(existsSync(legacyBrain)).toBe(false);
+    const legacyBytes = '# from an earlier install\nharness: claude-code\nsession: acp\nmodel: null\neffort: high\n';
+    writeFileSync(legacyBrain, legacyBytes, { mode: 0o600 });
     const beforeRoot = treeSnapshot(split);
-    const result = await publishSetup(config, generateSetup(answers(['claude'], 'thorough')));
+    const result = await publishSetup(config, generateSetup(answers(['claude'], 'high')));
+    expect(readFileSync(legacyBrain, 'utf8')).toBe(legacyBytes);
     expect(readFileSync(join(result.recoveryPath, 'fleet.yaml'), 'utf8')).toBe(beforeManifest);
     expect(treeSnapshot(join(result.recoveryPath, 'fleet'))).toEqual(beforeRoot);
     expect(readFileSync(config, 'utf8')).toBe(beforeManifest);
@@ -698,10 +920,10 @@ describe('locked replacement transaction', () => {
 
   it('rolls back both targets after an injected second-publication failure', async () => {
     const config = join(root, 'fleet.yaml');
-    await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
+    await publishSetup(config, generateSetup(answers(['codex'], 'low')));
     const beforeManifest = readFileSync(config, 'utf8');
     const beforeRoot = treeSnapshot(splitRootFor(config));
-    await expect(publishSetup(config, generateSetup(answers(['claude'], 'thorough')), {
+    await expect(publishSetup(config, generateSetup(answers(['claude'], 'high')), {
       beforePublish(entry) { if (entry === 'manifest') throw new Error('injected publication failure'); },
     })).rejects.toThrow(/original configuration restored/);
     expect(readFileSync(config, 'utf8')).toBe(beforeManifest);
@@ -721,10 +943,10 @@ describe('locked replacement transaction', () => {
 
   it('never overwrites an unproven path during rollback and retains recovery evidence', async () => {
     const config = join(root, 'fleet.yaml');
-    await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
+    await publishSetup(config, generateSetup(answers(['codex'], 'low')));
     let failure: Error | undefined;
     try {
-      await publishSetup(config, generateSetup(answers(['claude'], 'thorough')), {
+      await publishSetup(config, generateSetup(answers(['claude'], 'high')), {
         beforePublish(entry) {
           if (entry === 'manifest') writeFileSync(config, 'foreign\n', { mode: 0o600 });
         },
@@ -762,7 +984,7 @@ describe('locked replacement transaction', () => {
 
   it.skipIf(process.platform === 'win32')('retains inspectable evidence after a hard kill during publication', async () => {
     const config = join(root, 'fleet.yaml');
-    await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
+    await publishSetup(config, generateSetup(answers(['codex'], 'low')));
     const before = new Set(readdirSync(root));
     const child = join(root, 'hard-kill.mjs');
     const moduleUrl = new URL('../dist/init-wizard.js', import.meta.url).href;
@@ -772,15 +994,15 @@ describe('locked replacement transaction', () => {
       `import ${JSON.stringify(claudeHarnessUrl)};`,
       `import ${JSON.stringify(codexHarnessUrl)};`,
       `import { generateSetup, publishSetup } from ${JSON.stringify(moduleUrl)};`,
-      `const model = { harness: 'claude-code', session: 'acp', model: 'claude-opus-5', efforts: ['low','medium','high','xhigh','max'] };`,
-      `const answers = { subscriptions: ['claude'], assignmentStrategy: 'one-model', reasoning: 'thorough', models: { development: model, review: model, coordination: model } };`,
+      `const model = { harness: 'claude-code', session: 'acp', model: 'claude-opus-5', effort: 'high' };`,
+      `const answers = { subscriptions: ['claude'], assignmentStrategy: 'one-model', models: { development: model, review: model, coordination: model } };`,
       `await publishSetup(${JSON.stringify(config)}, generateSetup(answers), { beforePublish(entry) { if (entry === 'manifest') process.kill(process.pid, 'SIGKILL'); } });`,
     ].join('\n'), { mode: 0o600 });
     const result = spawnSync(process.execPath, [child], { encoding: 'utf8' });
     expect(result.signal).toBe('SIGKILL');
     expect(existsSync(config)).toBe(false);
     expect(readFileSync(join(splitRootFor(config), 'agent_templates/Developer.yaml'), 'utf8'))
-      .toContain('brain: { ref: codex-gpt-5-6-sol-low }');
+      .toContain('brain: { ref: development }');
     const created = readdirSync(root).filter(name => !before.has(name) && name !== 'hard-kill.mjs');
     expect(created.some(name => name.includes('init-recovery'))).toBe(true);
     expect(created.some(name => name.includes('init-stage'))).toBe(true);
@@ -811,7 +1033,7 @@ it('preserves literal inline brain data and existing custom Engineer files on mi
   const split = splitRootFor(config);
   const developer = join(split, 'agent_templates/Developer.yaml');
   const brain = { inline: { harness: 'codex', session: 'acp', model: "custom-$&-$`-$'-model" } };
-  writeFileSync(developer, readFileSync(developer, 'utf8').replace('brain: { ref: codex-gpt-5-6-sol-medium }',
+  writeFileSync(developer, readFileSync(developer, 'utf8').replace('brain: { ref: development }',
     () => `brain: ${JSON.stringify(brain)}`));
   const engineer = join(split, 'agent_templates/Engineer.yaml');
   rmSync(engineer);

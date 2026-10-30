@@ -25,6 +25,8 @@ export function makeHermesAdapter(exec: Exec = realExec, transport?: AcpSessionT
       },
     }),
     supportsResume: false,
+    // Hermes models come from the provider configured in the role home; Fleet knows none of them and sets no effort.
+    modelCapabilities: () => ({ sessions: ['acp'], models: [], modelRequired: true, customModels: true }),
     async checkPrereqs() {
       const result = await exec('hermes-acp', ['--help'], { timeout: 10_000 });
       const ok = result.code === 0;

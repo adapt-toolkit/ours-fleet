@@ -242,17 +242,25 @@ roles:
         existingIdentity: flow.check === false ? 'missing' : 'unknown',
         mode: 'current-fleet-first-boot', bindingEvidence: 'not-structured',
       });
+      const checked: unknown[] = [];
       const first = await service.create(
         canonicalRequest, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser',
+        async input => { checked.push(input); },
       );
+      // A retry of the accepted request returns its action even when a new request would now be refused.
+      const refuse = async () => { throw new FleetError('invalid_request', 'Brain: model now unavailable'); };
       const duplicate = await service.create(
-        canonicalRequest, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser',
+        canonicalRequest, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser', refuse,
       );
       expect(duplicate.actionId).toBe(first.actionId);
+      expect(checked).toHaveLength(1);
       await expect(service.create(
         canonicalWeb({ ...request, mission: 'changed request' }) as any, preview.previewHash,
-        '0123456789abcdef0123456789abcdef', 'browser',
+        '0123456789abcdef0123456789abcdef', 'browser', refuse,
       )).rejects.toMatchObject({ code: 'idempotency_conflict' });
+      await expect(service.create(
+        canonicalRequest, preview.previewHash, 'fedcba9876543210fedcba9876543210', 'browser', refuse,
+      )).rejects.toMatchObject({ code: 'invalid_request', message: 'Brain: model now unavailable' });
       const finalState = flow.probe === 'ready' ? 'session_reachable' : 'attention';
       for (let i = 0; i < 100 && service.get(first.actionId)?.state !== finalState; i++)
         await new Promise(resolve => setTimeout(resolve, 10));

@@ -2,7 +2,7 @@ import { stateRoot } from '../src/paths.js';
 import { privateRuntimeRoot, storeRoomSecret } from '../src/agent-ours/service.js';
 import { atomicPrivateWrite, binderKey } from '../src/agent-ours/state.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -335,6 +335,38 @@ describe('simple Cowork room member startup', () => {
     }
     expect(names).toEqual([`${task.key}-Constructor`,`${task.key}-ToString`,`${task.key}-ValueOf`,`${task.key}-Constructor-2`]);
     expect(getTask(task.task_id).member_naming?.counters).toMatchObject({constructor:2,tostring:1,valueof:1});
+  });
+
+  it('checks a manual Brain only for a new request, never for a retry of an accepted one', async () => {
+    const {requestMemberAddition,memberAddition}=await import('../src/rooms-tasks/add-member.js');
+    const task=createTask({title:'Manual Brain receipt',origin:{type:'cli'}});
+    createRoomRecord({room_id:'room-manual',room_name:'Room',room_identity_cid:'room-cid',task_id:task.task_id,template_snapshot:template(1)});
+    updateTaskRoom(task.task_id,'room-manual','room-cid');const h=coworkHarness();
+    await provisionMembers({cfg:cfg(),cowork:h.cowork,roomId:'room-manual',taskId:task.task_id,template:template(1),binPath:'/fleet'});
+    const configuration=cfg({rolePresets:{Critic:{mission:'Review'}},resolveAgentDefinition:()=>caller});
+    const request={requestId:'manual-request-123',slot:'Review',role:'Critic',brain:{inline:{harness:'codex',model:'gpt-6-luna',effort:'xhigh'}},agentTemplate:'Critic'};
+    const checked:unknown[]=[];
+    const accept=async(value:unknown)=>{checked.push(value);};
+    const refuse=async()=>{throw new Error('Brain: The active Codex account does not offer this model.');};
+    const input={taskId:task.task_id,request,cfg:configuration,cowork:h.cowork,binPath:'/fleet'};
+    await requestMemberAddition({...input,checkNewRequest:accept});
+    expect(checked).toEqual([request]);
+    await expect.poll(()=>memberAddition(task.task_id,request.requestId).state).toBe('succeeded');
+    const launches=mocks.spawnTemp.mock.calls.length;
+    // The account's models changed after acceptance: the identical retry still returns its receipt.
+    expect((await requestMemberAddition({...input,checkNewRequest:refuse})).state).toBe('succeeded');
+    await expect(requestMemberAddition({...input,request:{...request,brain:{inline:{...request.brain.inline,effort:'low'}}},checkNewRequest:refuse}))
+      .rejects.toThrow('different settings');
+    // A new request with a choice that is no longer offered is refused before any receipt or launch.
+    await expect(requestMemberAddition({...input,request:{...request,requestId:'manual-request-456',slot:'Second'},checkNewRequest:refuse}))
+      .rejects.toThrow('does not offer this model');
+    expect(existsSync(join(stateRoot(),'member-additions',task.task_id,'manual-request-456.json'))).toBe(false);
+    expect(mocks.spawnTemp.mock.calls.length).toBe(launches);
+    // No Brain in the request: the member keeps its Agent Template's own Brain.
+    const {brain:_omitted,...templateDefault}=request;
+    await requestMemberAddition({...input,request:{...templateDefault,requestId:'template-brain-789',slot:'Third'},checkNewRequest:accept});
+    await expect.poll(()=>memberAddition(task.task_id,'template-brain-789').state).toBe('succeeded');
+    expect(mocks.spawnTemp.mock.calls.length).toBe(launches+1);
   });
 
   it.each([['room',false],['task',false],['room',true],['task',true]] as const)('rechecks terminal ownership after waiting for %s lock (append=%s)', async (boundary,append) => {

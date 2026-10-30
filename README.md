@@ -1853,7 +1853,7 @@ and member status and choose supported recovery. These checks do not restart age
 recreate identities, redeem invites, or rewrite lifecycle state. Temporary room agents
 remain transient across host reboot; retained launch records do not restore them.
 
-See [predefined Brain models and runtime requirements](presets/README.md) for the verified model/effort matrix and regeneration instructions.
+See [models, efforts and Brains](presets/README.md) for the adapter model catalog, the three purpose Brains setup creates, and runtime requirements.
 
 ### YAML room layouts
 

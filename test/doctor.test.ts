@@ -219,6 +219,10 @@ describe('doctor', () => {
 
   it('warns when packaged Codex Brain model/effort pairs are absent from the local runtime catalog', async () => {
     const configPath = join(dir, 'catalog.yaml'); bootstrapPresets(configPath);
+    // Configured Codex Brains are checked, whatever they are called.
+    for (const [model, effort] of [['gpt-5.6-terra', 'low'], ['gpt-5.6-sol', 'medium'], ['gpt-5.6-sol', 'low']])
+      writeFileSync(join(dir, 'catalog', 'brains', `codex-${model.replace(/\./g, '-')}-${effort}.yaml`),
+        `harness: codex\nsession: acp\nmodel: ${model}\neffort: ${effort}\n`, { mode: 0o600 });
     const cache = join(dir, 'models.json');
     writeFileSync(cache, JSON.stringify({ models: [{ slug: 'gpt-5.6-sol', display_name: 'Sol',
       visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }] }));

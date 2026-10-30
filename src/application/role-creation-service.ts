@@ -313,6 +313,8 @@ export class RoleCreationService {
 
   async create(
     input: CreateRoleSessionRequest, previewHash: string, idempotencyKey: string, browserSession: string,
+    /** Checks a new request only; a retry of an accepted request returns its action. */
+    checkNewRequest?: (input: CreateRoleSessionRequest) => Promise<void>,
   ): Promise<CreationAction> {
     if (!/^[A-Za-z0-9_-]{22,256}$/.test(idempotencyKey))
       throw new FleetError('invalid_request', 'Idempotency-Key must contain at least 128 bits');
@@ -324,6 +326,7 @@ export class RoleCreationService {
         throw new FleetError('idempotency_conflict', 'Idempotency-Key was already used for another request');
       return this.actions.get(existing.actionId)!;
     }
+    await checkNewRequest?.(input);
     const preview = await this.preview(input);
     if (preview.previewHash !== previewHash)
       throw new FleetError('stale_state', 'preview is stale; review the effective plan again');

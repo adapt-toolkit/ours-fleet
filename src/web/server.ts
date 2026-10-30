@@ -9,9 +9,8 @@ import type { ConversationRoleObservation, ConversationRoleState } from '../appl
 import { conversationHasAttachment } from '../application/conversation-history.js';
 import { readDeliveredFile } from '../file-delivery/store.js';
 import { WorkspaceDeviceAuthError } from './workspace-devices.js';
-import { readFileSync } from 'node:fs';
-import { packagedPresetRoot } from '../preset-bootstrap.js';
-import { validateCatalog, type CatalogModel, type InitAnswers, type Subscription, type WorkKind } from '../init-wizard.js';
+import { PURPOSE_BRAINS, PurposeBrainConflictError, type InitAnswers, type PurposeChoice, type Subscription, type WorkKind } from '../init-wizard.js';
+import { harnessCapabilities, validateBrainChoice } from '../application/harness-capabilities.js';
 import { getAdapter } from '../harness/registry.js';
 import { storeAgentAttachment, attachmentPrompt, MAX_ATTACHMENT_BODY, readAgentAttachment, prepareAttachmentPresentation, presentAttachmentEvent } from './agent-attachments.js';
 import { readChatIdle } from '../temp-idle.js';
@@ -287,12 +286,12 @@ export async function buildWebServer(
     const harnesses=await Promise.all((['codex','claude-code'] as const).map(async harness=>{
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));
-    const catalog=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8')));
-    // Codex models are offered only when the runtime itself listed them for the active account.
-    // When it could not be asked, none is offered and the reason is reported.
-    const codexModels=services.codexModels ? await services.codexModels() : undefined;
-    const offered=(model:CatalogModel)=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model));
-    const payload = {harnesses,catalog:catalog.models.filter(offered),...(codexModels?{codexModels:codexModels.state==='known'?{state:'known'}:codexModels}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    // The catalog is each adapter's maintained models, narrowed to what the active Codex account offers.
+    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,checkReadiness:false});
+    const codex=capabilities.harnesses.find(item=>item.harness==='codex');
+    const catalog=capabilities.harnesses.flatMap(item=>item.models.filter(model=>model.available && model.efforts!==null)
+      .map(model=>({harness:item.harness,session:'acp',model:model.id,label:model.label,efforts:model.efforts})));
+    const payload = {harnesses,catalog,...(codex?.discovery?{codexModels:codex.discovery}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
     if(revision===services.configuration?.read().revision) { onboardingObserved={owner:browser.id,revision,payload}; events.publish('onboarding.changed',{}); }
     return payload;
   });
@@ -308,15 +307,24 @@ export async function buildWebServer(
   app.post('/api/v1/onboarding/setup',async request=>{
     auth.authenticate(request,true);
     if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
-    const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown}>}|undefined)?.models;
-    const codexModels=services.codexModels ? await services.codexModels() : undefined;
-    const supported=validateCatalog(JSON.parse(readFileSync(join(packagedPresetRoot(),'brain-catalog.json'),'utf8'))).models
-      .filter(model=>model.harness!=='codex' || !codexModels || (codexModels.state==='known' && codexModels.models.includes(model.model)));
-    const models={} as Record<WorkKind,CatalogModel>;
+    const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown;effort?:unknown}>}|undefined)?.models;
+    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,checkReadiness:false});
+    const models={} as Record<WorkKind,PurposeChoice>;
     for(const work of ONBOARDING_WORK){
-      const matches=supported.filter(model=>model.harness===requested?.[work]?.harness && model.model===requested?.[work]?.model);
-      if(matches.length!==1)throw new FleetError('invalid_request',`choose a supported model for ${work}`);
-      models[work]=matches[0];
+      const choice=requested?.[work];
+      const label=PURPOSE_BRAINS[work].label;
+      if(!choice || typeof choice!=='object' || !('effort' in choice))
+        throw new FleetError('invalid_request',`choose a harness, model and effort for the ${label} Brain`);
+      const {harness,model,effort}=choice as {harness?:unknown;model?:unknown;effort?:unknown};
+      if(typeof harness!=='string' || typeof model!=='string' || (effort!==null && typeof effort!=='string'))
+        throw new FleetError('invalid_request',`choose a harness, model and effort for the ${label} Brain`);
+      const check=validateBrainChoice(capabilities,{harness,session:'acp',model,effort});
+      // Setup offers the adapters' maintained models only, each with an explicit effort when it has one.
+      if(!check.ok)throw new FleetError('invalid_request',`${label} Brain: ${check.message}`);
+      if(!check.model || check.model.source!=='adapter')throw new FleetError('invalid_request',`${label} Brain: choose a supported model`);
+      if(check.model.efforts?.length && effort===null)
+        throw new FleetError('invalid_request',`${label} Brain: choose an effort for ${check.model.label} (${check.model.efforts.join(', ')})`);
+      models[work]={harness:harness as PurposeChoice['harness'],session:'acp',model,effort:effort as string|null};
     }
     const chosen=Object.values(models);
     const subscriptions=[...new Set(chosen.map(model=>model.harness==='codex'?'codex':'claude'))] as Subscription[];
@@ -325,15 +333,16 @@ export async function buildWebServer(
     // One setup at a time: the first-time check and the publication it guards must not interleave.
     const run=onboardingSetupQueue.then(async()=>{
       if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
-      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,reasoning:'balanced'});}
-      catch(error){throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);}
-      // Setup preserves files it finds, so confirm the published models are the ones this request chose.
-      // The prepared agents reference packaged Brain presets, so resolve what each of them now points at:
-      // a preserved file of a packaged name may hold another model, session or reasoning than its name says.
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models});}
+      catch(error){
+        if(error instanceof PurposeBrainConflictError)throw new FleetError('conflict',error.message);
+        throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);
+      }
+      // Setup preserves files it finds, so confirm each prepared agent now resolves to exactly the chosen triple.
       const published=configuration.read(true).model,brains=published.brains ?? {};
       const brainOf=(holder:Record<string,unknown>|undefined)=>brains[String((holder?.brain as {ref?:unknown}|undefined)?.ref ?? '')];
       const assigned:Record<WorkKind,Record<string,unknown>|undefined>={coordination:brainOf(published.agents.FleetCoordinator),development:brainOf(published.agent_templates?.Developer),review:brainOf(published.agent_templates?.Critic)};
-      for(const work of ONBOARDING_WORK)if(assigned[work]?.harness!==models[work].harness || assigned[work]?.model!==models[work].model || assigned[work]?.session!==models[work].session || assigned[work]?.effort!=='medium')
+      for(const work of ONBOARDING_WORK)if(assigned[work]?.harness!==models[work].harness || assigned[work]?.model!==models[work].model || assigned[work]?.session!==models[work].session || (assigned[work]?.effort ?? null)!==models[work].effort)
         throw new FleetError('conflict','Fleet was set up with different models; review its configuration');
       return {configured:true};
     });
@@ -341,13 +350,31 @@ export async function buildWebServer(
     return run;
   });
 
+  app.get('/api/v1/harness-capabilities', async request => {
+    auth.authenticate(request);
+    return harnessCapabilities({codexModels:services.codexModels});
+  });
+
   app.get('/api/v1/creation-capabilities', async request => {
     auth.authenticate(request);
     return services.creation.capabilities();
   });
 
+  // A new agent's own harness/model/effort must be one its adapter supports; saved Brains are used as they are.
+  const checkBrainChoice=async(brain:object|undefined)=>{
+    if(!brain || typeof brain!=='object')return;
+    const value=brain as Record<string,unknown>;
+    const check=validateBrainChoice(await harnessCapabilities({codexModels:services.codexModels,checkReadiness:false}),{
+      harness:String(value.harness),session:value.session as string|undefined,
+      model:value.model as string|null|undefined,effort:value.effort as string|undefined});
+    if(!check.ok)throw new FleetError('invalid_request',`Brain: ${check.message}`);
+  };
+  const checkInlineBrain=(creation:CreateRoleSessionRequest|undefined)=>
+    checkBrainChoice((creation as {brain?:{inline?:object}}|undefined)?.brain?.inline);
+
   app.post('/api/v1/roles/preview', async request => {
     auth.authenticate(request, true);
+    await checkInlineBrain(request.body as CreateRoleSessionRequest);
     return services.creation.preview(request.body as CreateRoleSessionRequest);
   });
 
@@ -358,7 +385,7 @@ export async function buildWebServer(
     if (!body?.request || !body.previewHash)
       throw new FleetError('invalid_request', 'request and previewHash are required');
     const action = await services.creation.create(
-      body.request, body.previewHash, idempotencyKey, session.id);
+      body.request, body.previewHash, idempotencyKey, session.id, checkInlineBrain);
     events.publish('creation.changed', action, action.roleId);
     reply.header('Location', `/api/v1/creation-actions/${encodeURIComponent(action.actionId)}`);
     reply.code(202);
@@ -719,7 +746,11 @@ export async function buildWebServer(
     auth.authenticate(request, true);
     const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
     try {
-      const result=await taskApi(()=>requireTaskRooms().addMember(taskRef(request),body));
+      // A new manual harness/model/effort must be one the adapter supports; nothing is substituted.
+      // A retry of an accepted request returns its receipt even if the account's models changed since.
+      const result=await taskApi(()=>requireTaskRooms().addMember(taskRef(request),body,async member=>{
+        if(typeof member.brain==='object')await checkBrainChoice(member.brain.inline);
+      }));
       reply.code(result.state==='running'?202:200);return result;
     } catch(error) {
       if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});

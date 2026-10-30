@@ -18,6 +18,7 @@ import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
 import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from './codex-reasoning.js';
+import { packagedModelCatalog } from '../application/model-catalog.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -381,6 +382,12 @@ export function makeCodexAdapter(
       addDirs: role => (role.harness_options as CodexOptions | undefined)?.add_dirs,
     }, transport, nativeTransport),
     supportsResume: true,
+    modelCapabilities: () => ({
+      sessions: ['acp', 'codex-app-server'],
+      models: packagedModelCatalog('codex').map(model => ({ id: model.model, label: model.label, efforts: model.efforts })),
+      modelRequired: false,
+      customModels: true,
+    }),
 
     async checkPrereqs() {
       const [r, hasOursCodex, plugins] = await Promise.all([

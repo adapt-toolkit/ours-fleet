@@ -1,5 +1,0 @@
-# Generated from presets/brain-catalog.json revision 4.
-harness: codex
-session: acp
-model: gpt-5.5
-effort: low

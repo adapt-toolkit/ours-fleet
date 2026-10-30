@@ -178,7 +178,7 @@ describe('secure local web host', () => {
     const payload={requestId:'request-1',slot:'Reviewer',role:'critic',brain:'codex',agentTemplate:'assistant'};
     try {
       expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,payload})).statusCode).toBe(202);
-      expect(taskRooms.addMember).toHaveBeenCalledWith('selected',payload);
+      expect(taskRooms.addMember).toHaveBeenCalledWith('selected',payload,expect.any(Function));
       expect((await server.app.inject({method:'GET',url:'/api/v1/tasks/selected/member-additions/request-1',headers})).json()).toEqual({state:'succeeded'});
       expect(taskRooms.memberAddition).toHaveBeenCalledWith('selected','request-1');
       expect((await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers:{host:boundary.host,cookie},payload})).statusCode).toBe(403);
@@ -187,6 +187,24 @@ describe('secure local web host', () => {
       taskRooms.addMember.mockRejectedValueOnce(new MemberAdditionRejected('Slot exists'));
       const rejected=await server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,payload});
       expect(rejected.statusCode).toBe(409);expect(rejected.json()).toMatchObject({accepted:false,error:{code:'member_not_accepted'}});
+    } finally {await server.close();}
+  });
+  it('forwards a supported manual harness/model/effort for one member and refuses an unsupported one', async () => {
+    await import('../../src/harness/codex.js');await import('../../src/harness/claude-code.js');
+    // The service runs the check only for a new request; this stand-in treats every request as new.
+    const taskRooms={addMember:vi.fn(async(_id:string,body:unknown,check:(body:unknown)=>Promise<void>)=>{await check(body);return {state:'running',requestId:'request-2'};}),memberAddition:vi.fn()};
+    const {server,cookie,csrf}=await authenticated({taskRooms,codexModels:async()=>({state:'known',models:['gpt-6-luna']})});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    const add=(inline:Record<string,unknown>)=>server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,
+      payload:{requestId:'request-2',slot:'Helper',role:'Developer',brain:{inline},agentTemplate:'Developer'}});
+    try {
+      expect((await add({harness:'codex',model:'gpt-6-luna',effort:'xhigh'})).statusCode).toBe(202);
+      expect(taskRooms.addMember).toHaveBeenCalledWith('selected',expect.objectContaining({brain:{inline:{harness:'codex',model:'gpt-6-luna',effort:'xhigh'}}}),expect.any(Function));
+      const unsupported=await add({harness:'codex',model:'gpt-6-luna',effort:'ultra'});
+      expect(unsupported.statusCode).toBe(400);expect(unsupported.json().error.message).toMatch(/does not support effort 'ultra'/);
+      expect((await add({harness:'codex',model:'gpt-6.1-sol',effort:'high'})).json().error.message).toMatch(/does not offer this model/);
+      expect((await add({harness:'claude-code',model:'claude-haiku-4-5-20251001',effort:'low'})).statusCode).toBe(400);
+      expect(taskRooms.addMember).toHaveBeenCalledTimes(4);
     } finally {await server.close();}
   });
   it('routes authenticated correspondence GETs to the selected supervisor without MCP',async()=>{
