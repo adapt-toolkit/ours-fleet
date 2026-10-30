@@ -13,7 +13,10 @@ import { createCoworkAdapter } from './cowork-adapter.js';
 import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-binding-client.js';
 import { readClientProfile } from '../client-profile.js';
 import { tempSupervisorLiveness } from '../temp-lifecycle.js';
-import { layoutOwnedMemberName, retireOwnedLayoutMember } from './layout-member-retirement.js';
+import {
+  allocateLayoutMemberName, layoutOwnedMemberName, legacyLayoutMemberName, retireOwnedLayoutMember,
+} from './layout-member-retirement.js';
+import type { LabelCandidate } from './member-naming.js';
 import { EMPTY_TASK_LAYOUT, emptyTaskLayout } from './empty-layout.js';
 
 export class NativeLayoutSupervisor implements LayoutSupervisor {
@@ -29,6 +32,11 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     const response = await controlRequest(agentDir(agent, temporary), { command: 'layout_control', layout: request }, 60_000);
     if (!response.ok) throw Error(response.error ?? 'layout control rejected'); return response.result;
   }
+  /** Named Role of an Agent Template, captured at config load before roles are flattened. */
+  private roleRefOf(template: string): string | undefined {
+    try { return loadConfig(this.configPath).agentTemplateRoleRefs?.[template]; }
+    catch { return undefined; }
+  }
   async inspect(agent: string, temporary: boolean): Promise<LayoutInstance> {
     return await this.request(agent, temporary, { action: 'inspect' }) as LayoutInstance;
   }
@@ -38,10 +46,15 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     return this.request(i.agent, i.temporary, { ...request, instance: i });
   }
   async verify(i: LayoutInstance): Promise<void> { await this.call(i, { action: 'verify' }); }
-  async spawn(key: string, template: string, snapshot?: AgentTemplateDefinition): Promise<LayoutInstance> {
+  async spawn(key: string, template: string, snapshot?: AgentTemplateDefinition,
+    labels: LabelCandidate[] = []): Promise<LayoutInstance> {
     const definition = snapshot ?? this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
-    const name = layoutOwnedMemberName(this.runId, key);
+    // The first allocation is durable on the task; recovery reuses it and never re-reads config.
+    const named = layoutOwnedMemberName(this.runId, key);
+    const name = named !== legacyLayoutMemberName(this.runId, key) ? named
+      : allocateLayoutMemberName(this.runId, key, [
+        { label: this.roleRefOf(template), source: 'template_ref' }, ...labels]);
     const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
     const task = taskId ? (await import('./task-state.js')).getTask(taskId) : undefined;
     if (task && task.layout?.run_id !== this.runId) throw Error('TASK_LAYOUT_OWNER_MISMATCH');

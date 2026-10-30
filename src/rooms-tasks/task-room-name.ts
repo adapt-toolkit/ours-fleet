@@ -48,12 +48,22 @@ function graphemeBound(value: string, maxCodePoints: number): string {
   return result.trimEnd();
 }
 
-/** Canonical Cowork room name for a Fleet task; never mutates the task title. */
-export function deriveTaskRoomName(title: string, taskId: string): string {
+const MISSION_KEY_PATTERN = /^[A-Z][A-Z0-9]{0,5}-[1-9][0-9]{0,8}$/;
+
+/**
+ * Canonical Cowork room name for a Fleet task; never mutates the task title.
+ * With a mission key the key leads (`MSN-1 Title [id]`), so it survives the
+ * room-identity cut; the canonical suffix keeps the name unique on a daemon
+ * shared by several Fleets.
+ */
+export function deriveTaskRoomName(title: string, taskId: string, missionKey?: string): string {
   if (!TASK_ID_PATTERN.test(taskId)) throw new Error(`invalid canonical task ID: ${taskId}`);
+  if (missionKey !== undefined && !MISSION_KEY_PATTERN.test(missionKey))
+    throw new Error(`invalid mission key: ${missionKey}`);
+  const lead = missionKey ? `${missionKey} ` : '';
   const suffix = ` [${taskId}]`;
-  const titleBudget = TASK_ROOM_NAME_MAX_CODE_POINTS - Array.from(suffix).length;
+  const titleBudget = TASK_ROOM_NAME_MAX_CODE_POINTS - Array.from(lead + suffix).length;
   const readable = sanitizeTitle(title);
   const bounded = graphemeBound(readable || FALLBACK_TITLE, titleBudget) || FALLBACK_TITLE;
-  return `${bounded}${suffix}`;
+  return `${lead}${bounded}${suffix}`;
 }

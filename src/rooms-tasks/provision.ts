@@ -37,7 +37,9 @@ import { SessionControlError } from '../session/types.js';
 import { closeManagedRoom, roomCloseLockPath, CLOSE_LOCK_STALE_MS } from './close.js';
 import { withFileLock } from '../atomic-file.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
-import { TaskStateError, taskDeletionState } from './task-state.js';
+import { TaskStateError, allocateTaskMemberNames, taskDeletionState } from './task-state.js';
+import { MemberNameError, type LabelCandidate } from './member-naming.js';
+import { assertMemberNotPermanent } from './member-ownership.js';
 import { buildRoomMemberTask, sha256Text } from './member-startup.js';
 import { agentDir } from '../paths.js';
 import { readProvenance } from '../creation.js';
@@ -63,6 +65,8 @@ export interface ProvisionMembersInput {
   startupWait?: Partial<StartupWaitPolicy>;
   /** Append only the supplied new slots to an already active room. */
   append?: boolean;
+  /** Durable name allocation key for an appended member (`add:<requestId>`). */
+  allocationKey?: string;
 }
 
 export interface StartupWaitPolicy {
@@ -81,6 +85,8 @@ interface ExpandedMember {
   launchDefinitionId: string;
   agentTemplateHash?: string;
   loopSource: 'agent-template' | 'cli' | 'omitted';
+  ordinal: number;
+  candidates: LabelCandidate[];
 }
 
 interface MemberSettings {
@@ -184,10 +190,38 @@ function expandMembers(
         launchDefinitionId: slot.launch_definition_id ?? slot.agent_template,
         agentTemplateHash: slot.agent_template_hash,
         loopSource: slot.loop_source ?? 'omitted',
+        ordinal: i,
+        candidates: [
+          { label: slot.role_preset?.id, source: 'role_override' },
+          { label: slot.role_label, source: 'template_ref' },
+          { label: slot.role, source: 'room_role' },
+          { label: slot.slot, source: 'slot' },
+        ],
       });
     }
   }
   return result;
+}
+
+/** A new name must not collide with any local agent state or a permanent identity. */
+export function assertMemberNameAvailable(name: string): void {
+  const taken = () => new MemberNameError('agent_name_taken',
+    `agent name ${name} is already used on this host or ours daemon, possibly by another Fleet; give this Fleet's lists distinct prefixes`);
+  if (existsSync(agentDir(name)) || existsSync(agentDir(name, true))) throw taken();
+  try { assertMemberNotPermanent(name); } catch { throw taken(); }
+}
+
+/**
+ * Members of a keyed task take their durable role-scoped names; unkeyed tasks
+ * and non-task rooms keep the legacy `prefix-slot-i` derivation.
+ */
+function nameMembers(input: Pick<ProvisionMembersInput, 'taskId' | 'append' | 'allocationKey'>, members: ExpandedMember[]): ExpandedMember[] {
+  if (!input.taskId) return members;
+  const names = allocateTaskMemberNames(input.taskId, members.map(member => ({
+    allocationKey: input.append && input.allocationKey ? input.allocationKey : `initial:${member.slot}:${member.ordinal}`,
+    candidates: member.candidates,
+  })), assertMemberNameAvailable);
+  return names ? members.map((member, index) => ({ ...member, name: names[index] })) : members;
 }
 
 function settingsFor(
@@ -561,7 +595,7 @@ export async function provisionMembers(input: ProvisionMembersInput): Promise<Ro
       if (!task || !['active', 'review'].includes(task.state) || room?.state !== 'active'
           || room.task_id !== task.task_id || room.room_identity_cid !== task.room_identity_cid)
         throw new Error('Adding an agent requires the exact active task room');
-      const names = expandMembers(input.template, shortId(task.task_id)).map(m => m.name);
+      const names = nameMembers(input, expandMembers(input.template, shortId(task.task_id))).map(m => m.name);
       if (room.member_seats.some(seat => names.includes(seat.role_name)))
         throw new Error('Member slot is already recorded; inspect its existing launch');
       if (room.member_seats.some(seat => seat.seat_state !== 'active'))
@@ -582,7 +616,7 @@ async function provisionMembersUnlocked(input: ProvisionMembersInput): Promise<R
   if (taskId && taskDeletionState(taskId) !== 'none')
     throw new Error(`task ${taskId} is pending deletion; refusing to provision members`);
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
-  const members = expandMembers(template, prefix);
+  const members = nameMembers(input, expandMembers(template, prefix));
   // Resolve every Agent before persisting launch intent or touching Cowork membership.
   const sealed = template.launch_snapshot_hash
     ? readLaunchSnapshot(template.launch_snapshot_hash) : undefined;

@@ -47,7 +47,8 @@ import type { TaskRoomApplicationService } from '../application/task-room-servic
 import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
-import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, TaskStateError } from '../rooms-tasks/task-state.js';
+import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, resolveTaskRef, TaskStateError } from '../rooms-tasks/task-state.js';
+import { MissionKeyError } from '../rooms-tasks/mission-keys.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import {
   appendTaskProgress, getTaskReview, taskProgressSnapshot, publicProgressEntry, publicReview, readTaskReviewArtifact,
@@ -382,10 +383,24 @@ export async function buildWebServer(
             ? 'conflict' : 'invalid_request';
         throw new FleetError(code, error.message);
       }
+      if (error instanceof MissionKeyError)
+        throw new FleetError(error.code === 'invalid_prefix' ? 'invalid_request' : 'conflict', error.message,
+          { details: { reason: error.code } });
       if (error instanceof TaskStateError && 'accepted' in error && error.accepted === false) return Promise.reject(Object.assign(new FleetError('invalid_request',error.message),{memberNotAccepted:true}));
       if (error instanceof TaskStateError) {
         throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'conflict', error.message);
       }
+      throw error;
+    }
+  };
+  /** Canonical task ID for a `:id` param holding an ID or a mission key; call only after authentication. */
+  const taskRef = (request: { params: unknown }, options: { allowDeleted?: boolean } = {}): string => {
+    const ref = String((request.params as { id?: unknown }).id ?? '');
+    try { return resolveTaskRef(ref, options); }
+    catch (error) {
+      if (error instanceof MissionKeyError) throw new FleetError('resource_not_found', error.message);
+      if (error instanceof TaskStateError)
+        throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'invalid_request', error.message);
       throw error;
     }
   };
@@ -403,7 +418,7 @@ export async function buildWebServer(
   });
   /** Browser task payloads carry Progress/To review counts; bodies have their own routes. */
   const wireTask = <T extends TaskRecord>(task: T) => {
-    const { progress: _progress, review: _review, ...rest } = task;
+    const { progress: _progress, review: _review, member_naming: _naming, ...rest } = task;
     return { ...rest, ...taskContributionSummary(task) };
   };
   const wireTaskResult = <T>(result: T): T => {
@@ -539,14 +554,28 @@ export async function buildWebServer(
   });
   app.post('/api/v1/task-lists', async (request, reply) => {
     auth.authenticate(request, true);
-    const name = String((request.body as { name?: unknown })?.name ?? '');
-    const list = await taskApi(() => requireTaskRooms().createTaskList({ actor: { kind: 'local_control', surface: 'web' }, name }));
+    const body = request.body as { name?: unknown; prefix?: unknown };
+    const name = String(body?.name ?? '');
+    if (body?.prefix !== undefined && typeof body.prefix !== 'string')
+      throw new FleetError('invalid_request', 'prefix must be a string');
+    const list = await taskApi(() => requireTaskRooms().createTaskList({ actor: { kind: 'local_control', surface: 'web' }, name,
+      prefix: body?.prefix as string | undefined }));
     reply.code(201); return { list };
+  });
+  app.get('/api/v1/task-lists/prefix-suggestion', async request => {
+    auth.authenticate(request);
+    const name = String((request.query as { name?: unknown }).name ?? '');
+    return { prefix: await taskApi(() => requireTaskRooms().suggestTaskListPrefix(name)) };
   });
   app.patch('/api/v1/task-lists/:name', async request => {
     auth.authenticate(request, true);
     const name = (request.params as { name: string }).name;
-    const newName = String((request.body as { name?: unknown })?.name ?? '');
+    const body = request.body as { name?: unknown; prefix?: unknown };
+    if (body?.prefix !== undefined && typeof body.prefix !== 'string')
+      throw new FleetError('invalid_request', 'prefix must be a string');
+    if (body?.name === undefined && typeof body?.prefix === 'string')
+      return { list: await taskApi(() => requireTaskRooms().setTaskListPrefix({ actor: { kind: 'local_control', surface: 'web' }, name, prefix: body.prefix as string })) };
+    const newName = String(body?.name ?? '');
     return { list: await taskApi(() => requireTaskRooms().renameTaskList({ actor: { kind: 'local_control', surface: 'web' }, name, newName })) };
   });
   app.delete('/api/v1/task-lists/:name', async request => {
@@ -561,11 +590,13 @@ export async function buildWebServer(
   });
   app.delete('/api/v1/tasks/:id', async (request, reply) => {
     auth.authenticate(request, true);
-    const taskId = (request.params as { id: string }).id;
+    const submitted = (request.params as { id: string }).id;
     const confirm = (request.query as { confirm?: string }).confirm;
-    // Exact-ID-twice confirmation is validated before existence or idempotency.
-    if (confirm !== taskId)
-      throw new FleetError('invalid_request', 'confirm must exactly repeat the task id');
+    // Exact raw ref-twice confirmation is validated before existence or idempotency.
+    if (confirm !== submitted)
+      throw new FleetError('invalid_request', 'confirm must exactly repeat the task id or key');
+    // A deleted key still maps to its canonical ID, so a repeated DELETE stays idempotent.
+    const taskId = taskRef(request, { allowDeleted: true });
     const accepted = await taskApi(() => requireTaskRooms().requestTaskDeletion({
       actor: { kind: 'local_control', surface: 'web' }, taskId,
     }));
@@ -579,7 +610,7 @@ export async function buildWebServer(
     return {
       task_id: taskId, accepted: true, deletion: 'pending',
       ...(outcome.error ? { error: outcome.error } : {}),
-      recovery: `Repeat DELETE /api/v1/tasks/${taskId}?confirm=${taskId}.`,
+      recovery: `Repeat DELETE /api/v1/tasks/${submitted}?confirm=${submitted}.`,
     };
   });
   app.post('/api/v1/tasks', async (request, reply) => {
@@ -607,7 +638,7 @@ export async function buildWebServer(
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);
-    const taskId = (request.params as { id: string }).id;
+    const taskId = taskRef(request);
     const list = String((request.body as { list?: unknown })?.list ?? '');
     return { task: wireTask(await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list }))) };
   });
@@ -618,18 +649,18 @@ export async function buildWebServer(
     if (typeof body?.brief !== 'string' || typeof body.expectedBrief !== 'string' || body.brief.length > 100_000)
       throw new FleetError('invalid_request', 'brief and expectedBrief must be strings; brief maximum is 100000 characters');
     return { task: wireTask(await taskApi(() => requireTaskRooms().editTaskDescription({
-      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+      actor: { kind: 'local_control', surface: 'web' }, taskId: taskRef(request),
       brief: body.brief as string, expectedBrief: body.expectedBrief as string,
     }))) };
   });
 
   app.get('/api/v1/tasks/:id', async request => {
     auth.authenticate(request);
-    return wireTaskResult(await taskApi(() => requireTaskRooms().getTask((request.params as { id: string }).id)));
+    return wireTaskResult(await taskApi(() => requireTaskRooms().getTask(taskRef(request))));
   });
   app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async request => {
     auth.authenticate(request);
-    return { progress: await reviewApi(() => taskProgressSnapshot(request.params.id)) };
+    return { progress: await reviewApi(() => taskProgressSnapshot(taskRef(request))) };
   });
   app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress', async (request, reply) => {
     auth.authenticate(request, true);
@@ -638,7 +669,7 @@ export async function buildWebServer(
     const requestKey = typeof body?.requestKey === 'string' ? body.requestKey : typeof header === 'string' ? header : undefined;
     if (typeof body?.text !== 'string' || (body.requestKey !== undefined && typeof body.requestKey !== 'string'))
       throw new FleetError('invalid_request', 'text must be a string; requestKey, when given, a string');
-    const result = await reviewApi(() => appendTaskProgress(request.params.id, {
+    const result = await reviewApi(() => appendTaskProgress(taskRef(request), {
       text: body.text as string, requestKey, author: { kind: 'local_control', surface: 'web' },
     }));
     if (!result.replayed) reply.code(201);
@@ -650,18 +681,18 @@ export async function buildWebServer(
     const ids = (request.body as { ids?: unknown })?.ids;
     if (!Array.isArray(ids) || ids.length > 200 || ids.some(id => typeof id !== 'string' || id.length > 64))
       throw new FleetError('invalid_request', 'ids must be at most 200 progress entry IDs');
-    return { unread: await reviewApi(() => acknowledgeTaskProgress(request.params.id, ids as string[])) };
+    return { unread: await reviewApi(() => acknowledgeTaskProgress(taskRef(request), ids as string[])) };
   });
   /** Acknowledge the To review revision the browser fetched and rendered. */
   app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/review/read', async request => {
     auth.authenticate(request, true);
     const revision = (request.body as { revision?: unknown })?.revision;
     if (!Number.isSafeInteger(revision) || (revision as number) < 0) throw new FleetError('invalid_request', 'revision must be a non-negative integer');
-    return { unread: await reviewApi(() => acknowledgeTaskReview(request.params.id, revision as number)) };
+    return { unread: await reviewApi(() => acknowledgeTaskReview(taskRef(request), revision as number)) };
   });
   app.get<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
     auth.authenticate(request);
-    const review = await reviewApi(() => getTaskReview(request.params.id));
+    const review = await reviewApi(() => getTaskReview(taskRef(request)));
     return { review: review ? publicReview(review) : null };
   });
   app.put<{ Params: { id: string } }>('/api/v1/tasks/:id/review', async request => {
@@ -669,7 +700,7 @@ export async function buildWebServer(
     const body = request.body as { markdown?: unknown; expectedMarkdown?: unknown };
     if (typeof body?.markdown !== 'string' || typeof body.expectedMarkdown !== 'string')
       throw new FleetError('invalid_request', 'markdown and expectedMarkdown must be strings');
-    const review = await reviewApi(() => setTaskReviewMarkdown(request.params.id, {
+    const review = await reviewApi(() => setTaskReviewMarkdown(taskRef(request), {
       markdown: body.markdown as string, expectedMarkdown: body.expectedMarkdown as string,
       author: { kind: 'local_control', surface: 'web' },
     }));
@@ -677,7 +708,7 @@ export async function buildWebServer(
   });
   app.get<{ Params: { id: string; artifactId: string } }>('/api/v1/tasks/:id/review/artifacts/:artifactId', async (request, reply) => {
     auth.authenticate(request);
-    const { artifact, bytes } = await reviewApi(() => readTaskReviewArtifact(request.params.id, request.params.artifactId));
+    const { artifact, bytes } = await reviewApi(() => readTaskReviewArtifact(taskRef(request), request.params.artifactId));
     reply.header('Cache-Control', 'private, no-store');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
@@ -688,7 +719,7 @@ export async function buildWebServer(
     auth.authenticate(request, true);
     const body=request.body as import('../rooms-tasks/add-member.js').AddMemberRequest;
     try {
-      const result=await taskApi(()=>requireTaskRooms().addMember((request.params as {id:string}).id,body));
+      const result=await taskApi(()=>requireTaskRooms().addMember(taskRef(request),body));
       reply.code(result.state==='running'?202:200);return result;
     } catch(error) {
       if(error instanceof Error && 'memberNotAccepted' in error) return reply.code(409).send({error:{code:'member_not_accepted',message:error.message},accepted:false});
@@ -697,7 +728,7 @@ export async function buildWebServer(
   });
   app.get('/api/v1/tasks/:id/member-additions/:requestId', async request => {
     auth.authenticate(request);
-    const {id,requestId}=request.params as {id:string;requestId:string};
+    const {requestId}=request.params as {id:string;requestId:string};const id=taskRef(request);
     return taskApi(()=>requireTaskRooms().memberAddition(id,requestId));
   });
   app.patch('/api/v1/tasks/:id/layout', async request => {
@@ -707,18 +738,19 @@ export async function buildWebServer(
     if (!name(body?.layout) || !(body.expectedLayout === null || name(body.expectedLayout)))
       throw new FleetError('invalid_request', 'layout must be a layout name; expectedLayout a layout name or null');
     const task = await taskApi(() => requireTaskRooms().setTaskLayout({ actor: { kind: 'local_control', surface: 'web' },
-      taskId: (request.params as { id: string }).id, layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
+      taskId: taskRef(request), layout: body.layout as string, expectedLayout: body.expectedLayout as string | null }));
     await audit.record({ requestId: request.id, browser: session.id, action: 'task.layout.set', result: 'succeeded' });
     return { task: wireTask(requireTaskRooms().withLayoutRooms(task)) };
   });
   app.get('/api/v1/tasks/:id/layout', async request => {
     auth.authenticate(request);
-    return { layout: await taskApi(async () => requireTaskRooms().taskLayout((request.params as { id: string }).id)) };
+    return { layout: await taskApi(async () => requireTaskRooms().taskLayout(taskRef(request))) };
   });
   for (const operation of ['open', 'close'] as const) {
     app.post(`/api/v1/tasks/:id/layout/rooms/:room/${operation}`, async (request, reply) => {
       const session = auth.authenticate(request, true);
-      const { id, room } = request.params as { id: string; room: string };
+      const { room } = request.params as { id: string; room: string };
+      const id = taskRef(request);
       const accepted = await taskApi(() => requireTaskRooms().launchTaskLayoutOperation({
         actor: { kind: 'local_control', surface: 'web' }, taskId: id, room,
         operation: operation === 'open' ? 'open' : 'close-room',
@@ -730,7 +762,7 @@ export async function buildWebServer(
   app.post('/api/v1/tasks/:id/layout/cleanup', async (request, reply) => {
     auth.authenticate(request, true);
     const accepted = await taskApi(() => requireTaskRooms().retryTaskLayoutCleanup({
-      actor: { kind: 'local_control', surface: 'web' }, taskId: (request.params as { id: string }).id,
+      actor: { kind: 'local_control', surface: 'web' }, taskId: taskRef(request),
     }));
     reply.code(202); return { operation: accepted };
   });
@@ -771,7 +803,7 @@ export async function buildWebServer(
   for (const action of ['start', 'block', 'unblock', 'review', 'finish', 'cancel'] as const) {
     app.post(`/api/v1/tasks/:id/${action}`, async (request, reply) => {
       auth.authenticate(request, true);
-      const taskId = (request.params as { id: string }).id;
+      const taskId = taskRef(request);
       const body = (request.body ?? {}) as { reason?: string; template?: string };
       const input = { actor: { kind: 'local_control' as const, surface: 'web' as const }, taskId };
       const api = requireTaskRooms();

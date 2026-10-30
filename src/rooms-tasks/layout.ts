@@ -33,7 +33,8 @@ export interface LayoutSupervisor {
   id: string;
   /** Must verify current launch, CID, live session and standalone ownership. */
   verify(instance: LayoutInstance): Promise<void>;
-  spawn(key: string, template: string, definition?: import('../config.js').AgentTemplateDefinition): Promise<LayoutInstance>;
+  spawn(key: string, template: string, definition?: import('../config.js').AgentTemplateDefinition,
+    labels?: import('./member-naming.js').LabelCandidate[]): Promise<LayoutInstance>;
   join(instance: LayoutInstance, invite: string, roomCid: string, membership?: { roomId: string; role: string }): Promise<void>;
   assign(instance: LayoutInstance, assignment: LayoutAssignment): Promise<void>;
   /** Retire the exact instance, or confirm it is already stopped; never stop a replacement. */
@@ -58,6 +59,20 @@ function need(ok: unknown, message: string): asserts ok { if (!ok) throw Error(m
 function instanceKey(definition: LayoutDefinition, participant: string, room: string): string {
   return definition.participants[participant]?.instance_scope === 'room' ? `${room}:${participant}` : participant;
 }
+/**
+ * Naming labels for a participant, after its template's named Role (added by
+ * the supervisor): a runtime-added member's room role, else its room role when
+ * every room it joins agrees (or its own room when room-scoped), else its key.
+ */
+function participantLabels(s: RoomLayoutState, participant: string, room?: string): import('./member-naming.js').LabelCandidate[] {
+  const added = s.additional_members?.[participant];
+  const roles = Object.entries(s.definition.rooms)
+    .filter(([key, spec]) => spec.members.includes(participant) && (!room || room === key))
+    .map(([, spec]) => spec.roles?.[participant] ?? participant);
+  const agreed = added?.role ?? (new Set(roles).size === 1 ? roles[0] : undefined);
+  return [{ label: agreed, source: 'room_role' }, { label: participant, source: 'participant_key' }];
+}
+
 export function validateLayout(def: LayoutDefinition): void {
   need(Object.keys(def.rooms).length, 'rooms required');
   const empty = Object.keys(def.participants).length === 0;
@@ -165,9 +180,10 @@ export class RoomLayout {
         const template = s.definition.participants[member]?.agent_template ?? s.additional_members?.[member]?.template;
         need(template, `no factory for ${member}`);
         if (this.supervisor.taskSupervised) p.task_supervised = true;
+        const labels = participantLabels(s, member, p.room);
         await this.mutation(s, `spawn:${resolvedKey}`, () => s.additional_members?.[member]
-          ? this.supervisor.spawn(resolvedKey, template, s.agent_templates?.[template])
-          : this.supervisor.spawn(resolvedKey, template), i => { p.instance = i; });
+          ? this.supervisor.spawn(resolvedKey, template, s.agent_templates?.[template], labels)
+          : this.supervisor.spawn(resolvedKey, template, undefined, labels), i => { p.instance = i; });
         await this.verify(p.instance!);
       }
     }
