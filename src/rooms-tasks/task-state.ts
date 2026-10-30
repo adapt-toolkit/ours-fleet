@@ -657,6 +657,8 @@ export function migrateMissionKeysLocked(configuredDefault?: string): void {
       }
     }));
   }
+  // Rows a crashed or sync-failed earlier pass already renamed are skipped above: confirm them before completion.
+  if (rows.length) fsyncDirectory(tasksDir());
   withMissionKeysLock(() => {
     const registry = readMissionKeyRegistry()!;
     registry.keys_migrated = true;

@@ -39,13 +39,17 @@ export function layoutOwnedMemberName(runId: string, key: string): string {
   return (taskId && recordedMemberName(taskId, `layout:${runId}:${key}`)) || legacyLayoutMemberName(runId, key);
 }
 
-/** Allocate (or reuse) the participant's durable role-scoped name before it is spawned. */
+/**
+ * Allocate (or reuse) the participant's durable role-scoped name before it is
+ * spawned. Every launch goes through the task allocator, which confirms a
+ * reused allocation is durable before returning it; retirement uses the
+ * side-effect-free layoutOwnedMemberName instead.
+ */
 export function allocateLayoutMemberName(runId: string, key: string, candidates: LabelCandidate[]): string {
   const taskId = taskOfRun(runId);
-  const existing = layoutOwnedMemberName(runId, key);
-  if (!taskId || existing !== legacyLayoutMemberName(runId, key)) return existing;
+  if (!taskId) return legacyLayoutMemberName(runId, key);
   return allocateTaskMemberNames(taskId, [{ allocationKey: `layout:${runId}:${key}`, candidates }],
-    assertMemberNameAvailable)?.[0] ?? existing;
+    assertMemberNameAvailable)?.[0] ?? legacyLayoutMemberName(runId, key);
 }
 function assertOwned(instance: LayoutInstance, runId: string, key: string): asserts instance is LayoutInstance & { agent: string } {
   if (instance.remote || !instance.agent || instance.temporary !== true

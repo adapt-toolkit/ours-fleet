@@ -14,7 +14,7 @@ import { callRemoteLayoutBinding, type LayoutBindingRequest } from './layout-bin
 import { readClientProfile } from '../client-profile.js';
 import { tempSupervisorLiveness } from '../temp-lifecycle.js';
 import {
-  allocateLayoutMemberName, layoutOwnedMemberName, legacyLayoutMemberName, retireOwnedLayoutMember,
+  allocateLayoutMemberName, retireOwnedLayoutMember,
 } from './layout-member-retirement.js';
 import type { LabelCandidate } from './member-naming.js';
 import { EMPTY_TASK_LAYOUT, emptyTaskLayout } from './empty-layout.js';
@@ -45,10 +45,9 @@ export class NativeLayoutSupervisor implements LayoutSupervisor {
     labels: LabelCandidate[] = []): Promise<LayoutInstance> {
     const definition = snapshot ?? this.templates[template];
     if (!definition) throw Error(`agent template not found in run snapshot: ${template}`);
-    // The first allocation is durable on the task; recovery reuses it. Labels come from the run snapshot only.
-    const named = layoutOwnedMemberName(this.runId, key);
-    const name = named !== legacyLayoutMemberName(this.runId, key) ? named
-      : allocateLayoutMemberName(this.runId, key, labels);
+    // The first allocation is durable on the task; recovery reuses it once its durability is confirmed.
+    // Labels come from the run snapshot only.
+    const name = allocateLayoutMemberName(this.runId, key, labels);
     const taskId = this.runId.startsWith('task-') ? this.runId.slice(5) : undefined;
     const task = taskId ? (await import('./task-state.js')).getTask(taskId) : undefined;
     if (task && task.layout?.run_id !== this.runId) throw Error('TASK_LAYOUT_OWNER_MISMATCH');
