@@ -338,22 +338,24 @@ export class FleetResourceViews {
     const views=eligible.map(view=>({protocolVersion:1 as const,producerGeneration:this.producerGeneration,viewId:view.descriptor.viewId,subscriptionEpoch:view.epoch,baselineId:view.baselineId,sequence:view.sequence+1,revision:view.revision,source:view.covered!}));
     return connection.output.send({protocolVersion:1,producerGeneration:this.producerGeneration,views},()=>{for(const view of eligible){view.sequence++;view.qualifiedAt=now;}});
   }
+  /** Whether `path` is, contains or lies within the manifest, its split definitions or another configuration input. */
+  private configurationDependency(path: string): boolean {
+    const manifest = resolve(this.scope.configPath ?? defaultConfigPath());
+    const root = resolve(splitRootFor(manifest)), changed = resolve(path);
+    const within = (candidate: string, parent: string) => {
+      const local = relative(parent, candidate);
+      return local === '' || (local !== '..' && !local.startsWith('..' + sep));
+    };
+    // Configuration and provenance read the manifest and split definitions;
+    // loadConfig also rejects legacy YAML files in the global fleet.d root.
+    // Ancestor replacement/unknown directory wakes remain conservative.
+    const legacy = resolve(fleetDDir());
+    return within(changed, root) || within(root, changed) || within(manifest, changed)
+      || within(changed, legacy) || within(legacy, changed)
+      || this.configurationInputs().some(input => within(resolve(input), changed));
+  }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
-    if (descriptor.resource === 'configuration') {
-      const manifest = resolve(this.scope.configPath ?? defaultConfigPath());
-      const root = resolve(splitRootFor(manifest)), changed = resolve(path);
-      const within = (candidate: string, parent: string) => {
-        const local = relative(parent, candidate);
-        return local === '' || (local !== '..' && !local.startsWith('..' + sep));
-      };
-      // Configuration and provenance read the manifest and split definitions;
-      // loadConfig also rejects legacy YAML files in the global fleet.d root.
-      // Ancestor replacement/unknown directory wakes remain conservative.
-      const legacy = resolve(fleetDDir());
-      return within(changed, root) || within(root, changed) || within(manifest, changed)
-        || within(changed, legacy) || within(legacy, changed)
-        || this.configurationInputs().some(input => within(resolve(input), changed));
-    }
+    if (descriptor.resource === 'configuration') return this.configurationDependency(path);
     // An explicitly selected manifest may use any pathname, including one
     // otherwise reserved for an independent task receipt.
     if (this.scope.configPath && resolve(path) === resolve(this.scope.configPath)) return true;
@@ -368,6 +370,13 @@ export class FleetResourceViews {
       /^(?:history\.jsonl|models_cache\.json|(?:thread_history|state|logs|queue|goals)_\d+\.sqlite(?:-wal|-shm|-journal)?)$/.test(relative(resolve(homedir(), '.codex'), path))
       || /^(?:workspace-devices\.db(?:-wal|-shm|-journal)?|audit[/\\]audit\.jsonl)$/.test(relative(resolve(stateRoot(), 'web'), path))
     )) return false;
+    // Task and room workspaces hold their agents' own execution artifacts (checkouts,
+    // builds, test logs); role projections read nothing there except declared role
+    // roots and configuration (manifest, split definitions), which stay fenced. Working
+    // agents write there continuously, which otherwise fences every directory capture
+    // until it resyncs. The workspace directories themselves and their ancestors remain full wakes.
+    if (roleProjection && !inRoleRoot && /^(?:tasks|rooms)[/\\][^/\\]+[/\\]/.test(relative(resolve(stateRoot(), 'workspaces'), path))
+      && !this.configurationDependency(path)) return false;
     // Preview selection reads role config/state and conversation ledgers, never
     // task layout run/operation/brief receipts. A worker may commit several of
     // these while that independent canonical preview read is in flight.
