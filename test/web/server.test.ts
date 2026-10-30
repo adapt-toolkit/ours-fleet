@@ -189,6 +189,23 @@ describe('secure local web host', () => {
       expect(rejected.statusCode).toBe(409);expect(rejected.json()).toMatchObject({accepted:false,error:{code:'member_not_accepted'}});
     } finally {await server.close();}
   });
+  it('forwards a supported manual harness/model/effort for one member and refuses an unsupported one', async () => {
+    await import('../../src/harness/codex.js');await import('../../src/harness/claude-code.js');
+    const taskRooms={addMember:vi.fn().mockResolvedValue({state:'running',requestId:'request-2'}),memberAddition:vi.fn()};
+    const {server,cookie,csrf}=await authenticated({taskRooms,codexModels:async()=>({state:'known',models:['gpt-6-luna']})});
+    const headers={host:boundary.host,cookie,origin:boundary.origin,'x-csrf-token':csrf};
+    const add=(inline:Record<string,unknown>)=>server.app.inject({method:'POST',url:'/api/v1/tasks/selected/members',headers,
+      payload:{requestId:'request-2',slot:'Helper',role:'Developer',brain:{inline},agentTemplate:'Developer'}});
+    try {
+      expect((await add({harness:'codex',model:'gpt-6-luna',effort:'xhigh'})).statusCode).toBe(202);
+      expect(taskRooms.addMember).toHaveBeenCalledWith('selected',expect.objectContaining({brain:{inline:{harness:'codex',model:'gpt-6-luna',effort:'xhigh'}}}));
+      const unsupported=await add({harness:'codex',model:'gpt-6-luna',effort:'ultra'});
+      expect(unsupported.statusCode).toBe(400);expect(unsupported.json().error.message).toMatch(/does not support effort 'ultra'/);
+      expect((await add({harness:'codex',model:'gpt-6.1-sol',effort:'high'})).json().error.message).toMatch(/does not offer this model/);
+      expect((await add({harness:'claude-code',model:'claude-haiku-4-5-20251001',effort:'low'})).statusCode).toBe(400);
+      expect(taskRooms.addMember).toHaveBeenCalledTimes(1);
+    } finally {await server.close();}
+  });
   it('routes authenticated correspondence GETs to the selected supervisor without MCP',async()=>{
     const calls:unknown[]=[];const {server,cookie}=await authenticated({session:async(id:string)=>({agentContacts:async()=>{calls.push({id,operation:'contacts'});return {contacts:[{name:'Peer'}]};},agentHistory:async(query:unknown)=>{calls.push({id,query});return {items:[],next_cursor:null};}}),oursTools:{call:()=>{throw Error('must not call MCP');}}});
     try{const headers={host:boundary.host,cookie};expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers})).json()).toMatchObject({contacts:[{name:'Peer'}]});const peer='B'.repeat(64);expect((await server.app.inject({method:'GET',url:`/api/v1/roles/Selected/messages?peer_cid=${peer}&limit=10&before_seq=4`,headers})).statusCode).toBe(200);expect(calls).toEqual([{id:'Selected',operation:'contacts'},{id:'Selected',query:{peer_cid:peer,limit:10,before_seq:4}}]);expect((await server.app.inject({method:'GET',url:'/api/v1/roles/Selected/contacts',headers:{host:boundary.host}})).statusCode).toBe(401);}finally{await server.close();}

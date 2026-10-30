@@ -107,12 +107,30 @@ export interface HarnessIsolationPaths {
 export interface ExitPolicy { cleanExitIsFresh: boolean; fastFailSecs: number }
 export interface ValidationError { path: string; message: string }
 
+/** A model the adapter knows, with the exact efforts it supports; [] means the model has no effort setting. */
+export interface HarnessKnownModel { id: string; label: string; efforts: string[] }
+
+/**
+ * Models and efforts a harness adapter maintains. Brain choices made in onboarding,
+ * Settings and launch flows are validated against this; existing Brains are not.
+ */
+export interface HarnessModelCapabilities {
+  sessions: string[];
+  models: HarnessKnownModel[];
+  /** A Brain must name a model; otherwise `model: null` selects the harness default. */
+  modelRequired: boolean;
+  /** Models outside `models` may be named; their efforts are unknown. */
+  customModels: boolean;
+}
+
 export interface HarnessAdapter {
   id: string;
   /** Harness-specific construction behind Fleet's shared live-session contract. */
   agentSession: AgentSessionAdapter;
   supportsResume: boolean;
   checkPrereqs(): Promise<PrereqReport>;
+  /** Models and efforts this adapter supports. Optional for test adapters. */
+  modelCapabilities?(): HarnessModelCapabilities;
   /**
    * `role` is the SESSION-AWARE half: some harness options can only be honoured
    * on some session types, and an option that is silently dropped is worse than

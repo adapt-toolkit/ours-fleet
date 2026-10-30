@@ -21,7 +21,7 @@ describe('packaged preset bootstrap', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
     expect(seeded.revision).toBe(13);
-    expect(seeded.created).toHaveLength(102);
+    expect(seeded.created).toHaveLength(20);
     // The standard experiences are also seeded as editable, web-visible room layouts.
     expect(new RoomLayoutDefinitions(configPath).list().map(entry => [entry.name, 'error' in entry ? entry.error : entry.issues]))
       .toEqual([['engineering', []], ['pair', []], ['single', []], ['team', []]]);
@@ -54,7 +54,8 @@ describe('packaged preset bootstrap', () => {
         expect(definition?.permissions).toMatchObject({ approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' });
       }
     }
-    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(83);
+    // No combinatorial model/effort catalog is installed; only the harness-default Brain ships.
+    expect(Object.keys(cfg.brainPresets ?? {})).toEqual(['claude-default']);
     for (const [id, brain] of Object.entries(cfg.brainPresets ?? {}))
       expect(() => validateEffectiveAgentTemplate({ role: { inline: {} }, brain: { inline: brain } }, id))
         .not.toThrow();
@@ -70,7 +71,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
-    expect(second.preserved).toHaveLength(101);
+    expect(second.preserved).toHaveLength(19);
   });
 
   it('creates private files and refuses symlink targets', () => {

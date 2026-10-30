@@ -16,7 +16,7 @@ import '../../src/harness/codex.js';
 
 const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
 const headers = { host: '127.0.0.1:49271', origin: 'http://127.0.0.1:49271' };
-const sol = { harness: 'codex', model: 'gpt-6.1-sol' };
+const sol = { harness: 'codex', model: 'gpt-6.1-sol', effort: 'medium' };
 
 let root: string;
 let previousHome: string | undefined;
@@ -56,21 +56,35 @@ describe('first-time setup through the API', () => {
       expect((await server.app.inject({ method: 'GET', url: '/api/v1/onboarding', headers: session })).json().configured).toBe(false);
       expect((await setup({ coordination: sol, development: sol, review: sol }, headers)).statusCode).toBe(401);
       expect((await setup({ coordination: sol, development: sol })).statusCode).toBe(400);
-      expect((await setup({ coordination: sol, development: sol, review: { harness: 'codex', model: 'not-a-model' } })).statusCode).toBe(400);
+      expect((await setup({ coordination: sol, development: sol, review: { harness: 'codex', model: 'not-a-model', effort: 'medium' } })).statusCode).toBe(400);
+      // Effort is part of each choice: omitted, unsupported, or set on a model without effort is refused, never replaced.
+      const noEffort = await setup({ coordination: sol, development: sol, review: { harness: 'codex', model: 'gpt-6-astra' } });
+      expect(noEffort.statusCode).toBe(400);
+      expect(noEffort.json().error.message).toMatch(/Critic Brain/);
+      expect((await setup({ coordination: sol, development: { harness: 'codex', model: 'gpt-6-luna', effort: 'ultra' }, review: sol })).json().error.message)
+        .toMatch(/does not support effort 'ultra'/);
+      expect((await setup({ coordination: sol, development: { harness: 'codex', model: 'gpt-6.1-sol', effort: null }, review: sol })).statusCode).toBe(400);
+      expect((await setup({ coordination: sol, development: sol, review: { harness: 'claude-code', model: 'claude-haiku-4-5-20251001', effort: 'low' } })).json().error.message)
+        .toMatch(/has no effort setting/);
       expect(hostSetups).toBe(0);
       expect(configuration.read(false).model.agents.FleetCoordinator).toBeUndefined();
 
-      const done = await setup({ coordination: sol, development: sol, review: { harness: 'codex', model: 'gpt-6-astra' } });
+      const done = await setup({ coordination: { ...sol, effort: 'low' }, development: { ...sol, effort: 'ultra' }, review: { harness: 'codex', model: 'gpt-6-astra', effort: 'xhigh' } });
       expect(done.json()).toEqual({ configured: true });
       expect(done.statusCode).toBe(200);
       expect(hostSetups).toBe(1);
       const model = configuration.read(true).model;
-      // Each prepared agent references the packaged Brain preset of its chosen model; no Brain is named after a kind of work.
-      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
-      expect(model.agent_templates.Developer.brain).toEqual({ ref: 'codex-gpt-6-1-sol-medium' });
-      expect(model.agent_templates.Critic.brain).toEqual({ ref: 'codex-gpt-6-astra-medium' });
-      expect(model.brains?.['codex-gpt-6-astra-medium']).toMatchObject({ harness: 'codex', model: 'gpt-6-astra', effort: 'medium' });
-      for (const work of ['coordination', 'development', 'review']) expect(model.brains?.[work]).toBeUndefined();
+      // Exactly three editable purpose Brains hold the chosen triples; no model/effort combination catalog is installed.
+      expect(model.agents.FleetCoordinator.brain).toEqual({ ref: 'coordination' });
+      expect(model.agent_templates.Developer.brain).toEqual({ ref: 'development' });
+      expect(model.agent_templates.Engineer.brain).toEqual({ ref: 'development' });
+      expect(model.agent_templates.Critic.brain).toEqual({ ref: 'critic' });
+      expect(model.agent_templates.LocalCoordinator.brain).toEqual({ ref: 'coordination' });
+      expect(model.brains).toEqual({
+        development: { harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort: 'ultra' },
+        critic: { harness: 'codex', session: 'acp', model: 'gpt-6-astra', effort: 'xhigh' },
+        coordination: { harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort: 'low' },
+      });
       expect(Object.keys(model.agent_templates).sort()).toEqual(['Critic', 'Developer', 'Engineer', 'LocalCoordinator']);
       expect((await server.app.inject({ method: 'GET', url: '/api/v1/onboarding', headers: session })).json().configured).toBe(true);
 
@@ -80,20 +94,21 @@ describe('first-time setup through the API', () => {
   });
 
   it.each([
-    ['another reasoning', 'harness: codex\nsession: acp\nmodel: gpt-6.1-sol\neffort: high\n'],
+    ['another effort', 'harness: codex\nsession: acp\nmodel: gpt-6.1-sol\neffort: high\n'],
     ['another session', 'harness: codex\nsession: codex-app-server\nmodel: gpt-6.1-sol\neffort: medium\n'],
-  ])('does not report setup done over a preserved Brain of a packaged name with %s', async (_name, customized) => {
+  ])('keeps an existing purpose Brain with %s and refuses setup before any change', async (_name, customized) => {
     const configPath = join(mkdtempSync(join(root, 'config-')), 'fleet.yaml');
     await ensureMinimalSetup(configPath);
-    const kept = join(splitRootFor(configPath), 'brains', 'codex-gpt-6-1-sol-medium.yaml');
+    const kept = join(splitRootFor(configPath), 'brains', 'critic.yaml');
     mkdirSync(join(splitRootFor(configPath), 'brains'), { recursive: true, mode: 0o700 });
     writeFileSync(kept, customized, { mode: 0o600 });
     const dir = mkdtempSync(join(root, 'web-'));
     const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(dir));
+    let hostSetups = 0;
     const server = await buildWebServer({
       audit: new AuditSink(join(dir, 'audit')), configuration: new FleetConfigService({ configPath }),
       onboardingSetup: async (answers: Parameters<typeof executeInitAnswers>[0]) => {
-        await executeInitAnswers(answers, configPath, { async hostSetup() {}, publish: publishSetup });
+        await executeInitAnswers(answers, configPath, { async hostSetup() { hostSetups++; }, publish: publishSetup });
       },
     } as any, boundary, { auth });
     try {
@@ -101,8 +116,10 @@ describe('first-time setup through the API', () => {
       const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
       const done = await server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string, 'content-type': 'application/json' }, payload: { models: { coordination: sol, development: sol, review: sol } } });
       expect(done.statusCode).toBe(409);
-      expect(done.json().error).toMatchObject({ code: 'conflict', message: 'Fleet was set up with different models; review its configuration' });
+      expect(done.json().error.code).toBe('conflict');
+      expect(done.json().error.message).toMatch(/brains\/critic\.yaml already exists with different settings.*Existing Brains are kept/);
       expect(done.json().configured).toBeUndefined();
+      expect(hostSetups).toBe(0);
       expect(readFileSync(kept, 'utf8')).toBe(customized);
     } finally { await server.close(); }
   });
@@ -123,7 +140,7 @@ describe('first-time setup through the API', () => {
       const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { ...headers, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
       const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? []).map(v => v.split(';')[0]).join('; ');
       const session = { ...headers, cookie, 'x-csrf-token': exchange.json().csrfToken as string, 'content-type': 'application/json' };
-      const astra = { harness: 'codex', model: 'gpt-6-astra' };
+      const astra = { harness: 'codex', model: 'gpt-6-astra', effort: 'medium' };
       const [first, second] = await Promise.all([sol, astra].map(model =>
         server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: session, payload: { models: { coordination: model, development: model, review: model } } })));
       expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);

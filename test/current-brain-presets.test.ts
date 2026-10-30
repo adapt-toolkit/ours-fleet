@@ -1,16 +1,18 @@
-import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
-import { validateCatalog, generateSetup } from '../src/init-wizard.js';
-import { claudeModelCatalog } from '../src/application/model-catalog.js';
+import { generateSetup, type PurposeChoice } from '../src/init-wizard.js';
+import { claudeModelCatalog, packagedModelCatalog } from '../src/application/model-catalog.js';
+import { getAdapter } from '../src/harness/registry.js';
+import '../src/harness/claude-code.js';
+import '../src/harness/codex.js';
+import '../src/harness/hermes.js';
 
-const catalog = validateCatalog(JSON.parse(readFileSync('presets/brain-catalog.json', 'utf8')));
+const catalog = packagedModelCatalog();
 const levels = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 describe('current Brain presets', () => {
-  it('ships the complete verified harness matrix with no unsupported combinations', () => {
+  it('keeps the verified harness matrix in the adapters\' catalog', () => {
     const expected = {
       'gpt-6.1-sol': [...levels, 'ultra'],
       'gpt-6-sol': [...levels, 'ultra'],
@@ -21,36 +23,44 @@ describe('current Brain presets', () => {
       'claude-haiku-4-5-20251001': [],
     };
     for (const [id, efforts] of Object.entries(expected)) {
-      const model = catalog.models.find(model => model.model === id)!;
+      const model = catalog.find(model => model.model === id)!;
       expect(model.efforts).toEqual(efforts);
-      for (const effort of efforts.length ? efforts : [undefined]) {
-        const filename = `${model.harness === 'codex' ? 'codex' : 'claude'}-${id.replace(/^claude-/, '').replace(/\./g, '-')}-${effort ?? 'default'}.yaml`;
-        const brain = parse(readFileSync(join('presets/fleet/brains', filename), 'utf8'));
-        expect(brain).toEqual({ harness: model.harness, session: 'acp', model: id,
-          ...(effort ? { effort } : {}) });
-      }
+      const adapter = getAdapter(model.harness).modelCapabilities!();
+      expect(adapter.models.find(item => item.id === id)).toEqual({ id, label: model.label, efforts });
     }
-    execFileSync(process.execPath, ['scripts/generate-brain-presets.mjs', '--check']);
   });
 
-  it.each([
-    ['quick', 'low'], ['balanced', 'medium'], ['thorough', 'high'],
-  ] as const)('generates GPT-6.1 Sol setup with %s reasoning', (reasoning, effort) => {
-    const model = catalog.models.find(model => model.model === 'gpt-6.1-sol')!;
+  it('ships no combinatorial Brain presets, only the harness-default Brain', () => {
+    expect(readdirSync('presets/fleet/brains')).toEqual(['claude-default.yaml']);
+  });
+
+  it('freezes every earlier generated Brain preset for honest provenance', () => {
+    const legacy = JSON.parse(readFileSync('presets/legacy/generated-brains-rev4.json', 'utf8')).brains;
+    expect(Object.keys(legacy)).toHaveLength(82);
+    expect(legacy['codex-gpt-6-1-sol-ultra']).toEqual({ harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort: 'ultra' });
+    expect(legacy['claude-haiku-4-5-20251001-default']).toEqual({ harness: 'claude-code', session: 'acp', model: 'claude-haiku-4-5-20251001' });
+  });
+
+  it.each(['low', 'xhigh', 'ultra'])('creates the GPT-6.1 Sol purpose Brains with exactly %s effort', effort => {
+    const choice: PurposeChoice = { harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort };
     const setup = generateSetup({ subscriptions: ['codex'], assignmentStrategy: 'one-model',
-      models: { development: model, review: model, coordination: model }, reasoning });
-    expect(parse(setup.files.get(`brains/codex-gpt-6-1-sol-${effort}.yaml`)!)).toEqual({
-      harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort,
-    });
-    for (const holder of ['agent_templates/Developer.yaml', 'agent_templates/Critic.yaml', 'agents/FleetCoordinator.yaml'])
-      expect(setup.files.get(holder)).toContain(`brain: { ref: codex-gpt-6-1-sol-${effort} }`);
+      models: { development: choice, review: choice, coordination: choice } });
+    for (const id of ['development', 'critic', 'coordination'])
+      expect(parse(setup.files.get(`brains/${id}.yaml`)!)).toEqual({ harness: 'codex', session: 'acp', model: 'gpt-6.1-sol', effort });
+    expect(setup.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
+    expect(setup.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: critic }');
+    expect(setup.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
   });
 
-  it('keeps Haiku effort-free in the picker and rejects assigning wizard reasoning to it', () => {
-    const model = catalog.models.find(model => model.model === 'claude-haiku-4-5-20251001')!;
-    expect(claudeModelCatalog().models.find(item => item.id === model.model)?.reasoningEfforts).toEqual([]);
+  it('keeps Haiku effort-free and rejects assigning an effort to it', () => {
+    const haiku = (effort: string | null): PurposeChoice =>
+      ({ harness: 'claude-code', session: 'acp', model: 'claude-haiku-4-5-20251001', effort });
+    expect(claudeModelCatalog().models.find(item => item.id === 'claude-haiku-4-5-20251001')?.reasoningEfforts).toEqual([]);
     expect(() => generateSetup({ subscriptions: ['claude'], assignmentStrategy: 'one-model',
-      models: { development: model, review: model, coordination: model }, reasoning: 'balanced' }))
-      .toThrow(/does not support balanced reasoning/);
+      models: { development: haiku('medium'), review: haiku('medium'), coordination: haiku('medium') } }))
+      .toThrow(/has no effort setting/);
+    const setup = generateSetup({ subscriptions: ['claude'], assignmentStrategy: 'one-model',
+      models: { development: haiku(null), review: haiku(null), coordination: haiku(null) } });
+    expect(parse(setup.files.get('brains/critic.yaml')!)).toEqual({ harness: 'claude-code', session: 'acp', model: 'claude-haiku-4-5-20251001' });
   });
 });

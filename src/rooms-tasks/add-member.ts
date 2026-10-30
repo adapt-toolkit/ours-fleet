@@ -18,7 +18,27 @@ import { layoutOwnedMemberName } from './layout-member-retirement.js';
 import { validLayoutKey } from './layout-config.js';
 
 export class MemberAdditionRejected extends TaskStateError { readonly accepted=false; }
-export interface AddMemberRequest { requestId: string; slot: string; role: string; brain: string; agentTemplate: string }
+/** A one-off harness/model/effort for this member only; no Brain is saved. Omitted model/effort keep the harness default. */
+export interface ManualBrain { harness: string; session?: string; model?: string; effort?: string }
+export interface AddMemberRequest { requestId: string; slot: string; role: string; brain: string | { inline: ManualBrain }; agentTemplate: string }
+const MANUAL_KEYS = ['harness', 'session', 'model', 'effort'];
+const text = (v: unknown, max = 128): v is string => typeof v === 'string' && v.length > 0 && v.length <= max;
+/** A saved Brain name, or exactly one manual harness/model/effort. */
+export function validMemberBrain(brain: unknown): brain is AddMemberRequest['brain'] {
+  if (text(brain)) return true;
+  const inline = (brain as { inline?: unknown } | null)?.inline as Record<string, unknown> | undefined;
+  return Boolean(brain) && typeof brain === 'object' && Object.keys(brain as object).join() === 'inline'
+    && Boolean(inline) && typeof inline === 'object' && !Array.isArray(inline)
+    && Object.keys(inline!).every(key => MANUAL_KEYS.includes(key)) && text(inline!.harness)
+    && ['session', 'model', 'effort'].every(key => inline![key] === undefined || text(inline![key]));
+}
+/** The member override: a saved Brain by name, or the manual triple as this member's own inline Brain. */
+function brainOverride(brain: AddMemberRequest['brain']) {
+  if (typeof brain === 'string') return { brain };
+  const { harness, session, model, effort } = brain.inline;
+  return { overrides: { brain: { inline: { harness, session: session ?? 'acp',
+    ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) } } } };
+}
 interface Receipt { requestId:string; taskId:string; roleId:string; hash:string; state:'running'|'succeeded'|'attention'|'failed'; error?:string }
 const running = new Set<string>();
 function pathFor(taskId:string, requestId:string) {
@@ -36,7 +56,7 @@ export function memberAddition(taskId:string,requestId:string) {
 export async function requestMemberAddition(input:{taskId:string;request:AddMemberRequest;cfg:FleetConfig;cowork?:CoworkAdapter;configPath?:string;binPath:string;provision?:typeof provisionMembers;layouts?:TaskLayouts}) {
   const {request:r,taskId}=input;
   if(!r || typeof r.slot!=='string' || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(r.slot)
-      || ![r.role,r.brain,r.agentTemplate].every(v=>typeof v==='string'&&v.length>0&&v.length<=128))
+      || ![r.role,r.agentTemplate].every(v=>text(v)) || !validMemberBrain(r.brain))
     // No receipt lookup has happened yet: this request ID may already be accepted.
     throw new TaskStateError('Slot, Role, Brain and Agent Template are required');
   const path=pathFor(taskId,r.requestId);
@@ -61,7 +81,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
         try {
           const plan = prepareExecutionPlan({ name: 'additional-member', version: 1, description: 'Additional task participant',
             members: [{ slot: r.slot, role: r.slot, count: 1, agent_template: r.agentTemplate }] }, input.cfg,
-          { [r.slot]: { role: r.role, brain: r.brain, ...(task.workspace ? { cwd: task.workspace.path } : {}) } });
+          { [r.slot]: { role: r.role, ...brainOverride(r.brain), ...(task.workspace ? { cwd: task.workspace.path } : {}) } });
           return Object.values(plan.launchDefinitions)[0];
         } catch (error) { throw new MemberAdditionRejected(error instanceof Error ? error.message : 'Invalid member configuration'); }
       })();
@@ -82,7 +102,7 @@ export async function requestMemberAddition(input:{taskId:string;request:AddMemb
     if(room.member_seats.some(s=>s.role_name===roleId))throw new MemberAdditionRejected('This member slot already exists');
     const plan=(()=>{try{return prepareExecutionPlan({name:'additional-member',version:1,description:'Additional task participant',
       contract:room.template_snapshot?.contract,members:[{slot:r.slot,role:r.role,count:1,agent_template:r.agentTemplate}]},input.cfg,
-      {[r.slot]:{role:r.role,brain:r.brain}});}catch(error){throw new MemberAdditionRejected(error instanceof Error?error.message:'Invalid member configuration');}})();
+      {[r.slot]:{role:r.role,...brainOverride(r.brain)}});}catch(error){throw new MemberAdditionRejected(error instanceof Error?error.message:'Invalid member configuration');}})();
     const template=sealTemplateSnapshot(plan.snapshot,input.cfg.agentTemplates??{},plan.launchDefinitions);
     const receipt:Receipt={taskId,requestId:r.requestId,roleId,hash,state:'running'};
     const save=()=>{replaceFileAtomically(path,JSON.stringify(receipt)+'\n',0o600);publishFleetResourceCommit(path);};

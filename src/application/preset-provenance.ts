@@ -1,7 +1,9 @@
 /** Where each configured definition came from, compared with the packaged presets.
  * A definition is `predefined` when it has the same value as the shipped preset of
  * the same name, `changed` when a preset of that name exists but the value differs,
- * and `custom` otherwise. Values are compared after parsing, so the formatting the
+ * and `custom` otherwise. A Brain whose name and value match a preset that earlier
+ * releases generated for every model and effort is `legacy`; one of such a name
+ * with another value is `changed`. Values are compared after parsing, so the formatting the
  * configuration editor writes does not count as a change. Preset text is returned
  * so users can see exactly what ships; it contains no host data.
  */
@@ -15,7 +17,7 @@ import { packagedPresetRoot } from '../preset-bootstrap.js';
 
 export const PROVENANCE_KINDS = { role: 'roles', brain: 'brains', template: 'agent_templates', layout: 'room_layouts' } as const;
 export type ProvenanceKind = keyof typeof PROVENANCE_KINDS;
-export type ProvenanceStatus = 'predefined' | 'changed' | 'custom';
+export type ProvenanceStatus = 'predefined' | 'changed' | 'custom' | 'legacy';
 export interface ProvenanceEntry { status: ProvenanceStatus; preset?: string }
 export type Provenance = Record<ProvenanceKind, Record<string, ProvenanceEntry>>;
 
@@ -34,6 +36,15 @@ function yamlFiles(dir: string): Map<string, string> {
   return files;
 }
 
+/** Brain presets earlier releases generated per model and effort; no longer shipped or installed. */
+function legacyBrains(presetRoot: string): Map<string, string> {
+  const path = join(presetRoot, '..', 'legacy', 'generated-brains-rev4.json');
+  if (!existsSync(path)) return new Map();
+  const { brains } = JSON.parse(readFileSync(path, 'utf8')) as { brains: Record<string, Record<string, string>> };
+  return new Map(Object.entries(brains).map(([name, value]) =>
+    [name, Object.entries(value).map(([key, item]) => `${key}: ${item}`).join('\n') + '\n']));
+}
+
 const parsed = (text: string): unknown => { try { return parse(text); } catch { return Symbol('unparseable'); } };
 
 export class PresetProvenance {
@@ -44,9 +55,14 @@ export class PresetProvenance {
     const result = {} as Provenance;
     for (const [kind, dir] of Object.entries(PROVENANCE_KINDS) as Array<[ProvenanceKind, string]>) {
       const presets = yamlFiles(join(this.presetRoot, dir)), installed = yamlFiles(join(split, dir));
+      const legacy = kind === 'brain' ? legacyBrains(this.presetRoot) : new Map<string, string>();
       result[kind] = Object.fromEntries([...installed].map(([name, text]) => {
         const preset = presets.get(name);
-        if (preset === undefined) return [name, { status: 'custom' }];
+        if (preset === undefined) {
+          const old = legacy.get(name);
+          if (old === undefined) return [name, { status: 'custom' }];
+          return [name, { status: isDeepStrictEqual(parsed(text), parsed(old)) ? 'legacy' : 'changed', preset: old }];
+        }
         return [name, { status: isDeepStrictEqual(parsed(text), parsed(preset)) ? 'predefined' : 'changed', preset }];
       }));
     }

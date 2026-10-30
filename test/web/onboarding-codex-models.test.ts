@@ -45,7 +45,7 @@ async function webConsole(answer?: () => OfferedModels) {
   const report = async () => (await server.app.inject({ method: 'GET', url: '/api/v1/onboarding', headers: session })).json() as { catalog: Array<{ harness: string; model: string }>; codexModels?: { state: string; reason?: string; models?: unknown } };
   const codex = async () => (await report()).catalog.filter(model => model.harness === 'codex').map(model => model.model).sort();
   const setup = (model: string) => server.app.inject({ method: 'POST', url: '/api/v1/onboarding/setup', headers: { ...session, 'content-type': 'application/json' },
-    payload: { models: Object.fromEntries(['coordination', 'development', 'review'].map(work => [work, { harness: 'codex', model }])) } });
+    payload: { models: Object.fromEntries(['coordination', 'development', 'review'].map(work => [work, { harness: 'codex', model, effort: 'medium' }])) } });
   return { server, report, codex, setup, setups: () => setups };
 }
 

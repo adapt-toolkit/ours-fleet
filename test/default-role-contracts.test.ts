@@ -11,10 +11,9 @@ import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
 const answers: InitAnswers = {
-  subscriptions: ['codex'], assignmentStrategy: 'one-model', reasoning: 'balanced',
+  subscriptions: ['codex'], assignmentStrategy: 'one-model',
   models: Object.fromEntries(['development', 'review', 'coordination'].map(work => [work, {
-    harness: 'codex', session: 'acp', model: 'gpt-5.6-sol',
-    efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    harness: 'codex', session: 'acp', model: 'gpt-5.6-sol', effort: 'medium',
   }])) as InitAnswers['models'],
 };
 
@@ -72,7 +71,7 @@ describe('packaged default role contract', () => {
     ]) expect(role).toMatch(marker);
     expect(role).not.toMatch(/engineer-mini|8hats/i);
     expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
-    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: codex-gpt-5-6-sol-medium }');
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: development }');
     const room = String(files.get('room_templates/engineering.yaml'));
     expect(room).toContain('role: Engineer');
     expect(room).toContain('agent_template: Engineer');

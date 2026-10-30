@@ -1,0 +1,497 @@
+{
+ "schema_version": 1,
+ "description": "Frozen values of the Brain presets generated from brain-catalog revision 4 (and earlier revisions still present in it). Used only to report untouched legacy presets honestly; never copied into new installations.",
+ "brains": {
+  "claude-fable-5-1-high": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5-1",
+   "effort": "high"
+  },
+  "claude-fable-5-1-low": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5-1",
+   "effort": "low"
+  },
+  "claude-fable-5-1-max": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5-1",
+   "effort": "max"
+  },
+  "claude-fable-5-1-medium": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5-1",
+   "effort": "medium"
+  },
+  "claude-fable-5-1-xhigh": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5-1",
+   "effort": "xhigh"
+  },
+  "claude-fable-5-high": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5",
+   "effort": "high"
+  },
+  "claude-fable-5-low": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5",
+   "effort": "low"
+  },
+  "claude-fable-5-max": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5",
+   "effort": "max"
+  },
+  "claude-fable-5-medium": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5",
+   "effort": "medium"
+  },
+  "claude-fable-5-xhigh": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-fable-5",
+   "effort": "xhigh"
+  },
+  "claude-haiku-4-5-20251001-default": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-haiku-4-5-20251001"
+  },
+  "claude-opus-5-5-high": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5-5",
+   "effort": "high"
+  },
+  "claude-opus-5-5-low": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5-5",
+   "effort": "low"
+  },
+  "claude-opus-5-5-max": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5-5",
+   "effort": "max"
+  },
+  "claude-opus-5-5-medium": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5-5",
+   "effort": "medium"
+  },
+  "claude-opus-5-5-xhigh": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5-5",
+   "effort": "xhigh"
+  },
+  "claude-opus-5-high": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5",
+   "effort": "high"
+  },
+  "claude-opus-5-low": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5",
+   "effort": "low"
+  },
+  "claude-opus-5-max": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5",
+   "effort": "max"
+  },
+  "claude-opus-5-medium": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5",
+   "effort": "medium"
+  },
+  "claude-opus-5-xhigh": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-opus-5",
+   "effort": "xhigh"
+  },
+  "claude-sonnet-5-high": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-sonnet-5",
+   "effort": "high"
+  },
+  "claude-sonnet-5-low": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-sonnet-5",
+   "effort": "low"
+  },
+  "claude-sonnet-5-max": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-sonnet-5",
+   "effort": "max"
+  },
+  "claude-sonnet-5-medium": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-sonnet-5",
+   "effort": "medium"
+  },
+  "claude-sonnet-5-xhigh": {
+   "harness": "claude-code",
+   "session": "acp",
+   "model": "claude-sonnet-5",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-3-codex-spark-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.3-codex-spark",
+   "effort": "high"
+  },
+  "codex-gpt-5-3-codex-spark-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.3-codex-spark",
+   "effort": "low"
+  },
+  "codex-gpt-5-3-codex-spark-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.3-codex-spark",
+   "effort": "medium"
+  },
+  "codex-gpt-5-3-codex-spark-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.3-codex-spark",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-4-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4",
+   "effort": "high"
+  },
+  "codex-gpt-5-4-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4",
+   "effort": "low"
+  },
+  "codex-gpt-5-4-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4",
+   "effort": "medium"
+  },
+  "codex-gpt-5-4-mini-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4-mini",
+   "effort": "high"
+  },
+  "codex-gpt-5-4-mini-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4-mini",
+   "effort": "low"
+  },
+  "codex-gpt-5-4-mini-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4-mini",
+   "effort": "medium"
+  },
+  "codex-gpt-5-4-mini-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4-mini",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-4-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.4",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-5-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.5",
+   "effort": "high"
+  },
+  "codex-gpt-5-5-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.5",
+   "effort": "low"
+  },
+  "codex-gpt-5-5-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.5",
+   "effort": "medium"
+  },
+  "codex-gpt-5-5-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.5",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-6-luna-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-luna",
+   "effort": "high"
+  },
+  "codex-gpt-5-6-luna-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-luna",
+   "effort": "low"
+  },
+  "codex-gpt-5-6-luna-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-luna",
+   "effort": "max"
+  },
+  "codex-gpt-5-6-luna-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-luna",
+   "effort": "medium"
+  },
+  "codex-gpt-5-6-luna-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-luna",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-6-sol-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "high"
+  },
+  "codex-gpt-5-6-sol-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "low"
+  },
+  "codex-gpt-5-6-sol-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "max"
+  },
+  "codex-gpt-5-6-sol-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "medium"
+  },
+  "codex-gpt-5-6-sol-ultra": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "ultra"
+  },
+  "codex-gpt-5-6-sol-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-sol",
+   "effort": "xhigh"
+  },
+  "codex-gpt-5-6-terra-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "high"
+  },
+  "codex-gpt-5-6-terra-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "low"
+  },
+  "codex-gpt-5-6-terra-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "max"
+  },
+  "codex-gpt-5-6-terra-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "medium"
+  },
+  "codex-gpt-5-6-terra-ultra": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "ultra"
+  },
+  "codex-gpt-5-6-terra-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-5.6-terra",
+   "effort": "xhigh"
+  },
+  "codex-gpt-6-1-sol-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "high"
+  },
+  "codex-gpt-6-1-sol-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "low"
+  },
+  "codex-gpt-6-1-sol-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "max"
+  },
+  "codex-gpt-6-1-sol-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "medium"
+  },
+  "codex-gpt-6-1-sol-ultra": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "ultra"
+  },
+  "codex-gpt-6-1-sol-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh"
+  },
+  "codex-gpt-6-astra-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "high"
+  },
+  "codex-gpt-6-astra-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "low"
+  },
+  "codex-gpt-6-astra-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "max"
+  },
+  "codex-gpt-6-astra-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "medium"
+  },
+  "codex-gpt-6-astra-ultra": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "ultra"
+  },
+  "codex-gpt-6-astra-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-astra",
+   "effort": "xhigh"
+  },
+  "codex-gpt-6-luna-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-luna",
+   "effort": "high"
+  },
+  "codex-gpt-6-luna-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-luna",
+   "effort": "low"
+  },
+  "codex-gpt-6-luna-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-luna",
+   "effort": "max"
+  },
+  "codex-gpt-6-luna-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-luna",
+   "effort": "medium"
+  },
+  "codex-gpt-6-luna-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-luna",
+   "effort": "xhigh"
+  },
+  "codex-gpt-6-sol-high": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "high"
+  },
+  "codex-gpt-6-sol-low": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "low"
+  },
+  "codex-gpt-6-sol-max": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "max"
+  },
+  "codex-gpt-6-sol-medium": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "medium"
+  },
+  "codex-gpt-6-sol-ultra": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "ultra"
+  },
+  "codex-gpt-6-sol-xhigh": {
+   "harness": "codex",
+   "session": "acp",
+   "model": "gpt-6-sol",
+   "effort": "xhigh"
+  }
+ }
+}
