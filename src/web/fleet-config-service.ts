@@ -72,6 +72,28 @@ export class FleetConfigService {
   /** Cached during canonical reads; observer filtering must never parse YAML. */
   resourceValidationInputs(): readonly string[] { return this.validationInputs; }
 
+  /**
+   * Record the manifest's external file references before a projection that loads
+   * the configuration, so a reference anywhere (including a task workspace) fences
+   * that capture even before the configuration itself has been read. A manifest that
+   * cannot be read keeps the last recorded inputs; the projection reports its error.
+   */
+  observeValidationInputs(): void {
+    try { this.recordValidationInputs(parse(trustedFile(this.path), {prettyErrors:false})); }
+    catch { /* unchanged */ }
+  }
+
+  private recordValidationInputs(parsed: unknown): void {
+    const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+    const manifest = record(parsed);
+    const vars = record(manifest.vars);
+    const expand = (value: string) => value.replace(/\$\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match);
+    const invite = record(record(manifest.rooms).owner).public_invite_file;
+    const prompts = Object.values(record(manifest.watchdogs)).map(value => record(value).prompt_file);
+    this.validationInputs = [...(typeof invite === 'string' ? [expand(expand(invite))] : []),
+      ...prompts.filter((value): value is string => typeof value === 'string').map(expand)].map(value => resolve(value));
+  }
+
   constructor(options: FleetConfigServiceOptions = {}) {
     this.path = options.configPath ?? defaultConfigPath();
     this.preflight = options.preflight ?? (async () => emptyReport());
@@ -82,16 +104,9 @@ export class FleetConfigService {
     const sources = readSources(this.path);
     let raw: EditableFleetModel;
     try {
-      const manifest = parse(sources.documents.get(basename(sources.manifest))!, {prettyErrors:false}) as Record<string, unknown>;
-      const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-      const vars = record(manifest.vars);
-      const expand = (value: string) => value.replace(/\$\{(\w+)\}/g, (match, key) => key in vars ? String(vars[key]) : match);
-      const invite = record(record(manifest.rooms).owner).public_invite_file;
-      const prompts = Object.values(record(manifest.watchdogs)).map(value => record(value).prompt_file);
       // Record even invalid/missing references before validation, so repairing an
       // already observed dependency can never retain a certified stale capture.
-      this.validationInputs = [...(typeof invite === 'string' ? [expand(expand(invite))] : []),
-        ...prompts.filter((value): value is string => typeof value === 'string').map(expand)].map(value => resolve(value));
+      this.recordValidationInputs(parse(sources.documents.get(basename(sources.manifest))!, {prettyErrors:false}));
       loadConfig(this.path, {yamlMode:'strict'});
       raw = modelFrom(sources, includeDefinitions);
     } catch (error) { throw safeError(error, sourceSensitiveValues(sources)); }

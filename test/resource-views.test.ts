@@ -743,3 +743,131 @@ it('keeps a capture qualification behind a backpressured chunked record',async()
   expect(views.map((v:any)=>v.viewId)).toEqual(['quiet']);
   expect(views[0].sequence).toBe(3);
 });
+
+// The production web scope observes the whole Fleet home, task and room workspaces included.
+function homeFixture(project:(descriptor:any,signal:AbortSignal)=>Promise<unknown>,configPath?:(home:string)=>string){
+  const home=mkdtempSync(join(tmpdir(),'resource-home-'));clean.push(()=>rmSync(home,{recursive:true,force:true}));
+  vi.stubEnv('OURS_FLEET_HOME',home);clean.push(()=>vi.unstubAllEnvs());
+  const roots=[join(stateRoot(),'agents'),join(stateRoot(),'tmp')];
+  const response=new EventEmitter() as any;response.write=vi.fn(()=>true);response.end=vi.fn();
+  const resources=new FleetResourceViews({paths:[...roots,stateRoot()],roots,...(configPath?{configPath:configPath(home)}:{}),watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();return h;}},project,()=>[],20);
+  const connection=resources.open(response,'owner',()=>true);clean.push(()=>resources.close());
+  const frames=()=>response.write.mock.calls.map(([s]:[string])=>String(s)).filter((s:string)=>s.startsWith('event: resource\n')).map((s:string)=>JSON.parse(s.split('data: ')[1]));
+  const register=(resource:string,extra={})=>resources.register('owner',connection.connectionId,'view',1,{viewId:'view',resource,...extra});
+  const bound=(binding:{baselineId:string})=>resources.bound('owner',connection.connectionId,'view',1,binding.baselineId);
+  return {home,roots,frames,register,bound};
+}
+const workspaceWrites=[['workspaces','tasks','0mexampletask0001','gates-fleet.log'],['workspaces','rooms','room-1','repo','node_modules','.package-lock.json']];
+
+for (const resource of ['directory', 'roles', 'previews']) {
+  it(`keeps the ${resource} view live while agents write in their task and room workspaces during every capture`, async () => {
+    let value = 'initial', reads = 0;
+    const f = homeFixture(async () => {
+      reads++;
+      for (const write of workspaceWrites) publishFleetResourceCommit(join(stateRoot(), ...write));
+      return {value};
+    });
+    const binding = f.register(resource, resource === 'previews' ? {ids:['member']} : {});
+    await expect(f.bound(binding)).resolves.toMatchObject({payload:{value:'initial'}});
+    expect(reads).toBe(1);
+    // An actual member change is still published while the workspace churn continues.
+    value = 'member changed';
+    publishFleetResourceCommit(join(f.roots[1], 'member', 'role.yaml'));
+    publishFleetResourceCommit(join(f.roots[1], 'member', '.conversation', 'events-000001.jsonl'));
+    await expect.poll(() => f.frames().filter(frame => frame.kind === 'snapshot').at(-1).payload).toEqual({value:'member changed'});
+    expect(f.frames().some(frame => frame.kind === 'resync' || frame.kind === 'health')).toBe(false);
+  });
+}
+
+for (const target of [['workspaces','tasks','0mexampletask0001'],['workspaces','tasks'],['workspaces'],['tasks','0mexampletask0001.json'],['tmp','member','role.yaml']]) {
+  it(`retains directory capture fencing for ${target.join('/')}`, async () => {
+    let reads = 0;
+    const f = homeFixture(async () => { reads++; publishFleetResourceCommit(join(stateRoot(), ...target)); return {value:'unstable'}; });
+    await expect(f.bound(f.register('directory'))).rejects.toThrow('unstable');
+    expect(reads).toBe(3);
+    expect(f.frames().some(frame => frame.kind === 'snapshot')).toBe(false);
+  });
+}
+
+it('retains directory fencing for split definitions of an explicit config inside a task workspace', async () => {
+  let reads = 0;
+  const config = (home: string) => join(home, '.ours-fleet', 'workspaces', 'tasks', '0mexampletask0001', 'fleet.yaml');
+  const f = homeFixture(async () => {
+    reads++;
+    publishFleetResourceCommit(join(stateRoot(), 'workspaces', 'tasks', '0mexampletask0001', 'fleet', 'agents', 'worker.yaml'));
+    return {value:'unstable'};
+  }, config);
+  await expect(f.bound(f.register('directory'))).rejects.toThrow('unstable');
+  expect(reads).toBe(3);
+});
+
+for (const resource of ['tasks', 'task-layout']) {
+  it(`retains ${resource} capture fencing for task workspace writes`, async () => {
+    let reads = 0;
+    const f = homeFixture(async () => { reads++; publishFleetResourceCommit(join(stateRoot(), ...workspaceWrites[0])); return {value:'unstable'}; });
+    await expect(f.bound(f.register(resource, resource === 'task-layout' ? {entityId:'0mexampletask0001'} : {}))).rejects.toThrow('unstable');
+    expect(reads).toBe(3);
+  });
+}
+
+it('keeps a natively watched directory view live while task workspace files are written during every capture', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'resource-workspace-churn-'));
+  clean.push(() => rmSync(home, {recursive:true,force:true}));
+  vi.stubEnv('OURS_FLEET_HOME', home); clean.push(() => vi.unstubAllEnvs());
+  const workspace = join(stateRoot(), 'workspaces', 'tasks', '0mexampletask0001');
+  mkdirSync(workspace, {recursive:true}); mkdirSync(join(stateRoot(), 'tmp', 'member'), {recursive:true});
+  const configPath = join(home, 'fleet.yaml'); writeFileSync(configPath, 'roles: {}\n');
+  let reads = 0, delivered!: () => void;
+  // The production web scope: an explicit config enables full Fleet-home discovery with native watches.
+  const resources = new FleetResourceViews({configPath, onInvalidated: path => { if (path?.startsWith(workspace)) delivered?.(); }}, async () => {
+    reads++;
+    // Hold this capture only until the native watch has delivered the workspace write.
+    const seen = new Promise<void>(resolve => { delivered = resolve; });
+    appendFileSync(join(workspace, 'gates-fleet.log'), `line ${reads}\n`);
+    await Promise.race([seen, new Promise(resolve => setTimeout(resolve, 2000))]);
+    return {value:'stable'};
+  }, () => []);
+  clean.push(() => resources.close());
+  const response = new EventEmitter() as any; response.write = vi.fn(() => true); response.end = vi.fn();
+  const connection = resources.open(response, 'owner', () => true);
+  const binding = resources.register('owner', connection.connectionId, 'view', 1, {viewId:'view', resource:'directory'});
+  await expect(resources.bound('owner', connection.connectionId, 'view', 1, binding.baselineId)).resolves.toMatchObject({payload:{value:'stable'}});
+  expect(reads).toBe(1);
+  const frames = response.write.mock.calls.map(([s]: [string]) => String(s)).filter((s: string) => s.startsWith('event: resource\n')).map((s: string) => JSON.parse(s.split('data: ')[1]));
+  expect(frames.some((frame: any) => frame.kind === 'resync')).toBe(false);
+});
+
+it('fences a directory capture on a configuration input inside a task workspace before configuration is read', async () => {
+  const {buildWebServer} = await import('../src/web/server.js');
+  const {FleetConfigService} = await import('../src/web/fleet-config-service.js');
+  const home = mkdtempSync(join(tmpdir(), 'resource-config-input-')); clean.push(() => rmSync(home, {recursive:true,force:true}));
+  vi.stubEnv('OURS_FLEET_HOME', home); clean.push(() => vi.unstubAllEnvs());
+  const invite = join(stateRoot(), 'workspaces', 'tasks', '0mexampletask0001', 'owner-invite.txt');
+  const configPath = join(home, 'fleet.yaml');
+  writeFileSync(configPath, `rooms:\n  owner:\n    public_invite_file: ${invite}\n`, {mode:0o600});
+  let reads = 0;
+  const query = {list: async () => { reads++; publishFleetResourceCommit(invite); return []; }};
+  const browser = {id:'browser', absoluteExpiresAt:Date.now()+60000};
+  const auth = {shutdown(){}, validateBoundary(){}, authenticate(){return browser;}, sessionValid(){return true;}, bindTransport(){return()=>{};}};
+  const roots = [join(stateRoot(), 'agents'), join(stateRoot(), 'tmp')];
+  const web = await buildWebServer({query, repository:{list:async()=>[]}, taskRooms:{listTasks:()=>[], listTaskLists:()=>[]},
+    configuration:new FleetConfigService({configPath}),
+    resourceScope:{configPath, paths:[...roots, stateRoot()], roots, watch:()=>{const h=new EventEmitter() as any;h.close=vi.fn();return h;}}} as any,
+    {origin:'http://127.0.0.1', host:'127.0.0.1'}, {auth:auth as any});
+  const address = await web.app.listen({host:'127.0.0.1', port:0});
+  const abort = new AbortController(); let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const response = await fetch(address + '/api/v1/resource-events', {signal:abort.signal}); reader = response.body!.getReader();
+    let records = ''; const decoder = new TextDecoder();
+    const until = async (test: (text: string) => boolean) => { while (!test(records)) { const next = await reader!.read(); if (next.done) throw Error('unexpected close'); records += decoder.decode(next.value, {stream:true}); } };
+    await until(text => text.includes('resource-connection'));
+    const connection = JSON.parse(records.split('data: ')[1].split('\n')[0]);
+    const registered = await fetch(address + '/api/v1/resource-subscriptions', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({connectionId:connection.connectionId, viewId:'directory', subscriptionEpoch:1, descriptor:{viewId:'directory', resource:'directory'}})});
+    expect(registered.status).toBe(200);
+    await until(text => text.includes('"kind":"resync"') || text.includes('"kind":"ready"'));
+    expect(records).toContain('"kind":"resync"');
+    expect(records).not.toContain('"kind":"ready"');
+    expect(reads).toBe(3);
+  } finally { abort.abort(); await reader?.cancel().catch(() => {}); await web.close(); }
+});
