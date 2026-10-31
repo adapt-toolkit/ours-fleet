@@ -169,7 +169,7 @@ function writeTask(record: TaskRecord | StoredTaskRecord, options: { durable?: b
       const next = status(record), before = previous ? status(previous) : undefined;
       pending.push({ eventId: `task:${record.task_id}:${randomUUID()}`, taskId: record.task_id,
         title: `Task ${!previous ? 'created' : 'updated'}: ${taskLabel(record)}`.slice(0, 160),
-        body: `Task ${record.task_id}: ${before ? `${before} → ` : 'created in '}${next}.`,
+        body: taskSentence(record, `${before ? `${before} → ` : 'created in '}${next}.`),
         target: { kind: 'task', taskId: record.task_id }, delivery: 'push-only' });
     }
     pending.push(...contributionEvents(previous, record));
@@ -187,6 +187,13 @@ function writeTask(record: TaskRecord | StoredTaskRecord, options: { durable?: b
 /** Human label for notification titles: the mission key, when issued, precedes the title. */
 const taskLabel = (record: { key?: string; title: string }): string =>
   record.key ? `${record.key} · ${record.title}` : record.title;
+
+/**
+ * Notification body naming the task by its mission key. The opaque task ID stays in routing and
+ * event fields only; a task without a key relies on its title, which the notification title shows.
+ */
+const taskSentence = (record: { key?: string }, text: string): string =>
+  record.key ? `Task ${record.key}: ${text}` : text[0].toUpperCase() + text.slice(1);
 
 /** Packages written before revisions existed count as revision 1; their next change becomes 2. No package is 0. */
 export const reviewRevision = (review: { revision?: number } | undefined): number => review ? review.revision ?? 1 : 0;
@@ -207,7 +214,7 @@ function contributionEvents(previous: StoredTaskRecord | undefined, record: Task
   const revision = reviewRevision(record.review);
   if (revision > reviewRevision(previous.review))
     events.push({ eventId: `task:${id}:review:${revision}`, taskId: id, title: `To review updated: ${taskLabel(record)}`.slice(0, 160),
-      body: `Task ${id}: the review package changed.`, target: { kind: 'task', taskId: id }, delivery: 'push-only' });
+      body: taskSentence(record, 'the review package changed.'), target: { kind: 'task', taskId: id }, delivery: 'push-only' });
   return events;
 }
 
