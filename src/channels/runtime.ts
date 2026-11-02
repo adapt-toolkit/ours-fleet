@@ -1,9 +1,9 @@
-import { join } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { attachOursClient } from '@ours.network/sdk/client';
 import { readClientProfile } from '../client-profile.js';
 import { loadConfig, splitRootFor } from '../config.js';
-import { stateRoot } from '../paths.js';
+import { agentsRoot, stateRoot, tmpRoot } from '../paths.js';
 import { observeFleetResources, publishFleetResourceCommit } from '../application/resource-observer.js';
 import type { RoleRepository } from '../application/role-repository.js';
 import { listRoomRecords } from '../rooms-tasks/room-state.js';
@@ -65,13 +65,19 @@ export function createChannels(options: { configPath: string; repository: RoleRe
   const sync = () => { void indexer.sync().catch(error => log(`channels: sync failed: ${(error as Error).message}`)); };
   const service = new ChannelsService({ store, reader, indexer, ownerRoot: () => last?.rootCid, ready: () => last !== undefined });
   sync();
-  // Re-derive sources when an agent journal, room record or role definition commits, so
-  // new or stopped agents change perspectives without polling. Bursts coalesce. Explicit
-  // paths only: the default scope covers the whole state root, including this index.
+  // Re-derive sources when one of their inputs commits, so new or stopped agents change
+  // perspectives without polling. Bursts coalesce. The configuration scope also tracks the
+  // manifest file itself; every wake is filtered to the actual inputs (never this index).
   const lifetime = new AbortController();
-  let pending: ReturnType<typeof setTimeout> | undefined;
-  observeFleetResources({ retryWatchFailures: true, paths: [privateRuntimeRoot(), join(stateRoot(), 'rooms'), splitRootFor(options.configPath)] }, () => {
-    if (pending || lifetime.signal.aborted) return;
+  const inputs = channelSourceInputs(options.configPath);
+  let pending: ReturnType<typeof setTimeout> | undefined, relevant = false;
+  observeFleetResources({
+    configPath: options.configPath, retryWatchFailures: true,
+    paths: [inputs.journals, inputs.rooms, inputs.splitRoot, inputs.permanentRoles, inputs.temporaryRoles],
+    onInvalidated: path => { if (path === undefined || inputs.affects(path)) relevant = true; },
+  }, () => {
+    if (!relevant || pending || lifetime.signal.aborted) return;
+    relevant = false;
     pending = setTimeout(() => { pending = undefined; sync(); }, 1_000);
     pending.unref?.();
   }, lifetime.signal);
@@ -79,4 +85,30 @@ export function createChannels(options: { configPath: string; repository: RoleRe
     service,
     close() { lifetime.abort(); if (pending) clearTimeout(pending); indexer.stop(); void eventsClient?.close().catch(() => {}); store.close(); },
   };
+}
+
+/**
+ * The files Channels source discovery reads: the manifest (Owner CID, roles), split role
+ * definitions, permanent and temporary role definitions, agent journals and room records.
+ * Conversation ledgers and other state under the role roots are not inputs.
+ */
+export function channelSourceInputs(configPath: string) {
+  const config = resolve(configPath);
+  const journals = resolve(privateRuntimeRoot()), rooms = resolve(stateRoot(), 'rooms'), splitRoot = resolve(splitRootFor(config));
+  const permanentRoles = resolve(agentsRoot()), temporaryRoles = resolve(tmpRoot());
+  const under = (path: string, root: string) => { const local = relative(root, path); return local !== '..' && !local.startsWith('..' + sep) && !local.startsWith(sep) ? local : undefined; };
+  const affects = (changed: string): boolean => {
+    const path = resolve(changed);
+    if (path === config || under(path, journals) !== undefined || under(path, rooms) !== undefined || under(path, splitRoot) !== undefined) return true;
+    for (const root of [permanentRoles, temporaryRoles]) {
+      const local = under(path, root);
+      if (local === undefined) continue;
+      const parts = local.split(sep).filter(Boolean);
+      // The roles directory, a role directory appearing/disappearing, or its definition.
+      return parts.length <= 1 || (parts.length === 2 && parts[1] === 'role.yaml');
+    }
+    // Ancestor replacement of any input root.
+    return [config, journals, rooms, splitRoot, permanentRoles, temporaryRoles].some(root => under(root, path) !== undefined);
+  };
+  return { journals, rooms, splitRoot, permanentRoles, temporaryRoles, affects };
 }

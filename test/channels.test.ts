@@ -251,3 +251,102 @@ describe('channels resource view', () => {
     expect(projected).toEqual(['directory']);
   });
 });
+
+describe('channels lifecycle', () => {
+  const owner = { kind: 'owner' as const, name: 'Owner', cid: OWNER, ended: false };
+  const sales = { kind: 'agent' as const, name: 'sales', cid: SALES, roleId: 'Sales', ended: false };
+  const idle = { resourceEvents: () => (async function* () { await new Promise(() => {}); })() };
+
+  it('never touches a closed store or publishes after stop, even when an in-flight read settles later', async () => {
+    const store = new ChannelsStore(tempDir('channels-shutdown-'));
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    clean.push(() => { process.off('unhandledRejection', onUnhandled); });
+    let started!: () => void;
+    const reading = new Promise<void>(resolve => { started = resolve; });
+    const reader: IdentityReader = {
+      contactsActivity: (_ref, signal) => new Promise((_resolve, reject) => {
+        started();
+        signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      }),
+      history: vi.fn(),
+    };
+    const onChange = vi.fn();
+    const indexer = new ChannelsIndexer({ store, reader, events: idle, debounceMs: 1, log: () => {}, onChange,
+      discover: async () => ({ ownerCid: OWNER, internal: new Set([OWNER]), sources: [owner] }) });
+    await indexer.sync();
+    await reading;
+    const published = onChange.mock.calls.length;
+    indexer.stop();
+    store.close();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(unhandled).toEqual([]);
+    expect(onChange).toHaveBeenCalledTimes(published);
+  });
+
+  it('removes newly internal identities from every cached edge, ended sources included, without daemon reads', async () => {
+    const store = new ChannelsStore(tempDir('channels-exclusion-')); clean.push(() => store.close());
+    const ended = { ...sales, ended: true };
+    let found: ChannelSources = { ownerCid: OWNER, internal: new Set([OWNER, SALES]), sources: [ended] };
+    const reader: IdentityReader = { contactsActivity: vi.fn(), history: vi.fn() };
+    const indexer = new ChannelsIndexer({ store, reader, events: idle, log: () => {}, onChange: () => {}, discover: async () => found });
+    clean.push(() => indexer.stop());
+    await indexer.sync();
+    store.replaceEdges(SALES, [{ contactCid: SOLO, contactName: 'Now an agent', lastActivity: '2026-11-02T10:00:00.000Z' },
+      { contactCid: ACME_A, contactName: 'Acme', lastActivity: '2026-11-02T09:00:00.000Z' }]);
+    found = { ...found, internal: new Set([OWNER, SALES, SOLO]) };
+    await indexer.sync();
+    expect(store.get(SOLO)).toBeNull();
+    expect(store.list().channels.map(c => c.cid)).toEqual([ACME_A]);
+    expect(reader.contactsActivity).not.toHaveBeenCalled();
+  });
+
+  function serviceFixture(history: IdentityReader['history']) {
+    const store = new ChannelsStore(tempDir('channels-history-')); clean.push(() => store.close());
+    store.setSources([owner, sales]);
+    store.replaceEdges(SALES, [{ contactCid: ACME_A, contactName: 'Acme', lastActivity: '2026-11-02T10:00:00.000Z' }], { producerGeneration: 'g1', position: 4 });
+    const indexer = { sync: vi.fn(), invalidate: vi.fn() };
+    const service = new ChannelsService({ store, reader: { contactsActivity: vi.fn(), history }, indexer: indexer as any, ownerRoot: () => undefined, ready: () => true });
+    return { store, indexer, service };
+  }
+  const page = { identity: { name: 'sales', cid: SALES }, source: { protocolVersion: 1 as const, producerGeneration: 'g1', position: 4 }, items: [{ seq: 1, wire_id: 'W' }], next_cursor: null };
+
+  it('pins history to the observed source generation and invalidates the source when it changed', async () => {
+    const history = vi.fn(async () => { throw new IdentityReadError(409, 'source_generation_changed', 'gen'); });
+    const { service, indexer } = serviceFixture(history);
+    await expect(service.history(ACME_A, SALES, {})).rejects.toMatchObject({ code: 'conflict' });
+    expect(history).toHaveBeenCalledWith({ identity: 'sales', expectedCid: SALES, peer_cid: ACME_A, expectedProducerGeneration: 'g1' });
+    expect(indexer.invalidate).toHaveBeenCalledWith(SALES);
+  });
+
+  it('discards a history response whose perspective left, ended or was re-observed during the read', async () => {
+    for (const change of ['removed', 'ended', 'replaced'] as const) {
+      let release!: () => void;
+      const { store, service } = serviceFixture(() => new Promise(resolve => { release = () => resolve(page); }));
+      const pending = service.history(ACME_A, SALES, {});
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      if (change === 'removed') store.setSources([owner]);
+      if (change === 'ended') store.setSources([owner, { ...sales, ended: true }]);
+      if (change === 'replaced') store.replaceEdges(SALES, [{ contactCid: ACME_A, contactName: 'Acme', lastActivity: '2026-11-02T11:00:00.000Z' }], { producerGeneration: 'g2', position: 1 });
+      release();
+      await expect(pending, change).rejects.toMatchObject({ code: { removed: 'resource_not_found', ended: 'capability_unavailable', replaced: 'conflict' }[change] });
+    }
+  });
+});
+
+describe('channels source inputs', () => {
+  it('re-derive sources for manifest, role definition, journal and room commits, never for the index or conversation ledgers', async () => {
+    const { channelSourceInputs, channelsPrivateDir } = await import('../src/channels/runtime.js');
+    const { agentsRoot, stateRoot, tmpRoot } = await import('../src/paths.js');
+    const config = join(tempDir('channels-inputs-'), 'fleet.yaml');
+    const { affects } = channelSourceInputs(config);
+    for (const path of [config, join(config.slice(0, -5), 'roles', 'sales.yaml'), join(stateRoot(), 'private-ours', 'b', 'state.json'),
+      join(stateRoot(), 'private-ours', 'b', 'retired-1', 'state.json'), join(stateRoot(), 'rooms', 'r.json'),
+      join(tmpRoot(), 'temp-agent'), join(tmpRoot(), 'temp-agent', 'role.yaml'), join(agentsRoot(), 'sales'), stateRoot()])
+      expect(affects(path), path).toBe(true);
+    for (const path of [join(channelsPrivateDir(), 'channels.db'), join(channelsPrivateDir(), 'channels.db-wal'),
+      join(agentsRoot(), 'sales', 'conversation.jsonl'), join(tmpRoot(), 'temp-agent', 'logs', 'x.log'), join(stateRoot(), 'web', 'audit', 'audit.jsonl')])
+      expect(affects(path), path).toBe(false);
+  });
+});

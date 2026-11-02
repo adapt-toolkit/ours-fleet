@@ -61,6 +61,10 @@ export class ChannelsStore {
       CREATE TABLE IF NOT EXISTS channels(cid TEXT PRIMARY KEY,name TEXT NOT NULL,last_activity TEXT NOT NULL,root_cid TEXT,root_name TEXT,conflicting INTEGER NOT NULL,perspectives INTEGER NOT NULL,owner_connected INTEGER NOT NULL,live_perspectives INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS channels_recent ON channels(last_activity DESC,cid);
       CREATE INDEX IF NOT EXISTS channels_root ON channels(root_cid,last_activity DESC,cid);`);
+    // The daemon source lifetime each source was last observed at (pins later history reads).
+    const columns = new Set((this.db.prepare('PRAGMA table_info(sources)').all() as Array<{ name: string }>).map(c => c.name));
+    if (!columns.has('generation')) this.db.exec('ALTER TABLE sources ADD COLUMN generation TEXT');
+    if (!columns.has('position')) this.db.exec('ALTER TABLE sources ADD COLUMN position INTEGER');
   }
   close(): void { this.db.close(); }
   private transaction<T>(run: () => T): T {
@@ -90,15 +94,32 @@ export class ChannelsStore {
     });
   }
 
-  /** Replace one source's edges from a fresh observation. */
-  replaceEdges(sourceCid: string, edges: ChannelEdge[]): void {
+  /** Replace one source's edges from a fresh observation at the given daemon source position. */
+  replaceEdges(sourceCid: string, edges: ChannelEdge[], observed?: { producerGeneration: string; position: number }): void {
     this.transaction(() => {
       const touched = new Set<string>(edges.map(e => e.contactCid));
       for (const row of this.db.prepare('SELECT contact_cid FROM edges WHERE source_cid=?').all(sourceCid) as Array<{ contact_cid: string }>) touched.add(row.contact_cid);
       this.db.prepare('DELETE FROM edges WHERE source_cid=?').run(sourceCid);
       const insert = this.db.prepare('INSERT INTO edges(source_cid,contact_cid,contact_name,last_activity,root_cid,root_name,role_id) VALUES(?,?,?,?,?,?,?)');
       for (const e of edges) insert.run(sourceCid, e.contactCid, e.contactName, e.lastActivity, e.rootCid ?? null, e.rootName ?? null, e.roleId ?? null);
-      this.db.prepare('UPDATE sources SET stale=0,observed_at=? WHERE cid=?').run(this.now(), sourceCid);
+      this.db.prepare('UPDATE sources SET stale=0,observed_at=?,generation=?,position=? WHERE cid=?')
+        .run(this.now(), observed?.producerGeneration ?? null, observed?.position ?? null, sourceCid);
+      for (const cid of touched) this.recompute(cid);
+    });
+  }
+
+  /**
+   * Drop every edge to a now-internal identity, from every source including ended ones,
+   * whose cached edges are never re-observed. Local SQL only.
+   */
+  excludeContacts(internal: Set<string>): void {
+    if (!internal.size) return;
+    this.transaction(() => {
+      const cids = [...internal];
+      const marks = cids.map(() => '?').join(',');
+      const touched = (this.db.prepare(`SELECT DISTINCT contact_cid FROM edges WHERE contact_cid IN (${marks})`).all(...cids) as Array<{ contact_cid: string }>).map(r => r.contact_cid);
+      if (!touched.length) return;
+      this.db.prepare(`DELETE FROM edges WHERE contact_cid IN (${marks})`).run(...cids);
       for (const cid of touched) this.recompute(cid);
     });
   }
@@ -164,10 +185,10 @@ export class ChannelsStore {
   }
 
   /** Whether `sourceCid` is a recorded perspective of `contactCid`. */
-  hasPerspective(contactCid: string, sourceCid: string): { name: string; kind: string; roleId?: string; ended: boolean } | null {
-    const row = this.db.prepare(`SELECT s.name,s.kind,s.role_id,s.ended FROM edges e JOIN sources s ON s.cid=e.source_cid WHERE e.contact_cid=? AND e.source_cid=?`)
+  hasPerspective(contactCid: string, sourceCid: string): { name: string; kind: string; roleId?: string; ended: boolean; generation?: string } | null {
+    const row = this.db.prepare(`SELECT s.name,s.kind,s.role_id,s.ended,s.generation FROM edges e JOIN sources s ON s.cid=e.source_cid WHERE e.contact_cid=? AND e.source_cid=?`)
       .get(contactCid.toUpperCase(), sourceCid.toUpperCase()) as Record<string, any> | undefined;
-    return row ? { name: row.name, kind: row.kind, ...(row.role_id ? { roleId: row.role_id } : {}), ended: !!row.ended } : null;
+    return row ? { name: row.name, kind: row.kind, ...(row.role_id ? { roleId: row.role_id } : {}), ended: !!row.ended, ...(row.generation ? { generation: row.generation } : {}) } : null;
   }
 
   sourcesSummary(): Array<{ cid: string; name: string; kind: string; ended: boolean; stale: boolean }> {

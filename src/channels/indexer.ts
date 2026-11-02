@@ -66,6 +66,8 @@ export class ChannelsIndexer {
     const internalChanged = found.internal.size !== this.internal.size || [...found.internal].some(cid => !this.internal.has(cid));
     this.internal = found.internal;
     this.deps.store.setSources(found.sources);
+    // Cached edges of every source, ended ones included, lose newly internal identities.
+    if (internalChanged) this.deps.store.excludeContacts(found.internal);
     const live = new Map(found.sources.filter(s => !s.ended).map(s => [s.cid, s]));
     for (const [cid, watch] of this.watches) {
       const next = live.get(cid);
@@ -82,6 +84,14 @@ export class ChannelsIndexer {
       } else if (internalChanged) this.schedule(watch);
     }
     this.deps.onChange();
+  }
+
+  /** The daemon source of `sourceCid` changed under a caller: drop its pin and observe again. */
+  invalidate(sourceCid: string): void {
+    const watch = this.watches.get(sourceCid.toUpperCase());
+    if (!watch || watch.abort.signal.aborted) return;
+    watch.generation = undefined; watch.position = undefined;
+    this.schedule(watch);
   }
 
   private retire(watch: Watch): void {
@@ -109,7 +119,7 @@ export class ChannelsIndexer {
         if (watch.abort.signal.aborted) return;
         this.deps.log(`channels: ${watch.source.name} event stream interrupted: ${(error as Error).message}`);
       }
-      if (watch.abort.signal.aborted) return;
+      if (this.retired(watch)) return;
       // The stream ended or failed: data may be behind until it is re-established.
       watch.generation = undefined;
       this.deps.store.markStale(watch.source.cid);
@@ -117,6 +127,10 @@ export class ChannelsIndexer {
       await new Promise(resolve => setTimeout(resolve, backoff));
       backoff = Math.min(backoff * 2, 30_000);
     }
+  }
+
+  private retired(watch: Watch): boolean {
+    return this.stopped || watch.abort.signal.aborted || this.watches.get(watch.source.cid) !== watch;
   }
 
   private schedule(watch: Watch): void {
@@ -130,19 +144,21 @@ export class ChannelsIndexer {
     watch.inflight = true; watch.dirty = false;
     try {
       const observation = await this.observe(watch);
-      if (!observation || watch.abort.signal.aborted) return;
-      this.deps.store.replaceEdges(watch.source.cid, edgesFrom(observation, this.internal));
+      // Retired (stopped, removed or replaced) work never touches the store or a successor.
+      if (!observation || this.retired(watch)) return;
+      this.deps.store.replaceEdges(watch.source.cid, edgesFrom(observation, this.internal), observation.source);
       watch.generation = observation.source.producerGeneration;
       watch.position = observation.source.position;
       this.deps.onChange();
     } catch (error) {
+      if (this.retired(watch)) return;
       this.deps.store.markStale(watch.source.cid);
       this.deps.onChange();
       if (error instanceof IdentityReadError && (error.code === 'identity_not_found' || error.code === 'identity_mismatch')) void this.sync();
       else this.deps.log(`channels: ${watch.source.name} observation failed: ${(error as Error).message}`);
     } finally {
       watch.inflight = false;
-      if (watch.dirty && !watch.abort.signal.aborted) this.schedule(watch);
+      if (watch.dirty && !this.retired(watch)) this.schedule(watch);
     }
   }
 
