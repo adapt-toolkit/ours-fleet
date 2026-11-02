@@ -58,6 +58,7 @@ import type { OfferedModels } from '../subscriptions/cli.js';
 import type { SubscriptionService } from '../subscriptions/service.js';
 
 import type { LayoutBindingGrants } from '../rooms-tasks/layout-binding-grants.js';
+import type { ChannelsService } from '../channels/service.js';
 
 const ONBOARDING_WORK = ['coordination', 'development', 'review'] as const;
 
@@ -85,6 +86,8 @@ export interface WebServices {
   presetProvenance?: PresetProvenance;
   oursTools?: Pick<SupervisorOursTools, 'list' | 'call'>;
   subscriptions?: SubscriptionService;
+  /** Ours Channels: Owner-only cross-identity external contacts. Absent: not configured. */
+  channels?: ChannelsService;
   /** First-time setup from the packaged presets; the account App supplies only the model choices. */
   onboardingSetup?(answers: InitAnswers): Promise<void>;
   /** The Codex models the runtime that sessions will use offers the active account. Absent: this server cannot tell, and filters nothing. */
@@ -496,6 +499,7 @@ export async function buildWebServer(
         try{return subscriptions().login(descriptor.entityId!,owner).view();}
         catch(error){if((error as any)?.code==='resource_not_found')return {deleted:true,id:descriptor.entityId};throw error;}
       case 'subscriptions': return {providers:await subscriptions().list(true)};
+      case 'channels': if(!services.channels)throw new FleetError('capability_unavailable','Ours Channels is not configured on this server');return services.channels.snapshot();
       case 'onboarding-health': {
         const revision=services.configuration?.read().revision;
         if(onboardingObserved && onboardingObserved.revision!==revision)onboardingObserved=undefined;
@@ -575,6 +579,16 @@ export async function buildWebServer(
     return reply.send(baseline.payload);
   });
   for(const resource of ['task-layout','creation-action','action','member-addition','login','onboarding-health'] as const) app.get('/api/v1/'+resource,async()=>{throw new ResourceBindingError(409,'resource binding required');});
+  const channels=()=>{if(!services.channels)throw new FleetError('capability_unavailable','Ours Channels is not configured on this server');return services.channels;};
+  const channelCid=(value:unknown)=>{const cid=String(value??'');if(!/^[0-9A-Fa-f]{64}$/.test(cid))throw new FleetError('invalid_request','a 64-hex container id is required');return cid.toUpperCase();};
+  const optionalInt=(value:unknown,name:string,max=Number.MAX_SAFE_INTEGER)=>{if(value===undefined||value==='')return undefined;const n=Number(value);if(!Number.isSafeInteger(n)||n<1||n>max)throw new FleetError('invalid_request',`${name} must be an integer from 1 to ${max}`);return n;};
+  app.get('/api/v1/channels',async request=>{auth.authenticate(request);const query=request.query as Record<string,string|undefined>;
+    return channels().list({...(query.cursor?{cursor:String(query.cursor)}:{}),...(query.q?{q:String(query.q).slice(0,200)}:{}),...(query.root?{root:channelCid(query.root)}:{}),...(query.limit?{limit:optionalInt(query.limit,'limit',200)}:{})});});
+  app.get('/api/v1/channels-status',async request=>{auth.authenticate(request);return channels().status();});
+  app.get<{Params:{cid:string}}>('/api/v1/channels/:cid',async request=>{auth.authenticate(request);return channels().get(channelCid(request.params.cid));});
+  app.get<{Params:{cid:string;source:string};Querystring:{before_seq?:string;limit?:string}}>('/api/v1/channels/:cid/perspectives/:source/messages',async request=>{auth.authenticate(request);
+    const before=optionalInt(request.query.before_seq,'before_seq'),limit=optionalInt(request.query.limit,'limit',200);
+    return channels().history(channelCid(request.params.cid),channelCid(request.params.source),{...(before!==undefined?{before_seq:before}:{}),...(limit!==undefined?{limit}:{})});});
   app.get('/api/v1/directory',async request=>{auth.authenticate(request);return project({viewId:'read',resource:'directory'},new AbortController().signal);});
   app.get('/api/v1/previews',async request=>{auth.authenticate(request);const query=request.query as any,ids=String(query.ids??'').split(',').filter(Boolean);return project(canonicalResourceDescriptor({viewId:'read',resource:'previews',ids,...(query.activityOnly==='true'?{activityOnly:true}:{})}),new AbortController().signal);});
   app.get('/api/v1/task-lists', async request => {

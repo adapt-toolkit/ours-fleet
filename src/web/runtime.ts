@@ -1,3 +1,4 @@
+import { createChannels } from '../channels/runtime.js';
 import { ConversationRoleObserver, type ConversationRoleState } from '../application/conversation-role-observer.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import {validateAccountOrigin} from '../account-origin.js';
@@ -210,6 +211,10 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const taskRooms = new TaskRoomApplicationService(options.configPath, { binPath: () => options.binPath });
   // One-time, lock-guarded mission key migration before serving; failure leaves it to the next mutation.
   await taskRooms.prepareMissionKeys().catch(error => console.warn(`mission key migration deferred: ${(error as Error).message}`));
+  // Ours Channels runs only where a daemon client profile exists.
+  let channels: ReturnType<typeof createChannels>;
+  try { channels = createChannels({ configPath: configuration.path, repository }); }
+  catch (error) { console.warn(`Ours Channels unavailable: ${(error as Error).message}`); channels = undefined; }
   let server: WebServer;
   try {
     server = await buildWebServer({
@@ -232,6 +237,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       });
     },
     codexModels: createCodexModelDiscovery(),
+    ...(channels ? { channels: channels.service } : {}),
     subscriptions: new SubscriptionService({
       agents: async () => (await query.list(true)).map(({ role, status }) => ({
         roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',
@@ -251,6 +257,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
     }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth });
   } catch (error) {
+    channels?.close();
     lock.release();
     throw error;
   }
@@ -313,7 +320,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await stopTunnel(); await notifications?.close(); await control?.close(); await gateway?.close(); await server.close(); }
+      try { await stopTunnel(); await notifications?.close(); await control?.close(); await gateway?.close(); await server.close(); channels?.close(); }
       finally { lock.release(); }
     },
   };
