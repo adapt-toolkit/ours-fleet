@@ -47,6 +47,7 @@ import type { RoomLayoutDefinitions } from '../application/room-layout-definitio
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { acknowledgeTaskProgress, acknowledgeTaskReview, contributionUnread, resolveTaskRef, TaskStateError } from '../rooms-tasks/task-state.js';
+import { CONTRIBUTION_CUTOFF_MAX, CONTRIBUTION_PAGE_MAX, listTaskContributions, readTaskContributions, type ContributionCutoff } from '../rooms-tasks/task-contributions.js';
 import { MissionKeyError } from '../rooms-tasks/mission-keys.js';
 import type { TaskRecord } from '../rooms-tasks/types.js';
 import {
@@ -703,6 +704,39 @@ export async function buildWebServer(
     }));
     if (!result.replayed) reply.code(201);
     return { entry: publicProgressEntry(result.entry), replayed: result.replayed };
+  });
+  /**
+   * Progress and To review of every task, newest first, for the notification list. The first page
+   * (no `before`) also carries the cutoff a bulk read may acknowledge up to: each task with unread
+   * items as it was read, one task at a time (per task, not one atomic instant across tasks).
+   */
+  app.get('/api/v1/contributions', async request => {
+    auth.authenticate(request);
+    const query = request.query as Record<string, string | undefined>;
+    if (query.unread !== undefined && !['true', 'false'].includes(query.unread))
+      throw new FleetError('invalid_request', 'unread must be true or false');
+    if (query.limit !== undefined && !/^\d{1,3}$/.test(query.limit))
+      throw new FleetError('invalid_request', `limit must be 1-${CONTRIBUTION_PAGE_MAX}`);
+    const page = await reviewApi(() => listTaskContributions({
+      ...(query.before !== undefined ? { before: query.before } : {}),
+      ...(query.limit !== undefined ? { limit: Number(query.limit) } : {}),
+      unread: query.unread === 'true',
+    }));
+    const { cutoff, ...rest } = page;
+    return query.before === undefined ? page : rest;
+  });
+  /** Bulk read up to a captured cutoff, at most `CONTRIBUTION_CUTOFF_MAX` tasks per request, with a result per task. */
+  app.post('/api/v1/contributions/read', async request => {
+    auth.authenticate(request, true);
+    const cutoff = (request.body as { cutoff?: unknown })?.cutoff;
+    const valid = (item: any) => !!item && typeof item === 'object' && Object.keys(item).length === 4
+      && typeof item.task_id === 'string' && /^[0-9a-z]{9}[0-9a-f]{8}$/.test(item.task_id) && Number.isSafeInteger(item.progress) && item.progress >= 0
+      && (item.progress_last === null || (typeof item.progress_last === 'string' && item.progress_last.length <= 64))
+      && Number.isSafeInteger(item.review) && item.review >= 0;
+    if (!Array.isArray(cutoff) || cutoff.length > CONTRIBUTION_CUTOFF_MAX || !cutoff.every(valid)
+      || new Set(cutoff.map(item => item.task_id)).size !== cutoff.length)
+      throw new FleetError('invalid_request', `cutoff must list at most ${CONTRIBUTION_CUTOFF_MAX} distinct tasks as captured`);
+    return { results: await reviewApi(() => readTaskContributions(cutoff as ContributionCutoff[])) };
   });
   /** Acknowledge Progress entries the browser actually showed; returns the task's remaining unread. */
   app.post<{ Params: { id: string } }>('/api/v1/tasks/:id/progress/read', async request => {

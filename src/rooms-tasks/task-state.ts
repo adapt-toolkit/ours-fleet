@@ -262,6 +262,41 @@ export function acknowledgeTaskReview(id: string, revision: number): { progress:
   });
 }
 
+/**
+ * Bulk read up to a captured cutoff: the first `progress` entries (Progress is append-only, so an
+ * entry appended after the capture has a higher index) and To review up to exactly `review`, never
+ * a newer revision. Both are written in one task change. Returns how many unread items this
+ * changed, or `changed` (nothing written) when the task no longer matches the cutoff, including a
+ * review revision the task never had; refuses a task pending deletion.
+ */
+export function acknowledgeTaskContributionsThrough(
+  id: string, cutoff: { progress: number; progressLast: string | null; review: number },
+): number | 'changed' {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    const { progress, progressLast, review } = cutoff;
+    // The cutoff names its last entry: a different entry at that position reads nothing.
+    const entries = task.progress ?? [];
+    if (!Number.isSafeInteger(progress) || progress < 0 || progress > entries.length
+      || (progress > 0 ? entries[progress - 1].id : null) !== progressLast
+      || !Number.isSafeInteger(review) || review < 0 || review > reviewRevision(task.review)) return 'changed';
+    const reads = task.contribution_reads;
+    if (!reads) return 0;
+    const seen = new Set(reads.progress_read);
+    const added = entries.slice(0, progress).map(entry => entry.id).filter(entryId => !seen.has(entryId));
+    const reviewRead = review > reads.review_revision;
+    if (!added.length && !reviewRead) return 0;
+    task.contribution_reads = {
+      progress_read: [...reads.progress_read, ...added],
+      review_revision: reviewRead ? review : reads.review_revision,
+    };
+    writeTask(task);
+    return added.length + (reviewRead ? 1 : 0);
+  });
+}
+
 const retiredNotificationsDir = () => join(tasksDir(), '.notification-retired');
 
 function typedTaskNotification(value: TaskNotificationEvent, id: string): boolean {
