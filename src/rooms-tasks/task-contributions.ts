@@ -77,7 +77,11 @@ function refresh(): number {
   if (cache?.dir !== dir) cache = { dir, tasks: new Map() };
   const current = cache;
   let names: string[];
-  try { names = readdirSync(dir); } catch { names = []; }
+  // No task directory yet means no tasks; any other failure is an error, never an empty list.
+  try { names = readdirSync(dir); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    names = [];
+  }
   const present = new Set<string>();
   let unavailable = 0;
   for (const name of names) {
@@ -153,7 +157,7 @@ export function listTaskContributions(options: { before?: string; limit?: number
 }
 
 export type ContributionReadResult = { task_id: string } & (
-  { status: 'read'; read: number } | { status: 'changed' | 'gone' | 'deleting' });
+  { status: 'read'; read: number } | { status: 'changed' | 'gone' | 'deleting' | 'failed' });
 
 /** Read every task of a captured cutoff up to that cutoff, each under its own lock; one task's outcome never blocks another. */
 export function readTaskContributions(cutoff: ContributionCutoff[]): ContributionReadResult[] {
@@ -164,7 +168,8 @@ export function readTaskContributions(cutoff: ContributionCutoff[]): Contributio
     } catch (error) {
       if (error instanceof TaskStateError && /pending deletion/.test(error.message)) return { task_id, status: 'deleting' };
       if (error instanceof TaskStateError && /not found/.test(error.message)) return { task_id, status: 'gone' };
-      throw error;
+      // An unreadable or unwritable record fails alone; tasks already read stay read and are reported.
+      return { task_id, status: 'failed' };
     }
   });
 }

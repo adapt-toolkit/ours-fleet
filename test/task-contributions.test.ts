@@ -72,8 +72,11 @@ it('the bulk read acknowledges exactly the captured cutoff: later appends and re
   review(b.task_id, 'v2');
   const results = readTaskContributions(cutoff);
   expect(results).toEqual(expect.arrayContaining([
-    { task_id: a.task_id, status: 'read', read: 2 }, { task_id: b.task_id, status: 'read', read: 1 },
+    { task_id: a.task_id, status: 'read', read: 2 },
+    // The captured revision 1 is acknowledged, but revision 2 is current and stays unread: nothing counted.
+    { task_id: b.task_id, status: 'read', read: 0 },
   ]));
+  expect(getTask(b.task_id).contribution_reads?.review_revision).toBe(1);
   expect(all(true).map(item => item.id).sort()).toEqual([`p:${a.task_id}:${late.id}`, `r:${b.task_id}:2`].sort());
   // Repeating the same cutoff changes nothing more.
   expect(readTaskContributions(cutoff).every(result => result.status === 'read' && result.read === 0)).toBe(true);
@@ -93,7 +96,7 @@ it('a cutoff that no longer matches its task, or names a revision it never had, 
   expect(readTaskContributions([{ task_id: a.task_id, progress: 1, progress_last: entry.id, review: 0 }])).toEqual([{ task_id: a.task_id, status: 'read', read: 1 }]);
   // An older acknowledgement never clears a newer revision, through either route.
   review(b.task_id, 'v2');
-  expect(readTaskContributions([{ task_id: b.task_id, progress: 0, progress_last: null, review: 1 }])).toEqual([{ task_id: b.task_id, status: 'read', read: 1 }]);
+  expect(readTaskContributions([{ task_id: b.task_id, progress: 0, progress_last: null, review: 1 }])).toEqual([{ task_id: b.task_id, status: 'read', read: 0 }]);
   expect(contributionUnread(getTask(b.task_id)).review).toBe(true);
   expect(acknowledgeTaskReview(b.task_id, 2).review).toBe(false);
 });
@@ -175,3 +178,20 @@ it('serves the list and the bulk read only to an authenticated session, with the
     expect((await read({ cutoff: [{ task_id: absent, progress: 0, progress_last: null, review: 0 }] })).json().results).toEqual([{ task_id: absent, status: 'gone' }]);
   } finally { await server.app.close(); }
 }, 30_000);
+
+it('one unreadable task fails alone in a bulk read, and an unreadable task directory is an error, never an empty list', () => {
+  const a = create('Alpha'), b = create('Beta'), c = create('Gamma');
+  for (const task of [a, b, c]) progress(task.task_id, 'entry');
+  const { cutoff } = listTaskContributions();
+  writeFileSync(file(b.task_id), '{');
+  const order = [a.task_id, b.task_id, c.task_id];
+  expect(readTaskContributions(order.map(id => cutoff.find(item => item.task_id === id)!))).toEqual([
+    { task_id: a.task_id, status: 'read', read: 1 }, { task_id: b.task_id, status: 'failed' }, { task_id: c.task_id, status: 'read', read: 1 },
+  ]);
+  const dir = tasksDir();
+  rmSync(dir, { recursive: true, force: true });
+  writeFileSync(dir, 'not a directory');
+  expect(() => listTaskContributions()).toThrow();
+  rmSync(dir);
+  expect(listTaskContributions()).toMatchObject({ items: [], unread_total: 0, unavailable: 0 });
+});

@@ -265,8 +265,8 @@ export function acknowledgeTaskReview(id: string, revision: number): { progress:
 /**
  * Bulk read up to a captured cutoff: the first `progress` entries (Progress is append-only, so an
  * entry appended after the capture has a higher index) and To review up to exactly `review`, never
- * a newer revision. Both are written in one task change. Returns how many unread items this
- * changed, or `changed` (nothing written) when the task no longer matches the cutoff, including a
+ * a newer revision. Both are written in one task change. Returns how many items that were unread
+ * are read now, or `changed` (nothing written) when the task no longer matches the cutoff, including a
  * review revision the task never had; refuses a task pending deletion.
  */
 export function acknowledgeTaskContributionsThrough(
@@ -293,7 +293,8 @@ export function acknowledgeTaskContributionsThrough(
       review_revision: reviewRead ? review : reads.review_revision,
     };
     writeTask(task);
-    return added.length + (reviewRead ? 1 : 0);
+    // An older revision moves the marker but leaves the current package unread: it is not counted.
+    return added.length + (reviewRead && review === reviewRevision(task.review) ? 1 : 0);
   });
 }
 
