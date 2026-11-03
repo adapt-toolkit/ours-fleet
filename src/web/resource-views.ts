@@ -173,7 +173,7 @@ export class ResourceOutput {
 
 export interface ResourceDescriptor {
   viewId: string;
-  resource: 'directory' | 'roles' | 'tasks' | 'task-lists' | 'configuration' | 'previews' | 'task-layout' | 'creation-action' | 'action' | 'member-addition' | 'login' | 'onboarding-health' | 'subscriptions';
+  resource: 'directory' | 'roles' | 'tasks' | 'task-lists' | 'configuration' | 'previews' | 'task-layout' | 'creation-action' | 'action' | 'member-addition' | 'login' | 'onboarding-health' | 'subscriptions' | 'channels';
   entityId?: string;
   receiptId?: string;
   provider?: 'claude' | 'codex';
@@ -190,7 +190,7 @@ export interface ResourceDescriptor {
 export function canonicalResourceDescriptor(input: unknown): ResourceDescriptor {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('invalid resource descriptor');
   const value = input as ResourceDescriptor;
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value.viewId) || !['directory','roles','tasks','task-lists','configuration','previews','task-layout','creation-action','action','member-addition','login','onboarding-health','subscriptions'].includes(value.resource)
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value.viewId) || !['directory','roles','tasks','task-lists','configuration','previews','task-layout','creation-action','action','member-addition','login','onboarding-health','subscriptions','channels'].includes(value.resource)
     || Object.keys(value).some(key => !['viewId','resource','includeTemporary','includeDefinitions','ids','state','list','groupByList','includeDeleting','entityId','receiptId','provider','activityOnly'].includes(key))) throw Error('invalid resource descriptor');
   if (value.activityOnly !== undefined && value.resource !== 'previews') throw Error('invalid resource descriptor');
   for (const key of ['includeTemporary','includeDefinitions','groupByList','includeDeleting','activityOnly'] as const) if (value[key] !== undefined && typeof value[key] !== 'boolean') throw Error('invalid resource descriptor');
@@ -355,6 +355,10 @@ export class FleetResourceViews {
       || this.configurationInputs().some(input => within(resolve(input), changed));
   }
   private affects(descriptor: ResourceDescriptor, path: string, structural = false): boolean {
+    // The Channels projection commits only its own private database; no other view reads it.
+    const channelsRoot = resolve(stateRoot(), 'private-channels'), channelsPath = path === channelsRoot || path.startsWith(channelsRoot + sep);
+    if (descriptor.resource === 'channels') return channelsPath || channelsRoot.startsWith(resolve(path) + sep);
+    if (channelsPath) return false;
     if (descriptor.resource === 'configuration') return this.configurationDependency(path);
     // An explicitly selected manifest may use any pathname, including one
     // otherwise reserved for an independent task receipt.
