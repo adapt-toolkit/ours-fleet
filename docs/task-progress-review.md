@@ -155,6 +155,8 @@ workspace-device bearer. `GET /api/v1/meta` reports API minor version 1.
 | `GET /tasks/:id/review` | `{review: {revision, markdown, updated_at, updated_by, artifacts: [{id, name, mime, size, sha256, added_at, added_by}]}}` or `{review: null}`. |
 | `PUT /tasks/:id/review` | `{markdown, expectedMarkdown}`; 409 when the Markdown changed meanwhile. |
 | `GET /tasks/:id/review/artifacts/:artifactId` | The retained bytes as `application/octet-stream` attachment with `Content-Security-Policy: default-src 'none'; sandbox`, `nosniff` and `no-store`. Another task's artifact ID is 404. |
+| `GET /contributions?limit=1-100&before=&unread=true` | Every task's Progress entries and current To review revision for the notification list, newest first: `{items: [{id, kind, task_id, mission_key?, task_title, task_state, at, excerpt, unread, entry_id? \| revision?}], next_cursor, unread_total, unavailable}`. The cursor is a position, valid after its item is read or deleted. Tasks pending deletion are left out; `unavailable` counts unreadable task records. The first page also has `cutoff: [{task_id, progress, progress_last, review}]` for every task with unread items, each captured from that task's own read (per task, not one instant across tasks). |
+| `POST /contributions/read` | `{cutoff}` with at most 200 distinct tasks from a first page: reads each task's first `progress` entries and review revision `review`, never later ones, one task change each. `{results: [{task_id, status}]}` in request order, `status` `read` (with `read`: items that were unread and are read now), `changed` (the task no longer matches its cutoff; nothing written), `gone`, `deleting` or `failed`. |
 
 The HTTP API has no upload route: the browser never submits a file path.
 
