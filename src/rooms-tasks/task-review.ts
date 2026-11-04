@@ -487,6 +487,8 @@ export function insideDirectory(root: string, path: string): boolean {
 /** The task's owned workspace, validated against its ownership marker. */
 export function taskWorkspaceRoot(task: TaskRecord): string {
   if (!task.workspace) throw new TaskReviewError('invalid_request', `task ${task.task_id} has no owned workspace`);
+  if (task.workspace_removal)
+    throw new TaskReviewError('invalid_request', `the working files of task ${task.task_id} were removed, so no file can be attached from them`);
   assertWorkspacePresent(task.workspace, 'task', task.task_id);
   return task.workspace.path;
 }

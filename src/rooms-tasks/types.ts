@@ -123,6 +123,22 @@ export interface TaskDeletionIntent {
   first_recovery_hint?: string;
 }
 
+/**
+ * Explicit removal of a Done task's owned working folder. The task record,
+ * Progress, To review files and agent archives stay; only the folder goes.
+ * `started_at` without `completed_at` means removal began and has not been
+ * confirmed: it may still be running or have been interrupted.
+ */
+export interface TaskWorkspaceRemoval {
+  started_at: string;
+  actor: TaskDeletionActor;
+  completed_at?: string;
+  /** The recorded folder was already absent when removal first ran. */
+  already_missing?: true;
+  error?: string;
+  error_at?: string;
+}
+
 export interface TaskLayoutLink {
   name: string;
   /** Deterministic `task-<task_id>` Room Layout run ID. */
@@ -188,6 +204,8 @@ export interface TaskRecord {
   /** Rooms whose notifications belong to this task; only grows. */
   notification_manifest?: import('./notification-manifest.js').TaskNotificationManifest;
   workspace?: import('./workspace.js').OwnedWorkspace;
+  /** Set once the Owner asked to remove the working folder; the record is never recreated from it. */
+  workspace_removal?: TaskWorkspaceRemoval;
   task_id: string;
   /**
    * Immutable human mission key (`MSN-1`), issued once from a durable

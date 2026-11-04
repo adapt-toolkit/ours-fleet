@@ -43,6 +43,7 @@ import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
+import { workingFilesSummary } from '../rooms-tasks/workspace-removal.js';
 import type { RoomLayoutDefinitions } from '../application/room-layout-definitions.js';
 import type { PresetProvenance } from '../application/preset-provenance.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
@@ -447,7 +448,7 @@ export async function buildWebServer(
   /** Browser task payloads carry Progress/To review counts; bodies have their own routes. */
   const wireTask = <T extends TaskRecord>(task: T) => {
     const { progress: _progress, review: _review, member_naming: _naming, ...rest } = task;
-    return { ...rest, ...taskContributionSummary(task) };
+    return { ...rest, ...taskContributionSummary(task), working_files: workingFilesSummary(task) };
   };
   const wireTaskResult = <T>(result: T): T => {
     const value = result as Record<string, unknown> | undefined;
@@ -642,6 +643,14 @@ export async function buildWebServer(
       ...(outcome.error ? { error: outcome.error } : {}),
       recovery: `Repeat DELETE /api/v1/tasks/${submitted}?confirm=${submitted}.`,
     };
+  });
+  // Removes only the Done task's own working folder; the task, Progress, To review files and chat history stay.
+  app.post('/api/v1/tasks/:id/working-files/remove', async request => {
+    auth.authenticate(request, true);
+    const result = await taskApi(() => requireTaskRooms().removeTaskWorkingFiles({
+      actor: { kind: 'local_control', surface: 'web' }, taskId: taskRef(request),
+    }));
+    return { task: wireTask(result.task), result: result.result, mentions: result.mentions };
   });
   app.post('/api/v1/tasks', async (request, reply) => {
     auth.authenticate(request, true);

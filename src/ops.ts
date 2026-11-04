@@ -1,4 +1,5 @@
 import { retireNotificationTarget } from './notifications/target-cleanup.js';
+import { withTaskFolderUseFence } from './rooms-tasks/workspace-removal.js';
 import {
   chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, unlinkSync,
 } from 'node:fs';
@@ -69,6 +70,18 @@ export interface OpsDeps {
 
 /** Materialize a role's state dir from config: briefing + markers. Returns the dir. */
 export function applyRole(
+  role: ResolvedRole,
+  opts: {
+    fresh?: boolean; temp?: boolean; configPath?: string;
+    identityGuarantee?: 'verified' | 'created' | 'unverified';
+  } = {},
+): string {
+  // Agent state that names a task folder is created under that folder's use fence,
+  // so a concurrent working-files removal either sees it or this launch refuses.
+  return withTaskFolderUseFence(role.cwd, () => applyRoleUnfenced(role, opts));
+}
+
+function applyRoleUnfenced(
   role: ResolvedRole,
   opts: {
     fresh?: boolean; temp?: boolean; configPath?: string;

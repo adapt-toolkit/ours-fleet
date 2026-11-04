@@ -334,6 +334,9 @@ export async function settleTaskDeletion(input: {
       if (task.workspace) {
         assertWorkspaceDeletable(task.workspace, 'task', taskId);
         beginTaskArchiveCleanup(taskId);
+        // Finish an interrupted working-files removal first: archive collection
+        // refuses to republish a folder over its pending tombstone.
+        if (task.workspace_removal) deleteWorkspace(task.workspace, 'task', taskId);
         collectWorkspaceArchives(task.workspace);
         deleteWorkspace(task.workspace, 'task', taskId);
       }

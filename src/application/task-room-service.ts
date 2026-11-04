@@ -43,6 +43,7 @@ import {
   type TaskDeletionSettleResult,
 } from '../rooms-tasks/deletion.js';
 import { withFileLock } from '../atomic-file.js';
+import { removeTaskWorkspace, type WorkspaceRemovalDeps, type WorkspaceRemovalOutcome } from '../rooms-tasks/workspace-removal.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import type {
   RoomLaunchPolicy, RoomOrchestrationRecord, TaskDeletionActor, TaskListRecord,
@@ -171,6 +172,8 @@ export interface TaskRoomServiceDeps {
   now?(): number;
   /** Test seam: register a task room with the notification service before the Owner joins. */
   associateRoomNotifications?(taskId: string, roomCid: string): Promise<void>;
+  /** Test seam: the process-use check of working-files removal. */
+  processesUsing?: WorkspaceRemovalDeps['processesUsing'];
 }
 
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
@@ -610,6 +613,17 @@ export class TaskRoomApplicationService {
         agents: [] });
     }
     return result;
+  }
+
+  /** Remove only a Done task's working folder; the task and its retained material stay. */
+  async removeTaskWorkingFiles(input: { actor: TaskRoomActor; taskId: string }): Promise<WorkspaceRemovalOutcome> {
+    let permanentCwds: (string | undefined)[] | undefined;
+    // An unreadable configuration cannot prove no permanent agent works in the folder.
+    try { permanentCwds = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath).roles.map(role => role.cwd); }
+    catch { permanentCwds = undefined; }
+    return removeTaskWorkspace(input.taskId, this.deletionActor(input.actor), {
+      permanentCwds, ...(this.deps.processesUsing ? { processesUsing: this.deps.processesUsing } : {}),
+    });
   }
 
   /** Worker entry: converge an accepted deletion; Cowork is resolved lazily. */
