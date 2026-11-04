@@ -10,7 +10,7 @@ import { planWorkspace, ensureWorkspace } from './workspace.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
-  TaskDeletionActor, TaskDeletionMemberPhase, TaskNotificationEvent,
+  TaskDeletionActor, TaskDeletionMemberPhase, TaskNotificationEvent, TaskWorkspaceRemoval,
 } from './types.js';
 import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists, resolveTaskList, writeTaskListPrefixesLocked } from './task-lists.js';
@@ -545,7 +545,8 @@ export function createTask(input: CreateTaskInput): TaskRecord {
   return withTaskLock(outcome.taskId, () => {
     const fresh = readTask(outcome.taskId);
     if (outcome.kind === 'existing') assertNoPendingDeletion(fresh);
-    if (fresh.workspace) ensureWorkspace(fresh.workspace);
+    // A replayed create never recreates a folder the Owner removed.
+    if (fresh.workspace && !fresh.workspace_removal) ensureWorkspace(fresh.workspace);
     return fresh;
   });
 }
@@ -1582,6 +1583,23 @@ export function updateTaskBrief(id: string, brief: string, expectedBrief: string
     if ((task.brief ?? '') !== expectedBrief && task.brief !== brief)
       throw new TaskStateError('Description changed elsewhere. Reload the task before saving.');
     task.brief = brief;
+    writeTask(task);
+    return task;
+  });
+}
+
+/**
+ * Record a step of an explicit working-folder removal. Callers hold the task
+ * operation lock; lifecycle state is untouched.
+ */
+export function updateTaskWorkspaceRemoval(
+  id: string, change: (removal: TaskWorkspaceRemoval | undefined) => TaskWorkspaceRemoval,
+): TaskRecord {
+  assertCanonicalTaskId(id);
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    task.workspace_removal = change(task.workspace_removal);
     writeTask(task);
     return task;
   });

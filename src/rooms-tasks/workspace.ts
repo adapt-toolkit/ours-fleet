@@ -251,6 +251,12 @@ export function assertWorkspaceDeletable(w: OwnedWorkspace, owner: OwnedWorkspac
   if (stat(staging(w, 'deleting'))) assertSafeAncestors(staging(w, 'deleting'));
 }
 
+/** True while the live folder, its deletion tombstone or a provisioning stage exists. */
+export function workspaceEntriesPresent(w: OwnedWorkspace): boolean {
+  validateWorkspace(w);
+  return [w.path, staging(w, 'deleting'), staging(w, 'provisioning')].some(path => stat(path) !== undefined);
+}
+
 export function deleteWorkspace(w: OwnedWorkspace, owner: OwnedWorkspace['owner'], id: string): void {
   assertWorkspaceDeletable(w, owner, id);
   const tomb = staging(w, 'deleting');

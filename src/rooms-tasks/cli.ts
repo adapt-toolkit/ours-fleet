@@ -1277,6 +1277,26 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
+  cOpt(taskCmd.command('remove-files <id>'))
+    .description("remove a Done task's working folder; the task, Progress, To review files and chat history stay")
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      id = cliTaskRef(id, opts.json);
+      try {
+        const outcome = await taskRoomService(opts.configuration).removeTaskWorkingFiles({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: outcome.task, result: outcome.result, mentions: outcome.mentions }, null, 2));
+          return;
+        }
+        const title = outcome.result === 'removed' ? 'Working files removed'
+          : outcome.result === 'already_missing' ? 'Working folder was already missing' : 'Working files already removed';
+        console.log(taskActionMarkdown(title, outcome.task, outcome.mentions.length
+          ? [{ label: 'Paths no longer resolve in', value: outcome.mentions.join(', ') }] : []));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
   cOpt(taskCmd.command('_settle <id>', { hidden: true }))
     .description('internal: settle a previously accepted task terminal intent')
     .option('--json', 'JSON output')

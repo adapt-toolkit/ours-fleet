@@ -676,6 +676,24 @@ management API equivalent is \`DELETE /api/v1/tasks/<id>?confirm=<id>\` (200 whe
 settled, 202 while pending; \`GET /api/v1/tasks?includeDeleting=true\` exposes
 deletion-pending tasks to operators).
 
+\`ours-fleet task remove-files <id>\` frees disk space by removing only a Done
+task's own working folder (\`workspaces/tasks/<task ID>\`), including checkouts
+and uncommitted or unpushed work in it. The task record, description, status,
+Progress, To review files, agent archives and room history stay; the task stays
+Done and is never recreated from the folder. Fleet refuses, with the reason and
+without stopping anything, unless the task is Done with its completion settled,
+no room record of the task remains, a layout run has finished closing and
+retiring its agents, no supervisor registration or unarchived agent state
+belongs to the task or works in the folder, and the folder passes the same
+ownership-marker, Git-registration, symlink and mount checks as deletion.
+Tasks without a recorded Fleet-owned folder cannot use it. Removal is recorded
+on the task (\`workspace_removal\`, shown as \`working_files\` in API task
+payloads: \`present\`, \`removing\` (started, not confirmed), \`failed\` or
+\`removed\`); a retry resumes an unfinished removal and repeating a finished one
+is a no-op. Files can no longer be attached to To review from the folder; Delete
+still works. The management API equivalent is
+\`POST /api/v1/tasks/<id>/working-files/remove\`.
+
 ### Task Progress and To review
 
 A task can carry an append-only **Progress** milestone log and a self-contained
