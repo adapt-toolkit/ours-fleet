@@ -686,7 +686,8 @@ no room record of the task remains, a layout run has finished closing and
 retiring its agents, no supervisor registration or unarchived agent state
 belongs to the task or works in the folder, no process uses the folder (Linux
 \`/proc\`; an unreadable process is excluded only when it is a zombie, its
-mount table cannot reach the folder or it is the user's service manager;
+mount table cannot reach the folder or it is the user's service manager as
+attested by the system manager;
 other platforms refuse), and the folder passes the same
 ownership-marker, Git-registration, symlink and mount checks as deletion.
 Tasks without a recorded Fleet-owned folder cannot use it. Removal is recorded

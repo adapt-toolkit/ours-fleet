@@ -255,7 +255,9 @@ refuses the removal. Platforms without this check refuse the removal.
 Some processes' entries are unreadable, for example non-dumpable ones or
 processes in containers. Such a process is excluded only on evidence: it is
 a zombie, its mount table cannot reach the folder's location on disk, or it
-is the user's service manager (`systemd --user`, `(sd-pam)`). Any other
+is the user's service manager as the system manager attests it
+(`systemctl show user@UID.service` MainPID, plus its `(sd-pam)` child in the same
+cgroup). Any other
 unreadable process of the same user refuses the removal and is named.
 Another user's unreadable process is skipped when a private ancestor closes
 the folder to it. Superuser processes are outside the check. Only a folder

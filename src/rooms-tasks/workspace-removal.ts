@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Dirent } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse } from 'yaml';
@@ -55,7 +56,8 @@ function closedToOtherUsers(path: string): boolean {
  * elsewhere removal is refused. When a process's entries are unreadable (for
  * example non-dumpable, or in a container), it is excluded only by evidence:
  * it is a zombie, its mount table cannot reach the folder's filesystem
- * location, or it is the user's service manager; otherwise it is reported.
+ * location, or it is the user's service manager as attested by the system
+ * manager; otherwise it is reported.
  * Other users' unreadable processes are skipped when a private ancestor
  * closes the folder to them; a superuser process is outside this check.
  */
@@ -65,6 +67,7 @@ export function processesUsing(path: string): string[] {
   const uid = process.geteuid?.();
   const othersClosed = closedToOtherUsers(path);
   const target = filesystemLocation(path);
+  const manager = userManagerPid(uid);
   const inside = (link: string) => contains(path, link.replace(/ \(deleted\)$/, ''));
   const gone = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
   const denied = (error: unknown) => ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '');
@@ -94,15 +97,39 @@ export function processesUsing(path: string): string[] {
     if (status === undefined || /^\d+ \(.*\) [ZX] /s.test(status)) continue; // exited or a zombie: no cwd or files
     const mounts = readProc(`/proc/${pid}/mountinfo`);
     if (mounts !== undefined && !reaches(mounts, target)) continue;
-    // The user's service manager (systemd --user and its PAM helper) never works in task folders.
+    if (isUserManager(pid, manager)) continue;
     const command = readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '').split('\0').join(' ');
-    if (command !== undefined && SERVICE_MANAGER.test(command) && parentIsInit(pid)) continue;
     users.push(`${pid} (unreadable${command ? `: ${command.slice(0, 80)}` : ''})`);
   }
   return users;
 }
 
-const SERVICE_MANAGER = /^(?:\/usr)?\/lib\/systemd\/systemd --user$|^\(sd-pam\)$/;
+/**
+ * The user's service manager as attested by the system manager (root-owned PID 1),
+ * not by anything the process says about itself. Undefined when it cannot be asked.
+ */
+function userManagerPid(uid: number | undefined): string | undefined {
+  if (uid === undefined) return undefined;
+  try {
+    const pid = execFileSync('systemctl', ['show', `user@${uid}.service`, '--property=MainPID', '--value'],
+      { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return /^[1-9]\d*$/.test(pid) ? pid : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * The attested user manager itself, or its PAM session helper: a direct child
+ * named `(sd-pam)` in the manager's own cgroup. Neither works in task folders.
+ */
+function isUserManager(pid: string, manager: string | undefined): boolean {
+  if (!manager) return false;
+  if (pid === manager) return true;
+  const stat = readProc(`/proc/${pid}/stat`);
+  const ppid = stat?.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+  const cgroup = (id: string) => readProc(`/proc/${id}/cgroup`);
+  return ppid === manager && readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '') === '(sd-pam)'
+    && cgroup(pid) !== undefined && cgroup(pid) === cgroup(manager);
+}
 
 function readProc(path: string): string | undefined {
   try { return readFileSync(path, 'utf8'); }
@@ -112,11 +139,6 @@ function readProc(path: string): string | undefined {
   }
 }
 
-function parentIsInit(pid: string): boolean {
-  const stat = readProc(`/proc/${pid}/stat`);
-  const ppid = stat?.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
-  return ppid === '1' || (ppid !== undefined && SERVICE_MANAGER.test(readProc(`/proc/${ppid}/cmdline`)?.replace(/\0+$/, '').split('\0').join(' ') ?? ''));
-}
 
 /** Where `path` lives: its device and its path within that filesystem, from our own mount table. */
 function filesystemLocation(path: string): { device: string; inside: string } {
