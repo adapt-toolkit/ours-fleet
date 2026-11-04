@@ -257,7 +257,13 @@ export function workspaceEntriesPresent(w: OwnedWorkspace): boolean {
   return [w.path, staging(w, 'deleting'), staging(w, 'provisioning')].some(path => stat(path) !== undefined);
 }
 
-export function deleteWorkspace(w: OwnedWorkspace, owner: OwnedWorkspace['owner'], id: string): void {
+export function deleteWorkspace(
+  w: OwnedWorkspace, owner: OwnedWorkspace['owner'], id: string,
+  options: {
+    /** Runs on the tombstone before removal; may restore it with `restoreTombstone` and throw. */
+    beforeRemove?(tomb: string, restoreTombstone: () => void): void;
+  } = {},
+): void {
   assertWorkspaceDeletable(w, owner, id);
   const tomb = staging(w, 'deleting');
   const pending = staging(w, 'provisioning');
@@ -273,6 +279,10 @@ export function deleteWorkspace(w: OwnedWorkspace, owner: OwnedWorkspace['owner'
     rmSync(pending, { recursive: true });
   }
   if (stat(tomb)) {
+    options.beforeRemove?.(tomb, () => {
+      if (stat(w.path)) fail('both live and deleting workspace exist');
+      renameSync(tomb, w.path);
+    });
     // This exact token-derived tombstone has already passed the marker and
     // Git audit; partial removal may have consumed those proofs on disk.
     prepareOwnedDeletionTree(tomb);

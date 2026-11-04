@@ -1593,13 +1593,15 @@ export function updateTaskBrief(id: string, brief: string, expectedBrief: string
  * operation lock; lifecycle state is untouched.
  */
 export function updateTaskWorkspaceRemoval(
-  id: string, change: (removal: TaskWorkspaceRemoval | undefined) => TaskWorkspaceRemoval,
+  id: string, change: (removal: TaskWorkspaceRemoval | undefined) => TaskWorkspaceRemoval | undefined,
 ): TaskRecord {
   assertCanonicalTaskId(id);
   return withTaskLock(id, () => {
     const task = readTask(id);
     assertNoPendingDeletion(task);
-    task.workspace_removal = change(task.workspace_removal);
+    const next = change(task.workspace_removal);
+    if (next) task.workspace_removal = next;
+    else delete task.workspace_removal;
     writeTask(task);
     return task;
   });

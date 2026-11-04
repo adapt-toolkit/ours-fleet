@@ -4,7 +4,7 @@
  * siblings inside the same temporary root.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,7 +15,9 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import { createRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
-import { removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
+import { assertCwdNotInRemovedTaskFolder, removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
+import { spawnTemp } from '../src/spawn.js';
+import { writeV2Fixture } from './v2-fixture.js';
 import {
   appendTaskProgress, attachTaskReviewArtifact, openTaskWorkspaceFile, readTaskReviewArtifact, setTaskReviewMarkdown,
 } from '../src/rooms-tasks/task-review.js';
@@ -66,7 +68,7 @@ function tempAgent(name: string, role: Record<string, unknown>, supervisor?: Rec
   const dir = join(tmpRoot(), name);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'role.yaml'), stringify({ name, ...role }));
-  if (supervisor) writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: name, launchId: 'l1', ...supervisor }));
+  writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: name, launchId: 'l1', ...supervisor }));
   return dir;
 }
 function archive(w: NonNullable<ReturnType<typeof getTask>['workspace']>, name: string) {
@@ -124,6 +126,22 @@ describe('removing a Done task working folder', () => {
     expect(again.task.workspace_removal).toEqual(after.workspace_removal);
     await expect(openTaskWorkspaceFile(getTask(t.task_id), join(w.path, 'report.md'))).rejects.toThrow(/were removed/);
     expect(existsSync(w.path)).toBe(false);
+  });
+
+  it('refuses to launch an agent into a removed folder, which would recreate it', async () => {
+    const t = doneTask();
+    const kept = doneTask();
+    await removeTaskWorkspace(t.task_id, actor, deps);
+    const alias = join(root, 'alias-to-removed'); symlinkSync(t.workspace!.path, alias);
+    for (const cwd of [t.workspace!.path, join(t.workspace!.path, 'checkout'), join(t.workspace!.path, '..x'), join(alias, 'sub')])
+      expect(() => assertCwdNotInRemovedTaskFolder(cwd)).toThrow(/working files of task .* were removed/);
+    for (const cwd of [kept.workspace!.path, join(root, 'elsewhere'), join(stateRoot(), 'workspaces', 'tasks', 'unknown'), undefined])
+      expect(() => assertCwdNotInRemovedTaskFolder(cwd)).not.toThrow();
+    writeV2Fixture(join(root, 'fleet.yaml'), { roles: {} });
+    await expect(spawnTemp({ name: 'Late', cwd: t.workspace!.path,
+      brain: { inline: { harness: 'claude-code', model: 'm' } }, role: { inline: { mission: 'x' } } } as any, '/b/ours-fleet', () => {}))
+      .rejects.toThrow(/were removed/);
+    expect(existsSync(t.workspace!.path)).toBe(false);
   });
 
   it('does not recreate the folder on an idempotent create replay', async () => {
@@ -199,9 +217,83 @@ describe('removing a Done task working folder', () => {
     await refused(t.task_id, /configuration cannot be read/, {} as typeof deps);
     expect(existsSync(join(path, '.fleet-workspace.json'))).toBe(true);
 
+    // Unknown supervisor ownership is not absence of ownership.
+    const unknown = tempAgent('unknown', { cwd: join(root, 'elsewhere') });
+    writeFileSync(join(unknown, '.temp-supervisor.json'), '{ not json');
+    await refused(t.task_id, /agent unknown has unreadable state/);
+    rmSync(unknown, { recursive: true });
+
+    const bare = tempAgent('bare', { cwd: join(root, 'elsewhere') });
+    rmSync(join(bare, '.temp-supervisor.json'));
+    await refused(t.task_id, /agent bare has unreadable state.*missing \.temp-supervisor\.json/);
+    writeFileSync(join(bare, '.temp-supervisor.json'), JSON.stringify({ version: 1, role: 'bare' }));
+    await refused(t.task_id, /agent bare has unreadable state.*invalid \.temp-supervisor\.json/);
+    rmSync(bare, { recursive: true });
+
+    const linkedState = join(root, 'linked-state'); mkdirSync(linkedState);
+    symlinkSync(linkedState, join(tmpRoot(), 'linked'));
+    await refused(t.task_id, /agent state linked is a symlink/);
+    rmSync(join(tmpRoot(), 'linked'));
+
+    // A permanent agent started from any configuration records its cwd in its state.
+    const permanentDir = join(stateRoot(), 'agents', 'Keeper'); mkdirSync(permanentDir, { recursive: true });
+    writeFileSync(join(permanentDir, '.cwd'), `${path}\n`);
+    await refused(t.task_id, /permanent agent Keeper works in this folder/);
+    writeFileSync(join(permanentDir, '.cwd'), `${join(root, 'elsewhere')}\n`);
+
+    // Component containment: `..checkout` is a descendant, not a parent.
+    const dotted = tempAgent('dotted', { cwd: join(path, '..checkout') });
+    await refused(t.task_id, /agent dotted works in this folder/);
+    rmSync(dotted, { recursive: true });
+
+    // A symlink alias outside the folder that resolves into it.
+    mkdirSync(join(path, 'checkout'));
+    const alias = join(root, 'alias');
+    symlinkSync(join(path, 'checkout'), alias);
+    const aliased = tempAgent('aliased', { cwd: join(alias, 'sub') });
+    await refused(t.task_id, /agent aliased works in this folder/);
+    rmSync(aliased, { recursive: true });
+    await refused(t.task_id, /permanent agent is configured to work in this folder/, { permanentCwds: [alias] });
+    rmSync(alias);
+
+    // An unreadable room record has an unknown owner.
+    mkdirSync(join(stateRoot(), 'rooms'), { recursive: true });
+    writeFileSync(join(stateRoot(), 'rooms', 'corrupt.json'), '{ truncated');
+    await refused(t.task_id, /room record corrupt.json cannot be read/);
+    writeFileSync(join(stateRoot(), 'rooms', 'corrupt.json'), '[]');
+    await refused(t.task_id, /room record corrupt.json is invalid/);
+    rmSync(join(stateRoot(), 'rooms', 'corrupt.json'));
+
+    // Refusals restore the record: nothing claims a removal started.
+    expect(getTask(t.task_id).workspace_removal).toBeUndefined();
+
     // An unrelated agent elsewhere does not block.
     tempAgent('unrelated', { cwd: join(root, 'elsewhere') });
     expect((await removeTaskWorkspace(t.task_id, actor, deps)).result).toBe('removed');
+  });
+
+  it('restores the folder and refuses when any process entered it before the rename', async () => {
+    const t = doneTask();
+    const path = t.workspace!.path;
+    mkdirSync(join(path, 'checkout'));
+    const child = spawn('sleep', ['30'], { cwd: join(path, 'checkout'), stdio: 'ignore' });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await expect(removeTaskWorkspace(t.task_id, actor, deps)).rejects.toThrow(new RegExp(`process .*${child.pid}.* is using the folder`));
+      expect(existsSync(join(path, '.fleet-workspace.json'))).toBe(true);
+      expect(readdirNames(join(stateRoot(), 'workspaces', 'tasks'))).toEqual([t.task_id]);
+      expect(getTask(t.task_id).workspace_removal).toBeUndefined();
+    } finally {
+      child.kill();
+      await new Promise(resolve => child.once('exit', resolve));
+    }
+    expect((await removeTaskWorkspace(t.task_id, actor, deps)).result).toBe('removed');
+
+    // A process check that cannot run restores the folder too.
+    const other = doneTask();
+    await expect(removeTaskWorkspace(other.task_id, actor, { ...deps, processesUsing: () => { throw Error('proc unavailable'); } }))
+      .rejects.toThrow(/processes using the folder cannot be checked/);
+    expect(existsSync(join(other.workspace!.path, '.fleet-workspace.json'))).toBe(true);
   });
 
   it('requires a layout task to have finished closing its rooms and retiring its agents', async () => {

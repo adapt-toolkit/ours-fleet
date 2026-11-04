@@ -2,6 +2,7 @@ import { taskSupervisorMayRun } from './task-supervision.js';
 import { randomUUID } from 'node:crypto';
 import { storeRoomSecret, storeTemporaryLaunch, preparePermanentAssignment } from './agent-ours/service.js';
 import { ensureWorkspace } from './rooms-tasks/workspace.js';
+import { assertCwdNotInRemovedTaskFolder } from './rooms-tasks/workspace-removal.js';
 import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -410,6 +411,7 @@ export async function spawnTemp(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
+  assertCwdNotInRemovedTaskFolder(prepared.role.cwd);
   if ((o.taskOwner || o.roomMemberStartup?.task_id) && !getAdapter(prepared.role.harness).supportsResume)
     throw Error('TASK_HARNESS_RESUME_UNSUPPORTED: task agents require a resumable harness');
   if (o.roomMemberStartup?.workspace) {

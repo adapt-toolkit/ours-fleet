@@ -30,6 +30,7 @@ complete internal worktree registries, including dirty and stale owned entries.
 | Operation | Workspace and execution artifacts | Member runtime evidence |
 | --- | --- | --- |
 | Complete, fail, cancel | Retained while Task is recorded | Retained in Fleet recovery archives |
+| Explicit working-files removal (Done Task only) | Task workspace removed; Task, Progress and To review files retained | Retained in Fleet recovery archives |
 | Linked Room retirement or deletion | Task workspace retained | Retained |
 | Internal standalone Room retirement | Room workspace retained | Retained |
 | Explicit Task deletion | Removed after member retirement, with the task's retained To review files | All proven owned retired launches removed |
@@ -39,7 +40,8 @@ Internal room close means retirement, not destructive Task deletion.
 The existing CLI `room close ID ID` remains a deprecated alias for explicit
 `room delete ID ID`: it deletes standalone room-owned artifacts, but always
 retains a linked Task workspace. Its repeated-ID confirmation is unchanged. To remove a Task's
-artifacts, explicitly delete the Task. Cancellation is not deletion. Automatic
+artifacts, explicitly delete the Task, or, for a Done Task, remove only its working files
+(`task remove-files ID`, below). Cancellation is not deletion. Automatic
 compatibility cleanup of legacy closed Rooms skips records with owned workspaces.
 These choices reconcile close/remove wording with the requirement that completed,
 recorded Tasks retain all artifacts.
@@ -223,3 +225,37 @@ requires a supported Home Screen installation and granted device/browser permiss
 reopen the workspace to reconcile an expired subscription and explicitly re-enable
 permission if it was revoked. Every received push must display a notification to
 honor Safari's user-visible push requirement.
+
+## Removing a Done Task's working files
+
+`ours-fleet task remove-files ID` (API `POST /api/v1/tasks/ID/working-files/remove`)
+frees disk space without deleting the Task. It removes only the recorded owned
+workspace through the same guarded deletion as Task deletion (marker, Git
+registration, symlink and mount checks, token tombstone). It never collects or
+erases recovery archives, member artifacts or the To review store, and never
+closes rooms or stops agents. It runs under the task operation lock and refuses
+with the reason unless all of these hold:
+
+- the Task is Done with its completion settled, and is not being deleted;
+- no room record names the Task or its workspace, and every room record is readable;
+- a layout run exists, is closed, is not uncertain, and has retired every owned participant;
+- no supervisor registration belongs to the Task;
+- no unarchived temporary agent state belongs to the Task or works in the
+  folder (cwd or startup workspace, literally or through symlinks), and all
+  such state is readable;
+- no permanent agent's recorded `.cwd` or configured cwd is in the folder.
+
+The intent is recorded before a final in-use scan. Agent state that names a
+task folder is created under that folder's use lock and refuses a folder
+whose removal began, so a concurrent launch is either seen by the scan or
+refused. After the folder is renamed to its tombstone and before anything
+is removed, every process's cwd, root and open files are checked (Linux
+`/proc`). A process that entered the folder earlier restores the folder and
+refuses the removal. Platforms without this check refuse the removal.
+
+The Task records `workspace_removal` (started, completed, error), shown as
+`working_files` in API payloads. A retry resumes an unfinished tombstone, and
+repeating a finished removal changes nothing. A folder already missing on the
+first run is recorded as such. A create replay never recreates the folder, and
+To review files can no longer be attached from it. Explicit Task deletion
+still works and first finishes an interrupted removal.

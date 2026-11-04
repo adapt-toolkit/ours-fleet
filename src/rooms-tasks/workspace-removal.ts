@@ -1,13 +1,13 @@
-import { lstatSync, readdirSync, readFileSync, type Dirent } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Dirent } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse } from 'yaml';
 
-import { withFileLock } from '../atomic-file.js';
-import { stateRoot, tmpRoot } from '../paths.js';
+import { withFileLock, withSynchronousFileLock } from '../atomic-file.js';
+import { agentsRoot, stateRoot, tmpRoot } from '../paths.js';
 import { listMembers } from '../supervisor/catalog.js';
-import { readTempSupervisor } from '../temp-lifecycle.js';
+import { readTempSupervisor, TEMP_SUPERVISOR_FILE } from '../temp-lifecycle.js';
 import { validLayoutKey } from './layout-config.js';
-import { listRoomRecords } from './room-state.js';
+import { roomsDir } from './room-state.js';
 import { getTask, TaskStateError, updateTaskWorkspaceRemoval } from './task-state.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import type { TaskDeletionActor, TaskRecord } from './types.js';
@@ -35,16 +35,106 @@ export interface WorkspaceRemovalOutcome {
 export interface WorkspaceRemovalDeps {
   /** Working directories of configured permanent agents; undefined when the configuration is unreadable. */
   permanentCwds?: readonly (string | undefined)[];
+  /** Test seam: process IDs whose cwd, root or open files are inside `path`. */
+  processesUsing?(path: string): string[];
+}
+
+/**
+ * Every process whose cwd, root or open file descriptor is inside `path`.
+ * Only Linux exposes this without extra tools; elsewhere use cannot be
+ * excluded, so removal is refused. Processes of other users cannot enter the
+ * private folder and are skipped when their entries are unreadable.
+ */
+export function processesUsing(path: string): string[] {
+  if (process.platform !== 'linux')
+    refuse('this platform cannot verify that no process is using the folder');
+  const inside = (link: string) => contains(path, link.replace(/ \(deleted\)$/, ''));
+  const read = (link: string): string | undefined => {
+    try { return readlinkSync(link); }
+    catch (error) {
+      if (['ENOENT', 'ESRCH', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return undefined;
+      throw error;
+    }
+  };
+  const users: string[] = [];
+  for (const pid of readdirSync('/proc').filter(name => /^\d+$/.test(name))) {
+    const links = ['cwd', 'root'].map(name => read(`/proc/${pid}/${name}`));
+    let fds: string[] = [];
+    try { fds = readdirSync(`/proc/${pid}/fd`); }
+    catch (error) {
+      if (!['ENOENT', 'ESRCH', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+    }
+    for (const fd of fds) links.push(read(`/proc/${pid}/fd/${fd}`));
+    if (links.some(link => link !== undefined && isAbsolute(link) && inside(link))) users.push(pid);
+  }
+  return users;
 }
 
 function refuse(reason: string): never {
   throw new TaskStateError(`cannot remove working files: ${reason}`);
 }
 
-/** True when `path` is `root` itself or inside it. */
+/** Component containment: `root` itself or a descendant (`..name` is a descendant). */
+function contains(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * Resolve symlinks through the deepest existing ancestor, following dangling
+ * links too: a link to a removed folder still names that folder.
+ */
+function canonical(path: string): string {
+  const absolute = resolve(path);
+  let existing = absolute;
+  const rest: string[] = [];
+  for (let links = 0; ;) {
+    try { return join(realpathSync(existing), ...rest); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      if (lstatSync(existing, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        if (++links > 40) throw Error(`too many symlinks in ${path}`);
+        existing = resolve(dirname(existing), readlinkSync(existing));
+        continue;
+      }
+      const parent = dirname(existing);
+      if (parent === existing) return absolute;
+      rest.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+}
+
+/** True when `path`, literally or through symlinks, names the folder or a descendant. */
 function within(root: string, path: string): boolean {
-  const rel = relative(root, resolve(path));
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  return contains(root, resolve(path)) || contains(root, canonical(path));
+}
+
+function exists(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+}
+
+/**
+ * Every room record, strictly: the general listing skips corrupt records,
+ * which here would turn unknown room ownership into a claim that none remains.
+ */
+function assertNoRoomRecord(task: TaskRecord): void {
+  let names: string[];
+  try { names = readdirSync(roomsDir()); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    refuse(`room records cannot be read (${String(error)})`);
+  }
+  for (const name of names.filter(name => name.endsWith('.json'))) {
+    let room: { room_id?: unknown; task_id?: unknown; workspace?: { path?: unknown } };
+    try { room = JSON.parse(readFileSync(join(roomsDir(), name), 'utf8')); }
+    catch (error) { refuse(`room record ${name} cannot be read, so its owner is unknown (${String(error)})`); }
+    if (!room || typeof room !== 'object' || typeof room.room_id !== 'string')
+      refuse(`room record ${name} is invalid, so its owner is unknown`);
+    if (room.task_id === task.task_id || room.workspace?.path === task.workspace!.path)
+      refuse(`room ${room.room_id} of this task is still open; close it first`);
+  }
 }
 
 function readRole(dir: string): { cwd?: unknown; roomMemberStartup?: { task_id?: unknown; workspace?: { path?: unknown } } } {
@@ -73,21 +163,56 @@ function assertNoAgentUsesFolder(task: TaskRecord, path: string, deps: Workspace
   }
   for (const entry of entries) {
     const dir = join(tmpRoot(), entry.name);
-    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-    let role, owner;
-    try { role = readRole(dir); owner = readTempSupervisor(dir)?.taskOwner; }
-    catch (error) { refuse(`agent ${entry.name} has unreadable state, so its use of this folder is unknown (${String(error)})`); }
-    const startup = role.roomMemberStartup;
-    if (owner?.taskId === task.task_id || startup?.task_id === task.task_id)
-      refuse(`agent ${entry.name} of this mission has not been retired`);
-    if ((typeof role.cwd === 'string' && within(path, role.cwd))
-        || (typeof startup?.workspace?.path === 'string' && within(path, startup.workspace.path)))
-      refuse(`agent ${entry.name} works in this folder`);
+    if (entry.isSymbolicLink()) refuse(`agent state ${entry.name} is a symlink, so its use of this folder is unknown`);
+    if (!entry.isDirectory()) continue;
+    let role, owner, uses;
+    try {
+      role = readRole(dir);
+      // A supervisor record that exists but does not parse proves nothing about its owner.
+      const supervisor = readTempSupervisor(dir);
+      if (!supervisor) throw Error(`${exists(join(dir, TEMP_SUPERVISOR_FILE)) ? 'invalid' : 'missing'} ${TEMP_SUPERVISOR_FILE}`);
+      owner = supervisor?.taskOwner;
+      const startup = role.roomMemberStartup;
+      if (owner?.taskId === task.task_id || startup?.task_id === task.task_id)
+        refuse(`agent ${entry.name} of this mission has not been retired`);
+      uses = (typeof role.cwd === 'string' && within(path, role.cwd))
+        || (typeof startup?.workspace?.path === 'string' && within(path, startup.workspace.path));
+    } catch (error) {
+      if (error instanceof TaskStateError) throw error;
+      refuse(`agent ${entry.name} has unreadable state, so its use of this folder is unknown (${String(error)})`);
+    }
+    if (uses) refuse(`agent ${entry.name} works in this folder`);
+  }
+
+  // A permanent agent's state records the cwd it was last started with, whatever configuration started it.
+  let permanent: Dirent[];
+  try { permanent = readdirSync(agentsRoot(), { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') refuse(`permanent agent state cannot be read (${String(error)})`);
+    permanent = [];
+  }
+  for (const entry of permanent) {
+    if (entry.isSymbolicLink()) refuse(`permanent agent state ${entry.name} is a symlink, so its use of this folder is unknown`);
+    if (!entry.isDirectory()) continue;
+    let uses;
+    try {
+      const file = join(agentsRoot(), entry.name, '.cwd');
+      if (!exists(file)) continue;
+      const stat = lstatSync(file);
+      if (!stat.isFile()) throw Error('unsafe .cwd');
+      const cwd = readFileSync(file, 'utf8').trim();
+      uses = !!cwd && within(path, cwd);
+    } catch (error) { refuse(`permanent agent ${entry.name} has unreadable state, so its use of this folder is unknown (${String(error)})`); }
+    if (uses) refuse(`permanent agent ${entry.name} works in this folder`);
   }
 
   if (!deps.permanentCwds) refuse('the Fleet configuration cannot be read to check permanent agents');
-  for (const cwd of deps.permanentCwds)
-    if (cwd && within(path, cwd)) refuse(`a permanent agent is configured to work in this folder (${cwd})`);
+  for (const cwd of deps.permanentCwds) {
+    let uses;
+    try { uses = !!cwd && within(path, cwd); }
+    catch (error) { refuse(`a permanent agent's working directory ${cwd} cannot be resolved (${String(error)})`); }
+    if (uses) refuse(`a permanent agent is configured to work in this folder (${cwd})`);
+  }
 }
 
 /** A layout task's rooms and agents must have finished closing. */
@@ -116,9 +241,7 @@ export function assertTaskWorkspaceRemovable(task: TaskRecord, deps: WorkspaceRe
   if (!task.workspace) refuse('this task has no Fleet-owned working folder');
   try { validateWorkspace(task.workspace, 'task', task.task_id); }
   catch (error) { refuse(`the recorded folder is not this task's Fleet-owned folder (${(error as Error).message})`); }
-  for (const room of listRoomRecords())
-    if (room.task_id === task.task_id || room.workspace?.path === task.workspace.path)
-      refuse(`room ${room.room_id} of this task is still open; close it first`);
+  assertNoRoomRecord(task);
   assertLayoutClosed(task);
   assertNoAgentUsesFolder(task, task.workspace.path, deps);
   for (const artifact of task.outcome?.artifacts ?? [])
@@ -153,17 +276,45 @@ export function removeTaskWorkspace(
         return { task, result: 'already_removed' as const, mentions: folderMentions(task) };
     }
     assertTaskWorkspaceRemovable(task, deps);
+    if (process.platform !== 'linux' && !deps.processesUsing)
+      refuse('this platform cannot verify that no process is using the folder');
     const workspace = task.workspace!;
     // Only a first attempt that finds nothing on disk is "already missing";
     // a retry after a partial removal is a completed removal.
     const missing = !previous && !workspaceEntriesPresent(workspace);
     const now = () => new Date().toISOString();
+    // Mark the intent first: a launch fenced after this point refuses the folder,
+    // and one fenced before it is visible to the scan below.
     updateTaskWorkspaceRemoval(taskId, current => {
       const { error: _error, error_at: _errorAt, completed_at: _completed, ...rest } = current ?? { started_at: now(), actor };
       return rest;
     });
-    try { deleteWorkspace(workspace, 'task', taskId); }
+    try { withSynchronousFileLock(taskFolderUseLockPath(taskId), () => assertNoAgentUsesFolder(task, workspace.path, deps)); }
     catch (error) {
+      updateTaskWorkspaceRemoval(taskId, () => previous);
+      throw error;
+    }
+    try {
+      deleteWorkspace(workspace, 'task', taskId, {
+        // A process that entered the folder before the rename keeps it as its cwd or open file;
+        // after the rename no new one can find it. Restore the folder rather than pull it away.
+        beforeRemove: (tomb, restore) => {
+          let users: string[];
+          try { users = (deps.processesUsing ?? processesUsing)(tomb); }
+          catch (error) { restore(); throw error instanceof TaskStateError ? error : new TaskStateError(`cannot remove working files: processes using the folder cannot be checked (${errorText(error)})`); }
+          if (users.length) {
+            restore();
+            throw new TaskStateError(`cannot remove working files: process ${users.join(', ')} is using the folder; stop it and retry`);
+          }
+        },
+      });
+    }
+    catch (error) {
+      if (error instanceof TaskStateError) {
+        // A live user is a refusal, not a failed removal: the folder is back in place.
+        updateTaskWorkspaceRemoval(taskId, () => previous);
+        throw error;
+      }
       const message = errorText(error);
       updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: message, error_at: now() }));
       refuse(`${message}. Nothing outside the folder was touched; fix the cause and retry`);
@@ -191,4 +342,44 @@ export function workingFilesSummary(task: TaskRecord): WorkingFilesSummary {
   if (removal.completed_at) return { state: 'removed', started_at: removal.started_at, removed_at: removal.completed_at };
   if (removal.error) return { state: 'failed', started_at: removal.started_at, error: removal.error };
   return { state: 'removing', started_at: removal.started_at };
+}
+
+/** Serializes agent state creation in a task folder with the removal's in-use scan. */
+function taskFolderUseLockPath(taskId: string): string {
+  return join(stateRoot(), 'locks', 'task-folder-use', encodeURIComponent(taskId));
+}
+
+/** Task IDs whose folder `cwd` names, literally or through symlinks. */
+function taskFoldersOf(cwd: string): string[] {
+  const base = join(stateRoot(), 'workspaces', 'tasks');
+  const ids = new Set<string>();
+  for (const path of [resolve(cwd), canonical(cwd)]) {
+    const rel = relative(base, path);
+    if (rel && contains(base, path)) ids.add(rel.split(sep)[0]);
+  }
+  return [...ids].filter(id => /^[a-zA-Z0-9_-]{1,80}$/.test(id)).sort();
+}
+
+export function assertCwdNotInRemovedTaskFolder(cwd: string | undefined): void {
+  if (!cwd) return;
+  for (const taskId of taskFoldersOf(cwd)) {
+    let task: TaskRecord;
+    try { task = getTask(taskId); } catch { continue; }
+    if (task.workspace_removal)
+      throw new TaskStateError(`the working files of task ${taskId} were removed; choose another working directory`);
+  }
+}
+
+/**
+ * Launch fence: an agent never starts in, and so never recreates, the folder
+ * of a task whose working files were removed. Creating its state under the
+ * folder's use lock makes it visible to a concurrent removal's scan.
+ */
+export function withTaskFolderUseFence<T>(cwd: string | undefined, work: () => T): T {
+  const ids = cwd ? taskFoldersOf(cwd) : [];
+  const fenced = (index: number): T => {
+    if (index === ids.length) { assertCwdNotInRemovedTaskFolder(cwd); return work(); }
+    return withSynchronousFileLock(taskFolderUseLockPath(ids[index]), () => fenced(index + 1));
+  };
+  return fenced(0);
 }
