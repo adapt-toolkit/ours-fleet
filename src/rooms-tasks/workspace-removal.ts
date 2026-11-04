@@ -39,35 +39,120 @@ export interface WorkspaceRemovalDeps {
   processesUsing?(path: string): string[];
 }
 
+/** True when some directory on the way to `path` is ours and closed to group and others. */
+function closedToOtherUsers(path: string): boolean {
+  const uid = process.geteuid?.();
+  for (let dir = resolve(path); ; dir = dirname(dir)) {
+    const stat = lstatSync(dir, { throwIfNoEntry: false });
+    if (stat && stat.uid === uid && (stat.mode & 0o011) === 0) return true;
+    if (dirname(dir) === dir) return false;
+  }
+}
+
 /**
- * Every process whose cwd, root or open file descriptor is inside `path`.
- * Only Linux exposes this without extra tools; elsewhere use cannot be
- * excluded, so removal is refused. Processes of other users cannot enter the
- * private folder and are skipped when their entries are unreadable.
+ * Every process whose cwd, root or open file descriptor is inside `path`, or
+ * whose use cannot be excluded. Only Linux exposes this without extra tools;
+ * elsewhere removal is refused. When a process's entries are unreadable (for
+ * example non-dumpable, or in a container), it is excluded only by evidence:
+ * it is a zombie, its mount table cannot reach the folder's filesystem
+ * location, or it is the user's service manager; otherwise it is reported.
+ * Other users' unreadable processes are skipped when a private ancestor
+ * closes the folder to them; a superuser process is outside this check.
  */
 export function processesUsing(path: string): string[] {
   if (process.platform !== 'linux')
     refuse('this platform cannot verify that no process is using the folder');
+  const uid = process.geteuid?.();
+  const othersClosed = closedToOtherUsers(path);
+  const target = filesystemLocation(path);
   const inside = (link: string) => contains(path, link.replace(/ \(deleted\)$/, ''));
-  const read = (link: string): string | undefined => {
-    try { return readlinkSync(link); }
-    catch (error) {
-      if (['ENOENT', 'ESRCH', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return undefined;
-      throw error;
-    }
-  };
+  const gone = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
+  const denied = (error: unknown) => ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '');
   const users: string[] = [];
   for (const pid of readdirSync('/proc').filter(name => /^\d+$/.test(name))) {
+    let unreadable = false;
+    const read = (link: string): string | undefined => {
+      try { return readlinkSync(link); }
+      catch (error) {
+        if (gone(error)) return undefined;
+        if (denied(error)) { unreadable = true; return undefined; }
+        throw error;
+      }
+    };
     const links = ['cwd', 'root'].map(name => read(`/proc/${pid}/${name}`));
-    let fds: string[] = [];
-    try { fds = readdirSync(`/proc/${pid}/fd`); }
+    try { for (const fd of readdirSync(`/proc/${pid}/fd`)) links.push(read(`/proc/${pid}/fd/${fd}`)); }
     catch (error) {
-      if (!['ENOENT', 'ESRCH', 'EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      if (denied(error)) unreadable = true;
+      else if (!gone(error)) throw error;
     }
-    for (const fd of fds) links.push(read(`/proc/${pid}/fd/${fd}`));
-    if (links.some(link => link !== undefined && isAbsolute(link) && inside(link))) users.push(pid);
+    if (links.some(link => link !== undefined && isAbsolute(link) && inside(link))) { users.push(pid); continue; }
+    if (!unreadable) continue;
+    const owner = lstatSync(`/proc/${pid}`, { throwIfNoEntry: false })?.uid;
+    if (owner === undefined) continue; // exited meanwhile
+    if (owner !== uid && othersClosed) continue;
+    const status = readProc(`/proc/${pid}/stat`);
+    if (status === undefined || /^\d+ \(.*\) [ZX] /s.test(status)) continue; // exited or a zombie: no cwd or files
+    const mounts = readProc(`/proc/${pid}/mountinfo`);
+    if (mounts !== undefined && !reaches(mounts, target)) continue;
+    // The user's service manager (systemd --user and its PAM helper) never works in task folders.
+    const command = readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '').split('\0').join(' ');
+    if (command !== undefined && SERVICE_MANAGER.test(command) && parentIsInit(pid)) continue;
+    users.push(`${pid} (unreadable${command ? `: ${command.slice(0, 80)}` : ''})`);
   }
   return users;
+}
+
+const SERVICE_MANAGER = /^(?:\/usr)?\/lib\/systemd\/systemd --user$|^\(sd-pam\)$/;
+
+function readProc(path: string): string | undefined {
+  try { return readFileSync(path, 'utf8'); }
+  catch (error) {
+    if (['ENOENT', 'ESRCH', 'EINVAL'].includes((error as NodeJS.ErrnoException).code ?? '')) return undefined;
+    throw error;
+  }
+}
+
+function parentIsInit(pid: string): boolean {
+  const stat = readProc(`/proc/${pid}/stat`);
+  const ppid = stat?.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+  return ppid === '1' || (ppid !== undefined && SERVICE_MANAGER.test(readProc(`/proc/${ppid}/cmdline`)?.replace(/\0+$/, '').split('\0').join(' ') ?? ''));
+}
+
+/** Where `path` lives: its device and its path within that filesystem, from our own mount table. */
+function filesystemLocation(path: string): { device: string; inside: string } {
+  const dev = lstatSync(path).dev;
+  // glibc dev_t encoding, as Node reports it on Linux.
+  const major = (Math.floor(dev / 256) & 0xfff) | (Math.floor(dev / 2 ** 32) & ~0xfff);
+  const minor = (dev & 0xff) | (Math.floor(dev / 4096) & ~0xff & 0xfffff);
+  const device = `${major}:${minor}`;
+  let best: { point: string; root: string } | undefined;
+  for (const line of readFileSync('/proc/self/mountinfo', 'utf8').split('\n')) {
+    const fields = line.split(' ');
+    if (fields[2] !== device) continue;
+    const point = unescapeMount(fields[4]);
+    if (contains(point, path) && (!best || point.length > best.point.length)) best = { point, root: unescapeMount(fields[3]) };
+  }
+  if (!best) throw Error(`no mount of device ${device} contains ${path}`);
+  return { device, inside: join(best.root, relative(best.point, path)) };
+}
+
+function unescapeMount(value = ''): string {
+  return value.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+}
+
+/** True when some mount in the table exposes the filesystem location, or anything under it. */
+export function reaches(mountinfo: string, target: { device: string; inside: string }): boolean {
+  return mountinfo.split('\n').some(line => {
+    const fields = line.split(' ');
+    if (fields[2] !== target.device) return false;
+    const root = unescapeMount(fields[3]);
+    return contains(root, target.inside) || contains(target.inside, root);
+  });
+}
+
+/** A use of the folder found after its rename; `restore` exists only for a freshly renamed intact folder. */
+class InUse extends Error {
+  constructor(message: string, readonly restore?: () => void) { super(message); }
 }
 
 function refuse(reason: string): never {
@@ -301,19 +386,24 @@ export function removeTaskWorkspace(
         beforeRemove: (tomb, restore) => {
           let users: string[];
           try { users = (deps.processesUsing ?? processesUsing)(tomb); }
-          catch (error) { restore(); throw error instanceof TaskStateError ? error : new TaskStateError(`cannot remove working files: processes using the folder cannot be checked (${errorText(error)})`); }
-          if (users.length) {
-            restore();
-            throw new TaskStateError(`cannot remove working files: process ${users.join(', ')} is using the folder; stop it and retry`);
+          catch (error) {
+            throw new InUse(`processes using the folder cannot be checked (${errorText(error)})`, restore);
           }
+          if (users.length) throw new InUse(`process ${users.join(', ')} is using the folder; stop it and retry`, restore);
         },
       });
     }
     catch (error) {
-      if (error instanceof TaskStateError) {
-        // A live user is a refusal, not a failed removal: the folder is back in place.
+      if (error instanceof InUse && error.restore) {
+        // A freshly renamed, intact folder goes back: a refusal, not a failed removal.
+        error.restore();
         updateTaskWorkspaceRemoval(taskId, () => previous);
-        throw error;
+        refuse(error.message);
+      }
+      if (error instanceof InUse) {
+        // A partial tombstone keeps its token provenance so a later retry can resume it.
+        updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: error.message, error_at: now() }));
+        refuse(`${error.message}; the partly removed folder is kept for retry`);
       }
       const message = errorText(error);
       updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: message, error_at: now() }));

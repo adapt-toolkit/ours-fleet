@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
@@ -15,7 +15,7 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import { createRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
-import { assertCwdNotInRemovedTaskFolder, removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
+import { assertCwdNotInRemovedTaskFolder, reaches, removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
 import { spawnTemp } from '../src/spawn.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import {
@@ -287,6 +287,19 @@ describe('removing a Done task working folder', () => {
       child.kill();
       await new Promise(resolve => child.once('exit', resolve));
     }
+    // A process of ours that hides its entries (non-dumpable) is unknown use, not absence.
+    const hidden = spawn('python3', ['-c', 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(30)'],
+      { cwd: path, stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      await new Promise(resolve => hidden.stdout!.once('data', resolve));
+      expect(() => readlinkSync(`/proc/${hidden.pid}/cwd`)).toThrow(/EACCES/);
+      await expect(removeTaskWorkspace(t.task_id, actor, deps)).rejects.toThrow(new RegExp(`process .*${hidden.pid} \\(unreadable: python3 .* is using the folder`));
+      expect(existsSync(join(path, '.fleet-workspace.json'))).toBe(true);
+      expect(getTask(t.task_id).workspace_removal).toBeUndefined();
+    } finally {
+      hidden.kill();
+      await new Promise(resolve => hidden.once('exit', resolve));
+    }
     expect((await removeTaskWorkspace(t.task_id, actor, deps)).result).toBe('removed');
 
     // A process check that cannot run restores the folder too.
@@ -294,6 +307,18 @@ describe('removing a Done task working folder', () => {
     await expect(removeTaskWorkspace(other.task_id, actor, { ...deps, processesUsing: () => { throw Error('proc unavailable'); } }))
       .rejects.toThrow(/processes using the folder cannot be checked/);
     expect(existsSync(join(other.workspace!.path, '.fleet-workspace.json'))).toBe(true);
+  });
+
+  it('excludes an unreadable process only when its mount table cannot reach the folder', () => {
+    const target = { device: '8:1', inside: '/home/u/.ours-fleet/workspaces/tasks/t1' };
+    const line = (device: string, root: string, point: string) => `1 2 ${device} ${root} ${point} rw - ext4 /dev/sda1 rw`;
+    // A container: overlay root plus binds of unrelated host paths on the same disk.
+    expect(reaches([line('0:241', '/', '/'), line('8:1', '/var/lib/docker/volumes/v/_data', '/var/lib/ours'),
+      line('8:1', '/home/u/.ours-fleet/workspaces/tasks/t10', '/w')].join('\n'), target)).toBe(false);
+    for (const root of ['/', '/home/u', '/home/u/.ours-fleet/workspaces/tasks/t1', '/home/u/.ours-fleet/workspaces/tasks/t1/sub', '/home/u/.ours-fleet/workspaces/tasks/t1/..x'])
+      expect(reaches(line('8:1', root, '/mnt'), target)).toBe(true);
+    expect(reaches(line('8:2', '/', '/'), target)).toBe(false);
+    expect(reaches(line('8:1', '/home/u/odd\\040name', '/m'), { device: '8:1', inside: '/home/u/odd name/x' })).toBe(true);
   });
 
   it('requires a layout task to have finished closing its rooms and retiring its agents', async () => {
@@ -361,6 +386,28 @@ describe('removing a Done task working folder', () => {
     const outcome = await removeTaskWorkspace(t.task_id, actor, deps);
     expect(outcome.result).toBe('removed');
     expect(outcome.task.workspace_removal?.already_missing).toBeUndefined();
+    expect(readdirNames(join(stateRoot(), 'workspaces', 'tasks'))).toEqual([]);
+  });
+
+  it.each([
+    ['a busy refusal', () => ['4242'], /process 4242 is using the folder; .*kept for retry/],
+    ['a failed process inspection', () => { throw Error('proc unavailable'); }, /processes using the folder cannot be checked .*kept for retry/],
+  ])('keeps a resumed partial tombstone in place after %s, so a retry can still finish it', async (_name, processesUsing, refusal) => {
+    const t = doneTask();
+    const w = t.workspace!;
+    writeFileSync(join(w.path, 'rest.bin'), 'data');
+    const tomb = join(stateRoot(), 'workspaces', 'tasks', `.${t.task_id}.${w.token}.deleting`);
+    patchTask(t.task_id, task => { task.workspace_removal = { started_at: new Date().toISOString(), actor }; });
+    renameSync(w.path, tomb);
+    rmSync(join(tomb, '.fleet-workspace.json')); // a partial rm already consumed the marker
+
+    await expect(removeTaskWorkspace(t.task_id, actor, { ...deps, processesUsing })).rejects.toThrow(refusal);
+    expect(existsSync(w.path)).toBe(false);
+    expect(readFileSync(join(tomb, 'rest.bin'), 'utf8')).toBe('data');
+    expect(workingFilesSummary(getTask(t.task_id))).toMatchObject({ state: 'failed', error: expect.stringMatching(/folder/) });
+
+    const outcome = await removeTaskWorkspace(t.task_id, actor, { ...deps, processesUsing: () => [] });
+    expect(outcome.result).toBe('removed');
     expect(readdirNames(join(stateRoot(), 'workspaces', 'tasks'))).toEqual([]);
   });
 

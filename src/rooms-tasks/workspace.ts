@@ -260,18 +260,23 @@ export function workspaceEntriesPresent(w: OwnedWorkspace): boolean {
 export function deleteWorkspace(
   w: OwnedWorkspace, owner: OwnedWorkspace['owner'], id: string,
   options: {
-    /** Runs on the tombstone before removal; may restore it with `restoreTombstone` and throw. */
-    beforeRemove?(tomb: string, restoreTombstone: () => void): void;
+    /**
+     * Runs on the tombstone before removal. `restoreTombstone` is given only when this call
+     * renamed the intact, marker-proven folder; a resumed partial tombstone must stay put.
+     */
+    beforeRemove?(tomb: string, restoreTombstone?: () => void): void;
   } = {},
 ): void {
   assertWorkspaceDeletable(w, owner, id);
   const tomb = staging(w, 'deleting');
   const pending = staging(w, 'provisioning');
+  let renamed = false;
   if (stat(w.path)) {
     if (stat(tomb)) fail('both live and deleting workspace exist');
     markedForDeletion(w);
     auditWorkspaceGit(w.path, { forDeletion: true });
     renameSync(w.path, tomb);
+    renamed = true;
   }
   if (stat(pending)) {
     if (readdirSync(pending).length) marked(pending, w);
@@ -279,10 +284,10 @@ export function deleteWorkspace(
     rmSync(pending, { recursive: true });
   }
   if (stat(tomb)) {
-    options.beforeRemove?.(tomb, () => {
+    options.beforeRemove?.(tomb, renamed ? () => {
       if (stat(w.path)) fail('both live and deleting workspace exist');
       renameSync(tomb, w.path);
-    });
+    } : undefined);
     // This exact token-derived tombstone has already passed the marker and
     // Git audit; partial removal may have consumed those proofs on disk.
     prepareOwnedDeletionTree(tomb);
