@@ -36,8 +36,8 @@ export interface WorkspaceRemovalOutcome {
 export interface WorkspaceRemovalDeps {
   /** Working directories of configured permanent agents; undefined when the configuration is unreadable. */
   permanentCwds?: readonly (string | undefined)[];
-  /** Test seam: process IDs whose cwd, root or open files are inside `path`. */
-  processesUsing?(path: string): string[];
+  /** Test seam: processes whose cwd, root or open files are inside `path`, or cannot be read. */
+  processesUsing?(path: string, context: ProcessCheckContext): ProcessUse;
 }
 
 /** True when some directory on the way to `path` is ours and closed to group and others. */
@@ -56,22 +56,42 @@ function closedToOtherUsers(path: string): boolean {
  * elsewhere removal is refused. When a process's entries are unreadable (for
  * example non-dumpable, or in a container), it is excluded only by evidence:
  * it is a zombie, its mount table cannot reach the folder's filesystem
- * location, or it is the user's service manager as attested by the system
- * manager; otherwise it is reported.
+ * location, it is the user's service manager (attested by the system manager)
+ * whose own records name nothing in the folder, or it is that manager's PAM
+ * helper started before the folder existed; otherwise it is reported.
  * Other users' unreadable processes are skipped when a private ancestor
  * closes the folder to them; a superuser process is outside this check.
  */
-export function processesUsing(path: string): string[] {
+/** A same-user process whose cwd and descriptors cannot be read. */
+export interface UnverifiedProcess { token: string; description: string }
+
+export interface ProcessUse {
+  /** Processes proven to use the folder. */
+  users: string[];
+  /** Processes whose use can be neither proven nor excluded. */
+  unverified: UnverifiedProcess[];
+}
+
+export interface ProcessCheckContext {
+  /** The folder's recorded path; configuration names it, not its tombstone. */
+  original: string;
+  /** When the folder came into existence (ms since the epoch). */
+  createdAt: number;
+}
+
+export function processesUsing(path: string, context: ProcessCheckContext): ProcessUse {
   if (process.platform !== 'linux')
     refuse('this platform cannot verify that no process is using the folder');
   const uid = process.geteuid?.();
   const othersClosed = closedToOtherUsers(path);
   const target = filesystemLocation(path);
   const manager = userManagerPid(uid);
+  let managerUse: string | undefined | null = null; // computed once, only when needed
   const inside = (link: string) => contains(path, link.replace(/ \(deleted\)$/, ''));
   const gone = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
   const denied = (error: unknown) => ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '');
   const users: string[] = [];
+  const unverified: UnverifiedProcess[] = [];
   for (const pid of readdirSync('/proc').filter(name => /^\d+$/.test(name))) {
     let unreadable = false;
     const read = (link: string): string | undefined => {
@@ -95,13 +115,26 @@ export function processesUsing(path: string): string[] {
     if (owner !== uid && othersClosed) continue;
     const status = readProc(`/proc/${pid}/stat`);
     if (status === undefined || /^\d+ \(.*\) [ZX] /s.test(status)) continue; // exited or a zombie: no cwd or files
+    // Nothing readable proves this process holds nothing in the folder: a retained cwd or
+    // descriptor survives namespace and chroot changes. Read-only context only informs the Owner.
+    // The short kernel name only: a command line may carry secrets.
+    const name = /^\d+ \((.*)\) /s.exec(status)?.[1]?.replace(/[^\w .:@()-]/g, '?') ?? '?';
     const mounts = readProc(`/proc/${pid}/mountinfo`);
-    if (mounts !== undefined && !reaches(mounts, target)) continue;
-    if (isUserManager(pid, manager)) continue;
-    const command = readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '').split('\0').join(' ');
-    users.push(`${pid} (unreadable${command ? `: ${command.slice(0, 80)}` : ''})`);
+    let hint: string | undefined;
+    if (manager && pid === manager) {
+      if (managerUse === null) managerUse = userManagerUse(uid!, [path, context.original]);
+      // A record naming the folder is positive evidence of use, not uncertainty.
+      if (managerUse !== undefined && !/cannot be|unknown/.test(managerUse)) {
+        users.push(`${pid} (user service manager: ${managerUse})`);
+        continue;
+      }
+      hint = managerUse === undefined ? "user service manager; its records name nothing in the folder" : `user service manager; ${managerUse}`;
+    } else if (manager && isPamHelper(pid, manager, context.createdAt)) hint = 'PAM helper of the user service manager, started before the folder existed';
+    else if (mounts !== undefined && !reaches(mounts, target)) hint = 'own mount namespace without the folder';
+    const started = status.slice(status.lastIndexOf(')') + 2).split(' ')[19];
+    unverified.push({ token: `${pid}:${started}`, description: `${pid} ${name}${hint ? ` (${hint})` : ''}` });
   }
-  return users;
+  return { users, unverified };
 }
 
 /**
@@ -117,18 +150,77 @@ function userManagerPid(uid: number | undefined): string | undefined {
   } catch { return undefined; }
 }
 
+const run = (command: string, args: string[]) => {
+  // The user manager's bus lives in the user's runtime directory, which a Fleet service may not inherit.
+  const env = { ...process.env, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.geteuid?.()}` };
+  try { return execFileSync(command, args, { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'], env }); }
+  catch (error) {
+    const stderr = String((error as { stderr?: unknown }).stderr ?? '').trim().split('\n')[0];
+    throw Error(stderr || (error as Error).message);
+  }
+};
+
 /**
- * The attested user manager itself, or its PAM session helper: a direct child
- * named `(sd-pam)` in the manager's own cgroup. Neither works in task folders.
+ * Whether the user service manager may use the folder, from its own read-only
+ * records: its attested working directory, socket units' paths and every
+ * file descriptor store (systemd 254+). Undefined when none names the folder;
+ * otherwise the reason, including any record that cannot be read.
  */
-function isUserManager(pid: string, manager: string | undefined): boolean {
-  if (!manager) return false;
-  if (pid === manager) return true;
+export function userManagerUse(uid: number, roots: string[], exec: typeof run = run): string | undefined {
+  const hits = (candidate: string) => isAbsolute(candidate) && roots.some(root => within(root, candidate));
+  try {
+    let cwd = exec('systemctl', ['show', `user@${uid}.service`, '--property=WorkingDirectory', '--value']).trim().replace(/^[-!]+/, '');
+    if (cwd === '~') cwd = process.env.HOME ?? '';
+    if (!cwd) cwd = '/';
+    if (hits(cwd)) return `works in ${cwd}`;
+    const units = exec('systemctl', ['--user', 'show', '*', '--property=Id', '--property=NFileDescriptorStore', '--property=Listen'])
+      .split(/\n\s*\n/).map(block => {
+        const unit: Record<string, string[]> = {};
+        for (const line of block.split('\n').filter(Boolean)) (unit[line.slice(0, line.indexOf('='))] ??= []).push(line);
+        return unit;
+      });
+    if (!units.some(unit => unit.Id)) return 'its units cannot be listed';
+    for (const unit of units) {
+      const id = unit.Id?.[0]?.slice(3);
+      for (const line of unit.Listen ?? []) {
+        const listen = line.slice(7).replace(/ \([^)]*\)$/, '');
+        if (hits(listen)) return `${id} listens on ${listen}`;
+      }
+      const stored = Number(unit.NFileDescriptorStore?.[0]?.slice(21) ?? 0);
+      if (!id || !Number.isSafeInteger(stored) || stored < 0) return `unit ${id ?? '?'} cannot be read`;
+      if (stored === 0) continue;
+      const entries = JSON.parse(exec('systemd-analyze', ['--user', 'fdstore', id, '--json=short'])) as Array<{ path?: string; type?: string }>;
+      if (!Array.isArray(entries)) return `the file descriptor store of ${id} cannot be read`;
+      for (const entry of entries) {
+        if (typeof entry.path === 'string' && entry.path && hits(entry.path.replace(/ \(deleted\)$/, '')))
+          return `${id} stores ${entry.path}`;
+        if (!entry.path && ['directory', 'regular'].includes(entry.type ?? ''))
+          return `${id} stores a file whose path is unknown`;
+      }
+    }
+    return undefined;
+  } catch (error) {
+    return `its records cannot be read (${String((error as Error).message ?? error).split('\n')[0]})`;
+  }
+}
+
+/**
+ * The manager's PAM session helper: a direct child named `(sd-pam)` in the
+ * manager's cgroup that started before the folder existed. It is forked when
+ * the session opens and then only waits, so it can hold nothing created later.
+ */
+function isPamHelper(pid: string, manager: string, folderCreatedAt: number): boolean {
   const stat = readProc(`/proc/${pid}/stat`);
-  const ppid = stat?.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+  if (!stat) return false;
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
   const cgroup = (id: string) => readProc(`/proc/${id}/cgroup`);
-  return ppid === manager && readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '') === '(sd-pam)'
-    && cgroup(pid) !== undefined && cgroup(pid) === cgroup(manager);
+  if (fields[1] !== manager || readProc(`/proc/${pid}/cmdline`)?.replace(/\0+$/, '') !== '(sd-pam)'
+      || cgroup(pid) === undefined || cgroup(pid) !== cgroup(manager)) return false;
+  const boot = Number(/^btime (\d+)$/m.exec(readProc('/proc/stat') ?? '')?.[1]);
+  let ticks = 100;
+  try { ticks = Number(run('getconf', ['CLK_TCK']).trim()) || 100; } catch { /* Linux default */ }
+  const started = (boot + Number(fields[19]) / ticks) * 1000;
+  return Number.isFinite(started) && Number.isFinite(folderCreatedAt) && started < folderCreatedAt;
 }
 
 function readProc(path: string): string | undefined {
@@ -406,26 +498,32 @@ export function removeTaskWorkspace(
         // A process that entered the folder before the rename keeps it as its cwd or open file;
         // after the rename no new one can find it. Restore the folder rather than pull it away.
         beforeRemove: (tomb, restore) => {
-          let users: string[];
-          try { users = (deps.processesUsing ?? processesUsing)(tomb); }
+          let use: ProcessUse;
+          try { use = (deps.processesUsing ?? processesUsing)(tomb, { original: workspace.path, createdAt: Date.parse(task.created_at) }); }
           catch (error) {
             throw new InUse(`processes using the folder cannot be checked (${errorText(error)})`, restore);
           }
-          if (users.length) throw new InUse(`process ${users.join(', ')} is using the folder; stop it and retry`, restore);
+          if (use.users.length) throw new InUse(`process ${use.users.join(', ')} is using the folder; stop it and retry`, restore);
+          // Use that can be neither proven nor excluded is refused, never assumed absent.
+          if (use.unverified.length)
+            throw new InUse(`${use.unverified.length} process(es) of this user cannot be checked for use of the folder: `
+              + use.unverified.map(entry => entry.description).join('; '), restore);
         },
       });
     }
     catch (error) {
-      if (error instanceof InUse && error.restore) {
-        // A freshly renamed, intact folder goes back: a refusal, not a failed removal.
-        error.restore();
-        updateTaskWorkspaceRemoval(taskId, () => previous);
-        refuse(error.message);
-      }
       if (error instanceof InUse) {
-        // A partial tombstone keeps its token provenance so a later retry can resume it.
-        updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: error.message, error_at: now() }));
-        refuse(`${error.message}; the partly removed folder is kept for retry`);
+        let message = `cannot remove working files: ${error.message}`;
+        if (error.restore) {
+          // A freshly renamed, intact folder goes back: a refusal, not a failed removal.
+          error.restore();
+          updateTaskWorkspaceRemoval(taskId, () => previous);
+        } else {
+          // A partial tombstone keeps its token provenance so a later retry can resume it.
+          updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: error.message, error_at: now() }));
+          message += '; the partly removed folder is kept for retry';
+        }
+        throw new TaskStateError(message);
       }
       const message = errorText(error);
       updateTaskWorkspaceRemoval(taskId, current => ({ ...current!, error: message, error_at: now() }));

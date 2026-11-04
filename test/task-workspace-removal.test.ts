@@ -15,7 +15,7 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import { createRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskDeletion, settleTaskDeletion } from '../src/rooms-tasks/deletion.js';
-import { assertCwdNotInRemovedTaskFolder, reaches, removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
+import { assertCwdNotInRemovedTaskFolder, processesUsing, reaches, userManagerUse, removeTaskWorkspace, workingFilesSummary } from '../src/rooms-tasks/workspace-removal.js';
 import { spawnTemp } from '../src/spawn.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import {
@@ -42,7 +42,20 @@ afterEach(() => {
 
 const actor = { kind: 'local_control', surface: 'web' } as const;
 const author = { kind: 'local_control', surface: 'cli' } as const;
-const deps = { permanentCwds: [] };
+/**
+ * The real process check, with uncertainty limited to this test's own children: a
+ * developer or CI host has unrelated unreadable processes (containers, a user manager)
+ * that strict removal rightly refuses on, but they are not this suite's fixtures.
+ * Proven use is never filtered.
+ */
+const fixturePids = new Set<string>();
+const deps = {
+  permanentCwds: [] as string[],
+  processesUsing: (path: string, context: Parameters<typeof processesUsing>[1]) => {
+    const use = processesUsing(path, context);
+    return { users: use.users, unverified: use.unverified.filter(entry => fixturePids.has(entry.token.split(':')[0])) };
+  },
+};
 const cowork = { closeRoom: async () => {}, deleteRoom: async () => {} };
 
 function git(cwd: string, ...args: string[]) {
@@ -290,10 +303,11 @@ describe('removing a Done task working folder', () => {
     // A process of ours that hides its entries (non-dumpable) is unknown use, not absence.
     const hidden = spawn('python3', ['-c', 'import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(30)'],
       { cwd: path, stdio: ['ignore', 'pipe', 'ignore'] });
+    fixturePids.add(String(hidden.pid));
     try {
       await new Promise(resolve => hidden.stdout!.once('data', resolve));
       expect(() => readlinkSync(`/proc/${hidden.pid}/cwd`)).toThrow(/EACCES/);
-      await expect(removeTaskWorkspace(t.task_id, actor, deps)).rejects.toThrow(new RegExp(`process .*${hidden.pid} \\(unreadable: python3 .* is using the folder`));
+      await expect(removeTaskWorkspace(t.task_id, actor, deps)).rejects.toThrow(new RegExp(`1 process\\(es\\) of this user cannot be checked for use of the folder: ${hidden.pid} python3`));
       expect(existsSync(join(path, '.fleet-workspace.json'))).toBe(true);
       expect(getTask(t.task_id).workspace_removal).toBeUndefined();
     } finally {
@@ -319,6 +333,28 @@ describe('removing a Done task working folder', () => {
       expect(reaches(line('8:1', root, '/mnt'), target)).toBe(true);
     expect(reaches(line('8:2', '/', '/'), target)).toBe(false);
     expect(reaches(line('8:1', '/home/u/odd\\040name', '/m'), { device: '8:1', inside: '/home/u/odd name/x' })).toBe(true);
+  });
+
+  it("excludes the user service manager only when its own records name nothing in the folder", () => {
+    const folder = '/home/u/.ours-fleet/workspaces/tasks/t1';
+    const roots = [`/home/u/.ours-fleet/workspaces/tasks/.t1.tok.deleting`, folder];
+    const units = (extra = '') => `Id=a.service\nNFileDescriptorStore=0\n\nId=b.socket\nNFileDescriptorStore=0\nListen=/run/user/1/s (Stream)\n${extra}`;
+    const fake = (cwd: string, show: string, stores: Record<string, unknown> = {}) => (command: string, args: string[]) => {
+      if (command === 'systemctl' && args[0] === 'show') return `${cwd}\n`;
+      if (command === 'systemctl') return show;
+      if (args[2] in stores) return JSON.stringify(stores[args[2]]);
+      throw Error('File descriptor store not enabled');
+    };
+    expect(userManagerUse(1, roots, fake('', units()))).toBeUndefined();
+    expect(userManagerUse(1, roots, fake(`-${folder}/sub`, units()))).toMatch(/works in/);
+    expect(userManagerUse(1, roots, fake('', units(`\nId=c.socket\nNFileDescriptorStore=0\nListen=${folder}/x.sock (Stream)\n`)))).toMatch(/c.socket listens on/);
+    const stored = units(`\nId=d.service\nNFileDescriptorStore=2\n`);
+    expect(userManagerUse(1, roots, fake('', stored, { 'd.service': [{ type: 'socket' }, { type: 'regular', path: '/tmp/x' }] }))).toBeUndefined();
+    expect(userManagerUse(1, roots, fake('', stored, { 'd.service': [{ type: 'directory', path: `${roots[0]}/sub (deleted)` }] }))).toMatch(/d.service stores/);
+    expect(userManagerUse(1, roots, fake('', stored, { 'd.service': [{ type: 'regular' }] }))).toMatch(/path is unknown/);
+    expect(userManagerUse(1, roots, fake('', stored))).toMatch(/records cannot be read/);
+    expect(userManagerUse(1, roots, fake('', ''))).toMatch(/units cannot be listed/);
+    expect(userManagerUse(1, roots, () => { throw Error('Failed to connect to bus'); })).toMatch(/records cannot be read \(Failed to connect to bus\)/);
   });
 
   it('requires a layout task to have finished closing its rooms and retiring its agents', async () => {
@@ -390,7 +426,8 @@ describe('removing a Done task working folder', () => {
   });
 
   it.each([
-    ['a busy refusal', () => ['4242'], /process 4242 is using the folder; .*kept for retry/],
+    ['a busy refusal', () => ({ users: ['4242'], unverified: [] }), /process 4242 is using the folder; .*kept for retry/],
+    ['an unverifiable process', () => ({ users: [], unverified: [{ token: '4243:1', description: '4243 worker' }] }), /cannot be checked for use of the folder: 4243 worker; .*kept for retry/],
     ['a failed process inspection', () => { throw Error('proc unavailable'); }, /processes using the folder cannot be checked .*kept for retry/],
   ])('keeps a resumed partial tombstone in place after %s, so a retry can still finish it', async (_name, processesUsing, refusal) => {
     const t = doneTask();
@@ -406,7 +443,7 @@ describe('removing a Done task working folder', () => {
     expect(readFileSync(join(tomb, 'rest.bin'), 'utf8')).toBe('data');
     expect(workingFilesSummary(getTask(t.task_id))).toMatchObject({ state: 'failed', error: expect.stringMatching(/folder/) });
 
-    const outcome = await removeTaskWorkspace(t.task_id, actor, { ...deps, processesUsing: () => [] });
+    const outcome = await removeTaskWorkspace(t.task_id, actor, { ...deps, processesUsing: () => ({ users: [], unverified: [] }) });
     expect(outcome.result).toBe('removed');
     expect(readdirNames(join(stateRoot(), 'workspaces', 'tasks'))).toEqual([]);
   });
@@ -472,7 +509,9 @@ describe('HTTP API', () => {
     const active = createTask({ title: 'active', origin: { type: 'cli' } });
     const boundary = { origin: 'http://127.0.0.1:49273', host: '127.0.0.1:49273' };
     const auth = new WebAuth(boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(join(root, 'auth')));
-    const service = new TaskRoomApplicationService(undefined, { loadConfiguration: () => ({ roles: [] }) as any });
+    let unverified = [{ token: '4244:1', description: '4244 worker' }];
+    const service = new TaskRoomApplicationService(undefined, { loadConfiguration: () => ({ roles: [] }) as any,
+      processesUsing: (path, context) => ({ users: processesUsing(path, context).users, unverified }) });
     const server = await buildWebServer({ taskRooms: service } as any, boundary, { auth });
     try {
       const exchange = await server.app.inject({ method: 'POST', url: '/api/v1/auth/exchange', headers: { host: boundary.host, origin: boundary.origin, authorization: `Bootstrap ${server.auth.bootstrapSecret}` } });
@@ -486,6 +525,13 @@ describe('HTTP API', () => {
       const refusedResponse = await post(active.task_id);
       expect(refusedResponse.statusCode).toBe(409);
       expect(refusedResponse.json().error.message).toMatch(/only a Done task/);
+
+      // Strict: use that cannot be checked refuses, with the folder restored.
+      const unknown = await post(t.task_id);
+      expect(unknown.statusCode).toBe(409);
+      expect(unknown.json().error.message).toMatch(/cannot be checked for use of the folder: 4244 worker/);
+      expect(existsSync(join(t.workspace!.path, '.fleet-workspace.json'))).toBe(true);
+      unverified = [];
 
       const removed = await post(t.key!);
       expect(removed.statusCode).toBe(200);
