@@ -5,7 +5,13 @@ import { dirname, join, isAbsolute, resolve, delimiter } from 'node:path';
 import { realExec, type Exec } from '../exec.js';
 import type { AcpAgentResolution } from './acp-agent.js';
 
-export const VERIFIED_CODEX_ACP_VERSIONS = new Set(['1.1.7', '1.10.0']);
+export const VERIFIED_CODEX_ACP_VERSIONS = new Set(['1.1.7', '1.10.0', '2.7.0']);
+
+/** The inspected runtime floor of the selected ACP adapter, shared by launch and doctor. */
+export function minimumCodexVersion(adapterVersion: string | undefined, model?: string | null): string {
+  if (adapterVersion === '2.7.0') return '0.166.0';
+  return model === 'gpt-6-astra' || adapterVersion === '1.10.0' ? '0.153.3' : '0.145.0';
+}
 
 export function executableOnPath(command: string, env: NodeJS.ProcessEnv, cwd = process.cwd()): string {
   if (isAbsolute(command) || command.includes('/') || command.includes('\\'))

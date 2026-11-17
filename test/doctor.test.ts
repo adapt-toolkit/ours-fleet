@@ -200,19 +200,20 @@ describe('doctor', () => {
     expect(runtime?.detail).toMatch(/fresh/);
     expect(runtime?.detail).toMatch(/unverified/);
   });
-  it('reports actual ACP/native paths and an old role override as an unsupported mismatch', async () => {
+  it.each(['0.145.0', '0.165.0'])('reports the ACP 2.7 runtime floor for a %s override', async oldVersion => {
     const native = join(dir, 'codex');
     const old = join(dir, 'old-codex');
     for (const path of [native, old]) { writeFileSync(path, '#!/bin/sh\n'); chmodSync(path, 0o700); }
     writeV2Fixture(join(dir, 'fleet.yaml'),
       `roles:\n  Coder:\n    harness: codex\n    session: acp\n    env:\n      PATH: ${JSON.stringify(dir)}\n      CODEX_PATH: ${JSON.stringify(old)}\n    monitor: { enabled: false }\n`);
     const exec: Exec = async cmd => ({ code: 0, stderr: '',
-      stdout: cmd === old ? 'codex-cli 0.145.0' : 'codex-cli 0.153.4' });
+      stdout: cmd === old ? `codex-cli ${oldVersion}` : 'codex-cli 0.166.0' });
     const rep = await doctor({}, exec, 'darwin');
     const check = rep.checks.find(c => c.name === 'codex ACP runtime: Coder')!;
     expect(check.ok).toBe(false);
     expect(check.detail).toContain(old);
-    expect(check.detail).toContain('WARNING version mismatch: native 0.153.4, ACP 0.145.0');
+    expect(check.detail).toContain(`WARNING version mismatch: native 0.166.0, ACP ${oldVersion}`);
+    expect(check.detail).toContain('minimum Codex 0.166.0');
     expect(check.detail).toContain('CODEX_PATH');
     expect(rep.checks.find(c => c.name === 'codex native: Coder')?.detail).toContain(native);
   });

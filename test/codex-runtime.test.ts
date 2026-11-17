@@ -55,7 +55,7 @@ describe('host Codex selection', () => {
     expect((await probeCodexRuntime(adapter(), { PATH: broken })).source).toBe('bundled');
   });
   it('lets an explicit CODEX_PATH decide, including an empty one that selects the bundled Codex', async () => {
-    const dir = hostPath('99.0.0'), chosen = binary('0.153.4');
+    const dir = hostPath('99.0.0'), chosen = binary('0.166.0');
     expect(hostCodex(adapter().manifestPath, { PATH: dir, CODEX_PATH: '' })).toBeUndefined();
     expect((await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: '' })).source).toBe('bundled');
     expect(await probeCodexRuntime(adapter(), { PATH: dir, CODEX_PATH: chosen })).toMatchObject({ source: 'CODEX_PATH', entry: chosen });
@@ -67,8 +67,8 @@ describe('Codex runtime provenance', () => {
     const runtime = await probeCodexRuntime(adapter(), { ...process.env, CODEX_PATH: '' });
     expect(runtime.source).toBe('bundled');
     expect(runtime.executable).toMatch(/vendor\/.*\/bin\/codex$/);
-    expect(codexVersionAtLeast(runtime.version, '0.153.3')).toBe(true);
-    expect(adapter().version).toBe('1.10.0');
+    expect(codexVersionAtLeast(runtime.version, '0.166.0')).toBe(true);
+    expect(adapter().version).toBe('2.7.0');
   });
   it('honors explicit CODEX_PATH and reports its executable version', async () => {
     const path = binary('0.145.0');
@@ -83,7 +83,7 @@ describe('Codex runtime provenance', () => {
     await expect(probeCodexRuntime({ argv: ['codex-acp'], bundled: false }, {}))
       .rejects.toThrow('runtime is unknown');
   });
-  it.each(['1.1.7', '1.10.0'])('retains metadata provenance for verified adapter %s', version => {
+  it.each(['1.1.7', '1.10.0', '2.7.0'])('retains metadata provenance for verified adapter %s', version => {
     expect(codexAcpLaunchForResolution({ argv: ['node', '/adapter'], bundled: true,
       manifestPath: '/package.json', version }).permissionMetadataSource).toBe('codex-acp');
   });
@@ -97,9 +97,9 @@ describe('Codex runtime provenance', () => {
       model: 'gpt-6-astra' }, { stateDir: dir, runCwd: dir })).rejects.toThrow('requires a newer Codex');
   });
   it('inherits the service override, with role override and explicit-empty taking precedence', async () => {
-    const inherited = binary('0.153.4');
+    const inherited = binary('0.166.0');
     vi.stubEnv('CODEX_PATH', inherited);
-    const selected = binary('0.153.4');
+    const selected = binary('0.166.0');
     for (const [env, expected] of [[{}, inherited], [{ CODEX_PATH: selected }, selected], [{ CODEX_PATH: '' }, '']] as const) {
       const dir = temp();
       const r = role(env);
@@ -110,8 +110,8 @@ describe('Codex runtime provenance', () => {
     }
   });
   it.each(['linux', 'darwin'] as const)('keeps persistent and temporary runtime precedence through the %s launcher', async platform => {
-    const inherited = binary('0.153.4');
-    const selected = binary('0.153.4');
+    const inherited = binary('0.166.0');
+    const selected = binary('0.166.0');
     vi.stubEnv('OURS_FLEET_HOME', temp());
     for (const env of [{}, { CODEX_PATH: selected }, { CODEX_PATH: '' }]) {
       vi.stubEnv('CODEX_PATH', inherited);
@@ -141,7 +141,7 @@ describe('Codex runtime provenance', () => {
   });
   it.each(['persistent', 'temporary'])('keeps role override behind proxy for %s state', async lifetime => {
     const dir = join(temp(), lifetime);
-    const path = binary('0.153.4');
+    const path = binary('0.166.0');
     const r = role({ CODEX_PATH: path });
     const prep = await makeCodexAdapter().prepareSession(r, { stateDir: dir, runCwd: dir });
     const launch = makeCodexAdapter().agentSession.prepareLaunch(r, prep);
