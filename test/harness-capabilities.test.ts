@@ -41,6 +41,28 @@ describe('adapter-owned model capabilities', () => {
     expect(codex.sessions).toEqual(['acp', 'codex-app-server']);
   });
 
+  it('offers and validates the requested 6.2 and Fable 5.2 models with their exact efforts', async () => {
+    const ids = ['gpt-6.2-astra', 'gpt-6.2-sol'];
+    const report = await facts(async () => ({ state: 'known', models: ids }));
+    for (const [harness, model, efforts] of [
+      ...ids.map(id => ['codex', id, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']] as const),
+      ['claude-code', 'claude-fable-5-2', ['low', 'medium', 'high', 'xhigh', 'max']] as const,
+    ]) {
+      expect(report.harnesses.find(item => item.harness === harness)?.models.find(item => item.id === model))
+        .toMatchObject({ efforts, available: true, source: 'adapter' });
+      for (const effort of efforts)
+        expect(validateBrainChoice(report, { harness, model, effort })).toMatchObject({ ok: true });
+      expect(validateBrainChoice(report, { harness, model, effort: 'none' }))
+        .toMatchObject({ ok: false, code: 'effort_unsupported' });
+    }
+    expect(validateBrainChoice(report, { harness: 'claude-code', model: 'claude-fable-5-2', effort: 'ultra' }))
+      .toMatchObject({ ok: false, code: 'effort_unsupported' });
+    const unavailable = await facts(async () => ({ state: 'known', models: [] }));
+    for (const model of ids)
+      expect(validateBrainChoice(unavailable, { harness: 'codex', model, effort: 'high' }))
+        .toMatchObject({ ok: false, code: 'model_unavailable' });
+  });
+
   it('marks Codex models unavailable with the reason when the account cannot be asked', async () => {
     const report = await facts(async () => ({ state: 'unknown', reason: 'codex app-server exited' }));
     const codex = report.harnesses[0];
@@ -139,6 +161,9 @@ describe('manual harness/model/effort for one member', () => {
   });
 
   it.each([
+    ...['gpt-6.2-astra', 'gpt-6.2-sol'].flatMap(model =>
+      ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(effort => ['codex', model, effort] as const)),
+    ...['low', 'medium', 'high', 'xhigh', 'max'].map(effort => ['claude-code', 'claude-fable-5-2', effort] as const),
     ['codex', 'gpt-6-luna', 'xhigh'],
     ['claude-code', 'claude-opus-5-5', 'max'],
   ] as const)('starts a %s session with exactly the manual model and effort', async (harness, model, effort) => {

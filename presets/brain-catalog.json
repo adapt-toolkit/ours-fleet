@@ -1,7 +1,10 @@
 {
   "schema_version": 2,
-  "catalog_revision": 5,
+  "catalog_revision": 6,
   "models": [
+    { "harness": "codex", "session": "acp", "model": "gpt-6.2-astra", "label": "GPT-6.2 Astra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-6.2-sol", "label": "GPT-6.2 Sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "harness": "claude-code", "session": "acp", "model": "claude-fable-5-2", "label": "Claude Fable 5.2", "efforts": ["low", "medium", "high", "xhigh", "max"] },
     { "harness": "codex", "session": "acp", "model": "gpt-6-astra", "label": "GPT-6 Astra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { "harness": "codex", "session": "acp", "model": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },

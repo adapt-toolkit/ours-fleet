@@ -13,7 +13,7 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
-import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast, hostCodex } from './codex-runtime.js';
+import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast, hostCodex, minimumCodexVersion } from './codex-runtime.js';
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
@@ -503,8 +503,7 @@ export function makeCodexAdapter(
           catch (error) {
             throw new Error(`Codex ACP runtime check failed: ${(error as Error).message}; check CODEX_PATH or reinstall Fleet with optional dependencies`);
           }
-          const minimum = role.model === 'gpt-6-astra' || resolution.version === '1.10.0'
-            ? '0.153.3' : '0.145.0';
+          const minimum = minimumCodexVersion(resolution.version, role.model);
           if (!codexVersionAtLeast(runtime.version, minimum))
             throw new Error(`${role.model ?? 'Codex ACP'} requires a newer Codex (>=${minimum}): ACP selects ${runtime.executable} (${runtime.version}); upgrade Fleet or set CODEX_PATH to a supported executable in the agent/service environment`);
         }
