@@ -188,9 +188,9 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 11, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
-    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 6, first: 'Claude Fable 5', id: 'claude-fable-5' },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 17, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 13, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
+    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 7, first: 'Claude Fable 5', id: 'claude-fable-5' },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 20, first: 'GPT-6 Astra', id: 'gpt-6-astra' },
   ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize, first, id }) => {
     // One model, then a distinct effort for each purpose: medium, high, xhigh.
     const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, 2, 3, true]);
@@ -241,6 +241,21 @@ describe('interactive questionnaire', () => {
     expect(final?.detail).toContain('Claude is validated when a role launches');
     expect(final?.detail).toContain('hard termination');
     expect(final?.detail?.match(/Your default Fleet setup:/g)).toHaveLength(1);
+  });
+
+  it.each([
+    { provider: 0, index: 11, id: 'gpt-6.2-astra', harness: 'codex', effortIndex: 5, effort: 'ultra' },
+    { provider: 0, index: 12, id: 'gpt-6.2-sol', harness: 'codex', effortIndex: 5, effort: 'ultra' },
+    { provider: 1, index: 6, id: 'claude-fable-5-2', harness: 'claude-code', effortIndex: 4, effort: 'max' },
+  ])('creates the exact new $id Brain through onboarding', async ({ provider, index, id, harness, effortIndex, effort }) => {
+    const prompt = new ScriptedPrompter([true, [provider], 0, index, effortIndex, effortIndex, effortIndex, true]);
+    const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
+    const generated = generateSetup(result!);
+    for (const work of WORK) {
+      expect(result!.models[work]).toEqual(model(harness, id, effort));
+      expect(brainOf(generated, work)).toContain(`model: ${id}\n`);
+      expect(brainOf(generated, work)).toContain(`effort: ${effort}\n`);
+    }
   });
 
   it('supports a deliberate both-provider per-job mix with an effort per purpose', async () => {
