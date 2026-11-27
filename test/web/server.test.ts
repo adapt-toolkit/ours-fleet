@@ -202,7 +202,7 @@ describe('secure local web host', () => {
       expect(taskRooms.addMember).toHaveBeenCalledWith('selected',expect.objectContaining({brain:{inline:{harness:'codex',model:'gpt-6-luna',effort:'xhigh'}}}),expect.any(Function));
       const unsupported=await add({harness:'codex',model:'gpt-6-luna',effort:'ultra'});
       expect(unsupported.statusCode).toBe(400);expect(unsupported.json().error.message).toMatch(/does not support effort 'ultra'/);
-      expect((await add({harness:'codex',model:'gpt-6.1-sol',effort:'high'})).json().error.message).toMatch(/does not offer this model/);
+      expect((await add({harness:'codex',model:'gpt-6.1-sol',effort:'high'})).json().error.message).toMatch(/runtime catalog does not list this model/);
       expect((await add({harness:'claude-code',model:'claude-haiku-4-5-20251001',effort:'low'})).statusCode).toBe(400);
       expect(taskRooms.addMember).toHaveBeenCalledTimes(4);
     } finally {await server.close();}
