@@ -1,3 +1,4 @@
+import {runtimePolicy} from './harness/runtime-policy.js';
 /**
  * Fleet-owned setup of native harness execution policy for the managed CLI.
  *
@@ -366,8 +367,9 @@ function codexRuntimeVersion(role: ResolvedRole, cwd: string): string | undefine
     return result.status === 0 ? /\b(\d+\.\d+\.\d+)\b/u.exec(result.stdout ?? '')?.[1] : undefined;
   };
   try {
+    const policy=runtimePolicy(env);
     if (env.CODEX_PATH) return reported(executableOnPath(env.CODEX_PATH, env, cwd));
-    if (role.session !== 'acp') return reported(executableOnPath('codex', env, cwd));
+    if (role.session !== 'acp' && policy!=='installed-v1') return reported(executableOnPath('codex', env, cwd));
     const manifest = resolveBundledAcpAgent('@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp').manifestPath;
     const host = hostCodex(manifest, env, cwd);
     if (host || !manifest) return host?.version;

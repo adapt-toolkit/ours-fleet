@@ -9,6 +9,8 @@ export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
 export interface RoleDirs { stateDir: string; runCwd: string }
 /** Extra command/argv/env contributed by prepareSession (overlays, trust, limits). */
 export interface SessionPrep {
+  runtimeWarnings?: string[];
+  runtimeExecutable?: string;
   env: Record<string, string>;
   /**
    * The settings overlay prepareSession wrote, if it wrote one.

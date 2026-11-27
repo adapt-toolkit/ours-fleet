@@ -30,7 +30,9 @@ export const CAP_MANAGED_CLI_CODEX_EFFORT = 'managed-cli.codex-reasoning-effort-
 /** `ours-fleet service check|refresh`: re-point service definitions after an update. */
 export const CAP_SERVICE_REFRESH = 'service.refresh-v1';
 
+export const CAP_INIT_RUNTIME_POLICY = 'init.runtime-policy-v1';
 export const CAPABILITIES = [
+  CAP_INIT_RUNTIME_POLICY,
   CAP_SERVICE_REFRESH,
   CAP_MANAGED_CLI_CODEX_EFFORT,
   CAP_MANAGED_CLI_SETUP,

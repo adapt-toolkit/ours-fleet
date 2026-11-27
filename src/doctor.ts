@@ -1,3 +1,5 @@
+import {runtimePolicy} from './harness/runtime-policy.js';
+import {hostClaude,bundledClaudeVersion} from './harness/claude-runtime.js';
 import { cloudflaredUnavailableError, cloudflaredVersionError, CLOUDFLARED_VERSION_TIMEOUT_MS, isSecureCloudflaredVersion, isSecureNodeVersion, nodeVersionError, parseCloudflaredVersion } from './security-versions.js';
 import { describeRegistration, refreshServiceRegistrations, registrationDrift, type RefreshOptions } from './supervisor/registration-refresh.js';
 import { join } from 'node:path';
@@ -170,6 +172,12 @@ export async function doctor(
   // host checks below still run, because they are what the operator needs next.
   const loaded = loadConfigResult(opts.configPath, opts.yamlMode);
   const roles = loaded.ok ? loaded.roles : [];
+  const modes={installed:0,legacy:0,explicit:0,invalid:0};
+  for(const role of roles.filter(role=>['claude-code','codex'].includes(role.harness))) {
+    const env={...process.env,...role.env},key=role.harness==='codex'?'CODEX_PATH':'CLAUDE_CODE_EXECUTABLE';
+    try {const policy=runtimePolicy(env);if(env[key]!==undefined || role.session_options?.acp?.command!==undefined || role.session_options?.codex_app_server?.command!==undefined)modes.explicit++;else if(policy==='installed-v1')modes.installed++;else modes.legacy++;}catch{modes.invalid++;}
+  }
+  checks.push({name:'runtime policy modes',ok:modes.invalid===0,detail:`${modes.installed} installed-v1, ${modes.legacy} legacy, ${modes.explicit} explicit, ${modes.invalid} invalid. Unmarked roles keep legacy fallback.`});
   checks.push(loaded.ok
     ? { name: 'config', ok: true, detail: loaded.files.join(' + ') }
     : { name: 'config', ok: false, detail: loaded.error });
@@ -658,13 +666,21 @@ export async function doctor(
       });
       continue;
     }
+    if(role.harness==='claude-code' && configured==null) {
+      try {
+        const adapter=resolveBundledAcpAgent('@agentclientprotocol/claude-agent-acp','claude-agent-acp','claude-agent-acp');
+        let warning:string|undefined;
+        const host=hostClaude(adapter.manifestPath,{...process.env,...role.env},undefined,undefined,message=>{warning=message;});
+        checks.push({name:`Claude runtime: ${role.name}`,ok:true,detail:host?`${host.path} (${host.version}); host`:`adapter-managed Claude Code (${bundledClaudeVersion(adapter.manifestPath!) ?? 'unknown'}); ${warning ?? 'explicit selection'}`});
+      }catch(error){checks.push({name:`Claude runtime: ${role.name}`,ok:false,detail:(error as Error).message});}
+    }
     if (role.harness === 'codex') {
       const env = { ...process.env, ...role.env };
       const cwd = role.cwd && existsSync(role.cwd) ? role.cwd : agentDir(role.name);
       let native: Awaited<ReturnType<typeof probeCodexRuntime>> | undefined;
       try {
         native = await probeCodexRuntime({ argv: ['codex'], bundled: false },
-          { ...env, CODEX_PATH: 'codex' }, exec, cwd);
+          { ...env, OURS_FLEET_RUNTIME_POLICY:'legacy', CODEX_PATH: 'codex' }, exec, cwd);
         checks.push({ name: `codex native: ${role.name}`, ok: true,
           detail: `${native.executable} (${native.version}); entry ${native.entry}` });
       } catch (error) {
@@ -678,7 +694,7 @@ export async function doctor(
         const minimum = minimumCodexVersion(bundled?.version, role.model);
         const supported = verified && codexVersionAtLeast(runtime.version, minimum);
         checks.push({ name: `codex ACP runtime: ${role.name}`, ok: supported,
-          detail: `${runtime.executable} (${runtime.version}); ${runtime.source}; entry ${runtime.entry}; adapter ${bundled?.version ?? 'unknown'}`
+          detail: `${runtime.executable} (${runtime.version}); ${runtime.source}; ${runtime.warning ?? ''}; entry ${runtime.entry}; adapter ${bundled?.version ?? 'unknown'}`
             + (native && native.version !== runtime.version
               ? `; WARNING version mismatch: native ${native.version}, ACP ${runtime.version}` : '')
             + (native && native.executable !== runtime.executable ? '; native and ACP executable paths differ' : '')

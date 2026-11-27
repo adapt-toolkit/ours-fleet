@@ -295,7 +295,7 @@ export async function buildWebServer(
     const codex=capabilities.harnesses.find(item=>item.harness==='codex');
     const catalog=capabilities.harnesses.flatMap(item=>item.models.filter(model=>model.available && model.efforts!==null)
       .map(model=>({harness:item.harness,session:'acp',model:model.id,label:`${model.label} (${model.source==='adapter'?'static catalog':item.discovery?.state==='known' && item.discovery.freshness==='cached'?'cached catalog':'fresh catalog'}${item.harness==='claude-code'?'; plan/org checked at launch':''})`,efforts:model.efforts,source:model.source,freshness:model.source==='adapter'?'static':item.discovery?.state==='known'?item.discovery.freshness ?? 'fresh':'static',defaultEffort:model.defaultEffort})));
-    const payload = {harnesses,catalog,...(codex?.discovery?{codexModels:codex.discovery}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
+    const payload = {harnesses,catalog,runtimePolicies:[{id:'installed-v1',label:'Use supported installed CLIs'},{id:'bundled',label:'Pin bundled runtimes; later CLI installs will not be picked up'},{id:'legacy',label:'Retain legacy automatic fallback'}],...(codex?.discovery?{codexModels:codex.discovery}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
     if(revision===services.configuration?.read().revision) { onboardingObserved={owner:browser.id,revision,payload}; events.publish('onboarding.changed',{}); }
     return payload;
   });
@@ -311,6 +311,8 @@ export async function buildWebServer(
   app.post('/api/v1/onboarding/setup',async request=>{
     auth.authenticate(request,true);
     if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
+    const runtimePolicy=(request.body as {runtimePolicy?:unknown}|undefined)?.runtimePolicy;
+    if(runtimePolicy!==undefined && (typeof runtimePolicy!=='string' || !['installed-v1','bundled','legacy'].includes(runtimePolicy)))throw new FleetError('invalid_request','runtimePolicy must be installed-v1, bundled or legacy');
     const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown;effort?:unknown}>}|undefined)?.models;
     const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,claudeModels:services.claudeModels,checkReadiness:false});
     const models={} as Record<WorkKind,PurposeChoice>;
@@ -338,7 +340,7 @@ export async function buildWebServer(
     // One setup at a time: the first-time check and the publication it guards must not interleave.
     const run=onboardingSetupQueue.then(async()=>{
       if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
-      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,runtimeCatalog});}
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,runtimeCatalog,...(runtimePolicy!==undefined?{runtimePolicy:runtimePolicy as InitAnswers['runtimePolicy']}:{})});}
       catch(error){
         if(error instanceof PurposeBrainConflictError)throw new FleetError('conflict',error.message);
         throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);

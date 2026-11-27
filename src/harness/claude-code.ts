@@ -1,3 +1,4 @@
+import {runtimePolicy} from './runtime-policy.js';
 import { acpMcpServersFor, validateMcpServers, type McpServerSpec } from './acp-mcp.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -299,6 +300,9 @@ export function makeClaudeCodeAdapter(
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      const runtimeWarnings:string[]=[];
+      const policy=runtimePolicy({...process.env,...role.env});
+      if(policy==='installed-v1' && customAcpCommand(role))runtimeWarnings.push('Custom ACP command retains its own executable selection; installed-v1 cannot verify that command runtime.');
       // Pre-trust stays a HOST-side step: inside the sandbox ~/.claude.json is
       // read-only, and it is the fleet's job to trust the role's dirs, not the
       // agent's (5.1, 6.1).
@@ -330,7 +334,7 @@ export function makeClaudeCodeAdapter(
       if (!customAcpCommand(role)) {
         const host = hostClaude(
           resolveBundledAcpAgent('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp').manifestPath,
-          { ...process.env, ...role.env }, dirs.runCwd);
+          { ...process.env, ...role.env }, dirs.runCwd, undefined, warning=>runtimeWarnings.push(warning));
         if (host) env.CLAUDE_CODE_EXECUTABLE = host.path;
       }
 
@@ -355,7 +359,7 @@ export function makeClaudeCodeAdapter(
       }
 
       return {
-        env,
+        env, ...(runtimeWarnings.length?{runtimeWarnings}:{}),
         ...(settingsOverlay ? { settingsOverlay } : {}),
         ...(mcpConfigFile ? { mcpConfigFile } : {}),
       };

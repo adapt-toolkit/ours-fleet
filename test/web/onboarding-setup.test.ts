@@ -188,3 +188,19 @@ describe('first-time setup through the API', () => {
     } finally { await server.close(); }
   });
 });
+it.each(['installed-v1','bundled','legacy'] as const)('keeps the API runtime choice %s through preflight and publication',async runtimePolicy=>{
+ const configPath=join(mkdtempSync(join(root,'policy-api-')),'fleet.yaml');await ensureMinimalSetup(configPath);
+ const dir=mkdtempSync(join(root,'auth-'));const auth=new WebAuth(boundary.origin,boundary.host,Date.now,new TrustedDeviceStore(dir));
+ let checked:string|undefined;let hosts=0;
+ const server=await buildWebServer({audit:new AuditSink(join(dir,'audit')),configuration:new FleetConfigService({configPath}),onboardingSetup:async(answers:Parameters<typeof executeInitAnswers>[0])=>executeInitAnswers(answers,configPath,{runtimePreflight:async value=>{checked=value.runtimePolicy;return[]},hostSetup:async()=>{hosts++},publish:publishSetup})} as any,boundary,{auth});
+ try {
+  const exchange=await server.app.inject({method:'POST',url:'/api/v1/auth/exchange',headers:{...headers,authorization:`Bootstrap ${server.auth.bootstrapSecret}`}});
+  const cookie=([] as string[]).concat(exchange.headers['set-cookie']??[]).map(v=>v.split(';')[0]).join('; ');
+  const session={...headers,cookie,'x-csrf-token':exchange.json().csrfToken as string};
+  const response=await server.app.inject({method:'POST',url:'/api/v1/onboarding/setup',headers:session,payload:{runtimePolicy,models:{development:sol,review:sol,coordination:sol}}});
+  expect(response.statusCode).toBe(200);expect(checked).toBe(runtimePolicy);expect(hosts).toBe(1);
+  const saved=readFileSync(join(splitRootFor(configPath),'agents/FleetCoordinator.yaml'),'utf8');
+  if(runtimePolicy==='installed-v1')expect(saved).toContain('OURS_FLEET_RUNTIME_POLICY: installed-v1');
+  if(runtimePolicy==='bundled')expect(saved).toContain('CODEX_PATH: ""');
+ } finally {await server.app.close();}
+});

@@ -21,7 +21,7 @@ function signInStamp(home: string): number {
 }
 
 /**
- * The models offered to the active Codex account by the runtime that sessions will actually use.
+ * The model catalog exposed by the selected runtime/profile, not an access check.
  * An answer is reused only for the same executable, version, profile and sign-in.
  */
 export function createCodexModelDiscovery(overrides: Partial<CodexModelDiscoveryDeps> = {}): () => Promise<OfferedModels> {
@@ -31,6 +31,8 @@ export function createCodexModelDiscovery(overrides: Partial<CodexModelDiscovery
     now: Date.now,
     ...overrides,
   };
+  let resolvingRuntime:ReturnType<CodexModelDiscoveryDeps['runtime']>|undefined;
+  const runtime=()=>resolvingRuntime ??= deps.runtime().finally(()=>{resolvingRuntime=undefined;});
   let cached: { key: string; until: number; value: OfferedModels } | undefined;
   let pending: { key: string; answer: Promise<OfferedModels> } | undefined;
   return async () => {
@@ -38,10 +40,10 @@ export function createCodexModelDiscovery(overrides: Partial<CodexModelDiscovery
     try {
       const profileId = readSubscriptionState().providers.codex.activeProfileId;
       const profile = profileHome('codex', profileId);
-      const runtime = await deps.runtime();
-      executable = runtime.executable;
+      const selected = await runtime();
+      executable = selected.executable;
       env = profileEnv('CODEX_HOME', profileId, profile);
-      key = [runtime.executable, runtime.version, profileId, signInStamp(profile)].join('\n');
+      key = [selected.executable, selected.version, profileId, signInStamp(profile)].join('\n');
     } catch (error) {
       return { state: 'unknown', reason: error instanceof Error ? error.message : String(error) };
     }

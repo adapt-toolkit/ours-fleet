@@ -234,6 +234,7 @@ export function harnessChildEnv(
     env.OURS_FLEET_REAL_CODEX_PATH = role.env?.CODEX_PATH
       ?? launchEnv.OURS_FLEET_REAL_CODEX_PATH ?? '';
   }
+  delete env.OURS_FLEET_RUNTIME_POLICY;
   assertModelPinReachesChild(role, env);
   return env;
 }
@@ -705,6 +706,7 @@ export async function runOnce(
     stateDir: dir, runCwd, configPath: configPath ?? resolveConfigPath(dir), temp,
     prep: await adapter.prepareSession(role, { stateDir: dir, runCwd }), log: deps.log,
   });
+  for(const warning of [...new Set(prep.runtimeWarnings ?? [])]) deps.log(`[${name}] WARNING ${warning}`);
   const sessionBackend = role.session ?? 'acp';
   const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);

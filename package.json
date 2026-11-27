@@ -21,6 +21,7 @@
     "docs/task-workspaces.md",
     "docs/live-voice.md",
     "docs/runtime-model-discovery.md",
+    "docs/runtime-policy.md",
     "docs/conversation-stream.md",
     "docs/room-layouts.md",
     "docs/validation/managed-cli-permissions.md",

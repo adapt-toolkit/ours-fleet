@@ -15,9 +15,7 @@ overrides remain authoritative. The installer itself never installs either CLI.
 
 The proposed strict missing/old-host error policy was held and reverted because
 it would break existing roles, including this host's Codex 0.162.1 versus the
-adapter's bundled 0.166.0. The preference to require a user-installed CLI for new
-Fleet setups remains unmet. A follow-up needs a persisted new/legacy policy
-marker and tested upgrade/old-client migration before changing defaults.
+adapter's bundled 0.166.0. The metadata-only change does not impose that policy. The separately reviewed runtime-policy slice adds an explicit fresh-init choice while preserving unmarked definitions; see [runtime policy](runtime-policy.md).
 
 Current Codex adapter qualification: 2.7.0 uses >=0.166.0; 1.10.0 uses >=0.153.3;
 legacy 1.1.7 uses >=0.145.0. Claude's current host preference compares against the

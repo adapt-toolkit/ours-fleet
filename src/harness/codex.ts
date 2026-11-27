@@ -1,3 +1,4 @@
+import {runtimePolicy} from './runtime-policy.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -193,6 +194,7 @@ function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
       ...(options?.search ? ['--search'] : []),
       'app-server',
     ];
+    if(prep.runtimeExecutable)return {argv:[prep.runtimeExecutable,...flags],env:prep.env};
     // Fleet delivers wakes through the native session itself. The ours-codex
     // launcher owns a remote TUI and cannot serve this stdio transport.
     if (launcher === 'auto' && role.monitor?.mode === 'fleet')
@@ -491,6 +493,16 @@ export function makeCodexAdapter(
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      const runtimeWarnings:string[]=[];
+      const policy=runtimePolicy({...process.env,...role.env});
+      const custom=role.session==='codex-app-server'?role.session_options?.codex_app_server?.command:role.session_options?.acp?.command;
+      if(policy==='installed-v1' && custom!=null)runtimeWarnings.push('Custom command retains its own executable selection; installed-v1 cannot verify that command runtime.');
+      let runtimeExecutable:string|undefined;
+      if(role.session==='codex-app-server' && policy==='installed-v1' && role.session_options?.codex_app_server?.command==null) {
+        const runtime=await probeCodexRuntime(bundledCodexAcp(),{...process.env,...role.env},realExec,dirs.runCwd);
+        runtimeExecutable=runtime.executable;
+        if(runtime.warning)runtimeWarnings.push(runtime.warning);
+      }
       // Per-role harness runtime home; harmless for un-isolated roles.
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
@@ -503,6 +515,7 @@ export function makeCodexAdapter(
           catch (error) {
             throw new Error(`Codex ACP runtime check failed: ${(error as Error).message}; check CODEX_PATH or reinstall Fleet with optional dependencies`);
           }
+          if(runtime.warning) runtimeWarnings.push(runtime.warning);
           const minimum = minimumCodexVersion(resolution.version, role.model);
           if (!codexVersionAtLeast(runtime.version, minimum))
             throw new Error(`${role.model ?? 'Codex ACP'} requires a newer Codex (>=${minimum}): ACP selects ${runtime.executable} (${runtime.version}); upgrade Fleet or set CODEX_PATH to a supported executable in the agent/service environment`);
@@ -515,7 +528,7 @@ export function makeCodexAdapter(
         // role with an ours identity, not just claude-code: a seed that works on one
         // harness and silently does nothing on the other is the same class of defect
         // as a config key that only works on one session type.
-        env: { OURS_BIND_IDENTITY: role.identity, ...codexAcpEnvironment(role, dirs) },
+        env: { OURS_BIND_IDENTITY: role.identity, ...codexAcpEnvironment(role, dirs) }, ...(runtimeWarnings.length?{runtimeWarnings}:{}), ...(runtimeExecutable?{runtimeExecutable}:{}),
       };
     },
 
