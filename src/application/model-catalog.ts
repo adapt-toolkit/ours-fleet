@@ -96,7 +96,7 @@ export function codexModelCatalog(path = join(homedir(), '.codex', 'models_cache
 }
 
 /**
- * Claude Code 2.1 has no typed model-list endpoint. These exact IDs are the
+ * Static fallback only. Live SDK supportedModels() metadata is queried separately. These IDs are the
  * versioned adapter contract verified with CLI 2.1.321, not aliases and
  * not a claim about account entitlement (which Claude validates at launch).
  */
@@ -105,6 +105,6 @@ export function claudeModelCatalog(): HarnessModelCatalog {
     models: packagedModelCatalog('claude-code').map(model => ({
       id: model.model, label: model.label, reasoningEfforts: model.efforts, source: 'claude-adapter-2.1' as const,
     })),
-    warnings: ['Claude Code exposes no typed model-list endpoint; choices require a current Claude runtime (verified with 2.1.321); older bundled SDKs need CLAUDE_CODE_EXECUTABLE. Entitlement is validated at launch.'],
+    warnings: ['Static adapter fallback; live SDK metadata is unavailable on this path. Choices require a current Claude runtime (verified with 2.1.321); older bundled SDKs need CLAUDE_CODE_EXECUTABLE. Entitlement is validated at launch.'],
   };
 }

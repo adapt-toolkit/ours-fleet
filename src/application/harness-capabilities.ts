@@ -1,3 +1,4 @@
+import type { ClaudeModels } from './claude-models.js';
 import { getAdapter, knownAdapters, productionAdapters } from '../harness/registry.js';
 import type { PrereqCheck } from '../harness/types.js';
 import type { OfferedModels } from '../subscriptions/cli.js';
@@ -11,6 +12,7 @@ export interface CapabilityModel {
   label: string;
   efforts: string[] | null;
   available: boolean;
+  defaultEffort?: string;
   reason?: string;
   source: 'adapter' | 'runtime-discovery';
 }
@@ -23,7 +25,7 @@ export interface HarnessCapability {
   modelRequired: boolean;
   customModels: boolean;
   models: CapabilityModel[];
-  discovery?: { state: 'known' } | { state: 'unknown'; reason: string };
+  discovery?: { state: 'known'; freshness?: 'fresh' | 'cached' } | { state: 'unknown'; reason: string };
 }
 
 export interface HarnessCapabilitiesReport { harnesses: HarnessCapability[] }
@@ -31,8 +33,20 @@ export interface HarnessCapabilitiesReport { harnesses: HarnessCapability[] }
 export interface HarnessCapabilityDeps {
   harnesses?: string[];
   codexModels?: () => Promise<OfferedModels>;
+  claudeModels?: () => Promise<ClaudeModels>;
   /** Skip executable checks when only model facts are needed. */
   checkReadiness?: boolean;
+}
+
+/** Picker requests do not wait for background CLI catalog initialization. */
+async function boundedDiscovery<T>(ask: () => Promise<T>): Promise<T | { state: 'unknown'; reason: string }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([ask(), new Promise<{state:'unknown';reason:string}>(resolve => {
+      timer = setTimeout(() => resolve({state:'unknown',reason:'Catalog refresh in progress; showing static fallback. Retry shortly.'}), 200);
+    })]);
+  } catch (error) { return {state:'unknown',reason:error instanceof Error ? error.message : String(error)}; }
+  finally { if (timer) clearTimeout(timer); }
 }
 
 /** Each production adapter's maintained models, narrowed by what the active Codex account offers. */
@@ -52,18 +66,34 @@ export async function harnessCapabilities(deps: HarnessCapabilityDeps = {}): Pro
       id: model.id, label: model.label, efforts: [...model.efforts], available: true, source: 'adapter' as const,
     }));
     let discovery: HarnessCapability['discovery'];
+    if (id === 'claude-code' && deps.claudeModels) {
+      const answer = await boundedDiscovery(deps.claudeModels);
+      discovery = answer.state === 'known' ? { state: 'known', freshness: answer.freshness } : answer;
+      if (answer.state === 'known') {
+        models = answer.catalog.map(row => ({ id: row.id, label: row.label, efforts: row.efforts,
+          available: true, source: 'runtime-discovery' as const }));
+      }
+      // Unknown discovery preserves the maintained adapter catalog as a static fallback.
+    }
     if (id === 'codex' && deps.codexModels) {
-      const offered = await deps.codexModels();
-      discovery = offered.state === 'known' ? { state: 'known' } : { state: 'unknown', reason: offered.reason };
+      const offered = await boundedDiscovery(deps.codexModels);
+      discovery = offered.state === 'known' ? { state: 'known', freshness: offered.freshness } : { state: 'unknown', reason: offered.reason };
       if (offered.state === 'known') {
-        models = models.map(model => offered.models.includes(model.id) ? model
-          : { ...model, available: false, reason: 'The active Codex account does not offer this model.' });
+        models = models.map(model => {
+          const runtime = offered.catalog?.find(row => row.id === model.id);
+          return runtime ? { ...model, label: runtime.label, efforts: runtime.efforts, ...(runtime.defaultEffort ? { defaultEffort: runtime.defaultEffort } : {}), source: 'runtime-discovery' as const }
+            : offered.models.includes(model.id) ? model
+            : { ...model, available: false, reason: 'The selected Codex runtime catalog does not list this model. Access is checked at launch.' };
+        });
         // Offered models the adapter does not maintain: selectable, but their efforts are not known.
         for (const extra of offered.models.filter(model => !models.some(known => known.id === model)))
-          models.push({ id: extra, label: extra, efforts: null, available: true, source: 'runtime-discovery' });
+          {
+            const runtime = offered.catalog?.find(row => row.id === extra);
+            models.push({ id: extra, label: runtime?.label ?? extra, efforts: runtime?.efforts ?? null, ...(runtime?.defaultEffort ? { defaultEffort: runtime.defaultEffort } : {}), available: true, source: 'runtime-discovery' });
+          }
       } else {
-        models = models.map(model => ({ ...model, available: false,
-          reason: `Codex could not report the models offered to the active account: ${offered.reason}` }));
+        models = models.map(model => ({ ...model,
+          reason: `Static fallback: Codex runtime catalog could not be read: ${offered.reason}. Access is checked at launch.` }));
       }
     }
     return { harness: id, ready, checks, sessions: [...capabilities.sessions], modelRequired: capabilities.modelRequired,

@@ -1,3 +1,4 @@
+import { createClaudeModelDiscovery } from '../application/claude-models.js';
 import { ConversationRoleObserver, type ConversationRoleState } from '../application/conversation-role-observer.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import {validateAccountOrigin} from '../account-origin.js';
@@ -232,6 +233,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       });
     },
     codexModels: createCodexModelDiscovery(),
+    claudeModels: createClaudeModelDiscovery(),
     subscriptions: new SubscriptionService({
       agents: async () => (await query.list(true)).map(({ role, status }) => ({
         roleId: role.id, stateDir: repository.stateDir(role), running: status.supervisor.liveness === 'running',

@@ -29,6 +29,8 @@ export interface InitAnswers {
   subscriptions: Subscription[];
   assignmentStrategy: AssignmentStrategy;
   models: Record<WorkKind, PurposeChoice>;
+  /** Validated runtime metadata supplied by the setup service, never copied from request JSON. */
+  runtimeCatalog?: PackagedModel[];
 }
 
 export interface Choice<T> { label: string; value: T }
@@ -256,7 +258,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     || new Set(answers.subscriptions).size !== answers.subscriptions.length
     || answers.subscriptions.some(subscription => !['codex', 'claude'].includes(subscription)))
     throw new Error('subscriptions must be a non-empty unique selection of Codex and/or Claude');
-  const supported = packagedModelCatalog();
+  const supported = answers.runtimeCatalog ?? packagedModelCatalog();
   const files = new Map<string, string>();
   files.set('fleet.yaml', [
     'api_version: ours.network/fleet/v2',

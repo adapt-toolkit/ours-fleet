@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -45,13 +45,12 @@ describe('host Claude Code selection', () => {
     expect(hostClaude(manifest(), { PATH: same })?.path).toBe(join(same, 'claude'));
     expect((await prepared(dir)).CLAUDE_CODE_EXECUTABLE).toBe(join(dir, 'claude'));
   });
-  it('keeps the bundled Claude Code when the host one is older, missing or unreadable', async () => {
-    expect(hostClaude(manifest(), { PATH: hostPath(reports('0.1.0')) })).toBeUndefined();
-    expect(hostClaude(manifest(), { PATH: temp() })).toBeUndefined();
-    expect(hostClaude(manifest(), { PATH: hostPath('exit 3') })).toBeUndefined();
-    expect(hostClaude(manifest(), { PATH: hostPath("printf 'no version here\\n'") })).toBeUndefined();
+  it('reports missing, old and unreadable host CLI without silently selecting another', async () => {
+    expect(() => hostClaude(manifest(), { PATH: hostPath(reports('0.1.0')) })).toThrow(/qualified/);
+    expect(() => hostClaude(manifest(), { PATH: temp() })).toThrow(/missing from PATH/);
+    expect(() => hostClaude(manifest(), { PATH: hostPath('exit 3') })).toThrow(/unreadable/);
     expect(hostClaude(undefined, { PATH: hostPath(reports('99.0.0')) })).toBeUndefined();
-    expect((await prepared(hostPath(reports('0.1.0')))).CLAUDE_CODE_EXECUTABLE).toBeUndefined();
+    await expect(prepared(hostPath(reports('0.1.0')))).rejects.toThrow(/No bundled fallback/);
   });
   it('lets an explicit CLAUDE_CODE_EXECUTABLE decide, in the role or the service environment', async () => {
     const dir = hostPath(reports('99.0.0'));
@@ -66,3 +65,11 @@ describe('host Claude Code selection', () => {
     expect((await prepared(hostPath(reports('99.0.0')), custom)).CLAUDE_CODE_EXECUTABLE).toBeUndefined();
   });
 });
+it('supports a PATH directory containing spaces and refuses non-executable or hung --version', () => {
+ const dir=join(temp(),'CLI with spaces'); mkdirSync(dir);
+ const path=join(dir,'claude');writeFileSync(path,`#!/bin/sh\nprintf '99.0.0\\n'\n`);chmodSync(path,0o700);
+ expect(hostClaude(manifest(),{PATH:dir})?.path).toBe(path);
+ chmodSync(path,0o600);expect(()=>hostClaude(manifest(),{PATH:dir})).toThrow(/missing from PATH/);
+ chmodSync(path,0o700);writeFileSync(path,'#!/bin/sh\n/bin/sleep 20\n');
+ expect(()=>hostClaude(manifest(),{PATH:dir})).toThrow(/unreadable/);
+},10000);
