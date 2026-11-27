@@ -97,9 +97,11 @@ export class CodexAppServerTransport implements CodexAppServerConnection {
 
   static async start(options: CodexAppServerTransportOptions): Promise<CodexAppServerTransport> {
     if (!options.argv.length) throw new Error('Codex app-server command is empty');
+    const childEnv={...(options.env?.FLEET_OURS_MANAGED==='1'?{}:process.env),...options.env};
+    delete childEnv.OURS_FLEET_RUNTIME_POLICY;
     const child = spawn(options.argv[0], options.argv.slice(1), {
       cwd: options.cwd,
-      env: { ...(options.env?.FLEET_OURS_MANAGED === '1' ? {} : process.env), ...options.env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     // `pid` is assigned synchronously on a successful local spawn. Checking it

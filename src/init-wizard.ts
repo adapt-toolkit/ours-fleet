@@ -1,3 +1,4 @@
+import { preflightInitRuntimes } from './harness/runtime-init.js';
 import {
   chmodSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync,
   openSync, readFileSync, readdirSync, renameSync, rmSync, statSync,
@@ -26,9 +27,12 @@ export interface PurposeChoice {
 }
 
 export interface InitAnswers {
+  runtimePolicy?: 'installed-v1' | 'bundled' | 'legacy';
   subscriptions: Subscription[];
   assignmentStrategy: AssignmentStrategy;
   models: Record<WorkKind, PurposeChoice>;
+  /** Validated runtime metadata supplied by the setup service, never copied from request JSON. */
+  runtimeCatalog?: PackagedModel[];
 }
 
 export interface Choice<T> { label: string; value: T }
@@ -53,6 +57,8 @@ export interface InitPublishResult {
 
 export interface InitExecutionDeps {
   hostSetup(): Promise<void>;
+  runtimePreflight?(answers:InitAnswers):Promise<string[]>;
+  runtimeLog?(message:string):void;
   publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
   generate?(answers: InitAnswers): GeneratedSetup;
   preflight?(configuration: string): InitPathState;
@@ -87,8 +93,8 @@ export function readInitSettings(path: string): InitAnswers {
   try { value = JSON.parse(readFileSync(resolve(path), 'utf8')); }
   catch (error) { throw new Error(`cannot read valid Fleet init settings ${path}: ${(error as Error).message}`, { cause: error }); }
   if (!isObject(value)) throw new Error('Fleet init settings must be a JSON object');
-  const legacy = hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']);
-  if (!legacy && !hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models']))
+  const legacy = hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']) || hasExactKeys(value, ['subscriptions','assignmentStrategy','models','reasoning','runtimePolicy']);
+  if (!legacy && !hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models']) && !hasExactKeys(value, ['subscriptions', 'assignmentStrategy', 'models','runtimePolicy']))
     throw new Error('Fleet init settings must contain exactly subscriptions, assignmentStrategy, and models');
   const models = value.models;
   if (!isObject(models) || !hasExactKeys(models, WORK_KINDS))
@@ -114,6 +120,7 @@ export function readInitSettings(path: string): InitAnswers {
     subscriptions: value.subscriptions as Subscription[],
     assignmentStrategy: value.assignmentStrategy as AssignmentStrategy,
     models: chosen,
+    ...(value.runtimePolicy!==undefined?{runtimePolicy:value.runtimePolicy as InitAnswers['runtimePolicy']}:{}) ,
   };
   // Generation is the single semantic/catalog validator for wizard and file input.
   generateSetup(answers);
@@ -188,7 +195,13 @@ export async function askInitQuestions(
       selected[work] = { harness: model.harness, session: model.session, model: model.model, effort };
     }
   }
-  const answers = { subscriptions: [...subscriptions].sort(), assignmentStrategy, models: selected };
+  const runtimePolicy=await prompter.select<NonNullable<InitAnswers['runtimePolicy']>>('Which runtime should freshly generated agents use?', [
+    {label:'Use my installed supported CLIs (recommended)',value:'installed-v1'},
+    {label:'Keep the adapter bundled runtimes (later CLI installs will not be picked up automatically)',value:'bundled'},
+    {label:'Retain legacy automatic fallback',value:'legacy'},
+  ],0);
+  if(!runtimePolicy)return undefined;
+  const answers = { subscriptions: [...subscriptions].sort(), assignmentStrategy, models: selected,runtimePolicy };
   const summary = formatSetupSummary(answers, configuration);
   const finalized = await prompter.confirm(
     'Create this default Fleet setup?',
@@ -215,6 +228,7 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     `  Manifest: ${configPath}`,
     `  Split configuration: ${splitRoot}`,
     `  Existing state: ${existing}`,
+    `  Runtime policy for new definitions: ${answers.runtimePolicy ?? 'legacy'}; existing files are kept`,
     `  Model assignment: ${answers.assignmentStrategy === 'one-model' ? 'one model for every job' : 'different models by job'}`,
     ...WORK_KINDS.map(work => `  ${friendly(work)}`),
     '  Availability: catalog support is not a recommendation or entitlement claim',
@@ -256,7 +270,10 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     || new Set(answers.subscriptions).size !== answers.subscriptions.length
     || answers.subscriptions.some(subscription => !['codex', 'claude'].includes(subscription)))
     throw new Error('subscriptions must be a non-empty unique selection of Codex and/or Claude');
-  const supported = packagedModelCatalog();
+  if(answers.runtimePolicy!==undefined && !['installed-v1','bundled','legacy'].includes(answers.runtimePolicy)) throw new Error('runtimePolicy must be installed-v1, bundled or legacy');
+  const runtimeLine=(work:WorkKind)=>answers.runtimePolicy==='installed-v1' ? 'env: { OURS_FLEET_RUNTIME_POLICY: installed-v1 }'
+    : answers.runtimePolicy==='bundled' ? `env: { ${answers.models[work].harness==='codex'?'CODEX_PATH':'CLAUDE_CODE_EXECUTABLE'}: "" }` : '';
+  const supported = answers.runtimeCatalog ?? packagedModelCatalog();
   const files = new Map<string, string>();
   files.set('fleet.yaml', [
     'api_version: ours.network/fleet/v2',
@@ -296,6 +313,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
       `role: { ref: ${role} }`,
       `brain: { ref: ${PURPOSE_BRAINS[ROLE_WORK[role]].id} }`,
       'coordinator: FleetCoordinator',
+      ...(runtimeLine(ROLE_WORK[role])?[runtimeLine(ROLE_WORK[role])]:[]),
       // Temporary default while the product is being tested: prepared agents work without asking.
       'permissions: { approval: allow, filesystem: unrestricted, unattended: deny }',
       'monitor: { mode: fleet, interrupt: after_tool }',
@@ -303,7 +321,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     ].join('\n'));
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
-    .replace('brain: { ref: claude-default }', `brain: { ref: ${PURPOSE_BRAINS.coordination.id} }`));
+    .replace('brain: { ref: claude-default }', `brain: { ref: ${PURPOSE_BRAINS.coordination.id} }`) + (runtimeLine('coordination') ? `\n${runtimeLine('coordination')}\n` : ''));
   for (const name of ['single', 'pair', 'team', 'engineering']) {
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
     files.set(`room_layouts/${name}.yaml`, preset(`room_layouts/${name}.yaml`));
@@ -357,6 +375,7 @@ export async function executeInitAnswers(
   const conflicts = purposeBrainConflicts(configuration, answers);
   if (conflicts.length) throw new PurposeBrainConflictError(`Setup would not use the chosen models: ${conflicts.join('; ')}. `
     + 'Existing Brains are kept; change them in Settings > Brains or choose matching models.');
+  for(const detail of await (deps.runtimePreflight ?? preflightInitRuntimes)(answers)) deps.runtimeLog?.(detail);
   try {
     await deps.hostSetup();
   } catch (error) {

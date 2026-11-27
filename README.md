@@ -2012,3 +2012,7 @@ verification, rotate credentials or restart services. A process that is
 already running keeps the binaries it started with: update Node.js and
 cloudflared, then restart the affected services (and rebuild or recreate
 containers) yourself.
+
+Runtime selection and live catalog metadata: see [installed runtimes and model discovery](docs/runtime-model-discovery.md), including the explicit bundled-runtime migration option.
+
+New initialization can choose installed or explicitly bundled agent runtimes; existing definitions retain their selection. See [runtime policy](docs/runtime-policy.md).

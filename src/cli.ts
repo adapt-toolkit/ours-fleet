@@ -1332,6 +1332,7 @@ cOpt(program.command('init').description('add missing Fleet defaults while prese
       die('ours-fleet init requires an interactive terminal; no host setup ran and no configuration changed');
     try {
       const initDeps = {
+        runtimeLog:(message:string)=>console.log(message),
         async hostSetup() {
           for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
           for (const message of await pickBackend().init(binPath)) console.log(message);

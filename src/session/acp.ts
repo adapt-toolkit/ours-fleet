@@ -551,6 +551,7 @@ export class AcpSession implements AgentSession {
       options.permissionMetadataSource === 'codex-acp'
         ? { [CODEX_DISABLE_INHERITED_MCP_ENV]: disableInheritedCodexMcp ? '1' : '0' }
         : {});
+    delete childEnv.OURS_FLEET_RUNTIME_POLICY;
     const child = spawn(options.argv[0], options.argv.slice(1), {
       cwd: options.cwd,
       env: childEnv,

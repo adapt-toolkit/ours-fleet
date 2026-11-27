@@ -40,6 +40,8 @@ class ScriptedPrompter implements InitPrompter {
     return indexes?.map(index => choices[index].value);
   }
   async select<T>(message: string, choices: Choice<T>[]): Promise<T | undefined> {
+    // Existing scenarios retain their explicit legacy policy; runtime-choice cases live separately.
+    if(message==='Which runtime should freshly generated agents use?')return choices.find(choice=>choice.value==='legacy')!.value;
     this.calls.push({ kind: 'select', message, labels: choices.map(choice => choice.label) });
     const index = this.script.shift() as number | undefined;
     return index === undefined ? undefined : choices[index].value;
@@ -69,6 +71,7 @@ function answers(
     ? model('codex', 'gpt-5.6-sol', effort) : model('claude-code', 'claude-opus-5', effort);
   return {
     subscriptions,
+    runtimePolicy:'legacy',
     assignmentStrategy: 'one-model',
     models: { development: selected(), review: selected(), coordination: selected() },
   };
@@ -263,7 +266,7 @@ describe('interactive questionnaire', () => {
     const prompt = new ScriptedPrompter([true, [0, 1], 1, 1, 0, 9, 4, 2, 5, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
     expect(result).toEqual({
-      subscriptions: ['claude', 'codex'], assignmentStrategy: 'per-job',
+      subscriptions: ['claude', 'codex'], assignmentStrategy: 'per-job', runtimePolicy:'legacy',
       models: {
         development: model('codex', 'gpt-5.6-sol', 'low'),
         review: model('claude-code', 'claude-opus-5', 'max'),

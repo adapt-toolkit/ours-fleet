@@ -72,13 +72,13 @@ describe('Codex models offered during onboarding', () => {
       expect((await web.setup('gpt-6-sol')).statusCode).toBe(400);
     } finally { await web.server.app.close(); }
   });
-  it('offers no Codex model and says why when the runtime could not be asked', async () => {
+  it('keeps a labeled static catalog when runtime discovery is unavailable', async () => {
     const web = await webConsole(() => ({ state: 'unknown', reason: 'model/list timed out' }));
     try {
-      expect(await web.codex()).toEqual([]);
+      expect(await web.codex()).toContain('gpt-6.1-sol');
       expect((await web.report()).codexModels).toEqual({ state: 'unknown', reason: 'model/list timed out' });
-      expect((await web.setup('gpt-6-sol')).statusCode).toBe(400);
-      expect(web.setups()).toBe(0);
+      expect((await web.setup('gpt-6-sol')).statusCode).toBe(409);
+      expect(web.setups()).toBe(1);
     } finally { await web.server.app.close(); }
   });
   it('follows the account when another one is signed in', async () => {
@@ -110,11 +110,11 @@ describe('asking the selected runtime for the account', () => {
       ask: async executable => { asked.push(`${executable} ${version}`); return { state: 'known', models: [version] }; },
       now: () => now,
     });
-    expect(await discover()).toEqual({ state: 'known', models: ['0.156.1'] });
-    expect(await discover()).toEqual({ state: 'known', models: ['0.156.1'] });
+    expect(await discover()).toMatchObject({ state: 'known', models: ['0.156.1'] });
+    expect(await discover()).toMatchObject({ state: 'known', models: ['0.156.1'] });
     expect(asked).toHaveLength(1);
     version = '0.157.0';
-    expect(await discover()).toEqual({ state: 'known', models: ['0.157.0'] });
+    expect(await discover()).toMatchObject({ state: 'known', models: ['0.157.0'] });
     utimesSync(join(home, 'auth.json'), new Date(86_400_000), new Date(86_400_000));
     await discover();
     expect(asked).toHaveLength(3);
@@ -130,9 +130,9 @@ describe('asking the selected runtime for the account', () => {
       ask: async () => ++answers === 1 ? { state: 'unknown', reason: 'codex app-server exited' } : { state: 'known', models: [] },
       now: () => now,
     });
-    expect(await discover()).toEqual({ state: 'unknown', reason: 'codex app-server exited' });
+    expect(await discover()).toMatchObject({ state: 'unknown', reason: 'codex app-server exited' });
     now += 11_000;
-    expect(await discover()).toEqual({ state: 'known', models: [] });
+    expect(await discover()).toMatchObject({ state: 'known', models: [] });
     const broken = createCodexModelDiscovery({ runtime: async () => { throw new Error('Cannot read Codex version'); }, ask: async () => ({ state: 'known', models: ['x'] }), now: () => 0 });
     expect(await broken()).toEqual({ state: 'unknown', reason: 'Cannot read Codex version' });
   });
@@ -169,10 +169,10 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   });
   it('reads every page of the runtime model list, leaving hidden models out', async () => {
     const bin = appServer({ '': { data: [{ id: 'gpt-6-sol' }, { id: 'gpt-reserve', hidden: true }], nextCursor: 'next' }, next: { data: [{ id: 'gpt-5.5', hidden: false }, { id: 7 }], nextCursor: null } });
-    expect(await codexOfferedModels(bin, process.env)).toEqual({ state: 'known', models: ['gpt-6-sol', 'gpt-5.5'] });
+    expect(await codexOfferedModels(bin, process.env)).toEqual({ state: 'known', models: ['gpt-6-sol', 'gpt-5.5'], freshness: 'fresh', catalog: [{ id: 'gpt-6-sol', label: 'gpt-6-sol', efforts: null }, { id: 'gpt-5.5', label: 'gpt-5.5', efforts: null }] });
   });
   it('keeps an empty list as an answer and a missing or broken answer as unknown', async () => {
-    expect(await codexOfferedModels(appServer({ '': { data: [], nextCursor: null } }), process.env)).toEqual({ state: 'known', models: [] });
+    expect(await codexOfferedModels(appServer({ '': { data: [], nextCursor: null } }), process.env)).toEqual({ state: 'known', models: [], catalog: [], freshness: 'fresh' });
     expect(await codexOfferedModels(appServer({ '': { models: [] } }), process.env)).toEqual({ state: 'unknown', reason: 'Codex did not return a model list' });
     expect((await codexOfferedModels(appServer({ '': 'exit' }), process.env)).state).toBe('unknown');
     expect((await codexOfferedModels(join(root, 'missing-codex'), process.env)).state).toBe('unknown');
