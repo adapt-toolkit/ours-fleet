@@ -1,13 +1,14 @@
 import {chmodSync,mkdirSync,mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join} from 'node:path';
-import {afterEach,expect,it} from 'vitest';
+import {afterEach,beforeEach,expect,it,vi} from 'vitest';
 import {hostClaude,bundledClaudeVersion} from '../src/harness/claude-runtime.js';
 import {hostCodex,probeCodexRuntime} from '../src/harness/codex-runtime.js';
 import {resolveBundledAcpAgent} from '../src/harness/acp-agent.js';
 import {makeClaudeCodeAdapter} from '../src/harness/claude-code.js';
 import {harnessChildEnv} from '../src/runner.js';
 const roots:string[]=[];const temp=()=>{const path=mkdtempSync(join(tmpdir(),'runtime-host-'));roots.push(path);return path;};
-afterEach(()=>{for(const path of roots.splice(0))rmSync(path,{recursive:true,force:true});});
+beforeEach(()=>{vi.stubEnv('CLAUDE_CODE_EXECUTABLE',undefined);vi.stubEnv('CODEX_PATH',undefined);});
+afterEach(()=>{vi.unstubAllEnvs();for(const path of roots.splice(0))rmSync(path,{recursive:true,force:true});});
 const claude=()=>resolveBundledAcpAgent('@agentclientprotocol/claude-agent-acp','claude-agent-acp','claude-agent-acp');
 const codex=()=>resolveBundledAcpAgent('@agentclientprotocol/codex-acp','codex-acp','codex-acp');
 const cli=(name:string,version:string)=>{const dir=join(temp(),'path with spaces');mkdirSync(dir);const path=join(dir,name);writeFileSync(path,`#!/bin/sh\nprintf '${version}\\n'\n`);chmodSync(path,0o700);return {dir,path};};
