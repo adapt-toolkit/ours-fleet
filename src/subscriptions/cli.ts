@@ -158,8 +158,26 @@ export async function withCodex<T>(bin: string, env: NodeJS.ProcessEnv, fn: (s: 
   try { return await fn(server); } finally { server.close(); }
 }
 
-/** What a Codex runtime offers the account it is signed in to. An empty list is an answer; unknown is not. */
-export type OfferedModels = { state: 'known'; models: string[] } | { state: 'unknown'; reason: string };
+/** Runtime catalog metadata, not an entitlement or successful inference check. */
+export interface RuntimeModel { id: string; label: string; efforts: string[] | null; defaultEffort?: string }
+export type OfferedModels = { state: 'known'; models: string[]; catalog?: RuntimeModel[]; freshness?: 'fresh' | 'cached' } | { state: 'unknown'; reason: string };
+
+/** Keep provider ordering and unknown effort support; reject malformed rows. */
+export function normalizeCodexModel(raw: unknown): RuntimeModel | undefined {
+  if (!raw || typeof raw !== 'object') return;
+  const row = raw as Record<string, unknown>;
+  const valid = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0 && value.length <= 256 && !/[\x00-\x1f]/.test(value);
+  const id = row.model ?? row.id;
+  if (!valid(id) || row.hidden === true) return;
+  const efforts = Array.isArray(row.supportedReasoningEfforts)
+    ? [...new Set(row.supportedReasoningEfforts.flatMap(item => {
+      const effort = item && typeof item === 'object' ? item.reasoningEffort : undefined;
+      return valid(effort) ? [effort] : [];
+    }))] : null;
+  return { id, label: valid(row.displayName) ? row.displayName : id, efforts,
+    ...(valid(row.defaultReasoningEffort) && efforts?.includes(row.defaultReasoningEffort)
+      ? { defaultEffort: row.defaultReasoningEffort } : {}) };
+}
 
 interface ModelPage { data?: unknown; nextCursor?: unknown }
 
@@ -174,14 +192,21 @@ export async function codexOfferedModels(bin: string, env: NodeJS.ProcessEnv, bu
   try {
     return await withCodex(bin, env, async server => {
       const models: string[] = [];
+      const catalog = new Map<string, RuntimeModel>();
+      const cursors = new Set<string>();
       let cursor: string | null = null;
       while (Date.now() < deadline) {
         const answer: ModelPage | undefined = await server.call<ModelPage | undefined>('model/list', { cursor, limit: null }, left());
         if (!Array.isArray(answer?.data)) return { state: 'unknown', reason: 'Codex did not return a model list' } as const;
-        for (const model of answer.data as Array<{ id?: unknown; hidden?: unknown }>)
-          if (model && typeof model.id === 'string' && model.id && model.hidden !== true) models.push(model.id);
+        for (const raw of answer.data) {
+          const model = normalizeCodexModel(raw);
+          if (model) { models.push(model.id); catalog.set(model.id, model); }
+        }
         cursor = typeof answer.nextCursor === 'string' && answer.nextCursor ? answer.nextCursor : null;
-        if (!cursor) return { state: 'known', models: [...new Set(models)] } as const;
+        if (!cursor) return { state: 'known', models: [...new Set(models)], catalog: [...catalog.values()], freshness: 'fresh' } as const;
+        if (cursors.has(cursor) || cursors.size >= 100)
+          return { state: 'unknown', reason: 'Codex returned invalid model pagination' } as const;
+        cursors.add(cursor);
       }
       return { state: 'unknown', reason: 'Codex did not finish listing its models in time' } as const;
     }, left());

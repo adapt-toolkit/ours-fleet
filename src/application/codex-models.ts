@@ -45,7 +45,7 @@ export function createCodexModelDiscovery(overrides: Partial<CodexModelDiscovery
     } catch (error) {
       return { state: 'unknown', reason: error instanceof Error ? error.message : String(error) };
     }
-    if (cached && cached.key === key && cached.until > deps.now()) return cached.value;
+    if (cached && cached.key === key && cached.until > deps.now()) return cached.value.state === 'known' ? { ...cached.value, freshness: 'cached' } : cached.value;
     if (pending?.key === key) return pending.answer;
     const answer = deps.ask(executable, env).then(value => {
       cached = { key, until: deps.now() + (value.state === 'known' ? KNOWN_FOR_MS : UNKNOWN_FOR_MS), value };

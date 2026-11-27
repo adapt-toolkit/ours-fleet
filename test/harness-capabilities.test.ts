@@ -31,7 +31,7 @@ describe('adapter-owned model capabilities', () => {
     expect(codex.models.find(model => model.id === 'gpt-6.1-sol')).toEqual({ id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol',
       efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], available: true, source: 'adapter' });
     expect(codex.models.find(model => model.id === 'gpt-6-luna')).toMatchObject({ available: false,
-      reason: 'The active Codex account does not offer this model.' });
+      reason: 'The selected Codex runtime catalog does not list this model. Access is checked at launch.' });
     // Offered by the account, not maintained by the adapter: efforts unknown (null), not "no effort" ([]).
     expect(codex.models.find(model => model.id === 'gpt-7-preview')).toEqual({ id: 'gpt-7-preview', label: 'gpt-7-preview',
       efforts: null, available: true, source: 'runtime-discovery' });
@@ -63,13 +63,13 @@ describe('adapter-owned model capabilities', () => {
         .toMatchObject({ ok: false, code: 'model_unavailable' });
   });
 
-  it('marks Codex models unavailable with the reason when the account cannot be asked', async () => {
+  it('retains static fallback with a reason when runtime metadata is unavailable', async () => {
     const report = await facts(async () => ({ state: 'unknown', reason: 'codex app-server exited' }));
     const codex = report.harnesses[0];
     expect(codex.discovery).toEqual({ state: 'unknown', reason: 'codex app-server exited' });
-    expect(codex.models.every(model => !model.available && model.reason?.includes('codex app-server exited'))).toBe(true);
+    expect(codex.models.every(model => model.available && model.source==='adapter' && model.reason?.includes('codex app-server exited'))).toBe(true);
     expect(validateBrainChoice(report, { harness: 'codex', model: 'gpt-6.1-sol', effort: 'high' }))
-      .toMatchObject({ ok: false, code: 'model_unavailable' });
+      .toMatchObject({ ok: true });
   });
 
   it('validates a new choice exactly and never substitutes a model or effort', async () => {
@@ -193,4 +193,20 @@ describe('manual harness/model/effort for one member', () => {
       expect(started.configSelections).toEqual([{ configId: 'effort', value: effort }]);
     }
   });
+});
+it('returns static fallback promptly while a background catalog refresh is pending',async()=>{
+ const start=Date.now();
+ const report=await facts(()=>new Promise(()=>{}));
+ expect(Date.now()-start).toBeLessThan(1500);
+ expect(report.harnesses[0].models.some(row=>row.available && row.source==='adapter')).toBe(true);
+ expect(report.harnesses[0].discovery?.state).toBe('unknown');
+});
+it('surfaces provider rejection of a catalog-listed model without substituting or retrying',async()=>{
+ const role={name:'CatalogRejected',identity:'CatalogRejected',harness:'claude-code',session:'acp',model:'claude-opus-5-5',sourceFile:'fixture'} as import('../src/config.js').ResolvedRole;
+ const denied=new Error('Provider denied model: not available to this plan');
+ const transport=vi.fn(async()=>{throw denied;}) as unknown as AcpSessionTransport;
+ const adapter=makeClaudeCodeAdapter(async()=>({code:0,stdout:'',stderr:''}),transport);
+ const prep={env:{}};const launch=adapter.agentSession.prepareLaunch(role,prep);
+ await expect(adapter.agentSession.start({role,prep,launch,cwd:root,stateDir:root,mode:'fresh',permissions:role.permissions,permissionMode:{fleetMode:'allow',nativeMode:'native'},log:()=>{}})).rejects.toBe(denied);
+ expect(transport).toHaveBeenCalledTimes(1);
 });

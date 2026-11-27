@@ -1,3 +1,4 @@
+import type { ClaudeModels } from '../application/claude-models.js';
 import { FleetResourceViews, ResourceBindingError, canonicalResourceDescriptor, type ResourceDescriptor } from './resource-views.js';
 import { publishFleetResourceCommit } from '../application/resource-observer.js';
 import { stateRoot, defaultConfigPath } from '../paths.js';
@@ -91,6 +92,7 @@ export interface WebServices {
   onboardingSetup?(answers: InitAnswers): Promise<void>;
   /** The Codex models the runtime that sessions will use offers the active account. Absent: this server cannot tell, and filters nothing. */
   codexModels?(): Promise<OfferedModels>;
+  claudeModels?(): Promise<ClaudeModels>;
 }
 
 export interface WebServer {
@@ -289,10 +291,10 @@ export async function buildWebServer(
       try{return {harness,...await getAdapter(harness).checkPrereqs()};}catch{return {harness,ok:false,checks:[{name:'availability',ok:false,detail:'Harness checks unavailable'}]};}
     }));
     // The catalog is each adapter's maintained models, narrowed to what the active Codex account offers.
-    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,checkReadiness:false});
+    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,claudeModels:services.claudeModels,checkReadiness:false});
     const codex=capabilities.harnesses.find(item=>item.harness==='codex');
     const catalog=capabilities.harnesses.flatMap(item=>item.models.filter(model=>model.available && model.efforts!==null)
-      .map(model=>({harness:item.harness,session:'acp',model:model.id,label:model.label,efforts:model.efforts})));
+      .map(model=>({harness:item.harness,session:'acp',model:model.id,label:`${model.label} (${model.source==='adapter'?'static catalog':item.discovery?.state==='known' && item.discovery.freshness==='cached'?'cached catalog':'fresh catalog'}${item.harness==='claude-code'?'; plan/org checked at launch':''})`,efforts:model.efforts,source:model.source,freshness:model.source==='adapter'?'static':item.discovery?.state==='known'?item.discovery.freshness ?? 'fresh':'static',defaultEffort:model.defaultEffort})));
     const payload = {harnesses,catalog,...(codex?.discovery?{codexModels:codex.discovery}:{}),providers:services.subscriptions ? await services.subscriptions.list() : [],coordinator:'FleetCoordinator',configured:onboardingConfigured()};
     if(revision===services.configuration?.read().revision) { onboardingObserved={owner:browser.id,revision,payload}; events.publish('onboarding.changed',{}); }
     return payload;
@@ -310,7 +312,7 @@ export async function buildWebServer(
     auth.authenticate(request,true);
     if(!services.configuration || !services.onboardingSetup)throw new FleetError('capability_unavailable','first-time Fleet setup is unavailable');
     const requested=(request.body as {models?:Record<string,{harness?:unknown;model?:unknown;effort?:unknown}>}|undefined)?.models;
-    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,checkReadiness:false});
+    const capabilities=await harnessCapabilities({harnesses:['codex','claude-code'],codexModels:services.codexModels,claudeModels:services.claudeModels,checkReadiness:false});
     const models={} as Record<WorkKind,PurposeChoice>;
     for(const work of ONBOARDING_WORK){
       const choice=requested?.[work];
@@ -323,7 +325,7 @@ export async function buildWebServer(
       const check=validateBrainChoice(capabilities,{harness,session:'acp',model,effort});
       // Setup offers the adapters' maintained models only, each with an explicit effort when it has one.
       if(!check.ok)throw new FleetError('invalid_request',`${label} Brain: ${check.message}`);
-      if(!check.model || check.model.source!=='adapter')throw new FleetError('invalid_request',`${label} Brain: choose a supported model`);
+      if(!check.model || check.model.efforts===null)throw new FleetError('invalid_request',`${label} Brain: choose a supported model`);
       if(check.model.efforts?.length && effort===null)
         throw new FleetError('invalid_request',`${label} Brain: choose an effort for ${check.model.label} (${check.model.efforts.join(', ')})`);
       models[work]={harness:harness as PurposeChoice['harness'],session:'acp',model,effort:effort as string|null};
@@ -331,11 +333,12 @@ export async function buildWebServer(
     const chosen=Object.values(models);
     const subscriptions=[...new Set(chosen.map(model=>model.harness==='codex'?'codex':'claude'))] as Subscription[];
     const oneModel=new Set(chosen.map(model=>`${model.harness}\0${model.model}`)).size===1;
+    const runtimeCatalog=capabilities.harnesses.flatMap(item=>item.models.filter(model=>model.available && model.efforts!==null).map(model=>({harness:item.harness as 'codex'|'claude-code',session:'acp' as const,model:model.id,label:model.label,efforts:model.efforts!})));
     const configuration=services.configuration,setup=services.onboardingSetup;
     // One setup at a time: the first-time check and the publication it guards must not interleave.
     const run=onboardingSetupQueue.then(async()=>{
       if(onboardingConfigured())throw new FleetError('conflict','Fleet is already set up; change its models in the configuration');
-      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models});}
+      try{await setup({subscriptions,assignmentStrategy:oneModel?'one-model':'per-job',models,runtimeCatalog});}
       catch(error){
         if(error instanceof PurposeBrainConflictError)throw new FleetError('conflict',error.message);
         throw new FleetError('backend_failure',`Fleet setup did not complete: ${(error as Error).message}`);
@@ -354,7 +357,7 @@ export async function buildWebServer(
 
   app.get('/api/v1/harness-capabilities', async request => {
     auth.authenticate(request);
-    return harnessCapabilities({codexModels:services.codexModels});
+    return harnessCapabilities({codexModels:services.codexModels,claudeModels:services.claudeModels});
   });
 
   app.get('/api/v1/creation-capabilities', async request => {
@@ -366,7 +369,7 @@ export async function buildWebServer(
   const checkBrainChoice=async(brain:object|undefined)=>{
     if(!brain || typeof brain!=='object')return;
     const value=brain as Record<string,unknown>;
-    const check=validateBrainChoice(await harnessCapabilities({codexModels:services.codexModels,checkReadiness:false}),{
+    const check=validateBrainChoice(await harnessCapabilities({codexModels:services.codexModels,claudeModels:services.claudeModels,checkReadiness:false}),{
       harness:String(value.harness),session:value.session as string|undefined,
       model:value.model as string|null|undefined,effort:value.effort as string|undefined});
     if(!check.ok)throw new FleetError('invalid_request',`Brain: ${check.message}`);
