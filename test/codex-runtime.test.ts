@@ -48,11 +48,11 @@ describe('host Codex selection', () => {
     const prep = await makeCodexAdapter().prepareSession(role(), { stateDir: state, runCwd: state });
     expect(prep.env.OURS_FLEET_REAL_CODEX_PATH).toBe(join(dir, 'codex'));
   });
-  it('reports old, missing and unreadable host Codex without silently selecting another', async () => {
-    await expect(probeCodexRuntime(adapter(), { PATH: hostPath('0.1.0') })).rejects.toThrow(/requires/);
-    await expect(probeCodexRuntime(adapter(), { PATH: temp() })).rejects.toThrow(/missing from PATH/);
-    const broken = temp(); writeFileSync(join(broken, 'codex'), '#!/bin/sh\nexit 1\n'); chmodSync(join(broken, 'codex'), 0o700);
-    await expect(probeCodexRuntime(adapter(), { PATH: broken })).rejects.toThrow(/unreadable/);
+  it('keeps the bundled Codex when the host one is older, missing or unreadable', async () => {
+    expect((await probeCodexRuntime(adapter(), { PATH: hostPath('0.1.0') })).source).toBe('bundled');
+    expect((await probeCodexRuntime(adapter(), { PATH: temp() })).source).toBe('bundled');
+    const broken = temp(); writeFileSync(join(broken, 'codex'), '#!/bin/sh\nexit 3\n'); chmodSync(join(broken, 'codex'), 0o700);
+    expect((await probeCodexRuntime(adapter(), { PATH: broken })).source).toBe('bundled');
   });
   it('lets an explicit CODEX_PATH decide, including an empty one that selects the bundled Codex', async () => {
     const dir = hostPath('99.0.0'), chosen = binary('0.166.0');
@@ -196,11 +196,3 @@ describe.skipIf(process.platform !== 'linux')('actual ACP runtime process chain'
     }
   }, 12000);
 });
-it('supports installed Codex in a path with spaces and refuses non-executable or hung versions', () => {
- const dir=join(temp(),'CLI with spaces');mkdirSync(dir);
- const path=join(dir,'codex');writeFileSync(path,`#!/bin/sh\nprintf 'codex-cli 99.0.0\\n'\n`);chmodSync(path,0o700);
- expect(hostCodex(adapter().manifestPath,{PATH:dir})?.path).toBe(path);
- chmodSync(path,0o600);expect(()=>hostCodex(adapter().manifestPath,{PATH:dir})).toThrow(/missing from PATH/);
- chmodSync(path,0o700);writeFileSync(path,'#!/bin/sh\n/bin/sleep 20\n');
- expect(()=>hostCodex(adapter().manifestPath,{PATH:dir})).toThrow(/unreadable/);
-},10000);

@@ -201,3 +201,12 @@ it('returns static fallback promptly while a background catalog refresh is pendi
  expect(report.harnesses[0].models.some(row=>row.available && row.source==='adapter')).toBe(true);
  expect(report.harnesses[0].discovery?.state).toBe('unknown');
 });
+it('surfaces provider rejection of a catalog-listed model without substituting or retrying',async()=>{
+ const role={name:'CatalogRejected',identity:'CatalogRejected',harness:'claude-code',session:'acp',model:'claude-opus-5-5',sourceFile:'fixture'} as import('../src/config.js').ResolvedRole;
+ const denied=new Error('Provider denied model: not available to this plan');
+ const transport=vi.fn(async()=>{throw denied;}) as unknown as AcpSessionTransport;
+ const adapter=makeClaudeCodeAdapter(async()=>({code:0,stdout:'',stderr:''}),transport);
+ const prep={env:{}};const launch=adapter.agentSession.prepareLaunch(role,prep);
+ await expect(adapter.agentSession.start({role,prep,launch,cwd:root,stateDir:root,mode:'fresh',permissions:role.permissions,permissionMode:{fleetMode:'allow',nativeMode:'native'},log:()=>{}})).rejects.toBe(denied);
+ expect(transport).toHaveBeenCalledTimes(1);
+});

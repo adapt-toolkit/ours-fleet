@@ -58,7 +58,7 @@ function installedCodexVersion(path: string, env: NodeJS.ProcessEnv): string | u
 /**
  * The host's own Codex, when ACP sessions should run it instead of the copy bundled with the adapter.
  * The person signs in to, updates and checks the host Codex, and a newer Codex knows models the bundled
- * one does not. Missing or unqualified installed CLIs produce an actionable error; an explicit CODEX_PATH
+ * one does not. It is used only when it is at least as new as the bundled copy; an explicit CODEX_PATH
  * (including an empty one, which selects the bundled copy) always decides instead.
  */
 export function hostCodex(
@@ -70,12 +70,9 @@ export function hostCodex(
   try {
     path = executableOnPath('codex', env, cwd);
     bundled = JSON.parse(readFileSync(createRequire(adapterManifest).resolve('@openai/codex/package.json'), 'utf8')).version;
-  } catch { throw new Error('Codex is missing from PATH or the adapter runtime is unavailable. Install Codex from https://developers.openai.com/codex/cli, sign in, then retry. Set CODEX_PATH for a custom executable; an explicit empty value retains the bundled runtime.'); }
+  } catch { return undefined; }
   const found = version(path, env);
-  const adapterVersion = JSON.parse(readFileSync(adapterManifest, 'utf8')).version;
-  const minimum = minimumCodexVersion(adapterVersion);
-  if (!found || !codexVersionAtLeast(found, minimum)) throw new Error(`Codex at ${path} reports ${found ?? 'an unreadable version'}; adapter ${adapterVersion} requires ${minimum} or newer. Update your chosen CLI explicitly, then retry, or set CODEX_PATH. No bundled fallback was selected.`);
-  return { path, version: found };
+  return found && typeof bundled === 'string' && codexVersionAtLeast(found, bundled) ? { path, version: found } : undefined;
 }
 
 export interface CodexRuntime {

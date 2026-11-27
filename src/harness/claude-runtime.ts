@@ -22,7 +22,7 @@ export function bundledClaudeVersion(adapterManifest: string): string | undefine
 /**
  * The host's own Claude Code, when ACP sessions should run it instead of the copy bundled with the adapter.
  * The person signs in to, updates and checks the host Claude Code, and a newer one knows models the bundled
- * one does not. Missing or unqualified installed CLIs produce an actionable error; an explicit
+ * one does not. It is used only when it is at least as new as the bundled copy; an explicit
  * CLAUDE_CODE_EXECUTABLE, in the role or the service environment, always decides instead.
  */
 export function hostClaude(
@@ -33,8 +33,7 @@ export function hostClaude(
   const bundled = bundledClaudeVersion(adapterManifest);
   if (!bundled) return undefined;
   let path: string;
-  try { path = executableOnPath('claude', env, cwd); } catch { throw new Error('Claude Code is missing from PATH. Install it from https://code.claude.com/docs/en/setup, sign in, then retry the Fleet command. Set CLAUDE_CODE_EXECUTABLE for a custom executable; an explicit empty value retains the bundled runtime.'); }
+  try { path = executableOnPath('claude', env, cwd); } catch { return undefined; }
   const found = version(path, env);
-  if (!found || !codexVersionAtLeast(found, bundled)) throw new Error(`Claude Code at ${path} reports ${found ?? 'an unreadable version'}; this adapter is qualified with ${bundled} or newer. Update your chosen CLI explicitly, then retry, or explicitly select a runtime with CLAUDE_CODE_EXECUTABLE. No bundled fallback was selected.`);
-  return { path, version: found };
+  return found && codexVersionAtLeast(found, bundled) ? { path, version: found } : undefined;
 }

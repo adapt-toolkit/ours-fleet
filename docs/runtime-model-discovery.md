@@ -8,23 +8,32 @@ There are four independent versions: the Ours integration/skill bundle, the upst
 
 The adapter dependencies stay pinned because their control protocol, permissions and effort handling are qualified together. The SDK dependencies carry native upstream binaries; removing every pin would not remove that bundled runtime and would discard reproducibility.
 
-Default launch now uses an installed compatible CLI. Missing, unreadable or too-old PATH binaries produce actionable errors instead of silently switching to the SDK copy. Codex adapter 2.7.0 requires 0.166.0 (existing adapter qualification); 1.10.0 requires 0.153.3, legacy 1.1.7 requires 0.145.0. Claude retains the conservative qualified floor equal to the selected SDK's claudeCodeVersion (currently 2.1.321). That is a tested qualification boundary, NOT proof that every earlier Claude is incompatible or every future version works. No lower universal Claude ACP floor was established.
+Fleet already uses your installed Claude/Codex when it is at least as new as the
+adapter's bundled copy. If it is older, missing or unreadable, Fleet silently uses
+the bundled copy. This precedence is unchanged from 2.4.0; explicit executable
+overrides remain authoritative. The installer itself never installs either CLI.
 
-Existing roles/configurations retain their model, effort, CLI override and auth settings. If they previously relied on silent bundled fallback, select that runtime deliberately in role `env` or the service environment:
+The proposed strict missing/old-host error policy was held and reverted because
+it would break existing roles, including this host's Codex 0.162.1 versus the
+adapter's bundled 0.166.0. The preference to require a user-installed CLI for new
+Fleet setups remains unmet. A follow-up needs a persisted new/legacy policy
+marker and tested upgrade/old-client migration before changing defaults.
 
-```yaml
-env:
-  CLAUDE_CODE_EXECUTABLE: ""
-  CODEX_PATH: ""
-```
+Current Codex adapter qualification: 2.7.0 uses >=0.166.0; 1.10.0 uses >=0.153.3;
+legacy 1.1.7 uses >=0.145.0. Claude's current host preference compares against the
+SDK's claudeCodeVersion (2.1.321), a conservative qualification boundary, not a
+proof that all earlier releases are incompatible or all future releases work.
 
-Each key affects only its own provider. A nonempty CLAUDE_CODE_EXECUTABLE or CODEX_PATH remains the explicit custom executable choice. These changes do not rewrite PATH, auth profiles or user settings. Custom ACP commands retain control of their own runtime.
+Existing roles retain their model, effort, CLI override and authentication.
+An explicit nonempty CLAUDE_CODE_EXECUTABLE or CODEX_PATH selects a custom path.
+An explicit empty value keeps the bundled runtime. No setting is rewritten.
+Custom ACP commands retain control of their runtime.
 
 ## Model sources
 
 Official interfaces: [Codex app-server model/list](https://learn.chatgpt.com/docs/app-server#models), [Claude SDK query.supportedModels](https://code.claude.com/docs/en/agent-sdk/typescript#query-object).
 
-Codex model/list is already in released Fleet 2.4.0; this change retains previously dropped fields. IDs use `model` (falling back to `id`), label uses `displayName`, efforts use ordered `supportedReasoningEfforts[].reasoningEffort`, and the optional suggested default uses `defaultReasoningEffort` only when supported. Installed host schema verified with codex-cli 0.162.1; schema artifacts in task tooling-evidence/codex-schema. This host's CLI is below the selected adapter 2.7.0 floor, so default Fleet discovery reports the prerequisite rather than silently querying the bundled 0.166.0. A deliberately selected bundled runtime is still available.
+Codex model/list is already in released Fleet 2.4.0; this change retains previously dropped fields. IDs use `model` (falling back to `id`), label uses `displayName`, efforts use ordered `supportedReasoningEfforts[].reasoningEffort`, and the optional suggested default uses `defaultReasoningEffort` only when supported. Installed host schema verified with codex-cli 0.162.1; schema artifacts in task tooling-evidence/codex-schema. This host's installed CLI is below the selected adapter 2.7.0 floor; unchanged Fleet precedence queries the bundled 0.166.0 for discovery and launch. The generated 0.162.1 schema is evidence of the installed host interface, not a claim that this is the selected ACP runtime.
 
 Claude metadata uses the selected adapter's SDK with the installed CLI and provider environment. The probe replaces CLAUDE_CONFIG_DIR with a private disposable directory: actual initialization writes metadata (.claude.json and plugin-store metadata), even with persistSession=false. No auth file is copied, and user settings/auth directories are not the probe's write destination. This deliberately returns a generic provider/harness catalog, not an account-specific eligibility list. ID is SDK `value` (preserves aliases), label is `displayName`, efforts are `supportedEffortLevels`; supportsEffort=false means no effort setting. Missing support means unknown, never all efforts. SDK metadata does not provide a reliable per-model default effort, so none is invented. `resolvedModel` is not substituted for aliases or user choices.
 
@@ -37,3 +46,13 @@ Onboarding payload carries per-entry `source`, `freshness` (fresh/cached/static)
 Static fallback is a maintained adapter contract, not current account availability. All catalog entries require provider validation at launch. No private account endpoint, API-key model endpoint substitute, session token scraping or paid inference was used to refresh models.
 
 Claude picker labels explicitly say “plan/org checked at launch”. Its no-credential probe cannot discover plan tier or organization allowlists. The probe always disables updater and nonessential traffic with DISABLE_AUTOUPDATER=1 and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; it never updates the selected CLI. CLI version detection in this Claude discovery path uses async execFile under a one-second timeout. Error responses use fixed metadata error categories and never return raw SDK/environment diagnostics. Environment hashes remain in closure memory only and are never logged or persisted.
+
+## Internal runtime-selection audit (policy unchanged)
+
+- Claude launch: harness/claude-code.ts prepareSession -> hostClaude; merged role/service env preserves explicit override.
+- Codex persistent/temporary launch: harness/codex.ts runtime resolution and prepareSession -> hostCodex/probeCodexRuntime; same merged environment.
+- Managed CLI launch: managed-cli.ts -> hostCodex, unchanged.
+- Codex model metadata: application/codex-models.ts -> probeCodexRuntime with service env and the selected subscription profile for the app-server request, unchanged executable precedence.
+- Doctor: doctor.ts -> probeCodexRuntime for native or ACP selections, unchanged.
+- Subscription login/status helpers use defaultBinaries() (OURS_FLEET_CLAUDE_BIN / OURS_FLEET_CODEX_BIN or PATH), not hostClaude/hostCodex. Those overrides and profiles are unchanged.
+- New Claude metadata: application/claude-models.ts uses async installed-CLI inspection, private disposable config and static fallback; it never changes a launch selection. Bundled-only Claude metadata returns unknown/static rather than selecting another executable.
